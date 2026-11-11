@@ -47,7 +47,7 @@ revisados=(
     gpu/pgs_puente/compose_circuits.comp gpu/pgs_puente/pgs_puente.cpp gpu/pgs_puente/pgs_puente.h
     docs/lanzamiento/img/cockpit-hud.png docs/lanzamiento/img/cockpit-start-lights.png
     docs/lanzamiento/img/grid-22-cars-aerial.png docs/lanzamiento/img/menu-pc-graphics.png
-    docs/lanzamiento/img/replay-tv-camera.png
+    docs/lanzamiento/img/replay-tv-camera.png docs/lanzamiento/img/cabecera-readme.png
     scripts/ab_ciclos.py scripts/ab_diagnostico.py scripts/ab_resumen.py scripts/bft_decodificar.py
     scripts/buscar_valor.py scripts/capturar-ventana.ps1 scripts/carrera-directa.ps1 scripts/cazar-cuelgue.ps1
     scripts/comparar_partidas.py scripts/desfase-lineas.ps1 scripts/ee_xref.py scripts/elf_ps2.py
@@ -73,7 +73,7 @@ clasificar() {
     case "$1" in
         src/*.cpp | src/*.h | parches/*.patch) clase=publico ;;
         # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
-        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | docs/lanzamiento/*.md) clase=privado ;;
+        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
         src/* | parches/* | gpu/* | config/* | scripts/* | docs/*) clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;
@@ -154,10 +154,10 @@ done
 
 # Datos personales, sin distinguir mayusculas: rutas de la unidad J: y de la carpeta del usuario de Windows, su nombre,
 # su correo y las carpetas del proyecto y de la ISO. Se permiten el enlace al repositorio publico
-# (github.com/<cuenta>/F1-06-PC) y las carpetas de usuario genericas (Users/Public y Users/p de los tests).
+# (github.com/<cuenta>/F1-06-PC), los perfiles publicos de Ko-fi y X del autor y las carpetas de usuario genericas (Users/Public y Users/p de los tests).
 # Los corchetes evitan que este mismo script coincida con sus patrones.
 personales='J:[\\/]|[a-z]:[\\/]+users[\\/]+[a-z0-9._-]{2,}|K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula'
-permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#users[\\/]+(public|default)\b##gI'
+permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
 # En los binarios solo los patrones largos (los cortos darian falsos positivos en datos comprimidos).
 personales_binario='K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula|[a-z]:[\\/]+users[\\/]+k[e]vin'
 buscar_personales() { sed -E "$permitidos" | grep -i -E "$personales"; }

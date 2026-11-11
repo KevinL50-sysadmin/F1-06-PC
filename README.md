@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/lanzamiento/img/cabecera-readme.png" alt="F1 06 PC: the PS2 game, statically recompiled into a native Windows port" width="100%"></p>
+
 # F1 06 PC: a native Windows port of Formula One 06 (PS2) by static recompilation
 
 > **Fan project. Not affiliated with, endorsed by or connected to Sony Interactive Entertainment, SCE Studio Liverpool,
