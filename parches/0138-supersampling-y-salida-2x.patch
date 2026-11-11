@@ -1,0 +1,834 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 1e59c41..3fff4e1 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -230,6 +230,7 @@ private:
+     std::vector<uint8_t> m_hostPresentationFrame;
+     uint32_t m_hostPresentationWidth = 0;
+     uint32_t m_hostPresentationHeight = 0;
++    uint32_t m_hostPresentationRowPixels = 0; // PresentationFrame::rowPixels (0: 640)
+     uint32_t m_hostPresentationDisplayFbp = 0;
+     uint32_t m_hostPresentationSourceFbp = 0;
+     bool m_hostPresentationUsedPreferred = false;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 58d424f..76b438c 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -50,6 +50,22 @@ GSMode ps2GsModeFromEnvironment(const char *value);
+ // PS2X_GS_GPU_DLL, or pgs_puente.dll next to the executable.
+ std::filesystem::path ps2GsGpuBridgePath();
+ 
++// Phase 3 (T1): paraLLEl-GS's image quality, from opciones.ini (supersampling, alta_resolucion) or the variables
++// PS2X_GS_SSAA (1, 2, 4, 8 or 16; anything else 1), PS2X_GS_ALTA_RES and PS2X_GS_SSAA_TEXTURAS ("1": on). Only the GPU
++// GS uses them; with the CPU GS they are ignored with one "[gs:gpu]" line (ps2GsGpuQualityIgnoredWarnings).
++// Supersampling draws each pixel from up to 16 samples (smoother edges) at the same output size; alta_resolucion
++// (4x or more) scans out twice the size on each axis from those samples (a 512x512 frame becomes 1024x1024).
++struct GSGpuQuality
++{
++    uint32_t superSampling = 1u;
++    bool highResolution = false;
++    bool superSampledTextures = false;
++};
++GSGpuQuality ps2GsGpuQualityFromEnvironment(const char *superSampling, const char *highResolution,
++                                            const char *superSampledTextures);
++GSGpuQuality ps2GsGpuQualityFromEnvironment();
++uint32_t ps2GsGpuQualityIgnoredWarnings();
++
+ class GSGpuBackend final : public GSRasterBackend
+ {
+ public:
+@@ -59,6 +75,12 @@ public:
+ 
+     std::string DeviceName() const;
+ 
++    // The quality in use (superSampling as the GPU runs it: at most its top rate).
++    GSGpuQuality Quality() const;
++    // Applies quality between two frames (the device is created with room for the top rate, so it can go up as well
++    // as down; the GPU waits and the super samples restart from the next frame). Returns the quality in use.
++    GSGpuQuality SetQuality(const GSGpuQuality &quality);
++
+     // The registers that are not in a GSPresentationRequest (SMODE1).
+     void SetPrivilegedRegisters(const GSRegisters *registers);
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..81d5955 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -298,6 +298,9 @@ struct PresentationFrame
+     uint32_t displayFbp = 0;
+     uint32_t sourceFbp = 0;
+     bool usedPreferred = false;
++    // Pixels from one row to the next; 0: 640 (the CPU presenter's frame). Frames larger than 640x512 (the GPU GS's
++    // alta_resolucion, twice the size on each axis) have packed rows (rowPixels = width).
++    uint32_t rowPixels = 0;
+ 
+     explicit operator bool() const
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index ea28fd8..7600ffd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -557,6 +557,7 @@ void GS::reset()
+         m_hostPresentationFrame.clear();
+         m_hostPresentationWidth = 0u;
+         m_hostPresentationHeight = 0u;
++        m_hostPresentationRowPixels = 0u;
+         m_hostPresentationDisplayFbp = 0u;
+         m_hostPresentationSourceFbp = 0u;
+         m_hostPresentationUsedPreferred = false;
+@@ -1030,6 +1031,7 @@ void GS::latchHostPresentationFrame()
+         m_hostPresentationFrame = std::move(frame.pixels);
+         m_hostPresentationWidth = width;
+         m_hostPresentationHeight = height;
++        m_hostPresentationRowPixels = frame.rowPixels;
+         m_hostPresentationDisplayFbp = displayFbp;
+         m_hostPresentationSourceFbp = sourceFbp;
+         m_hostPresentationUsedPreferred = usedPreferred;
+@@ -1080,7 +1082,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
+     if (outWidth != 0u && outHeight != 0u)
+     {
+-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
++        // Frames larger than 640x512 (the GPU GS's alta_resolucion) come with packed rows.
++        const size_t sourceRowBytes =
++            static_cast<size_t>(m_hostPresentationRowPixels != 0u ? m_hostPresentationRowPixels : kHostFrameWidth) * 4u;
+         for (uint32_t y = 0; y < outHeight; ++y)
+         {
+             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 0b415cd..e9235a2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -26,9 +26,9 @@
+ 
+ namespace
+ {
+-    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 3), declared here so that the runtime
++    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 4), declared here so that the runtime
+     // does not depend on the bridge's source tree.
+-    constexpr uint32_t kPgsApiVersion = 3u;
++    constexpr uint32_t kPgsApiVersion = 4u;
+     constexpr size_t kVramSize = 4u * 1024u * 1024u;
+     struct pgs_context;
+     struct PgsCreateInfo
+@@ -48,6 +48,7 @@ namespace
+         uint64_t serial;
+         uint32_t circuits, composed;
+         uint64_t scanout;
++        uint32_t scale, super_sampling;
+     };
+     struct PgsComposeInfo
+     {
+@@ -63,8 +64,14 @@ namespace
+         kScanoutForceProgressive = 1u << 0,
+         kScanoutAntiBlur = 1u << 2,
+         kScanoutAdaptHorizontal = 1u << 4,
++        kScanoutHighRes = 1u << 5,
+         kScanoutSplitCircuits = 1u << 6,
+     };
++    enum : uint32_t
++    {
++        kCreateDynamicSuperSampling = 1u << 0,
++        kCreateSuperSampledTextures = 1u << 1,
++    };
+ 
+     struct PgsApi
+     {
+@@ -84,6 +91,8 @@ namespace
+         int (*vsync_composed)(pgs_context *, const PgsPrivRegs *, uint32_t, uint32_t, const PgsComposeInfo *);
+         int (*get_frame)(pgs_context *, int, PgsFrame *);
+         void (*get_stats)(pgs_context *, PgsStats *);
++        uint32_t (*set_quality)(pgs_context *, uint32_t, uint32_t);
++        uint32_t (*get_super_sampling)(pgs_context *);
+     };
+ 
+     constexpr uint32_t kHostFrameWidth = 640u; // the presentation frame's row stride (gs_frontend.cpp)
+@@ -91,6 +100,28 @@ namespace
+     constexpr uint32_t kGifPath = 3u;          // whole packets, each one parsed from its first tag (see GifPacket)
+ 
+     std::atomic<uint32_t> g_fallbackWarnings{0u};
++    std::atomic<uint32_t> g_qualityIgnoredWarnings{0u};
++
++    bool isOne(const char *value)
++    {
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }
++
++    // The GPU quality options asked for, when the CPU GS draws: one line for the whole process.
++    void warnQualityIgnored()
++    {
++        const GSGpuQuality quality = ps2GsGpuQualityFromEnvironment();
++        if (quality.superSampling == 1u && !quality.highResolution && !quality.superSampledTextures)
++            return;
++        static std::once_flag s_warned;
++        std::call_once(s_warned, [&]() {
++            g_qualityIgnoredWarnings.fetch_add(1u, std::memory_order_relaxed);
++            std::fprintf(stderr,
++                         "[gs:gpu] supersampling = %u y alta_resolucion = %d son del GS por GPU: con el GS de CPU no se "
++                         "usan\n",
++                         quality.superSampling, quality.highResolution ? 1 : 0);
++        });
++    }
+ 
+     // GIF bits per pixel of a transfer format (local -> host size).
+     uint32_t bitsPerPixel(uint32_t psm)
+@@ -401,6 +432,12 @@ struct GSGpuBackend::Impl
+     std::atomic<uint64_t> mutations{0u}; // records that may change local memory, queued so far
+ 
+     const GSRegisters *privRegs = nullptr;
++    // The quality asked for at creation (PS2X_GS_SSAA, ...) and the one in use (under qualityMutex; superSampling as
++    // the DLL runs it), set on the GS GPU thread.
++    GSGpuQuality requestedQuality{};
++    mutable std::mutex qualityMutex;
++    GSGpuQuality quality{};
++    bool dynamicSuperSampling = true; // PS2X_GS_SSAA_DINAMICO=0: room for the creation rate only (diagnosis)
+     uint32_t scanoutFlags = kScanoutForceProgressive | kScanoutAdaptHorizontal;
+     bool scanoutFromVram = false; // PS2X_GS_GPU_ESCANEO=vram: the CPU converts a copy of the GPU's local memory
+     bool translateCrtc = true;    // PS2X_GS_GPU_ESCANEO=crudo: the HLE's CRTC registers as they are
+@@ -522,17 +559,28 @@ struct GSGpuBackend::Impl
+                 publish(std::move(composed));
+             return;
+         }
++        // A high resolution scanout (alta_resolucion) is twice the size on each axis: its rows are packed.
++        const uint32_t scale = frame.scale == 2u ? 2u : 1u;
+         PresentationFrame result{};
+-        result.width = std::min(frame.width, kHostFrameWidth);
+-        result.height = std::min(frame.height, kHostFrameHeight);
+-        result.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+-        for (uint32_t y = 0; y < result.height; ++y)
+-        {
+-            uint8_t *dst = result.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
+-            std::memcpy(dst, frame.rgba + static_cast<size_t>(y) * frame.width * 4u, result.width * 4u);
+-            for (uint32_t x = 0; x < result.width; ++x)
+-                dst[x * 4u + 3u] = 0xFFu;
+-        }
++        result.width = std::min(frame.width, kHostFrameWidth * scale);
++        result.height = std::min(frame.height, kHostFrameHeight * scale);
++        const uint32_t rowPixels = scale == 1u ? kHostFrameWidth : result.width;
++        result.rowPixels = scale == 1u ? 0u : rowPixels;
++        result.pixels.assign(static_cast<size_t>(rowPixels) * (scale == 1u ? kHostFrameHeight : result.height) * 4u, 0u);
++        if (rowPixels == frame.width)
++            std::memcpy(result.pixels.data(), frame.rgba, static_cast<size_t>(rowPixels) * result.height * 4u);
++        else
++            for (uint32_t y = 0; y < result.height; ++y)
++                std::memcpy(result.pixels.data() + static_cast<size_t>(y) * rowPixels * 4u,
++                            frame.rgba + static_cast<size_t>(y) * frame.width * 4u, result.width * 4u);
++        // Composed frames come with alpha 0xFF (compose_circuits.comp).
++        if (frame.composed == 0u)
++            for (uint32_t y = 0; y < result.height; ++y)
++            {
++                uint8_t *dst = result.pixels.data() + static_cast<size_t>(y) * rowPixels * 4u;
++                for (uint32_t x = 0; x < result.width; ++x)
++                    dst[x * 4u + 3u] = 0xFFu;
++            }
+         result.displayFbp = frame.composed != 0u && known ? shownFbp(scanoutRequests[frame.scanout % kScanoutHistory])
+                                                           : static_cast<uint32_t>(lastScanoutRequest.dispfb1 & 0x1FFu);
+         result.sourceFbp = result.displayFbp;
+@@ -546,9 +594,11 @@ struct GSGpuBackend::Impl
+             s_sizeLogs < 20u)
+         {
+             ++s_sizeLogs;
+-            std::fprintf(stderr, "[gs:gpu] fotograma: %ux%u (modo %ux%u, entrelazado=%u, circuitos aparte=%u)\n",
++            std::fprintf(stderr,
++                         "[gs:gpu] fotograma: %ux%u (modo %ux%u, entrelazado=%u, circuitos aparte=%u, escala %u, "
++                         "supersampling x%u)\n",
+                          frame.width, frame.height, frame.mode_width, frame.mode_height, frame.interlaced,
+-                         frame.circuits);
++                         frame.circuits, frame.scale, frame.super_sampling);
+         }
+         s_lastWidth = frame.width;
+         s_lastHeight = frame.height;
+@@ -742,8 +792,12 @@ struct GSGpuBackend::Impl
+         t_onGpuThread = true;
+         nameThisThread();
+         char error[256] = {};
+-        PgsCreateInfo info{sizeof(PgsCreateInfo), 1u, 0u};
++        const uint32_t createFlags = (dynamicSuperSampling ? kCreateDynamicSuperSampling : 0u) |
++                                     (requestedQuality.superSampledTextures ? kCreateSuperSampledTextures : 0u);
++        PgsCreateInfo info{sizeof(PgsCreateInfo), requestedQuality.superSampling, createFlags};
+         context = api.create(&info, error, sizeof(error));
++        if (context != nullptr)
++            applyQuality(requestedQuality, api.get_super_sampling(context));
+         {
+             std::lock_guard<std::mutex> lock(mutex);
+             created = true;
+@@ -788,6 +842,20 @@ struct GSGpuBackend::Impl
+         context = nullptr;
+     }
+ 
++    // The quality in use once the DLL runs superSampling (GS GPU thread); the high resolution scanout flag follows it.
++    // PS2X_GS_GPU_ESCANEO=cpu merges native-size circuits (composeCircuits): no high resolution there.
++    GSGpuQuality applyQuality(const GSGpuQuality &wanted, uint32_t superSampling)
++    {
++        GSGpuQuality applied = wanted;
++        applied.superSampling = superSampling;
++        applied.highResolution = wanted.highResolution && !composeOnCpu;
++        applied.superSampledTextures = wanted.superSampledTextures && superSampling > 1u;
++        scanoutFlags = applied.highResolution ? scanoutFlags | kScanoutHighRes : scanoutFlags & ~kScanoutHighRes;
++        std::lock_guard<std::mutex> lock(qualityMutex);
++        quality = applied;
++        return applied;
++    }
++
+     // Copies all of the GPU's local memory into vramCache (GS GPU thread).
+     void copyVram(std::vector<uint8_t> &out) const
+     {
+@@ -872,6 +940,8 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     resolve(api.vsync_composed, "pgs_vsync_composed");
+     resolve(api.get_frame, "pgs_get_frame");
+     resolve(api.get_stats, "pgs_get_stats");
++    resolve(api.set_quality, "pgs_set_quality");
++    resolve(api.get_super_sampling, "pgs_get_super_sampling");
+     if (!complete || api.api_version() != kPgsApiVersion)
+     {
+         error = dll.string() + " no tiene la API esperada (version " + std::to_string(kPgsApiVersion) + ")";
+@@ -889,6 +959,9 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+         impl.coalesce = std::strcmp(value, "0") != 0;
+     if (const char *value = std::getenv("PS2X_GS_GPU_BANDERAS")) // scanout flags of pgs_vsync (diagnosis)
+         impl.scanoutFlags = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
++    impl.requestedQuality = ps2GsGpuQualityFromEnvironment();
++    if (const char *value = std::getenv("PS2X_GS_SSAA_DINAMICO"))
++        impl.dynamicSuperSampling = std::strcmp(value, "0") != 0;
+ 
+     impl.worker = std::thread([&impl]() { impl.workerLoop(); });
+     {
+@@ -932,6 +1005,52 @@ std::string GSGpuBackend::DeviceName() const
+     return m_impl->deviceName;
+ }
+ 
++GSGpuQuality GSGpuBackend::Quality() const
++{
++    std::lock_guard<std::mutex> lock(m_impl->qualityMutex);
++    return m_impl->quality;
++}
++
++GSGpuQuality GSGpuBackend::SetQuality(const GSGpuQuality &quality)
++{
++    Impl &impl = *m_impl;
++    GSGpuQuality applied{};
++    // After everything queued so far (the scanout waiting to be coalesced too): between two frames.
++    impl.runSync([&]() {
++        const uint32_t rate = impl.api.set_quality(impl.context, quality.superSampling,
++                                                   quality.superSampledTextures ? kCreateSuperSampledTextures : 0u);
++        applied = impl.applyQuality(quality, rate);
++    });
++    std::fprintf(stderr, "[gs:gpu] calidad: supersampling x%u (pedido x%u), alta_resolucion=%d, texturas=%d\n",
++                 applied.superSampling, quality.superSampling, applied.highResolution ? 1 : 0,
++                 applied.superSampledTextures ? 1 : 0);
++    return applied;
++}
++
++GSGpuQuality ps2GsGpuQualityFromEnvironment(const char *superSampling, const char *highResolution,
++                                            const char *superSampledTextures)
++{
++    GSGpuQuality quality{};
++    if (superSampling != nullptr)
++        for (const char *rate : {"1", "2", "4", "8", "16"})
++            if (std::strcmp(superSampling, rate) == 0)
++                quality.superSampling = static_cast<uint32_t>(std::atoi(rate));
++    quality.highResolution = isOne(highResolution);
++    quality.superSampledTextures = isOne(superSampledTextures);
++    return quality;
++}
++
++GSGpuQuality ps2GsGpuQualityFromEnvironment()
++{
++    return ps2GsGpuQualityFromEnvironment(std::getenv("PS2X_GS_SSAA"), std::getenv("PS2X_GS_ALTA_RES"),
++                                          std::getenv("PS2X_GS_SSAA_TEXTURAS"));
++}
++
++uint32_t ps2GsGpuQualityIgnoredWarnings()
++{
++    return g_qualityIgnoredWarnings.load(std::memory_order_relaxed);
++}
++
+ void GSGpuBackend::SetPrivilegedRegisters(const GSRegisters *registers)
+ {
+     m_impl->privRegs = registers;
+@@ -1101,7 +1220,10 @@ uint64_t GSGpuBackend::ScanoutsRun() const
+ std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend()
+ {
+     if (ps2GsModeFromEnvironment(std::getenv("PS2X_GS")) != GSMode::Gpu)
++    {
++        warnQualityIgnored();
+         return nullptr;
++    }
+     const std::filesystem::path dll = ps2GsGpuBridgePath();
+     std::string error;
+     std::unique_ptr<GSGpuBackend> backend = GSGpuBackend::Create(dll, error);
+@@ -1112,10 +1234,19 @@ std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend()
+             g_fallbackWarnings.fetch_add(1u, std::memory_order_relaxed);
+             std::fprintf(stderr, "[gs:gpu] no se puede usar el GS por GPU: %s; se usa el GS de CPU\n", error.c_str());
+         });
++        warnQualityIgnored();
+         return nullptr;
+     }
+-    std::fprintf(stderr, "[gs:gpu] GS por GPU: paraLLEl-GS en %s (%s)\n", backend->DeviceName().c_str(),
+-                 dll.string().c_str());
++    const GSGpuQuality wanted = ps2GsGpuQualityFromEnvironment();
++    const GSGpuQuality quality = backend->Quality();
++    std::fprintf(stderr,
++                 "[gs:gpu] GS por GPU: paraLLEl-GS en %s (%s); supersampling x%u (pedido x%u), alta_resolucion=%d, "
++                 "texturas_supersampling=%d\n",
++                 backend->DeviceName().c_str(), dll.string().c_str(), quality.superSampling, wanted.superSampling,
++                 quality.highResolution ? 1 : 0, quality.superSampledTextures ? 1 : 0);
++    if (quality.highResolution && quality.superSampling < 4u)
++        std::fprintf(stderr, "[gs:gpu] alta_resolucion necesita supersampling = 4 o mas: la imagen sale a su "
++                             "resolucion nativa\n");
+     return backend;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index a1a1e60..cca58ee 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -80,6 +80,18 @@ namespace ps2x
+              "Dibujo de los graficos: gpu = en la tarjeta grafica (Vulkan), lo normal; cpu = modo Software, mas lento\n"
+              "(el dibujo de referencia). Si falta pgs_puente.dll junto al juego o Vulkan, se usa cpu.",
+              "cpu"},
++            // The player gets x4 + double resolution (measured free on an RTX 4070 Ti, odd/tasks/fase3 L2); development
++            // keeps the native picture so the measuring scripts stay comparable.
++            {"supersampling", "PS2X_GS_SSAA", "4", {{"1", "1"}, {"2", "2"}, {"4", "4"}, {"8", "8"}, {"16", "16"}}, 0, 0,
++             "Supersampling del GS por GPU (bordes mas suaves): 1 = sin supersampling; 2, 4, 8 o 16 muestras por\n"
++             "pixel. Cuanto mas alto, mas trabajo para la tarjeta grafica; con una grafica modesta, baja a 1 o 2. Con\n"
++             "gs = cpu no se usa.",
++             "1"},
++            {"alta_resolucion", "PS2X_GS_ALTA_RES", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Salida a doble resolucion del GS por GPU: 1 = imagen con el doble de ancho y de alto (mas nitida),\n"
++             "sacada de las muestras del supersampling, que debe ser 4 o mas; 0 = resolucion nativa. Con gs = cpu no\n"
++             "se usa.",
++             "0"},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c802026..597daff 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -573,7 +573,9 @@ namespace
+ // use it.
+ // With PS2X_CAPTURA_RAM=1 the capture also saves the EE RAM (32 MB) next to the PNG, as <path>.ram, taken at the same
+ // moment (to find game variables by what the screen shows).
+-static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t width, uint32_t height, const uint8_t *rdram)
++// frame: rows of rowPixels pixels (the frame texture's width), the picture in its top left width x height pixels.
++static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t rowPixels, uint32_t width, uint32_t height,
++                                 const uint8_t *rdram)
+ {
+     static const char *const s_request = std::getenv("PS2X_CAPTURA_PETICION");
+     static uint32_t s_skip = 0u;
+@@ -596,14 +598,13 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t wid
+         path.erase(0, 3); // UTF-8 BOM
+     while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' '))
+         path.pop_back();
+-    width = std::min<uint32_t>(width, FB_WIDTH);
+-    height = std::min<uint32_t>(height, FB_HEIGHT);
+-    if (!path.empty() && width != 0u && height != 0u && frame.size() >= static_cast<size_t>(FB_WIDTH) * height * 4u)
++    width = std::min<uint32_t>(width, rowPixels);
++    if (!path.empty() && width != 0u && height != 0u && frame.size() >= static_cast<size_t>(rowPixels) * height * 4u)
+     {
+         std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
+         for (uint32_t y = 0; y < height; ++y)
+             std::memcpy(pixels.data() + static_cast<size_t>(y) * width * 4u,
+-                        frame.data() + static_cast<size_t>(y) * FB_WIDTH * 4u, static_cast<size_t>(width) * 4u);
++                        frame.data() + static_cast<size_t>(y) * rowPixels * 4u, static_cast<size_t>(width) * 4u);
+         for (size_t i = 3u; i < pixels.size(); i += 4u)
+             pixels[i] = 0xFFu;
+         Image image{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+@@ -624,6 +625,34 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t wid
+     std::remove(s_request);
+ }
+ 
++// Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest made
++// uneven pixels). PS2X_FILTRO=0: nearest, as before.
++static void ApplyFrameFilter(Texture2D &tex)
++{
++    const char *filterEnv = std::getenv("PS2X_FILTRO");
++    SetTextureFilter(tex, filterEnv != nullptr && filterEnv[0] == '0' ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
++}
++
++// Phase 3 (T1): the GPU GS's alta_resolucion hands out frames up to twice 640x512 on each axis. The frame texture grows
++// to the largest one seen (never shrinks: the picture is drawn from its top left corner, srcRect).
++static bool EnsureFrameTexture(Texture2D &tex, uint32_t width, uint32_t height)
++{
++    if (width <= static_cast<uint32_t>(tex.width) && height <= static_cast<uint32_t>(tex.height))
++        return false;
++    const int newWidth = std::max(tex.width, static_cast<int>(width));
++    const int newHeight = std::max(tex.height, static_cast<int>(height));
++    Image blank = GenImageColor(newWidth, newHeight, BLANK);
++    Texture2D grown = LoadTextureFromImage(blank);
++    UnloadImage(blank);
++    if (grown.id == 0u)
++        return false;
++    UnloadTexture(tex);
++    tex = grown;
++    ApplyFrameFilter(tex);
++    std::cerr << "[ventana] textura del fotograma: " << newWidth << "x" << newHeight << std::endl;
++    return true;
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -638,7 +667,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+ 
+     if (s_hasUploadedFrame)
+-        SaveRequestedCapture(s_uploadBuffer, s_lastWidth, s_lastHeight, rt->memory().getRDRAM());
++        SaveRequestedCapture(s_uploadBuffer, static_cast<uint32_t>(tex.width), s_lastWidth, s_lastHeight,
++                             rt->memory().getRDRAM());
+ 
+     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+@@ -668,7 +698,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                                                    &sourceFbp,
+                                                    &usedPreferredDisplaySource))
+     {
+-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
++        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
+         UpdateTexture(tex, blank.data);
+         UnloadImage(blank);
+         outWidth = FB_WIDTH;
+@@ -704,13 +734,18 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_lastWidth = width;
+     s_lastHeight = height;
+ 
++    // The texture as large as the frame (at most twice 640x512 on each axis), and the upload buffer as the texture.
++    EnsureFrameTexture(tex, std::min<uint32_t>(width, FB_WIDTH * 2u), std::min<uint32_t>(height, FB_HEIGHT * 2u));
++    const uint32_t texWidth = static_cast<uint32_t>(tex.width);
++    const uint32_t texHeight = static_cast<uint32_t>(tex.height);
++    s_uploadBuffer.resize(static_cast<size_t>(texWidth) * texHeight * 4u);
+     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+     if (!s_scratch.empty() && width != 0u && height != 0u)
+     {
+-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
+-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
++        const uint32_t copyWidth = std::min<uint32_t>(width, texWidth);
++        const uint32_t copyHeight = std::min<uint32_t>(height, texHeight);
+         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
+-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
++        const size_t dstRowBytes = static_cast<size_t>(texWidth) * 4u;
+         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
+         for (uint32_t y = 0; y < copyHeight; ++y)
+         {
+@@ -2782,12 +2817,7 @@ void PS2Runtime::run()
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+     Texture2D frameTex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
+-    // Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest
+-    // made uneven pixels). PS2X_FILTRO=0: nearest, as before.
+-    {
+-        const char *filterEnv = std::getenv("PS2X_FILTRO");
+-        SetTextureFilter(frameTex, filterEnv != nullptr && filterEnv[0] == '0' ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+-    }
++    ApplyFrameFilter(frameTex);
+     PresentAspect presentAspect = initialPresentAspect();
+     bool aspectChosenByUser = std::getenv("PS2X_ASPECTO") != nullptr;
+ 
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index cf70b9e..a1afc92 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -256,6 +256,34 @@ namespace
+             }
+         t.Equals(different, size_t{0}, "identical pixels (first difference at " + first + ")");
+     }
++
++    // Pixels from one row of frame to the next (PresentationFrame::rowPixels, 0 = 640).
++    uint32_t rowPixelsOf(const PresentationFrame &frame)
++    {
++        return frame.rowPixels != 0u ? frame.rowPixels : 640u;
++    }
++
++    // Pixels of big (twice the size of small on each axis) that differ from the small pixel they come from
++    // (each small pixel covers 2x2 big ones); the first one in first.
++    size_t differencesFromDoubled(const PresentationFrame &small, const PresentationFrame &big, std::string &first)
++    {
++        size_t different = 0u;
++        first = "none";
++        for (uint32_t y = 0; y < big.height; ++y)
++            for (uint32_t x = 0; x < big.width; ++x)
++            {
++                const uint8_t *expected =
++                    small.pixels.data() + (static_cast<size_t>(y / 2u) * rowPixelsOf(small) + x / 2u) * 4u;
++                const uint8_t *actual = big.pixels.data() + (static_cast<size_t>(y) * rowPixelsOf(big) + x) * 4u;
++                if (std::memcmp(expected, actual, 4u) == 0)
++                    continue;
++                if (different++ == 0u)
++                    first = std::to_string(x) + "," + std::to_string(y);
++            }
++        return different;
++    }
++
++    const auto kNoEnvironment = [](const char *) -> const char * { return nullptr; };
+ }
+ 
+ void register_ps2_gs_gpu_tests()
+@@ -494,6 +522,239 @@ void register_ps2_gs_gpu_tests()
+             t.Equals(backend->ScanoutsRun() - before, uint64_t{2}, "both scanouts run");
+         });
+ 
++        tc.Run("supersampling and alta_resolucion default to 4 and 1 for the player, 1 and 0 in development", [](TestCase &t)
++        {
++            for (const bool development : {false, true})
++            {
++                const std::string ssaa = development ? "1" : "4";
++                const std::string high = development ? "0" : "1";
++                const std::string text = ps2x::defaultOptionsText(development);
++                t.IsTrue(text.find("\nsupersampling = " + ssaa + "\n") != std::string::npos,
++                         "the default file has supersampling = " + ssaa);
++                t.IsTrue(text.find("\nalta_resolucion = " + high + "\n") != std::string::npos,
++                         "the default file has alta_resolucion = " + high);
++                const ps2x::OptionsFile defaults = ps2x::parseOptions(text, "opciones.ini", development);
++                t.IsTrue(defaults.warnings.empty(), "the default file parses without warnings");
++                const auto settings = settingsOf(defaults, kNoEnvironment);
++                t.IsTrue(settings.count("PS2X_GS_SSAA") == 1u && settings.at("PS2X_GS_SSAA") == ssaa,
++                         "PS2X_GS_SSAA=" + ssaa);
++                t.IsTrue(settings.count("PS2X_GS_ALTA_RES") == 1u && settings.at("PS2X_GS_ALTA_RES") == high,
++                         "PS2X_GS_ALTA_RES=" + high);
++            }
++            const std::string text = ps2x::defaultOptionsText();
++            t.IsTrue(text.find("# Supersampling del GS por GPU") != std::string::npos, "supersampling has its comment");
++            t.IsTrue(text.find("# Salida a doble resolucion del GS por GPU") != std::string::npos,
++                     "alta_resolucion has its comment");
++            const auto settings = settingsOf(ps2x::parseOptions("supersampling = 16\nalta_resolucion = 1\n"), kNoEnvironment);
++            t.Equals(settings.at("PS2X_GS_SSAA"), std::string("16"), "supersampling = 16 -> PS2X_GS_SSAA=16");
++            t.Equals(settings.at("PS2X_GS_ALTA_RES"), std::string("1"), "alta_resolucion = 1 -> PS2X_GS_ALTA_RES=1");
++        });
++
++        tc.Run("PS2X_GS_SSAA and PS2X_GS_ALTA_RES win over the file; bad values keep the default with a warning", [](TestCase &t)
++        {
++            const ps2x::OptionsFile options = ps2x::parseOptions("supersampling = 4\nalta_resolucion = 1\n");
++            const auto set = [](const char *name) -> const char * {
++                if (std::strcmp(name, "PS2X_GS_SSAA") == 0)
++                    return "16";
++                return std::strcmp(name, "PS2X_GS_ALTA_RES") == 0 ? "0" : nullptr;
++            };
++            const auto settings = settingsOf(options, set);
++            t.IsTrue(settings.count("PS2X_GS_SSAA") == 0u, "PS2X_GS_SSAA already set wins over the file");
++            t.IsTrue(settings.count("PS2X_GS_ALTA_RES") == 0u, "PS2X_GS_ALTA_RES already set wins over the file");
++
++            const ps2x::OptionsFile bad =
++                ps2x::parseOptions("supersampling = 3\nalta_resolucion = 2\n", "opciones.ini", true);
++            t.Equals(bad.values.at("supersampling"), std::string("1"), "supersampling falls back to 1 in development");
++            t.Equals(bad.values.at("alta_resolucion"), std::string("0"), "alta_resolucion falls back to 0 in development");
++            const ps2x::OptionsFile badPlayer = ps2x::parseOptions("supersampling = 3\nalta_resolucion = 2\n");
++            t.Equals(badPlayer.values.at("supersampling"), std::string("4"), "supersampling falls back to 4 for the player");
++            t.Equals(badPlayer.values.at("alta_resolucion"), std::string("1"), "alta_resolucion falls back to 1 for the player");
++            t.Equals(bad.warnings.size(), size_t{2}, "one warning each");
++            t.IsTrue(bad.warnings.size() == 2u &&
++                         bad.warnings[0] == "[opciones] opciones.ini:1: valor no valido '3' para supersampling; se usa 1 "
++                                            "(valores: 1, 2, 4, 8, 16)" &&
++                         bad.warnings[1] == "[opciones] opciones.ini:2: valor no valido '2' para alta_resolucion; se usa 0 "
++                                            "(valores: 0, 1)",
++                     "the warnings name the values");
++        });
++
++        tc.Run("the GPU quality comes from PS2X_GS_SSAA, PS2X_GS_ALTA_RES and PS2X_GS_SSAA_TEXTURAS", [](TestCase &t)
++        {
++            const GSGpuQuality none = ps2GsGpuQualityFromEnvironment(nullptr, nullptr, nullptr);
++            t.Equals(none.superSampling, 1u, "unset: 1x");
++            t.IsTrue(!none.highResolution && !none.superSampledTextures, "unset: no high resolution, no textures");
++            for (const char *rate : {"1", "2", "4", "8", "16"})
++                t.Equals(ps2GsGpuQualityFromEnvironment(rate, nullptr, nullptr).superSampling,
++                         static_cast<uint32_t>(std::atoi(rate)), std::string("rate ") + rate);
++            for (const char *rate : {"0", "3", "32", "x4", ""})
++                t.Equals(ps2GsGpuQualityFromEnvironment(rate, nullptr, nullptr).superSampling, 1u,
++                         std::string("a bad rate is 1x: '") + rate + "'");
++            const GSGpuQuality all = ps2GsGpuQualityFromEnvironment("16", "1", "1");
++            t.IsTrue(all.superSampling == 16u && all.highResolution && all.superSampledTextures, "16, 1, 1");
++            t.IsTrue(!ps2GsGpuQualityFromEnvironment("16", "0", "0").highResolution, "alta 0");
++        });
++
++        tc.Run("with gs = cpu the GPU quality options are ignored with one log line", [](TestCase &t)
++        {
++            // Once per process: another test's GS::init may have printed it already.
++            ScopedEnvironment mode("PS2X_GS", nullptr);
++            {
++                ScopedEnvironment rate("PS2X_GS_SSAA", "1");
++                ScopedEnvironment high("PS2X_GS_ALTA_RES", "0");
++                const uint32_t before = ps2GsGpuQualityIgnoredWarnings();
++                t.IsTrue(ps2GsCreateRequestedGpuBackend() == nullptr, "no GPU backend in cpu mode");
++                t.Equals(ps2GsGpuQualityIgnoredWarnings(), before, "the defaults are not warned about");
++            }
++            ScopedEnvironment rate("PS2X_GS_SSAA", "16");
++            ScopedEnvironment high("PS2X_GS_ALTA_RES", "1");
++            t.IsTrue(ps2GsCreateRequestedGpuBackend() == nullptr, "still no GPU backend");
++            t.IsTrue(ps2GsCreateRequestedGpuBackend() == nullptr, "twice");
++            t.Equals(ps2GsGpuQualityIgnoredWarnings(), 1u, "one line for the whole process");
++        });
++
++        tc.Run("with supersampling the frame keeps its size and pixels", [](TestCase &t)
++        {
++            ScopedEnvironment rate("PS2X_GS_SSAA", "4");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            t.Equals(backend->Quality().superSampling, 4u, "4x in use");
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            const PresentationFrame frame = gpuScanout(*backend, request);
++            t.Equals(frame.rowPixels, 0u, "the usual 640-pixel rows");
++            expectSamePresentation(t, cpu.Present(request), frame);
++        });
++
++        tc.Run("alta_resolucion with 4x supersampling scans out exactly twice the native size", [](TestCase &t)
++        {
++            ScopedEnvironment rate("PS2X_GS_SSAA", "4");
++            ScopedEnvironment high("PS2X_GS_ALTA_RES", "1");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            t.IsTrue(backend->Quality().highResolution, "high resolution in use");
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            const PresentationFrame native = cpu.Present(request);
++            const PresentationFrame frame = gpuScanout(*backend, request);
++            t.Equals(frame.width, 1024u, "1024 pixels wide");
++            t.Equals(frame.height, 1024u, "1024 lines");
++            t.Equals(frame.rowPixels, 1024u, "rows packed");
++            t.Equals(frame.pixels.size(), size_t{1024u * 1024u * 4u}, "exactly the frame's pixels");
++            if (frame.width != 1024u || frame.height != 1024u || frame.pixels.size() != size_t{1024u * 1024u * 4u})
++                return;
++            // Uploaded (not drawn) pixels have no super samples: each one is scanned out as 2x2.
++            std::string first;
++            t.Equals(differencesFromDoubled(native, frame, first), size_t{0},
++                     "each CPU pixel doubled (first difference at " + first + ")");
++        });
++
++        tc.Run("alta_resolucion below 4x keeps the native size", [](TestCase &t)
++        {
++            ScopedEnvironment rate("PS2X_GS_SSAA", "2");
++            ScopedEnvironment high("PS2X_GS_ALTA_RES", "1");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            expectSamePresentation(t, cpu.Present(request), gpuScanout(*backend, request));
++        });
++
++        tc.Run("SetQuality changes supersampling and alta_resolucion while running", [](TestCase &t)
++        {
++            ScopedEnvironment rate("PS2X_GS_SSAA", "1");
++            ScopedEnvironment high("PS2X_GS_ALTA_RES", "0");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            t.Equals(gpuScanout(*backend, request).width, 512u, "512 wide at 1x");
++
++            GSGpuQuality wanted{};
++            wanted.superSampling = 16u;
++            wanted.highResolution = true;
++            const GSGpuQuality applied = backend->SetQuality(wanted);
++            t.IsTrue(applied.superSampling >= 4u, "raised from 1x (the GPU's top rate: " +
++                                                      std::to_string(applied.superSampling) + "x)");
++            t.IsTrue(applied.highResolution, "high resolution on");
++            PresentationFrame frame{};
++            for (int attempt = 0; attempt < 100 && frame.width != 1024u; ++attempt)
++                frame = gpuScanout(*backend, request);
++            t.Equals(frame.width, 1024u, "1024 wide after SetQuality");
++            t.Equals(frame.height, 1024u, "1024 lines after SetQuality");
++
++            const GSGpuQuality back = backend->SetQuality(GSGpuQuality{});
++            t.IsTrue(back.superSampling == 1u && !back.highResolution, "back to 1x without high resolution");
++            for (int attempt = 0; attempt < 100 && frame.width != 512u; ++attempt)
++                frame = gpuScanout(*backend, request);
++            t.Equals(frame.width, 512u, "512 wide again");
++            t.Equals(frame.rowPixels, 0u, "with the usual rows");
++        });
++
++        tc.Run("the GS latch hands the window the whole 2x frame, packed", [](TestCase &t)
++        {
++            ScopedEnvironment rate("PS2X_GS_SSAA", "4");
++            ScopedEnvironment high("PS2X_GS_ALTA_RES", "1");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            const PresentationFrame native = cpu.Present(request);
++
++            GSRegisters regs{};
++            regs.pmode = request.pmode;
++            regs.dispfb1 = request.dispfb1;
++            regs.display1 = request.display1;
++            regs.dispfb2 = request.dispfb2;
++            regs.display2 = request.display2;
++            regs.bgcolor = request.bgcolor;
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++            GSGpuBackend *gpu = backend.get();
++            gs.setRasterBackend(std::move(backend));
++
++            std::vector<uint8_t> pixels;
++            uint32_t width = 0u, height = 0u;
++            for (int attempt = 0; attempt < 200 && width != 1024u; ++attempt)
++            {
++                gs.latchHostPresentationFrame();
++                gpu->WaitIdle();
++                if (!gs.copyLatchedHostPresentationFrame(pixels, width, height))
++                    width = 0u;
++                if (width != 1024u)
++                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            }
++            t.Equals(width, 1024u, "the window gets 1024 pixels wide");
++            t.Equals(height, 1024u, "and 1024 lines");
++            t.Equals(pixels.size(), size_t{1024u * 1024u * 4u}, "packed rows");
++            if (pixels.size() != size_t{1024u * 1024u * 4u})
++                return;
++            PresentationFrame latched{};
++            latched.pixels = pixels;
++            latched.width = width;
++            latched.height = height;
++            latched.rowPixels = width;
++            std::string first;
++            t.Equals(differencesFromDoubled(native, latched, first), size_t{0},
++                     "the same picture, doubled (first difference at " + first + ")");
++        });
++
+         tc.Run("a single 640x448 circuit scans out 1:1 as the CPU presents it", [](TestCase &t)
+         {
+             std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index ea7c16e..af3dc9f 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -323,7 +323,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{6}, "six options");
++            t.Equals(ps2x::optionSpecs().size(), size_t{8}, "eight options");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);
+@@ -335,10 +335,11 @@ void register_ps2_user_paths_tests()
+                 t.IsTrue(development.find(std::string("\n") + spec.key + " = " + expected + "\n") != std::string::npos,
+                          std::string("development key line of ") + spec.key);
+             }
+-            t.Equals(std::string(ps2x::optionDefault(ps2x::optionSpecs().back(), false)), std::string("gpu"),
+-                     "gs: gpu for the player");
+-            t.Equals(std::string(ps2x::optionDefault(ps2x::optionSpecs().back(), true)), std::string("cpu"),
+-                     "gs: cpu in development");
++            const ps2x::OptionSpec &gs = *std::find_if(ps2x::optionSpecs().begin(), ps2x::optionSpecs().end(),
++                                                       [](const ps2x::OptionSpec &spec)
++                                                       { return std::string(spec.key) == "gs"; });
++            t.Equals(std::string(ps2x::optionDefault(gs, false)), std::string("gpu"), "gs: gpu for the player");
++            t.Equals(std::string(ps2x::optionDefault(gs, true)), std::string("cpu"), "gs: cpu in development");
+         });
+ 
+         tc.Run("parseOptions accepts spaces, comments, CRLF, a BOM and any case", [](TestCase &t)

@@ -1,0 +1,369 @@
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index 09e86df..6557522 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -1,13 +1,15 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
+ #include <cstdint>
+ #include <string>
+ 
+ // Fase 5 (T13, F1 06): the photo mode (opciones.ini tecla_modo_foto: f8, f5, p or no). The key freezes the race (the
+ // game's simulation steps stop; it keeps drawing), hides the HUD, mutes the sound and hands the race camera to a free
+-// camera moved with the keyboard and the pad; the photo key (tecla_foto) takes the picture and the same key goes back.
++// camera moved with the keyboard and the pad; the photo key (tecla_foto) or the pad's circle takes the picture and the
++// same key or START goes back. Nativizacion T10: also PHOTO MODE in the game's pause menu (PhotoModeRequest).
+ // The window's thread reads the input (ps2_runtime.cpp); the game's thread moves the camera on each of its frames and
+ // gives it to the game (src/f1_overrides.cpp).
+ namespace ps2x
+@@ -185,9 +187,42 @@ namespace ps2x
+     };
+ 
+     // PS2 pad bits (libpad order, as ps2_options_menu.h's).
+-    constexpr uint16_t kPhotoPadUp = 1u << 4, kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10,
+-                       kPhotoPadR1 = 1u << 11, kPhotoPadTriangle = 1u << 12, kPhotoPadCross = 1u << 14,
+-                       kPhotoPadSquare = 1u << 15;
++    constexpr uint16_t kPhotoPadStart = 1u << 3, kPhotoPadUp = 1u << 4, kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10,
++                       kPhotoPadR1 = 1u << 11, kPhotoPadTriangle = 1u << 12, kPhotoPadCircle = 1u << 13,
++                       kPhotoPadCross = 1u << 14, kPhotoPadSquare = 1u << 15;
++    constexpr uint16_t kPhotoPadAllHeld = 0xFFFFu; // the previous frame's buttons when it has just gone on
++
++    // Nativizacion T10: the pad's buttons that the camera does not use, on their press (previous: the last frame's
++    // buttons, kPhotoPadAllHeld on the first frame, so the button that chose it does not count): circle takes a photo
++    // (as tecla_foto) and START leaves (as tecla_modo_foto).
++    struct PhotoModePadActions
++    {
++        bool photo = false;
++        bool leave = false;
++    };
++
++    inline PhotoModePadActions photoModePadActions(uint16_t previous, uint16_t pressed)
++    {
++        const uint16_t now = static_cast<uint16_t>(pressed & ~previous);
++        return {(now & kPhotoPadCircle) != 0u, (now & kPhotoPadStart) != 0u};
++    }
++
++    // The line at the bottom of the window when it goes on: how to move, take a photo and leave (photoKey: tecla_foto,
++    // modeKey: tecla_modo_foto, as opciones.ini; "no" or the photo's key: none).
++    inline std::string photoModeHelpLine(const std::string &photoKey, const std::string &modeKey)
++    {
++        const auto name = [](const std::string &option)
++        {
++            std::string upper = option;
++            std::transform(upper.begin(), upper.end(), upper.begin(),
++                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++            return upper + " o ";
++        };
++        const bool photo = !photoKey.empty() && photoKey != "no";
++        const bool mode = !modeKey.empty() && modeKey != "no" && modeKey != photoKey;
++        return "Modo foto: WASD, R F, flechas, Q E, Z X o los sticks. Foto: " + (photo ? name(photoKey) : std::string()) +
++               "circulo. Salir: " + (mode ? name(modeKey) : std::string()) + "START.";
++    }
+ 
+     // Keyboard: W S A D move, R F up and down, arrows turn, Q E roll, Z X zoom, Shift fast (x4), Ctrl slow (x0.25),
+     // Backspace back to the start. Pad: left stick moves, right stick turns, R2 L2 up and down, L1 R1 roll, the d-pad's
+@@ -225,8 +260,16 @@ namespace ps2x
+         bool toggle(double now)
+         {
+             if (m_active)
++            {
+                 m_active = false;
+-            else if (m_lastCamera >= 0.0 && now - m_lastCamera <= kEnterWindow)
++                return m_active;
++            }
++            return enter(now);
++        }
++        // On if a race camera is drawing (as the key); the new state.
++        bool enter(double now)
++        {
++            if (!m_active && m_lastCamera >= 0.0 && now - m_lastCamera <= kEnterWindow)
+                 m_active = true;
+             return m_active;
+         }
+@@ -243,12 +286,58 @@ namespace ps2x
+         double m_lastCamera = -1.0;
+     };
+ 
++    // Nativizacion T10: PHOTO MODE in the game's pause menu. Choosing it closes the pause as CONTINUE does and asks for
++    // the photo mode; the game's thread serves the request on each race frame, once the pause menu has closed and a
++    // race camera draws again, with the same switch as the key. Never turns it off; dropped after kTimeout seconds.
++    class PhotoModeRequest
++    {
++    public:
++        static constexpr double kTimeout = 5.0;
++        enum class Step
++        {
++            None,    // nothing asked, or still waiting
++            Entered, // the photo mode went on now
++            Expired  // not served in time: dropped
++        };
++
++        void request(double now) { m_since = now; }
++        bool pending() const { return m_since >= 0.0; }
++        Step serve(PhotoModeSwitch &photoMode, double now, bool pauseMenuOpen)
++        {
++            if (m_since < 0.0)
++                return Step::None;
++            if (now - m_since > kTimeout)
++            {
++                m_since = -1.0;
++                return Step::Expired;
++            }
++            if (pauseMenuOpen)
++                return Step::None;
++            if (photoMode.active())
++            {
++                m_since = -1.0;
++                return Step::None;
++            }
++            if (!photoMode.enter(now))
++                return Step::None;
++            m_since = -1.0;
++            return Step::Entered;
++        }
++
++    private:
++        double m_since = -1.0;
++    };
++
+     // The shared state (ps2_runtime.cpp; any thread). The window: setPhotoModeKeyOption from the menus,
+     // togglePhotoMode with the key or PS2X_MENU_GUION's "modo_foto", setPhotoModeInput on each of its frames. The game:
+     // photoModeCameraFrame when a race camera draws, photoModeActive and photoModeInput.
+     void setPhotoModeKeyOption(const std::string &option);
+     std::string photoModeKeyOption();
+     bool togglePhotoMode();
++    // Nativizacion T10: the game's pause menu (src/f1_overrides.cpp, "ps2x:modo_foto") asks for it; the game's thread
++    // serves it on each race frame (pauseMenuOpen: the game's pause menu is still open).
++    void requestPhotoModeFromMenu();
++    void servePhotoModeRequest(bool pauseMenuOpen);
+     bool photoModeActive();
+     void photoModeCameraFrame();
+     void setPhotoModeInput(const FreeCameraInput &input);
+diff --git a/ps2xRuntime/src/lib/ps2_replay_scrub.h b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+index 2bfbfd1..f8f1200 100644
+--- a/ps2xRuntime/src/lib/ps2_replay_scrub.h
++++ b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+@@ -19,6 +19,10 @@ namespace ps2x
+     constexpr double kReplayMuteAfterSeek = 0.3;  // the sound stays off this long after the jump back
+     constexpr double kReplayActiveWindow = 1.0;   // the replay counts as on while the game saw it this recently
+ 
++    // Nativizacion T10: the line at the bottom of the window when a replay starts (the pad first, as the game is played).
++    constexpr const char *kReplayControlsLine =
++        "Repeticion: L2 atras, R2 adelante (x2, x4), SELECT pausa. Teclado: J, L, K.";
++
+     // What the player holds (pausePresses counts the pause key's presses, so none is lost between two game frames).
+     struct ReplayScrubControls
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d31adf5..8a570b7 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -740,6 +740,7 @@ namespace
+     std::string g_photoModeKey;
+     bool g_photoModeKeyRead = false;
+     ps2x::PhotoModeSwitch g_photoModeSwitch;
++    ps2x::PhotoModeRequest g_photoModeRequest; // Nativizacion T10: the pause menu's PHOTO MODE
+     ps2x::FreeCameraInput g_photoModeInput;
+     std::atomic<bool> g_photoModeOn{false};
+     std::chrono::steady_clock::time_point g_photoModeClockStart = std::chrono::steady_clock::now();
+@@ -795,11 +796,45 @@ namespace ps2x
+             return on;
+         }
+         std::cout << "[modo-foto] " << (on ? "entra" : "sale") << std::endl;
+-        SetPhotoMessage(on ? "Modo foto: WASD, R F, flechas, Q E, Z X (o los sticks). Foto con su tecla; sale con la misma."
++        SetPhotoMessage(on ? ps2x::photoModeHelpLine(ps2x::photoKeyOption(), ps2x::photoModeKeyOption())
+                            : "Modo foto: fuera.");
+         return on;
+     }
+ 
++    void requestPhotoModeFromMenu()
++    {
++        {
++            std::lock_guard<std::mutex> lock(g_photoModeMutex);
++            g_photoModeRequest.request(PhotoModeClock());
++        }
++        std::cout << "[modo-foto] pedido desde la pausa del juego" << std::endl;
++    }
++
++    void servePhotoModeRequest(bool pauseMenuOpen)
++    {
++        ps2x::PhotoModeRequest::Step step = ps2x::PhotoModeRequest::Step::None;
++        {
++            std::lock_guard<std::mutex> lock(g_photoModeMutex);
++            if (!g_photoModeRequest.pending())
++                return;
++            step = g_photoModeRequest.serve(g_photoModeSwitch, PhotoModeClock(), pauseMenuOpen);
++            if (step == ps2x::PhotoModeRequest::Step::Entered)
++            {
++                g_photoModeInput = {};
++                g_photoModeOn.store(true, std::memory_order_relaxed);
++            }
++        }
++        if (step == ps2x::PhotoModeRequest::Step::Entered)
++        {
++            std::cout << "[modo-foto] entra (desde la pausa del juego)" << std::endl;
++            SetPhotoMessage(ps2x::photoModeHelpLine(ps2x::photoKeyOption(), ps2x::photoModeKeyOption()));
++        }
++        else if (step == ps2x::PhotoModeRequest::Step::Expired)
++        {
++            std::cout << "[modo-foto] el pedido de la pausa caduca (no hay camara de carrera dibujando)" << std::endl;
++        }
++    }
++
+     bool photoModeActive()
+     {
+         return g_photoModeOn.load(std::memory_order_relaxed);
+@@ -825,9 +860,11 @@ namespace ps2x
+ }
+ 
+ // The window's part, once per frame (main thread): the key, going off by itself when the race camera stops, and the
+-// held keys and pad for the free camera (none while the options menu is open).
++// held keys and pad for the free camera (none while the options menu is open). Nativizacion T10: the pad's circle
++// takes a photo and START leaves (photoModePadActions).
+ static void UpdatePhotoMode(bool optionsMenuOpen)
+ {
++    static uint16_t s_padHeld = ps2x::kPhotoPadAllHeld;
+     // The same key as the photos' (F8 in both): the photo goes first and the photo mode has no key.
+     const int key = PhotoModeKeyCode(ps2x::photoModeKeyOption());
+     const bool sharedKey = key != KEY_NULL && key == PhotoKeyCode(ps2x::photoKeyOption());
+@@ -847,7 +884,10 @@ static void UpdatePhotoMode(bool optionsMenuOpen)
+     if (wentOff)
+         std::cout << "[modo-foto] sale (la camara de carrera ya no dibuja)" << std::endl;
+     if (!ps2x::photoModeActive())
++    {
++        s_padHeld = ps2x::kPhotoPadAllHeld;
+         return;
++    }
+     ps2x::PhotoModeKeys keys;
+     ps2x::PhotoModePad pad;
+     if (!optionsMenuOpen)
+@@ -870,6 +910,20 @@ static void UpdatePhotoMode(bool optionsMenuOpen)
+         keys.slow = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+         keys.reset = IsKeyDown(KEY_BACKSPACE);
+         pad = ps2x::readPhotoModePad();
++        const ps2x::PhotoModePadActions actions = ps2x::photoModePadActions(s_padHeld, pad.pressed);
++        s_padHeld = pad.pressed;
++        if (actions.photo)
++            ps2x::requestPhoto();
++        if (actions.leave)
++        {
++            ps2x::togglePhotoMode();
++            s_padHeld = ps2x::kPhotoPadAllHeld;
++            return;
++        }
++    }
++    else
++    {
++        s_padHeld = ps2x::kPhotoPadAllHeld;
+     }
+     ps2x::setPhotoModeInput(ps2x::freeCameraInput(keys, pad));
+ }
+@@ -966,7 +1020,10 @@ static void UpdateReplayScrub(bool optionsMenuOpen)
+         return;
+     }
+     if (!s_wasActive)
++    {
+         std::cout << "[repeticion] controles: J atras, L adelante (x2, x4), K pausa; mando L2, R2, SELECT" << std::endl;
++        SetPhotoMessage(ps2x::kReplayControlsLine); // Nativizacion T10: shown, not only in the log
++    }
+     s_wasActive = true;
+     bool rewind = false, fastForward = false, pause = false;
+     if (!optionsMenuOpen)
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 57970d0..81cb277 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1182,6 +1182,90 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(photoMode.active(), "and stays off");
+         });
+ 
++        tc.Run("the pause menu's photo mode goes on once the pause has closed and the race camera draws", [](TestCase &t)
++        {
++            ps2x::PhotoModeSwitch photoMode;
++            ps2x::PhotoModeRequest request;
++            t.IsTrue(request.serve(photoMode, 5.0, false) == ps2x::PhotoModeRequest::Step::None, "nothing asked");
++            t.IsFalse(request.pending(), "nothing pending");
++
++            request.request(10.0);
++            photoMode.cameraFrame(10.0);
++            t.IsTrue(request.pending(), "asked from the pause menu");
++            t.IsTrue(request.serve(photoMode, 10.1, true) == ps2x::PhotoModeRequest::Step::None,
++                     "the pause menu still open: it waits");
++            t.IsFalse(photoMode.active(), "off while the pause menu is open");
++            t.IsTrue(request.serve(photoMode, 11.0, false) == ps2x::PhotoModeRequest::Step::None,
++                     "closed, but no race camera yet: it waits");
++            t.IsTrue(request.pending(), "still pending");
++            photoMode.cameraFrame(11.2);
++            t.IsTrue(request.serve(photoMode, 11.2, false) == ps2x::PhotoModeRequest::Step::Entered,
++                     "the race camera draws: on");
++            t.IsTrue(photoMode.active(), "the same switch as the key");
++            t.IsFalse(request.pending(), "served");
++            t.IsTrue(request.serve(photoMode, 11.3, false) == ps2x::PhotoModeRequest::Step::None, "once");
++
++            request.request(20.0);
++            photoMode.cameraFrame(20.0);
++            t.IsTrue(request.serve(photoMode, 20.1, false) == ps2x::PhotoModeRequest::Step::None,
++                     "already on: nothing");
++            t.IsTrue(photoMode.active(), "a request never turns it off");
++            t.IsFalse(request.pending(), "and is dropped");
++            t.IsFalse(photoMode.toggle(20.2), "the key still turns it off");
++
++            request.request(30.0);
++            photoMode.cameraFrame(30.0 + ps2x::PhotoModeRequest::kTimeout + 0.01);
++            t.IsTrue(request.serve(photoMode, 30.0 + ps2x::PhotoModeRequest::kTimeout + 0.01, false) ==
++                         ps2x::PhotoModeRequest::Step::Expired,
++                     "not served in time (the race ended): dropped");
++            t.IsFalse(photoMode.active(), "stays off");
++            t.IsFalse(request.pending(), "nothing pending");
++        });
++
++        tc.Run("the photo mode's pad: circle takes a photo and START leaves, on the press only", [](TestCase &t)
++        {
++            using ps2x::photoModePadActions;
++            t.IsTrue(ps2x::kPhotoPadCircle == (1u << 13) && ps2x::kPhotoPadStart == (1u << 3), "the PS2's bits");
++            ps2x::PhotoModePadActions a = photoModePadActions(0u, ps2x::kPhotoPadCircle);
++            t.IsTrue(a.photo && !a.leave, "circle pressed: a photo");
++            a = photoModePadActions(ps2x::kPhotoPadCircle, ps2x::kPhotoPadCircle);
++            t.IsTrue(!a.photo && !a.leave, "circle held: only one");
++            a = photoModePadActions(ps2x::kPhotoPadCircle, ps2x::kPhotoPadCircle | ps2x::kPhotoPadStart);
++            t.IsTrue(!a.photo && a.leave, "START pressed: leave");
++            a = photoModePadActions(ps2x::kPhotoPadAllHeld, ps2x::kPhotoPadCircle | ps2x::kPhotoPadStart);
++            t.IsTrue(!a.photo && !a.leave, "held when it went on (the button that chose it): nothing");
++            a = photoModePadActions(0u, ps2x::kPhotoPadCross | ps2x::kPhotoPadTriangle | ps2x::kPhotoPadL1);
++            t.IsTrue(!a.photo && !a.leave, "the camera's buttons do neither");
++
++            ps2x::PhotoModePad pad;
++            pad.pressed = ps2x::kPhotoPadCircle | ps2x::kPhotoPadStart;
++            const ps2x::FreeCameraInput input = ps2x::freeCameraInput({}, pad);
++            t.IsTrue(input.forward == 0.0f && input.right == 0.0f && input.up == 0.0f && input.yaw == 0.0f &&
++                         input.pitch == 0.0f && input.roll == 0.0f && input.zoom == 0.0f && input.speed == 1.0f &&
++                         !input.reset, "circle and START do not move the camera");
++        });
++
++        tc.Run("the photo mode's line says how to take a photo and leave with the keys and the pad", [](TestCase &t)
++        {
++            t.Equals(ps2x::photoModeHelpLine("f12", "f8"),
++                     std::string("Modo foto: WASD, R F, flechas, Q E, Z X o los sticks. Foto: F12 o circulo. "
++                                 "Salir: F8 o START."),
++                     "the keys of opciones.ini and the pad");
++            t.Equals(ps2x::photoModeHelpLine("no", "p"),
++                     std::string("Modo foto: WASD, R F, flechas, Q E, Z X o los sticks. Foto: circulo. Salir: P o START."),
++                     "no photo key: the pad only");
++            t.Equals(ps2x::photoModeHelpLine("f8", "f8"),
++                     std::string("Modo foto: WASD, R F, flechas, Q E, Z X o los sticks. Foto: F8 o circulo. Salir: START."),
++                     "the same key for both: it takes the photo, the mode has no key");
++        });
++
++        tc.Run("the replay's line says its controls on the pad and the keys", [](TestCase &t)
++        {
++            t.Equals(std::string(ps2x::kReplayControlsLine),
++                     std::string("Repeticion: L2 atras, R2 adelante (x2, x4), SELECT pausa. Teclado: J, L, K."),
++                     "the pad first, as the game is played");
++        });
++
+         tc.Run("the replay plays as the game does with nothing held and pauses with the pause key", [](TestCase &t)
+         {
+             ps2x::ReplayScrubber scrub;

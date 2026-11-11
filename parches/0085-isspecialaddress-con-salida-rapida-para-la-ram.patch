@@ -1,0 +1,31 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index fcb0eac..0c1efe0 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -63,7 +63,10 @@
+ // cycle by cycle (before patch 0081), 73 everything of patch 0081 off at once (71, 72 and 74; kept by runBlocks), 74
+ // (VU1 and VU0) the compiled schedules with the late upper results (jitUpperLate, jitUpperDst) through calls (before
+ // patch 0081; kept by runBlocks), 75 the GIF packets processed on the EE thread (before patch 0082), 76 modes 73 and
+-// 75 together (patches 0081 and 0082 off at once; kept by runBlocks).
++// 75 together (patches 0081 and 0082 off at once; kept by runBlocks), 77 (VU1 and VU0) every FMAC flag entry of the
++// compiled schedules worked out and committed whole (before patch 0083; kept by runBlocks), 78 everything of patches
++// 0081-0084 off at once (73, 75, 77 and 79; kept by runBlocks), 79 the PATH1 GIF packets queued and copied by the
++// arbiter (before patch 0084).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/include/runtime/ps2_address.h b/ps2xRuntime/include/runtime/ps2_address.h
+index f7689e0..518d1e2 100644
+--- a/ps2xRuntime/include/runtime/ps2_address.h
++++ b/ps2xRuntime/include/runtime/ps2_address.h
+@@ -52,6 +52,10 @@ static inline constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physAddr)
+ 
+ static inline constexpr bool Ps2IsSpecialAddress(uint32_t addr)
+ {
++    // F1 06 port, patch 0085: below 0x10000000 is the RAM (and nothing special), the common case of the translated
++    // code's loads and stores: one compare (the rest below gives the same answer for it).
++    if (addr < PS2_IO_BASE)
++        return false;
+     if (Ps2IsKseg23Address(addr))
+         return true;
+ 

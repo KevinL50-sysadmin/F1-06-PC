@@ -1,0 +1,431 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0caf664..6942aea 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -5,7 +5,8 @@
+ // A/B switch for performance work. Optimized paths that keep their previous implementation check it: 0 runs the
+ // current code, 1 the previous one (GS: drawing on the EE thread with the reference rasterizer), 2 the GS without its
+ // band workers (everything rasterized on the GS thread), 3 the VU1 interpreter without blocks (ps2_vu1_blocks.h), 4 the
+-// IOP advanced on every EE checkpoint instead of in batches (EeScheduler::accountCycles). A
++// IOP advanced on every EE checkpoint instead of in batches (EeScheduler::accountCycles), 5 the VU1 blocks with the
++// upper instruction dispatched as before BlockPair::upperFn. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index fb27a5c..a01e784 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -322,8 +322,14 @@ namespace
+         uint16_t pad2;
+     };
+ 
++    // The upper instruction of a pair as one call (BlockPair::upperFn, see upperFunction): FMAC with its kind and
++    // source fixed at compile time, SimpleOp with its kind fixed. Null for NOP and CLIP.
++    struct BlockPair;
++    using UpperFn = void (*)(const BlockPair &, const VU1State &, FmacResult &);
++
+     struct BlockPair
+     {
++        UpperFn upperFn = nullptr;
+         uint32_t pc = 0u;
+         uint32_t lower = 0u;
+         uint32_t upper = 0u;
+@@ -355,6 +361,61 @@ namespace
+         SimpleOp simple;
+     };
+ 
++    template <uint8_t Kind, uint8_t Source>
++    void upperFmac(const BlockPair &p, const VU1State &vu, FmacResult &up)
++    {
++        runFmacOpFixed<Kind, Source>(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
++    }
++    template <uint8_t Kind>
++    void upperSimple(const BlockPair &p, const VU1State &vu, FmacResult &up)
++    {
++        runSimpleOpFixed<Kind>(p.simple, vu.vf, vu.i, up.value);
++    }
++    inline void upperFmacAny(const BlockPair &p, const VU1State &vu, FmacResult &up)
++    {
++        runFmacOp(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
++    }
++    template <uint8_t Kind>
++    constexpr UpperFn kUpperFmacBySource[4] = {&upperFmac<Kind, FmacSourceVt>, &upperFmac<Kind, FmacSourceBc>,
++                                               &upperFmac<Kind, FmacSourceQ>, &upperFmac<Kind, FmacSourceI>};
++
++    // Dispatching on every pair of the block (the upper path, then the FMAC source and kind, or the SimpleOp kind)
++    // was a large part of the block loop: the pair keeps the function for its operation.
++    inline UpperFn upperFunction(const PairPlan &plan)
++    {
++        if (plan.upperPath == UpperFmac)
++        {
++            const uint32_t source = plan.fmac.source & 3u;
++            switch (plan.fmac.kind)
++            {
++            case FmacAdd: return kUpperFmacBySource<FmacAdd>[source];
++            case FmacSub: return kUpperFmacBySource<FmacSub>[source];
++            case FmacMul: return kUpperFmacBySource<FmacMul>[source];
++            case FmacMadd: return kUpperFmacBySource<FmacMadd>[source];
++            case FmacMsub: return kUpperFmacBySource<FmacMsub>[source];
++            case FmacOpmsub: return source == FmacSourceVt ? &upperFmac<FmacOpmsub, FmacSourceVt> : &upperFmacAny;
++            case FmacOpmula: return source == FmacSourceVt ? &upperFmac<FmacOpmula, FmacSourceVt> : &upperFmacAny;
++            default: return &upperFmacAny;
++            }
++        }
++        else if (plan.upperPath == UpperSimple)
++        {
++            switch (plan.simple.kind)
++            {
++            case SimpleMaxBc: return &upperSimple<SimpleMaxBc>;
++            case SimpleMiniBc: return &upperSimple<SimpleMiniBc>;
++            case SimpleMaxI: return &upperSimple<SimpleMaxI>;
++            case SimpleMiniI: return &upperSimple<SimpleMiniI>;
++            case SimpleMax: return &upperSimple<SimpleMax>;
++            case SimpleMini: return &upperSimple<SimpleMini>;
++            case SimpleItof: return &upperSimple<SimpleItof>;
++            case SimpleFtoi: return &upperSimple<SimpleFtoi>;
++            default: return &upperSimple<SimpleAbs>; // runSimpleOp's default
++            }
++        }
++        return nullptr;
++    }
++
+     enum BlockEnd : uint8_t
+     {
+         EndNext = 0,
+@@ -739,6 +800,7 @@ namespace
+             bp.issue = static_cast<uint16_t>(step.issue);
+             bp.commitEnd = static_cast<uint16_t>(out.commits.size());
+             bp.upperPath = plan.upperPath;
++            bp.upperFn = upperFunction(plan);
+             bp.fmac = plan.fmac;
+             bp.simple = plan.simple;
+             bp.xgkick = pi.xgkick;
+@@ -1112,15 +1174,18 @@ namespace
+             break;
+         case FastMr32:
+         {
+-            const float *s = vu.vf[p.fastA];
+-            const float rotated[4] = {s[1], s[2], s[3], s[0]};
++            // Built in a register and stored whole: lane stores followed by blendLanes' 16-byte read stall it.
++            const __m128 s = _mm_loadu_ps(vu.vf[p.fastA]);
++            alignas(16) float rotated[4];
++            _mm_store_ps(rotated, _mm_shuffle_ps(s, s, _MM_SHUFFLE(0, 3, 2, 1)));
+             writeVf(rotated);
+             break;
+         }
+         case FastMfir:
+         {
+-            const int32_t value = static_cast<int16_t>(vu.vi[p.fastA] & 0xFFFF);
+-            const int32_t words[4] = {value, value, value, value};
++            alignas(16) int32_t words[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(words),
++                            _mm_set1_epi32(static_cast<int16_t>(vu.vi[p.fastA] & 0xFFFF)));
+             writeVf(words);
+             break;
+         }
+@@ -1136,8 +1201,9 @@ namespace
+             break;
+         case FastIsw:
+         {
+-            const uint32_t value = static_cast<uint16_t>(vu.vi[p.fastB] & 0xFFFF);
+-            const uint32_t words[4] = {value, value, value, value};
++            alignas(16) uint32_t words[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(words),
++                            _mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(vu.vi[p.fastB] & 0xFFFF))));
+             store(offsetAddress(p.fastA), words);
+             break;
+         }
+@@ -1146,8 +1212,9 @@ namespace
+             break;
+         default: // FastIswr
+         {
+-            const uint32_t value = static_cast<uint16_t>(vu.vi[p.fastB] & 0xFFFF);
+-            const uint32_t words[4] = {value, value, value, value};
++            alignas(16) uint32_t words[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(words),
++                            _mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(vu.vi[p.fastB] & 0xFFFF))));
+             store(plainAddress(vu.vi[p.fastA]), words);
+             break;
+         }
+@@ -1160,6 +1227,7 @@ namespace
+     {
+         VU1State &vu = host.state();
+         const uint64_t entry = st.cycle;
++        const bool oldDispatch = g_ps2AbMode.load(std::memory_order_relaxed) == 5;
+         BlockRedirect redirect;
+         redirect.state = &st;
+         const auto commit = [&](const BlockCommit &c)
+@@ -1195,28 +1263,33 @@ namespace
+                 commit(s.commits[nextCommit]);
+             const uint64_t issue = entry + p.issue;
+ 
+-            // Upper instruction, on the registers as they were before the pair.
++            // Upper instruction, on the registers as they were before the pair: FMAC (with its flag entry, unless it
++            // writes no lane) and SimpleOp through upperFn; CLIP here.
+             FmacResult up;
+-            switch (p.upperPath)
++            if (oldDispatch && p.upperFn != nullptr)
++            {
++                // A/B mode 5: the dispatch before upperFn.
++                if (p.upperPath == UpperFmac)
++                {
++                    runFmacOp(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
++                    if (p.upperFlags != 0u)
++                        st.flags[(issue + 4u) & 7u][0] = {up.mac, up.status, up.sticky, 0u, p.upperFlags};
++                }
++                else
++                    runSimpleOp(p.simple, vu.vf, vu.i, up.value);
++            }
++            else if (p.upperFn != nullptr)
+             {
+-            case UpperFmac:
+-                runFmacOp(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
++                p.upperFn(p, vu, up);
+                 if (p.upperFlags != 0u)
+                     st.flags[(issue + 4u) & 7u][0] = {up.mac, up.status, up.sticky, 0u, p.upperFlags};
+-                break;
+-            case UpperSimple:
+-                runSimpleOp(p.simple, vu.vf, vu.i, up.value);
+-                break;
+-            case UpperClip:
++            }
++            else if (p.upperPath == UpperClip)
+             {
+                 uint32_t &workingClip = host.workingClip();
+                 workingClip = ((workingClip << 6) | (vuClipFlags(vu.vf[p.simple.fs], vu.vf[p.simple.ft][3]) & 0x3Fu)) &
+                               0xFFFFFFu;
+                 st.flags[(issue + 4u) & 7u][0] = {0u, 0u, 0u, workingClip, kFlagClip};
+-                break;
+-            }
+-            default:
+-                break;
+             }
+ 
+             // Lower instruction.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 16c17fd..ff2e0fb 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -28,6 +28,13 @@
+ #define PS2_VU_FMAC_SSE2 1
+ #endif
+ 
++// The operations the blocks call through one pointer per pair (runFmacOpFixed, runSimpleOpFixed) are expanded there.
++#if defined(_MSC_VER)
++#define PS2_VU_FORCEINLINE __forceinline
++#else
++#define PS2_VU_FORCEINLINE inline __attribute__((always_inline))
++#endif
++
+ namespace
+ {
+     // Trazas temporales de diagnóstico (F1 06): historial de los últimos pares ejecutados.
+@@ -425,7 +432,7 @@ namespace
+     }
+ 
+     template <uint8_t Kind>
+-    inline void fmacSse2(__m128 a, __m128 b, __m128 c, uint8_t components, FmacResult &out)
++    PS2_VU_FORCEINLINE void fmacSse2(__m128 a, __m128 b, __m128 c, uint8_t components, FmacResult &out)
+     {
+         if constexpr (Kind == FmacAdd || Kind == FmacSub || Kind == FmacMul || Kind == FmacOpmula)
+         {
+@@ -433,7 +440,7 @@ namespace
+             // result: |value| <= |exact| <= |true result| < |value| + one float ulp. So when every written lane of the
+             // value is a normal float with an exponent between 2 and 253 (2^-125 <= |value| < 2^127), the exact
+             // result is not zero, not below FLT_MIN and not above FLT_MAX, and has the value's sign: the flags are the
+-            // signs alone and nothing is replaced. (MADD/MSUB/OPMSUB round twice in float: not here.)
++            // signs alone and nothing is replaced. (MADD/MSUB/OPMSUB round twice in float: see below.)
+             __m128 value;
+             if constexpr (Kind == FmacAdd)
+                 value = _mm_add_ps(a, b);
+@@ -457,6 +464,43 @@ namespace
+                 return;
+             }
+         }
++        else if (Kind == FmacMadd || Kind == FmacMsub || (Kind == FmacOpmsub && (components & 0x8u) == 0u))
++        {
++            // Two roundings toward zero: pf = a * b, then v = c +/- pf. The "exact" result is c +/- p with the product
++            // p = a * b exact in double and one rounding toward zero. When every written lane has v and pf with an
++            // exponent between 2 and 253 and v at most 22 binades below pf, the exact result is not zero, not below
++            // FLT_MIN and not above FLT_MAX, and has v's sign; and the product, between FLT_MIN and FLT_MAX, adds only
++            // its sign to the sticky flags. Why (MADD; MSUB is MADD with -pf): pf has p's sign and |p - pf| < u, the ulp
++            // of pf. Let t = c + pf, so |v| <= |t| and s = c + p = t + (p - pf). If c and pf have the same sign, or
++            // |c| < |pf|, then s has t's sign and |s| >= |t| >= |v| >= 2^-125. If |c| > |pf| (opposite signs), c and pf
++            // are multiples of u, so t (not 0, as v is not) is too and s keeps t's sign with |s| > |t| - u >= |v| - u
++            // >= |v| / 2 >= 2^-126, because |v| >= 2u. And |s| < |t| + u <= 2^127 + 2^103. OPMSUB: only without w,
++            // whose exact result is the zero of the w lane.
++            const __m128 product = _mm_mul_ps(a, b);
++            __m128 value = Kind == FmacMadd ? _mm_add_ps(c, product) : _mm_sub_ps(c, product);
++            if constexpr (Kind == FmacOpmsub)
++                value = _mm_and_ps(value, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
++            const __m128i valueExponent = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(value), 23), _mm_set1_epi32(0xFF));
++            const __m128i productExponent =
++                _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(product), 23), _mm_set1_epi32(0xFF));
++            const __m128i one = _mm_set1_epi32(1);
++            const __m128i top = _mm_set1_epi32(254);
++            __m128i inRange = _mm_and_si128(_mm_cmpgt_epi32(valueExponent, one), _mm_cmplt_epi32(valueExponent, top));
++            inRange = _mm_and_si128(inRange, _mm_and_si128(_mm_cmpgt_epi32(productExponent, one),
++                                                           _mm_cmplt_epi32(productExponent, top)));
++            inRange = _mm_and_si128(inRange, _mm_cmpgt_epi32(_mm_add_epi32(valueExponent, _mm_set1_epi32(23)),
++                                                             productExponent));
++            const uint32_t safe = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(inRange)));
++            if ((safe & components) == components)
++            {
++                const uint32_t s = static_cast<uint32_t>(_mm_movemask_ps(value)) & components;
++                out.mac = static_cast<uint32_t>(kReverse4[s]) << 4;
++                out.status = s != 0u ? 0x2u : 0u;
++                out.sticky = (static_cast<uint32_t>(_mm_movemask_ps(product)) & components) != 0u ? 0x2u : 0u;
++                _mm_storeu_ps(out.value, value);
++                return;
++            }
++        }
+         const __m128d aLow = _mm_cvtps_pd(a);
+         const __m128d aHigh = _mm_cvtps_pd(_mm_movehl_ps(a, a));
+         const __m128d bLow = _mm_cvtps_pd(b);
+@@ -627,6 +671,42 @@ namespace
+ #endif
+     }
+ 
++    // runFmacOp with the kind and the source fixed at compile time (the blocks pick it once per pair:
++    // ps2_vu1_blocks.h): the same operations without the dispatch.
++    template <uint8_t Kind, uint8_t Source>
++    PS2_VU_FORCEINLINE void runFmacOpFixed(const FmacOp &op, const float (*vf)[4], const float *acc, float q, float i,
++                                           FmacResult &out)
++    {
++#if PS2_VU_FMAC_SSE2
++        if constexpr (sizeof(long double) == sizeof(double))
++        {
++            __m128 a = normalize4(_mm_loadu_ps(vf[op.fs]));
++            __m128 b;
++            if constexpr (Source == FmacSourceBc)
++                b = _mm_set1_ps(vuNormalizeOperand(vf[op.ft][op.bc]));
++            else if constexpr (Source == FmacSourceQ)
++                b = _mm_set1_ps(vuNormalizeOperand(q));
++            else if constexpr (Source == FmacSourceI)
++                b = _mm_set1_ps(vuNormalizeOperand(i));
++            else
++                b = normalize4(_mm_loadu_ps(vf[op.ft]));
++            __m128 c = _mm_setzero_ps();
++            if constexpr (Kind == FmacMadd || Kind == FmacMsub || Kind == FmacOpmsub)
++                c = normalize4(_mm_loadu_ps(acc));
++            if constexpr (Kind == FmacOpmsub || Kind == FmacOpmula)
++            {
++                a = _mm_shuffle_ps(a, a, _MM_SHUFFLE(3, 0, 2, 1));
++                b = _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2));
++            }
++            fmacSse2<Kind>(a, b, c, op.components, out);
++        }
++        else
++            runFmacOpScalar(op, vf, acc, q, i, out);
++#else
++        runFmacOpScalar(op, vf, acc, q, i, out);
++#endif
++    }
++
+     // Upper operations without flags, computed as execUpper does: MAX/MINI (bit compares of the raw values),
+     // ITOF/FTOI and ABS. They write `target`: fd for MAX/MINI, ft for the others.
+     enum SimpleKind : uint8_t
+@@ -688,7 +768,59 @@ namespace
+         return s;
+     }
+ 
+-    inline void runSimpleOp(const SimpleOp &s, const float (*vf)[4], float i, float out[4])
++#if PS2_VU_FMAC_SSE2
++    // vuMaxBits / vuMinBits on four lanes: signed compares of the raw words, the smaller of two negatives for MAX.
++    template <bool Max>
++    inline __m128i maxMiniBits4(__m128i a, __m128i b)
++    {
++        const __m128i aGreater = _mm_cmpgt_epi32(a, b);
++        const __m128i larger = _mm_or_si128(_mm_and_si128(aGreater, a), _mm_andnot_si128(aGreater, b));
++        const __m128i smaller = _mm_or_si128(_mm_and_si128(aGreater, b), _mm_andnot_si128(aGreater, a));
++        const __m128i bothNegative = _mm_srai_epi32(_mm_and_si128(a, b), 31);
++        const __m128i normal = Max ? larger : smaller;
++        const __m128i negative = Max ? smaller : larger;
++        return _mm_or_si128(_mm_and_si128(bothNegative, negative), _mm_andnot_si128(bothNegative, normal));
++    }
++
++    // A SimpleOp on the four lanes at once, with its kind fixed at compile time.
++    template <uint8_t Kind>
++    PS2_VU_FORCEINLINE __m128i simpleOpSse2(const SimpleOp &s, const float (*vf)[4], float i)
++    {
++        const __m128i vs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vf[s.fs]));
++        if constexpr (Kind == SimpleMaxBc || Kind == SimpleMiniBc)
++            return maxMiniBits4<Kind == SimpleMaxBc>(vs, _mm_castps_si128(_mm_set1_ps(vf[s.ft][s.param])));
++        else if constexpr (Kind == SimpleMaxI || Kind == SimpleMiniI)
++            return maxMiniBits4<Kind == SimpleMaxI>(vs, _mm_castps_si128(_mm_set1_ps(i)));
++        else if constexpr (Kind == SimpleMax || Kind == SimpleMini)
++            return maxMiniBits4<Kind == SimpleMax>(vs, _mm_loadu_si128(reinterpret_cast<const __m128i *>(vf[s.ft])));
++        else if constexpr (Kind == SimpleItof)
++        {
++            // The same conversion (in the current rounding mode) and division as the scalar code.
++            static constexpr float kDivisors[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++            __m128 value = _mm_cvtepi32_ps(vs);
++            if (s.param != 0u)
++                value = _mm_div_ps(value, _mm_set1_ps(kDivisors[s.param]));
++            return _mm_castps_si128(value);
++        }
++        else if constexpr (Kind == SimpleFtoi)
++        {
++            // vuFloatToInt: the operand times a power of two is exact in float (normalized, no overflow below 2^31),
++            // so the double product equals the float one; truncation, and the saturation of the positive side
++            // (cvttps2dq gives 0x80000000, INT_MIN, for everything out of range).
++            static constexpr float kScales[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++            const __m128 scaled = _mm_mul_ps(normalize4(_mm_castsi128_ps(vs)), _mm_set1_ps(kScales[s.param]));
++            const __m128i truncated = _mm_cvttps_epi32(scaled);
++            const __m128i positiveOverflow = _mm_castps_si128(_mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f)));
++            return _mm_or_si128(_mm_andnot_si128(positiveOverflow, truncated),
++                                _mm_and_si128(positiveOverflow, _mm_set1_epi32(0x7FFFFFFF)));
++        }
++        else // SimpleAbs
++            return _mm_and_si128(_mm_castps_si128(normalize4(_mm_castsi128_ps(vs))), _mm_set1_epi32(0x7FFFFFFF));
++    }
++#endif
++
++    // Lane by lane (PS2_VU_FMAC_SCALAR builds).
++    inline void runSimpleOpScalar(const SimpleOp &s, const float (*vf)[4], float i, float out[4])
+     {
+         const float *vs = vf[s.fs];
+         switch (s.kind)
+@@ -740,6 +872,41 @@ namespace
+         }
+     }
+ 
++    // The result goes out in one 16-byte store: four lane stores followed by the 16-byte read of the destination
++    // write (blendLanes) stall that read until the stores retire.
++    inline void runSimpleOp(const SimpleOp &s, const float (*vf)[4], float i, float out[4])
++    {
++#if PS2_VU_FMAC_SSE2
++        __m128i result;
++        switch (s.kind)
++        {
++        case SimpleMaxBc: result = simpleOpSse2<SimpleMaxBc>(s, vf, i); break;
++        case SimpleMiniBc: result = simpleOpSse2<SimpleMiniBc>(s, vf, i); break;
++        case SimpleMaxI: result = simpleOpSse2<SimpleMaxI>(s, vf, i); break;
++        case SimpleMiniI: result = simpleOpSse2<SimpleMiniI>(s, vf, i); break;
++        case SimpleMax: result = simpleOpSse2<SimpleMax>(s, vf, i); break;
++        case SimpleMini: result = simpleOpSse2<SimpleMini>(s, vf, i); break;
++        case SimpleItof: result = simpleOpSse2<SimpleItof>(s, vf, i); break;
++        case SimpleFtoi: result = simpleOpSse2<SimpleFtoi>(s, vf, i); break;
++        default: result = simpleOpSse2<SimpleAbs>(s, vf, i); break;
++        }
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), result);
++#else
++        runSimpleOpScalar(s, vf, i, out);
++#endif
++    }
++
++    // The same with the kind fixed at compile time (the blocks pick it once per pair: ps2_vu1_blocks.h).
++    template <uint8_t Kind>
++    PS2_VU_FORCEINLINE void runSimpleOpFixed(const SimpleOp &s, const float (*vf)[4], float i, float out[4])
++    {
++#if PS2_VU_FMAC_SSE2
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), simpleOpSse2<Kind>(s, vf, i));
++#else
++        runSimpleOpScalar(s, vf, i, out);
++#endif
++    }
++
+     // How run() executes the upper instruction of a pair.
+     enum UpperPath : uint8_t
+     {

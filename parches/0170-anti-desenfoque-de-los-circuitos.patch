@@ -1,0 +1,224 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 7fec175..d6116b4 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -126,3 +126,18 @@ private:
+ 
+     std::unique_ptr<BandState> m_bands; // null: no band workers
+ };
++
++// Patch 0170: anti-blur, as PCSX2's PCRTC Anti-Blur. With both read circuits enabled (PMODE EN1, EN2) reading the
++// same buffer (FBP, FBW, PSM, DBX) one line apart (DBY), the flicker filter of an interlaced TV: circuit 2 gets
++// circuit 1's DBY, so the merge blends the same lines. Returns DISPFB2 as presented (unchanged otherwise).
++uint64_t ps2GsAntiBlurDispfb2(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2, bool enabled);
++// On unless value is "0" (F1_GS_ANTIDESENFOQUE=0, diagnosis).
++bool ps2GsAntiBlurFromEnvironment(const char *value);
++// F1_GS_ANTIDESENFOQUE, read once (the first call prints it).
++bool ps2GsAntiBlurEnabled();
++// Patch 0170: whether the flip snapshot (patch 0104, ps2GsBeforeDisplayChange) of these display registers is skipped.
++// A game showing both circuits rewrites the DISPFB pair at each flip (F1 06: DISPFB2, then DISPFB1); the snapshot
++// before the second write is a half flip (circuit 1 on the buffer left, circuit 2 one line off on the next one) and,
++// being the last one, was the one presented. It is skipped when anti-blur is on: both circuits enabled, other FBP,
++// same FBW, PSM and DBX, DBY one line apart; never twice in a row (skippedLast), so such a display never freezes.
++bool ps2GsSkipFlipSnapshot(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2, bool skippedLast, bool enabled);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 02a2ada..9203089 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -6685,8 +6685,11 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }
+ 
+-PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
++PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &originalRequest)
+ {
++    // Patch 0170: anti-blur (ps2GsAntiBlurDispfb2).
++    GSPresentationRequest request = originalRequest;
++    request.dispfb2 = ps2GsAntiBlurDispfb2(request.pmode, request.dispfb1, request.dispfb2, ps2GsAntiBlurEnabled());
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+@@ -6814,3 +6817,46 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     result.sourceFbp = selected.fbp;
+     return result;
+ }
++
++uint64_t ps2GsAntiBlurDispfb2(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2, bool enabled)
++{
++    constexpr uint64_t kDbyShift = 43u;
++    constexpr uint64_t kDbyMask = 0x7FFull << kDbyShift;
++    constexpr uint64_t kBufferMask = 0xFFFFFull | (0x7FFull << 32u); // FBP, FBW, PSM, DBX
++    if (!enabled || (pmode & 3u) != 3u || (dispfb1 & kBufferMask) != (dispfb2 & kBufferMask))
++        return dispfb2;
++    const uint64_t dby1 = (dispfb1 & kDbyMask) >> kDbyShift;
++    const uint64_t dby2 = (dispfb2 & kDbyMask) >> kDbyShift;
++    if (dby1 + 1u != dby2 && dby2 + 1u != dby1)
++        return dispfb2;
++    return (dispfb2 & ~kDbyMask) | (dispfb1 & kDbyMask);
++}
++
++bool ps2GsAntiBlurFromEnvironment(const char *value)
++{
++    return value == nullptr || std::strcmp(value, "0") != 0;
++}
++
++bool ps2GsAntiBlurEnabled()
++{
++    static const bool s_enabled = []
++    {
++        const bool on = ps2GsAntiBlurFromEnvironment(std::getenv("F1_GS_ANTIDESENFOQUE"));
++        std::fprintf(stderr, "[gs] antidesenfoque de los circuitos: %s\n",
++                     on ? "activo" : "desactivado (F1_GS_ANTIDESENFOQUE=0)");
++        return on;
++    }();
++    return s_enabled;
++}
++
++bool ps2GsSkipFlipSnapshot(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2, bool skippedLast, bool enabled)
++{
++    constexpr uint64_t kFbpMask = 0x1FFull;
++    constexpr uint64_t kOtherBufferMask = (0xFFFFFull & ~kFbpMask) | (0x7FFull << 32u); // FBW, PSM, DBX
++    if (!enabled || skippedLast || (pmode & 3u) != 3u || (dispfb1 & kFbpMask) == (dispfb2 & kFbpMask) ||
++        (dispfb1 & kOtherBufferMask) != (dispfb2 & kOtherBufferMask))
++        return false;
++    const uint64_t dby1 = (dispfb1 >> 43u) & 0x7FFu;
++    const uint64_t dby2 = (dispfb2 >> 43u) & 0x7FFu;
++    return dby1 + 1u == dby2 || dby2 + 1u == dby1;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 390a362..bd3aea9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -656,6 +656,7 @@ namespace
+     GSPresentationRequest g_lastRequest{}; // the last one built under the state lock (context frames, preferred)
+     bool g_hasLastRequest = false;
+     std::atomic<int64_t> g_lastFlipSnapshotNs{0};
++    bool g_skippedLastFlipSnapshot = false; // patch 0170 (EE thread, ps2GsBeforeDisplayChange)
+ 
+     int64_t steadyNs()
+     {
+@@ -731,6 +732,11 @@ void ps2GsBeforeDisplayChange()
+     request.display2 = g_displayPrivRegs->display2;
+     request.bgcolor = g_displayPrivRegs->bgcolor;
+     request.vsyncTick = g_displayPrivRegs->vsyncTick.load(std::memory_order_acquire);
++    // Patch 0170: the snapshot of a half flip is not presented (ps2GsSkipFlipSnapshot); the one before it stands.
++    g_skippedLastFlipSnapshot = ps2GsSkipFlipSnapshot(request.pmode, request.dispfb1, request.dispfb2,
++                                                      g_skippedLastFlipSnapshot, ps2GsAntiBlurEnabled());
++    if (g_skippedLastFlipSnapshot)
++        return;
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+     if (s_gifThreadEnabled && mode != 75 && mode != 76 && mode != 78 && s_gifThread.submitSnapshotMarker(request))
+         return;
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 031be9b..6082f07 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -778,8 +778,10 @@ struct GSGpuBackend::Impl
+     void runScanout(const ScanoutCommand &command)
+     {
+         statScanouts.fetch_add(1u, std::memory_order_relaxed);
+-        lastScanoutRequest = command.request;
+-        const GSPresentationRequest &request = command.request;
++        // Patch 0170: anti-blur, as the CPU presenter (GSCpuBackend::PresentFromLocalMemory).
++        GSPresentationRequest request = command.request;
++        request.dispfb2 = ps2GsAntiBlurDispfb2(request.pmode, request.dispfb1, request.dispfb2, ps2GsAntiBlurEnabled());
++        lastScanoutRequest = request;
+         if (scanoutFromVram)
+         {
+             const void *mapped = api.map_vram_read(context, 0u, kVramSize);
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index f2951c9..9249b83 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_runtime.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
++#include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+@@ -4887,5 +4888,83 @@ void register_ps2_gs_tests()
+             t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 5u, 3u) & 0xFFu, 0xFFu,
+                      "an opaque texel in the centre is drawn in full");
+         });
++        tc.Run("anti-blur aligns circuit 2 with circuit 1 when they read the same buffer one line apart", [](TestCase &t)
++        {
++            constexpr uint64_t kBothCircuits = 0x8003u; // EN1, EN2, MMOD 0 (F1 06)
++            const auto dispfb = [](uint64_t fbp, uint64_t fbw, uint64_t psm, uint64_t dbx, uint64_t dby) {
++                return fbp | (fbw << 9u) | (psm << 15u) | (dbx << 32u) | (dby << 43u);
++            };
++            const uint64_t line0 = dispfb(0u, 10u, GS_PSM_CT32, 0u, 0u);
++            const uint64_t line1 = dispfb(0u, 10u, GS_PSM_CT32, 0u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, line0, line1, true), line0,
++                     "circuit 2 one line below circuit 1 takes circuit 1's DBY");
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, line1, line0, true), line1,
++                     "circuit 2 one line above circuit 1 takes circuit 1's DBY");
++            const uint64_t at100 = dispfb(140u, 10u, GS_PSM_CT16S, 8u, 100u);
++            const uint64_t at101 = dispfb(140u, 10u, GS_PSM_CT16S, 8u, 101u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, at100, at101, true), at100,
++                     "only DBY changes, whatever the buffer and DBX");
++        });
++
++        tc.Run("anti-blur leaves circuit 2 alone unless both circuits read the same buffer one line apart", [](TestCase &t)
++        {
++            constexpr uint64_t kBothCircuits = 0x8003u;
++            const auto dispfb = [](uint64_t fbp, uint64_t fbw, uint64_t psm, uint64_t dbx, uint64_t dby) {
++                return fbp | (fbw << 9u) | (psm << 15u) | (dbx << 32u) | (dby << 43u);
++            };
++            const uint64_t first = dispfb(0u, 10u, GS_PSM_CT32, 0u, 0u);
++            const uint64_t twoLines = dispfb(0u, 10u, GS_PSM_CT32, 0u, 2u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, twoLines, true), twoLines, "DBY 2 lines apart");
++            const uint64_t otherFbp = dispfb(128u, 10u, GS_PSM_CT32, 0u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, otherFbp, true), otherFbp, "another FBP");
++            const uint64_t otherFbw = dispfb(0u, 8u, GS_PSM_CT32, 0u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, otherFbw, true), otherFbw, "another FBW");
++            const uint64_t otherPsm = dispfb(0u, 10u, GS_PSM_CT24, 0u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, otherPsm, true), otherPsm, "another PSM");
++            const uint64_t otherDbx = dispfb(0u, 10u, GS_PSM_CT32, 1u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, otherDbx, true), otherDbx, "another DBX");
++            const uint64_t below = dispfb(0u, 10u, GS_PSM_CT32, 0u, 1u);
++            t.Equals(ps2GsAntiBlurDispfb2(0x8001u, first, below, true), below, "circuit 2 disabled");
++            t.Equals(ps2GsAntiBlurDispfb2(0x8002u, first, below, true), below, "circuit 1 disabled");
++            t.Equals(ps2GsAntiBlurDispfb2(kBothCircuits, first, below, false), below, "anti-blur turned off");
++        });
++
++        tc.Run("anti-blur is on unless F1_GS_ANTIDESENFOQUE is 0", [](TestCase &t)
++        {
++            t.IsTrue(ps2GsAntiBlurFromEnvironment(nullptr), "unset: on");
++            t.IsTrue(ps2GsAntiBlurFromEnvironment("1"), "1: on");
++            t.IsFalse(ps2GsAntiBlurFromEnvironment("0"), "0: off");
++        });
++        tc.Run("the flip snapshot of a half flip is skipped, once", [](TestCase &t)
++        {
++            constexpr uint64_t kBothCircuits = 0x8003u;
++            const auto dispfb = [](uint64_t fbp, uint64_t dby) { return fbp | (10ull << 9u) | (dby << 43u); };
++            // F1 06 flipping from buffer 0 to 128: DISPFB2 is written first, then DISPFB1.
++            t.IsTrue(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 1u), false, true),
++                     "circuit 2 already on the next buffer one line lower: skipped");
++            t.IsTrue(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(128u, 1u), dispfb(0u, 0u), false, true),
++                     "circuit 2 one line higher on the other buffer: skipped");
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 1u), true, true),
++                      "never two in a row");
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 1u), false, false),
++                      "anti-blur turned off");
++        });
++
++        tc.Run("the flip snapshot of a whole display is still taken", [](TestCase &t)
++        {
++            constexpr uint64_t kBothCircuits = 0x8003u;
++            const auto dispfb = [](uint64_t fbp, uint64_t dby) { return fbp | (10ull << 9u) | (dby << 43u); };
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(0u, 1u), false, true),
++                      "both circuits on the buffer being left (patch 0104)");
++            t.IsFalse(ps2GsSkipFlipSnapshot(0x8001u, dispfb(0u, 0u), dispfb(128u, 1u), false, true),
++                      "one circuit shown");
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 0u), false, true),
++                      "two buffers on the same lines");
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 2u), false, true),
++                      "two buffers two lines apart");
++            t.IsFalse(ps2GsSkipFlipSnapshot(kBothCircuits, dispfb(0u, 0u), dispfb(128u, 1u) | (1ull << 32u), false,
++                                            true),
++                      "another DBX");
++        });
+     });
+ }

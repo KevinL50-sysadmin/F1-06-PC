@@ -1,0 +1,332 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 5f1436a..61b1b12 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -36,7 +36,9 @@
+ // patch 0064), 39 the GS upload jobs spread over the band workers and every dependency waiting for all of them
+ // (before patch 0065), 40 modes 35, 36 and 38 together (everything of patches 0062 to 0065 off at once), 41 the GS triangle rows one pixel at a time
+ // (before patch 0066), 42 the presentation copy of the GS local memory made by the GS thread after waiting for
+-// every band job (before patch 0067). A
++// every band job (before patch 0067), 43 the compiled VU1 schedules with IADDIU, MOVE, B, IBEQ, IBNE, the
++// branch backup and the pending branch of the pc through calls (before patch 0068), 44 modes 41, 42 and 43 together
++// (everything of patches 0066 to 0068 off at once). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1b030b6..c6ac7c8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2451,8 +2451,9 @@ namespace
+             return true;
+         };
+ 
+-        // Patch 0066: four pixels at a time (A/B mode 41: one by one, as before).
+-        const bool simd = g_ps2AbMode.load(std::memory_order_relaxed) != 41;
++        // Patch 0066: four pixels at a time (A/B modes 41 and 44: one by one, as before).
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        const bool simd = abMode != 41 && abMode != 44;
+         const int skip = static_cast<int>(count - 1u) << shift;
+         for (int y = firstBandRow(t.minY, shift, count, index); y <= t.maxY; y = nextBandRow(y, shift, skip))
+         {
+@@ -4570,7 +4571,7 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+ {
+     // Patch 0067: the copy of local memory for the presentation as a band job, so that this thread does not wait for
+-    // every pending job (the "directo" waits of [gs:bandas], one per presented frame). A/B mode 42: here, as before;
++    // every pending job (the "directo" waits of [gs:bandas], one per presented frame). A/B modes 42 and 44: here, as before;
+     // also without band workers, in A/B modes 36, 37 and 40 (the coordinator waits there), while F1_GS_VERIFICAR_BANDAS
+     // checks batches, and when the caller needs it now. 0: copied already.
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -4582,7 +4583,7 @@ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+     out.resize(m_vramSize);
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+     BandState *bands = m_bands.get();
+-    if (!defer || bands == nullptr || mode == 42 || mode == 36 || mode == 37 || mode == 40 || bands->verifyLeft != 0u ||
++    if (!defer || bands == nullptr || mode == 42 || mode == 44 || mode == 36 || mode == 37 || mode == 40 || bands->verifyLeft != 0u ||
+         bands->RefreshMinDone() >= bands->prepared)
+     {
+         WaitBandsUnlocked();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index e76daf6..f10a2ab 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1967,13 +1967,14 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 || abMode == 43 || abMode == 44) && s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40)
++            else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40 ||
++                     abMode == 43 || abMode == 44)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 1e75559..8b195b3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3245,6 +3245,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         uint32_t codeSize() const { return codeBytesSize; }
+         int32_t readBranchVi(uint8_t reg) const { return vu.readBranchVi(reg); }
++        // Where the branch backup lives, from the VU1State (patch 0068: the JIT's inline IBEQ/IBNE and backups).
++        int32_t stateOffset(const void *field) const
++        {
++            return static_cast<int32_t>(static_cast<const char *>(field) - reinterpret_cast<const char *>(&vu.m_state));
++        }
++        int32_t backupValueOffset() const { return stateOffset(&vu.m_viBranchBackupValue); }
++        int32_t backupRegOffset() const { return stateOffset(&vu.m_viBranchBackupReg); }
++        int32_t backupValidOffset() const { return stateOffset(&vu.m_viBranchBackupValid); }
+         float normalizeResult(float value) const
+         {
+             uint32_t ignoredFlags = 0u;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 32d8354..1279be5 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -838,6 +838,10 @@
+         uint32_t data;
+         uint32_t dataBytes;
+         uint32_t codeSize;
++        // Patch 0068: the pc mask, and the branch backup's fields as offsets from the VU1State (rbx; they are in the
++        // interpreter around it, so they may be negative).
++        uint32_t pcMask;
++        int32_t backupValue, backupReg, backupValid;
+     };
+ 
+     // eax = (vi[base] + imm) * 16 & (dataBytes - 1); rcx = data (offsetAddress of fastLowerBody).
+@@ -924,9 +928,158 @@
+         return true;
+     }
+ 
++    // Patch 0068 (A/B modes 43 and 44: through calls, as before): more lower steps inline.
++    inline void jitStoreByte(JitEmitter &e, JitEmitter::Base base, int32_t disp, uint8_t value)
++    {
++        e.bytes({0xC6}); // mov byte [base + disp], imm8
++        e.modrm(0, base, static_cast<uint32_t>(disp));
++        e.bytes({value});
++    }
++    inline void jitCmpByte(JitEmitter &e, JitEmitter::Base base, int32_t disp, uint8_t value)
++    {
++        e.bytes({0x80}); // cmp byte [base + disp], imm8
++        e.modrm(7, base, static_cast<uint32_t>(disp));
++        e.bytes({value});
++    }
++
++    // jitBackup inline: host.setBranchBackup(p.backupReg, st.jitOldVi).
++    inline void jitEmitBackup(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        if (p.backupReg == 0u)
++        {
++            jitStoreByte(e, B::Vu, h.backupValid, 0u);
++            return;
++        }
++        e.load32(0, B::St, offsetof(BlockState, jitOldVi));
++        e.store32(B::Vu, static_cast<size_t>(static_cast<uint32_t>(h.backupValue)), 0);
++        jitStoreByte(e, B::Vu, h.backupReg, p.backupReg);
++        jitStoreByte(e, B::Vu, h.backupValid, 1u);
++    }
++
++    // The VI result of a lower instruction in eax (already 16-bit sign-extended): where fastLowerBody's writeVi puts it.
++    inline void jitEmitWriteVi(JitEmitter &e, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        if (p.viMode == ViNow)
++            e.store32(B::Vu, offsetof(VU1State, vi) + 4u * p.viReg, 0);
++        else if (p.viMode == ViPending)
++            e.store32(B::St, offsetof(BlockState, pendingVi) + 4u * p.viReg, 0);
++    }
++
++    // eax (reg 0) or ecx (reg 1) = host.readBranchVi(vi): the backup value when it is valid for that register.
++    inline void jitEmitReadBranchVi(JitEmitter &e, const JitHostLayout &h, uint8_t vi, uint8_t reg)
++    {
++        using B = JitEmitter;
++        if (vi == 0u)
++        {
++            e.bytes({0x31, static_cast<uint8_t>(0xC0u | (reg << 3) | reg)}); // xor reg, reg
++            return;
++        }
++        e.load32(reg, B::Vu, offsetof(VU1State, vi) + 4u * vi);
++        jitCmpByte(e, B::Vu, h.backupValid, 0u);
++        const size_t invalid = e.je32();
++        jitCmpByte(e, B::Vu, h.backupReg, vi);
++        const size_t other = e.jne32();
++        e.load32(reg, B::Vu, static_cast<size_t>(static_cast<uint32_t>(h.backupValue)));
++        e.bind(invalid);
++        e.bind(other);
++    }
++
++    // fastLowerBody's branchTo.
++    inline void jitEmitBranchTo(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        jitStoreByte(e, B::Vu, static_cast<int32_t>(offsetof(VU1State, branchPending)), 1u);
++        e.bytes({0xC7}); // mov dword [rbx + branchTarget], target
++        e.modrm(0, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchTarget)));
++        e.imm32((p.pc + 8u + static_cast<uint32_t>(static_cast<int32_t>(p.fastImm) * 8)) & h.pcMask);
++        e.bytes({0xC7}); // mov dword [rbx + branchDelay], 1
++        e.modrm(0, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchDelay)));
++        e.imm32(1u);
++    }
++
++    // IADDIU, MOVE, B, IBEQ and IBNE inline (fastLowerBody's expressions). False: not one of them.
++    inline bool jitEmitLowerMore(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        if (p.lowerExec != LowerFast)
++            return false;
++        switch (p.fastOp)
++        {
++        case FastIaddiu:
++            if (p.viMode != ViNow && p.viMode != ViPending)
++                return true; // writes nothing
++            e.load32(0, B::Vu, offsetof(VU1State, vi) + 4u * p.fastA);
++            e.bytes({0x05}); // add eax, imm
++            e.imm32(static_cast<uint32_t>(static_cast<int32_t>(p.fastImm)));
++            e.movsxEaxAx();
++            jitEmitWriteVi(e, p);
++            return true;
++        case FastMove:
++        {
++            if (!s_jitSse41)
++                return false;
++            if (p.lowerDst != DstVf && p.lowerDst != DstVfPending)
++                return true;
++            const uint8_t imm = jitBlendImm(p.lowerLanes);
++            if (imm == 0u)
++                return true;
++            const B::Base base = p.lowerDst == DstVf ? B::Vu : B::St;
++            const size_t target = p.lowerDst == DstVf ? offsetof(VU1State, vf) + 16u * p.lowerReg
++                                                      : offsetof(BlockState, pendingVf) + 16u * p.lowerReg;
++            e.loadXmm(1, B::Vu, offsetof(VU1State, vf) + 16u * p.fastA);
++            if (imm == 0xFu)
++                e.storeXmm(base, target, 1);
++            else
++            {
++                e.loadXmm(0, base, target);
++                e.blendXmm0Xmm1(imm);
++                e.storeXmm(base, target, 0);
++            }
++            return true;
++        }
++        case FastB:
++            jitEmitBranchTo(e, h, p);
++            return true;
++        case FastIbeq:
++        case FastIbne:
++        {
++            jitEmitReadBranchVi(e, h, p.fastA, 0u);
++            jitEmitReadBranchVi(e, h, p.fastB, 1u);
++            e.bytes({0x66, 0x39, 0xC8}); // cmp ax, cx (the int16 values)
++            const size_t skip = p.fastOp == FastIbeq ? e.jne32() : e.je32();
++            jitEmitBranchTo(e, h, p);
++            e.bind(skip);
++            return true;
++        }
++        default:
++            return false;
++        }
++    }
++
++    // jitPcPending inline.
++    inline void jitEmitPcPending(JitEmitter &e, const JitHostLayout &h)
++    {
++        using B = JitEmitter;
++        e.bytes({0x83}); // cmp dword [rbx + branchDelay], 0
++        e.modrm(7, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchDelay)));
++        e.bytes({0x00});
++        const size_t delayed = e.jne32();
++        e.load32(0, B::Vu, offsetof(VU1State, branchTarget));
++        e.andEax(h.pcMask);
++        e.store32(B::Vu, offsetof(VU1State, pc), 0);
++        jitStoreByte(e, B::Vu, static_cast<int32_t>(offsetof(VU1State, branchPending)), 0u);
++        const size_t done = e.jmp32();
++        e.bind(delayed);
++        e.bytes({0xFF}); // dec dword [rbx + branchDelay]
++        e.modrm(1, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchDelay)));
++        e.bind(done);
++    }
++
+     // jitPc inline: the next pc, then the pending branch (rare) through jitPcPending.
+     template <typename Host>
+-    void jitEmitPc(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    void jitEmitPc(JitEmitter &e, const JitHostLayout &h, const BlockPair &p, bool inlinePending)
+     {
+         using B = JitEmitter;
+         uint32_t nextPc = p.pc + 8u;
+@@ -939,7 +1092,10 @@
+         e.modrm(7, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchPending)));
+         e.bytes({0x00});
+         const size_t skip = e.je32();
+-        e.call(reinterpret_cast<const void *>(&jitPcPending<Host>), &p);
++        if (inlinePending)
++            jitEmitPcPending(e, h);
++        else
++            e.call(reinterpret_cast<const void *>(&jitPcPending<Host>), &p);
+         e.bind(skip);
+     }
+ 
+@@ -966,8 +1122,8 @@
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
+     // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls), 31 (LQ, SQ, the pc and the end
+-    // of the block through calls), 32 (flag commits through calls), 34 (no JitKnownNormal) and 35 (no exact zeros
+-    // in the inline FMAC), in s.jitCalls.
++    // of the block through calls), 32 (flag commits through calls), 34 (no JitKnownNormal), 35 (no exact zeros
++    // in the inline FMAC) and 43 (patch 0068's lower steps through calls), in s.jitCalls.
+     template <typename Host>
+     bool jitCompile(BlockEngine &engine, Schedule &s, Host &host, int alternative = 0)
+     {
+@@ -975,10 +1131,12 @@
+         const bool inlineLower = alternative != 31 && s_jitInlineLower;
+         const bool inlineFlags = alternative != 32 && s_jitInlineFlags;
+         const bool trackNormal = alternative != 34; // A/B mode 34: every FMAC operand normalized
++        const bool inlineMore = alternative != 43 && alternative != 44 && inlineLower; // A/B modes 43 and 44: as before
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+-            static_cast<uint32_t>(reinterpret_cast<const char *>(&host.dataSize) - hostBase), host.codeSize()};
++            static_cast<uint32_t>(reinterpret_cast<const char *>(&host.dataSize) - hostBase), host.codeSize(),
++            host.pcMask(), host.backupValueOffset(), host.backupRegOffset(), host.backupValidOffset()};
+         (alternative == 0 ? s.jitTried : s.jitCallsTried) = true;
+         s.jitRanges.clear();
+         s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
+@@ -1049,13 +1207,19 @@
+                 }
+                 if (p.lowerExec == LowerFast)
+                 {
+-                    if (!(inlineLower && (jitEmitLq(e, layout, p) || jitEmitSq<Host>(e, layout, p))))
++                    if (!(inlineLower && (jitEmitLq(e, layout, p) || jitEmitSq<Host>(e, layout, p))) &&
++                        !(inlineMore && jitEmitLowerMore(e, layout, p)))
+                         e.call(reinterpret_cast<const void *>(kLowerFast<Host>[p.fastOp]), &p);
+                 }
+                 else if (p.lowerExec == LowerImmediate)
+                     e.call(reinterpret_cast<const void *>(&jitImmediate<Host>), &p);
+                 if (p.backup != 0u)
+-                    e.call(reinterpret_cast<const void *>(&jitBackup<Host>), &p);
++                {
++                    if (inlineMore)
++                        jitEmitBackup(e, layout, p);
++                    else
++                        e.call(reinterpret_cast<const void *>(&jitBackup<Host>), &p);
++                }
+             }
+ 
+             if (!upperDone && p.upperFn != nullptr &&
+@@ -1085,7 +1249,7 @@
+             if (p.branch || &p == &s.pairs.back())
+             {
+                 if (inlineLower)
+-                    jitEmitPc<Host>(e, layout, p);
++                    jitEmitPc<Host>(e, layout, p, inlineMore);
+                 else
+                     e.call(reinterpret_cast<const void *>(&jitPc<Host>), &p);
+             }

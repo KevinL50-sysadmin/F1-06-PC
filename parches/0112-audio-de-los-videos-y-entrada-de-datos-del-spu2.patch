@@ -1,0 +1,641 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 97a09ac..480e79f 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -40,6 +40,12 @@ namespace ps2x::iop::detail
+         // samples, when the write position (sample & 0x1FF) reaches it. AUDIO.IRX relies on it at boot (default IRQA).
+         constexpr uint32_t kOutputAreaBegin = 0x400u, kOutputAreaEnd = 0x1000u;
+         constexpr uint32_t kDefaultIrqa = 0x800u;
++        // Sound data input (patch 0112): core c reads a stereo sample every 48 kHz tick from 0x2000 + c*0x400 (left)
++        // and 0x2200 + c*0x400 (right), at the same position (sample & 0x1FF) as the output areas, mixed with BVOL and
++        // MMIX bits 7-4. It is the AutoDMA buffer, but the SPU2 reads it whether or not AutoDMA runs: F1 06's AUDIO.IRX
++        // plays the videos' PCM by writing it there with sceSdVoiceTrans and refilling each half when an IRQA inside
++        // it (0x24F8) fires, without ADMAS. An IRQA in this area fires like one in the output areas.
++        constexpr uint32_t kInputAreaBegin = 0x2000u, kInputAreaEnd = 0x2800u;
+ 
+         int16_t clamp16(int32_t value) noexcept
+         {
+@@ -152,6 +158,7 @@ namespace ps2x::iop::detail
+         std::chrono::steady_clock::time_point reportStart = std::chrono::steady_clock::now();
+         uint64_t reportSample = 0;
+         int32_t peak = 0;
++        int32_t inputPeak[2]{}; // sound data input after BVOL, for the report
+         FILE *wav = nullptr;
+         uint64_t wavFrames = 0;
+ 
+@@ -580,7 +587,7 @@ namespace ps2x::iop::detail
+             outR = (rv.prevOutR + rv.outR) >> 1;
+         }
+ 
+-        void pushFrame(int16_t left, int16_t right)
++        void pushFrame(int16_t left, int16_t right, const int16_t *wavInput)
+         {
+             peak = std::max<int32_t>(peak, std::max(std::abs(static_cast<int32_t>(left)), std::abs(static_cast<int32_t>(right))));
+             const int32_t gain = g_outputGain.load(std::memory_order_relaxed);
+@@ -588,7 +595,7 @@ namespace ps2x::iop::detail
+             right = clamp16((right * gain) >> 8);
+             if (wav)
+             {
+-                const int16_t frame[2] = {left, right};
++                const int16_t frame[2] = {wavInput ? wavInput[0] : left, wavInput ? wavInput[1] : right};
+                 std::fwrite(frame, sizeof(frame), 1, wav);
+                 ++wavFrames;
+             }
+@@ -636,16 +643,39 @@ namespace ps2x::iop::detail
+                     which ^= 1;
+                 }
+             }
++            // PS2X_SPU2_WAV_ENTRADA=<core> (debugging): the WAV dump gets that core's sound data input (as stored, before
++            // BVOL) instead of the output.
++            static const int s_wavInputCore = []
++            {
++                const char *value = std::getenv("PS2X_SPU2_WAV_ENTRADA");
++                return value ? std::clamp(std::atoi(value), 0, 1) : -1;
++            }();
+             for (uint32_t i = 0; i < n; ++i)
+             {
+                 int32_t extL = 0, extR = 0;
++                const uint32_t inputPos = static_cast<uint32_t>(sample & 0x1FFu);
++                int16_t wavInput[2]{};
++                if (s_wavInputCore >= 0)
++                {
++                    const uint32_t base = kInputAreaBegin + static_cast<uint32_t>(s_wavInputCore) * 0x400u + inputPos;
++                    wavInput[0] = static_cast<int16_t>(owner.m_ram[base]);
++                    wavInput[1] = static_cast<int16_t>(owner.m_ram[base + 0x200u]);
++                }
+                 for (int core = 0; core < 2; ++core)
+                 {
+                     const uint32_t mmix = reg(core, kMmix) & (core == 0 ? 0xFF0u : 0xFFFu);
+-                    int32_t tdL = ((mmix & 0x800u) ? dryL[core][i] : 0) + ((mmix & 0x008u) ? extL : 0);
+-                    int32_t tdR = ((mmix & 0x400u) ? dryR[core][i] : 0) + ((mmix & 0x004u) ? extR : 0);
+-                    const int32_t twL = ((mmix & 0x200u) ? wetL[core][i] : 0) + ((mmix & 0x002u) ? extL : 0);
+-                    const int32_t twR = ((mmix & 0x100u) ? wetR[core][i] : 0) + ((mmix & 0x001u) ? extR : 0);
++                    int32_t inL = 0, inR = 0;
++                    if ((mmix & 0xF0u) != 0u)
++                    {
++                        const uint32_t base = kInputAreaBegin + static_cast<uint32_t>(core) * 0x400u + inputPos;
++                        inL = (static_cast<int16_t>(owner.m_ram[base]) * static_cast<int16_t>(common(core, 0xC))) >> 15;
++                        inR = (static_cast<int16_t>(owner.m_ram[base + 0x200u]) * static_cast<int16_t>(common(core, 0xE))) >> 15;
++                        inputPeak[core] = std::max(inputPeak[core], std::max(std::abs(inL), std::abs(inR)));
++                    }
++                    int32_t tdL = ((mmix & 0x800u) ? dryL[core][i] : 0) + ((mmix & 0x080u) ? inL : 0) + ((mmix & 0x008u) ? extL : 0);
++                    int32_t tdR = ((mmix & 0x400u) ? dryR[core][i] : 0) + ((mmix & 0x040u) ? inR : 0) + ((mmix & 0x004u) ? extR : 0);
++                    const int32_t twL = ((mmix & 0x200u) ? wetL[core][i] : 0) + ((mmix & 0x020u) ? inL : 0) + ((mmix & 0x002u) ? extL : 0);
++                    const int32_t twR = ((mmix & 0x100u) ? wetR[core][i] : 0) + ((mmix & 0x010u) ? inR : 0) + ((mmix & 0x001u) ? extR : 0);
+                     if ((reg(core, kAttr) & 0x80u) != 0u)
+                     {
+                         int32_t rvL, rvR;
+@@ -664,7 +694,7 @@ namespace ps2x::iop::detail
+                     }
+                     else
+                     {
+-                        pushFrame(static_cast<int16_t>(outL), static_cast<int16_t>(outR));
++                        pushFrame(static_cast<int16_t>(outL), static_cast<int16_t>(outR), s_wavInputCore >= 0 ? wavInput : nullptr);
+                     }
+                 }
+                 ++sample;
+@@ -717,9 +747,13 @@ namespace ps2x::iop::detail
+                                  reg(core, v * 0x10u + 4u), reg(core, v * 0x10u + 6u), reg(core, v * 0x10u + 8u),
+                                  (reg32(core, kVmixL) >> v) & 1u);
+                 }
+-            std::fprintf(stderr, "[spu2]   pico=%d mvol=%x/%x %x/%x mmix=%x/%x attr=%x/%x\n", peak, common(0, 0), common(0, 2),
+-                         common(1, 0), common(1, 2), reg(0, kMmix), reg(1, kMmix), reg(0, kAttr), reg(1, kAttr));
++            std::fprintf(stderr, "[spu2]   pico=%d mvol=%x/%x %x/%x mmix=%x/%x attr=%x/%x bvol=%x/%x %x/%x entrada=%u/%u picoEntrada=%d/%d\n", peak,
++                         common(0, 0), common(0, 2), common(1, 0), common(1, 2), reg(0, kMmix), reg(1, kMmix), reg(0, kAttr),
++                         reg(1, kAttr), common(0, 0xC), common(0, 0xE), common(1, 0xC), common(1, 0xE),
++                         owner.m_inputTransfers[0].exchange(0u), owner.m_inputTransfers[1].exchange(0u), inputPeak[0],
++                         inputPeak[1]);
+             peak = 0;
++            inputPeak[0] = inputPeak[1] = 0;
+             reportStart = now;
+             reportSample = sample;
+             keyOns = audibleVoiceSamples = fetchIrqs = 0;
+@@ -1013,6 +1047,9 @@ namespace ps2x::iop::detail
+                 std::memcpy(iopRam + source + i * 2u, spu, 2u);
+         }
+         transferIrqCheck(core, start, words);
++        for (int c = 0; c < 2; ++c)
++            if (((start - (kInputAreaBegin + static_cast<uint32_t>(c) * 0x400u)) & kRamMask) < 0x400u)
++                m_inputTransfers[c].fetch_add(1u, std::memory_order_relaxed);
+         setTsa(core, (start + words) & kRamMask);
+         if (toSpu && m_threadEnabled)
+             ensureThread();
+@@ -1041,7 +1078,11 @@ namespace ps2x::iop::detail
+         {
+             m_outputIrqSample[core] = UINT64_MAX;
+             const uint32_t target = irqa(core);
+-            if ((m_regs[core * 0x200u + kAttr / 2u] & 0x40u) == 0u || target < kOutputAreaBegin || target >= kOutputAreaEnd)
++            const bool inOutputArea = target >= kOutputAreaBegin && target < kOutputAreaEnd;
++            // A/B mode 106 (patch 0112): no IRQ in the input areas, as before.
++            const bool inInputArea = target >= kInputAreaBegin && target < kInputAreaEnd &&
++                                     g_ps2AbMode.load(std::memory_order_relaxed) != 106;
++            if ((m_regs[core * 0x200u + kAttr / 2u] & 0x40u) == 0u || (!inOutputArea && !inInputArea))
+                 continue;
+             const uint64_t phase = target & 0x1FFu;
+             uint64_t s = (current & ~uint64_t{0x1FF}) + phase;
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index d4a0aed..47b3320 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -81,6 +81,7 @@ namespace ps2x::iop::detail
+         std::atomic<uint32_t> m_pubEnvx[2][24]{};
+         std::atomic<uint32_t> m_pubVolx[2][24]{}; // VOLXL | VOLXR << 16
+         std::atomic<uint32_t> m_asyncIrq{0};      // cores whose IRQA a voice fetch hit
++        std::atomic<uint32_t> m_inputTransfers[2]{}; // DMA/manual transfers into each core's sound data input area
+         std::atomic<uint64_t> m_asyncIrqSeq[2]{}; // commands applied when it happened
+         std::atomic<bool> m_stop{false};
+         std::unique_ptr<Synth> m_synth;
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0ad11b8..5aa7cac 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -72,7 +72,8 @@
+ // still working out the FMAC entries committed after them and committing those of unknown kind through a call, and
+ // the VU run setting its rounding mode through the CRT (before patch 0099).
+ // 105 (patch 0111) the SPU2 synthesis thread treating every voice as unheard (it walks addresses, envelopes and IRQs
+-// but decodes and mixes nothing: the cost of the sound without changing what the IOP sees).
++// but decodes and mixes nothing: the cost of the sound without changing what the IOP sees), 106 (patch 0112) no SPU2
++// IRQ in the sound data input areas (0x2000-0x27FF), as before patch 0112.
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index bcb99e6..8cbecf0 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -371,6 +371,39 @@ void EeScheduler::run()
+             running->invocations.push_back(std::move(invocation));
+             continue;
+         }
++        // Patch 0112: interrupt-like invocations (INTC handlers, alarms, GS callbacks, SIF commands from the IOP) also
++        // enter on top of a thread-level invocation (an HLE call or a callback that guest code runs in the thread's
++        // name), as a real interrupt would; only not on top of another interrupt-like one. Before, they waited for the
++        // invocation to finish: F1 06's video audio callback (run by sceMpeg in the video thread) polls until CORE.IRX
++        // answers, and that answer is a SIF command, so the intro hung ("cid 1 sin respuesta").
++        if (!m_pendingInvocations.empty() && !running->invocations.empty())
++        {
++            const auto interruptLike = [](GuestInvocationKind kind)
++            {
++                return kind == GuestInvocationKind::Interrupt || kind == GuestInvocationKind::Alarm ||
++                       kind == GuestInvocationKind::GsCallback || kind == GuestInvocationKind::SifCommand;
++            };
++            const bool insideInterruptLike = std::any_of(running->invocations.begin(), running->invocations.end(),
++                                                         [&](const GuestInvocation &invocation)
++                                                         { return interruptLike(invocation.kind); });
++            if (!insideInterruptLike)
++            {
++                const auto pending = std::find_if(m_pendingInvocations.begin(), m_pendingInvocations.end(),
++                                                  [&](const GuestInvocation &invocation)
++                                                  { return interruptLike(invocation.kind); });
++                if (pending != m_pendingInvocations.end())
++                {
++                    GuestInvocation invocation = std::move(*pending);
++                    m_pendingInvocations.erase(pending);
++                    if (getRegU32(&invocation.context, 29) == 0u)
++                    {
++                        SET_GPR_U32(&invocation.context, 29, invocationStackTop());
++                    }
++                    running->invocations.push_back(std::move(invocation));
++                    continue;
++                }
++            }
++        }
+ 
+         // Traza temporal (F1 06): ultimas reanudaciones del planificador, volcadas si falta la funcion.
+         struct TrazaDespacho
+@@ -2532,3 +2565,10 @@ void ps2SetVideoModePal(bool pal)
+         std::fprintf(stderr, "[ee:vblank] %s: %u us%s\n", pal ? "PAL" : "NTSC", period,
+                      forcedVBlankPeriodUs() != 0u ? " (PS2X_VBLANK_HZ manda)" : "");
+ }
++
++// Patch 0112: VBLANK period in microseconds (PAL 20000, NTSC 16667, or PS2X_VBLANK_HZ), for the sceMpeg HLE's picture
++// clock, which counts in VBLANK ticks.
++uint32_t ps2VBlankPeriodUs()
++{
++    return static_cast<uint32_t>(vblankPeriod().count());
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index cbef11d..7643015 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -16,11 +16,14 @@ extern "C"
+ }
+ #endif
+ 
++#include <chrono>
+ #include <deque>
+ #include <memory>
+ 
+ #include "Syscalls/Helpers/State.h"
+ 
++uint32_t ps2VBlankPeriodUs(); // EeScheduler.cpp (parche 0112)
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -479,11 +482,21 @@ namespace ps2_stubs
+         };
+ 
+         constexpr uint64_t kPictureClockOne = 1ull << 32u;
+-        // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
++        // Without a frame rate: two VBLANK ticks per picture (25 pictures/s in PAL, 30 in NTSC).
+         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
+         constexpr size_t kMpegTimingScanLimit = 4096u;
+         constexpr size_t kMaxDecodedPicturesAhead = 8u;
+ 
++        struct MpegPendingAudio
++        {
++            uint64_t serial = 0u;
++            MpegRegisteredCallback callback;
++            uint32_t streamType = 0u;
++            uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
++            uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
++            std::vector<uint8_t> bytes;
++        };
++
+         struct MpegPlaybackState
+         {
+             uint32_t picturesServed = 0u;
+@@ -516,6 +529,10 @@ namespace ps2_stubs
+             // callback "sin datos" no trajo ninguno (ver sceMpegGetPicture).
+             uint64_t pssBytesIn = 0u;
+             bool nodataStalled = false;
++            // Paquetes de audio de los videos que aun no ha aceptado el callback del juego (ver deliverPendingAudio) y
++            // el VBLANK en que lo rechazo por ultima vez.
++            std::deque<MpegPendingAudio> pendingAudio;
++            uint64_t audioRefusedTick = std::numeric_limits<uint64_t>::max();
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -527,6 +544,8 @@ namespace ps2_stubs
+             uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+             uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+             std::vector<MpegRegisteredCallback> callbacks;
++            // Audio: copia del contenido del paquete (el anillo del juego puede cambiar antes de que se entregue).
++            std::vector<uint8_t> bytes;
+         };
+ 
+         struct MpegStubState
+@@ -555,9 +574,11 @@ namespace ps2_stubs
+         // TODO this resolution should follow runtime resolution
+         constexpr uint32_t kStubMovieWidth = 320u;
+         constexpr uint32_t kStubMovieHeight = 240u;
++        // sceMpegStrType de libmpeg: M2V 0, IPU 1, PCM 2, ADPCM 3, DATA 4 (antes el audio salia como 1 y 2, y su tipo 1
++        // le llegaba al callback de video del juego).
+         constexpr uint32_t kMpegStrM2V = 0u;
+-        constexpr uint32_t kMpegStrPCM = 1u;
+-        constexpr uint32_t kMpegStrADPCM = 2u;
++        constexpr uint32_t kMpegStrPCM = 2u;
++        constexpr uint32_t kMpegStrADPCM = 3u;
+         constexpr uint8_t kMpegPackHeader = 0xBAu;
+         constexpr uint8_t kMpegSystemHeader = 0xBBu;
+         constexpr uint8_t kMpegProgramEnd = 0xB9u;
+@@ -568,6 +589,10 @@ namespace ps2_stubs
+         constexpr uint32_t kMpegCbNodata = 1u;                     // sceMpegCbNodata
+         constexpr uint32_t kMpegCbBackground = 4u;                 // sceMpegCbBackground
+         constexpr uint64_t kMpegNodataInvocationTag = 0x4D504E44u; // "MPND"
++        constexpr uint64_t kMpegAudioInvocationTag = 0x4D504155u;  // "MPAU"
++        // Tope de paquetes de audio pendientes por video (~2 KB cada uno): el demultiplexor va unos fotogramas por
++        // delante, asi que esto solo se alcanza si el juego deja de aceptar audio.
++        constexpr size_t kMaxPendingAudioPackets = 1024u;
+ 
+         uint64_t mpegPictureIntervalQ32(uint8_t frameRateCode, uint8_t frameRateExtensionN = 0u, uint8_t frameRateExtensionD = 0u)
+         {
+@@ -606,10 +631,13 @@ namespace ps2_stubs
+                 return 0u;
+             }
+ 
++            // Parche 0112: el reloj de las imagenes cuenta VBLANK del planificador, que en PAL son de 50 Hz; antes se
++            // suponian campos NTSC (60000/1001 Hz) y los videos de 25 imagenes/s de F1 06 iban a 20,8 (la intro, de
++            // 67 s, duraba 80). VBLANK por imagen = (1e6 / periodo_us) * den / num.
+             const uint64_t extensionNumerator = static_cast<uint64_t>(frameRateExtensionN) + 1u;
+             const uint64_t extensionDenominator = static_cast<uint64_t>(frameRateExtensionD) + 1u;
+-            const uint64_t denominator = 1001u * frameRateNumerator * extensionNumerator;
+-            const uint64_t numerator = (60000u * frameRateDenominator * extensionDenominator) << 32u;
++            const uint64_t denominator = static_cast<uint64_t>(ps2VBlankPeriodUs()) * frameRateNumerator * extensionNumerator;
++            const uint64_t numerator = (1000000u * frameRateDenominator * extensionDenominator) << 32u;
+             return std::max(kPictureClockOne, (numerator + denominator / 2u) / denominator);
+         }
+ 
+@@ -739,13 +767,14 @@ namespace ps2_stubs
+ 
+         uint64_t mpegPtsDeltaToVSyncQ32(uint64_t delta90k)
+         {
+-            // 90 kHz MPEG clock -> NTSC field clock (60000/1001 Hz):
+-            // fields = pts * 60000 / (90000 * 1001) = pts * 2 / 3003.
+-            constexpr uint64_t kPtsDivisor = 3003u;
+-            const uint64_t whole = delta90k / kPtsDivisor;
+-            const uint64_t remainder = delta90k % kPtsDivisor;
+-            const uint64_t wholeQ32 = whole * 2u * kPictureClockOne;
+-            const uint64_t remainderQ32 = ((remainder * 2u * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
++            // 90 kHz MPEG clock -> VBLANK ticks (parche 0112: del periodo real, 50 Hz en PAL, no campos NTSC):
++            // ticks = pts * 1e6 / (90000 * periodo_us) = pts * 100 / (9 * periodo_us).
++            const uint64_t divisor = 9u * static_cast<uint64_t>(ps2VBlankPeriodUs());
++            const uint64_t scaled = delta90k * 100u;
++            const uint64_t whole = scaled / divisor;
++            const uint64_t remainder = scaled % divisor;
++            const uint64_t wholeQ32 = whole * kPictureClockOne;
++            const uint64_t remainderQ32 = ((remainder * kPictureClockOne) + divisor / 2u) / divisor;
+             return wholeQ32 + remainderQ32;
+         }
+ 
+@@ -1163,7 +1192,8 @@ namespace ps2_stubs
+                                       uint32_t len,
+                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
+                                       int64_t pts90k = -1,
+-                                      int64_t dts90k = -1)
++                                      int64_t dts90k = -1,
++                                      const uint8_t *hostBytes = nullptr)
+         {
+             MpegStreamCallbackEvent event{};
+             event.mpegAddr = mpegAddr;
+@@ -1175,6 +1205,10 @@ namespace ps2_stubs
+             event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
+             if (!event.callbacks.empty())
+             {
++                if (hostBytes)
++                {
++                    event.bytes.assign(hostBytes, hostBytes + len);
++                }
+                 callbackEvents.push_back(std::move(event));
+             }
+         }
+@@ -1359,7 +1393,8 @@ namespace ps2_stubs
+                             static_cast<uint32_t>(packetEnd - payloadStart),
+                             callbackEvents,
+                             pes.pts90k,
+-                            pes.dts90k);
++                            pes.dts90k,
++                            buffer.data() + payloadStart);
+                         queueStreamCallbackEvent(
+                             mpegAddr,
+                             kMpegStrADPCM,
+@@ -1367,7 +1402,8 @@ namespace ps2_stubs
+                             static_cast<uint32_t>(packetEnd - payloadStart),
+                             callbackEvents,
+                             pes.pts90k,
+-                            pes.dts90k);
++                            pes.dts90k,
++                            buffer.data() + payloadStart);
+                     }
+                 }
+ 
+@@ -1596,20 +1632,6 @@ namespace ps2_stubs
+             {
+                 return;
+             }
+-            // F1 06: el callback del audio de los videos (sceMpegStrPCM/ADPCM, 0x29AAB0) espera activamente a que la
+-            // libreria de sonido del IOP haga sitio, y sin SPU2 no lo hace nunca: como corre en el hilo de
+-            // invocaciones, ninguna otra (respuestas SIF de las lecturas) volvia a entrar. Hasta que haya sonido, el
+-            // audio de los videos no se entrega; PS2X_MPEG_AUDIO=1 lo vuelve a entregar.
+-            static const bool s_audio = []
+-            {
+-                const char *valor = std::getenv("PS2X_MPEG_AUDIO");
+-                return valor && std::atoi(valor) != 0;
+-            }();
+-            if (!s_audio && (event.streamType == 2u || event.streamType == 3u))
+-            {
+-                return;
+-            }
+-
+             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+             if (cbDataAddr == 0u)
+             {
+@@ -1640,6 +1662,197 @@ namespace ps2_stubs
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+         }
+ 
++        bool isAudioStreamType(uint32_t streamType)
++        {
++            return streamType == kMpegStrPCM || streamType == kMpegStrADPCM;
++        }
++
++        // PS2X_MPEG_AUDIO=0 deja los videos sin sonido (no se entrega su audio al juego).
++        bool mpegAudioEnabled()
++        {
++            static const bool s_enabled = []
++            {
++                const char *valor = std::getenv("PS2X_MPEG_AUDIO");
++                return !valor || std::atoi(valor) != 0;
++            }();
++            return s_enabled;
++        }
++
++        struct MpegAudioStats
++        {
++            uint64_t queued = 0u;
++            uint64_t delivered = 0u;
++            uint64_t refused = 0u;
++            uint64_t dropped = 0u;
++            uint64_t bytes = 0u;
++            size_t maxPending = 0u;
++            std::chrono::steady_clock::time_point lastReport{};
++        };
++        MpegAudioStats g_mpegAudioStats;
++        uint64_t g_mpegAudioSerial = 0u;
++
++        void reportMpegAudioStatsUnlocked(size_t pending)
++        {
++            MpegAudioStats &st = g_mpegAudioStats;
++            st.maxPending = std::max(st.maxPending, pending);
++            const auto now = std::chrono::steady_clock::now();
++            if (now - st.lastReport < std::chrono::seconds(10))
++            {
++                return;
++            }
++            st.lastReport = now;
++            std::cerr << "[mpeg:audio] encolados=" << st.queued << " entregados=" << st.delivered << " rechazos="
++                      << st.refused << " descartados=" << st.dropped << " bytes=" << st.bytes << " pendientes=" << pending
++                      << " maxPendientes=" << st.maxPending << std::endl;
++        }
++
++        // Saca de callbackEvents los de audio y los deja pendientes en la reproduccion (una entrada por callback).
++        void takeAudioEventsUnlocked(MpegPlaybackState &playback, std::vector<MpegStreamCallbackEvent> &events)
++        {
++            auto firstAudio = std::stable_partition(events.begin(), events.end(), [](const MpegStreamCallbackEvent &event)
++                                                    { return !isAudioStreamType(event.streamType); });
++            if (mpegAudioEnabled())
++            {
++                for (auto it = firstAudio; it != events.end(); ++it)
++                {
++                    for (const MpegRegisteredCallback &callback : it->callbacks)
++                    {
++                        MpegPendingAudio packet{};
++                        packet.serial = ++g_mpegAudioSerial;
++                        packet.callback = callback;
++                        packet.streamType = it->streamType;
++                        packet.pts = it->pts;
++                        packet.dts = it->dts;
++                        packet.bytes = it->bytes;
++                        playback.pendingAudio.push_back(std::move(packet));
++                        ++g_mpegAudioStats.queued;
++                    }
++                }
++                while (playback.pendingAudio.size() > kMaxPendingAudioPackets)
++                {
++                    playback.pendingAudio.pop_front();
++                    if (g_mpegAudioStats.dropped++ < 4u)
++                    {
++                        std::cerr << "[mpeg:audio] el juego no acepta el audio: se descartan paquetes" << std::endl;
++                    }
++                }
++            }
++            events.erase(firstAudio, events.end());
++        }
++
++        // F1 06: el callback del audio de los videos (sceMpegStrPCM, 0x29AAB0) mete el audio en un anillo y, al llenar
++        // un bloque, lo manda a CORE.IRX y espera su respuesta (WaitSema). Encolado como invocacion, el planificador
++        // lo metia en cualquier hilo que estuviera corriendo sin invocaciones, como el que procesa las respuestas de
++        // la cola SIF: ese hilo se quedaba esperandose a si mismo (cuelgue de la intro, "cid 1 sin respuesta").
++        // Como en la libmpeg real, se llama en el hilo del video: al final de sceMpegDemuxPss/Ring y al principio de
++        // sceMpegGetPicture, de uno en uno y en orden. Si devuelve 0 (lleva demasiado audio por delante de la imagen:
++        // su presupuesto +0xC4 pasa de la mitad de 64 KB; el bucle de cada fotograma lo rebaja) el paquete se queda
++        // pendiente y se reintenta en el siguiente VBLANK, en vez de perderse.
++        // Si hay algo que entregar no vuelve (invocacion del hilo actual); al acabar sigue entregando y, con
++        // thenGetPicture, repite sceMpegGetPicture.
++        void deliverPendingAudio(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t mpegAddr,
++                                 bool thenGetPicture)
++        {
++            EeScheduler &scheduler = runtime->eeScheduler();
++            if (scheduler.hasInvocation(GuestInvocationKind::HleCall, kMpegAudioInvocationTag))
++            {
++                return;
++            }
++
++            MpegPendingAudio packet{};
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
++                if (it == g_mpeg_stub_state.playbackByMpeg.end())
++                {
++                    return;
++                }
++                MpegPlaybackState &playback = it->second;
++                while (!playback.pendingAudio.empty() && !runtime->hasFunction(playback.pendingAudio.front().callback.func))
++                {
++                    playback.pendingAudio.pop_front();
++                }
++                if (playback.pendingAudio.empty() || playback.audioRefusedTick == scheduler.currentVSyncTick())
++                {
++                    return;
++                }
++                packet = playback.pendingAudio.front();
++            }
++
++            const uint32_t len = static_cast<uint32_t>(packet.bytes.size());
++            const uint32_t blockAddr = runtime->guestMalloc(kMpegCallbackDataSize + align16(len), 16u);
++            if (blockAddr == 0u)
++            {
++                return;
++            }
++            const uint32_t dataAddr = blockAddr + kMpegCallbackDataSize;
++            MpegStreamCallbackEvent event{};
++            event.mpegAddr = mpegAddr;
++            event.streamType = packet.streamType;
++            event.dataAddr = dataAddr;
++            event.len = len;
++            event.pts = packet.pts;
++            event.dts = packet.dts;
++            uint8_t *data = len != 0u ? getMemPtr(rdram, dataAddr) : nullptr;
++            if (!writeMpegCallbackData(rdram, blockAddr, event) || (len != 0u && !data))
++            {
++                runtime->guestFree(blockAddr);
++                return;
++            }
++            if (len != 0u)
++            {
++                std::memcpy(data, packet.bytes.data(), len);
++            }
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::HleCall;
++            invocation.tag = kMpegAudioInvocationTag;
++            invocation.context = *ctx;
++            invocation.context.pc = packet.callback.func;
++            SET_GPR_U32(&invocation.context, 4, mpegAddr);
++            SET_GPR_U32(&invocation.context, 5, blockAddr);
++            SET_GPR_U32(&invocation.context, 6, packet.callback.data);
++            SET_GPR_U32(&invocation.context, 7, 0u);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            const uint64_t serial = packet.serial;
++            invocation.onComplete = [rdram, runtime, mpegAddr, blockAddr, serial, len, thenGetPicture](
++                                        const R5900Context &done, R5900Context &parent)
++            {
++                runtime->guestFree(blockAddr);
++                const bool accepted = getRegU32(&done, 2) != 0u;
++                {
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
++                    if (it != g_mpeg_stub_state.playbackByMpeg.end())
++                    {
++                        MpegPlaybackState &playback = it->second;
++                        if (accepted)
++                        {
++                            if (!playback.pendingAudio.empty() && playback.pendingAudio.front().serial == serial)
++                            {
++                                playback.pendingAudio.pop_front();
++                            }
++                            ++g_mpegAudioStats.delivered;
++                            g_mpegAudioStats.bytes += len;
++                        }
++                        else
++                        {
++                            playback.audioRefusedTick = runtime->eeScheduler().currentVSyncTick();
++                            ++g_mpegAudioStats.refused;
++                        }
++                        reportMpegAudioStatsUnlocked(playback.pendingAudio.size());
++                    }
++                }
++                deliverPendingAudio(rdram, &parent, runtime, mpegAddr, thenGetPicture);
++                if (thenGetPicture)
++                {
++                    sceMpegGetPicture(rdram, &parent, runtime);
++                }
++            };
++            scheduler.invokeCurrent(std::move(invocation));
++        }
++
+         void dispatchStreamCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+@@ -2121,6 +2334,7 @@ namespace ps2_stubs
+                 consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+                 playback.pssBytesIn += consumed;
++                takeAudioEventsUnlocked(getPlaybackState(mpegAddr), callbackEvents);
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
+@@ -2165,6 +2379,7 @@ namespace ps2_stubs
+ 
+         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+         setReturnS32(ctx, static_cast<int32_t>(consumed));
++        deliverPendingAudio(rdram, ctx, runtime, mpegAddr, false);
+     }
+ 
+     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2213,6 +2428,7 @@ namespace ps2_stubs
+                     callbackEvents);
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+                 playback.pssBytesIn += consumed;
++                takeAudioEventsUnlocked(getPlaybackState(mpegAddr), callbackEvents);
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+@@ -2260,6 +2476,7 @@ namespace ps2_stubs
+ 
+         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+         setReturnS32(ctx, static_cast<int32_t>(consumed));
++        deliverPendingAudio(rdram, ctx, runtime, mpegAddr, false);
+     }
+ 
+     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2307,6 +2524,7 @@ namespace ps2_stubs
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t imageAddr = getRegU32(ctx, 5);
++        deliverPendingAudio(rdram, ctx, runtime, mpegAddr, true);
+         uint32_t width = kStubMovieWidth;
+         uint32_t height = kStubMovieHeight;
+         uint32_t frameCount = 0u;

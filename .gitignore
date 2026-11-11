@@ -1,0 +1,18 @@
+# Solo el trabajo propio: estado, scripts, codigo propio, configuracion y parches sobre PS2Recomp.
+# Fuera: el juego (ISO extraida: no se puede publicar), compilaciones, logs, herramientas portables,
+# PS2Recomp (tiene su propio git; nuestros cambios van en parches/) y las tarjetas de memoria.
+/juego/
+/build/
+/logs/
+/tools/
+/third_party/
+/mc0/
+/mc1/
+/dist/
+/vu1_code.bin
+/vu1_data.bin
+/imgui.ini
+/analisis/listado-ee-crudo.txt
+/analisis/analyzer-log.txt
+__pycache__/
+*.pyc

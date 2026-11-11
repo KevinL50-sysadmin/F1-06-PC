@@ -1,0 +1,371 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 594feb1..a9c7d3c 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -2,10 +2,14 @@
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_intc_queue.h"
+ #include "runtime/ps2_ab.h"
++#include <algorithm>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+ #include <emmintrin.h>
+ #include <iostream>
++#include <map>
++#include <vector>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -400,6 +404,124 @@ void ps2Vif1ResetStall()
+     g_vif1StallOffset = 0;
+ }
+ 
++namespace
++{
++    // UNPACK by format (patch 0051): with CL >= WL every write takes the next source vector, and while 16 bytes of
++    // the packet remain from the vector the decode reads them without the per-element bounds checks (as element()
++    // in processVIF1Data: S fills xyzw, V2 writes x y x y, V3 takes w from the next element of the stream).
++    template <uint32_t VL, uint32_t VN>
++    __forceinline __m128i unpackDecode(const uint8_t *src, bool zeroExtend)
++    {
++        __m128i v;
++        if constexpr (VL == 0u)
++        {
++            if constexpr (VN >= 2u)
++                v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src));
++            else
++                v = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src));
++        }
++        else if constexpr (VL == 1u)
++        {
++            const __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src));
++            v = zeroExtend ? _mm_unpacklo_epi16(h, _mm_setzero_si128()) : _mm_srai_epi32(_mm_unpacklo_epi16(h, h), 16);
++        }
++        else
++        {
++            int32_t word;
++            std::memcpy(&word, src, sizeof(word));
++            const __m128i b = _mm_cvtsi32_si128(word);
++            if (zeroExtend)
++                v = _mm_unpacklo_epi16(_mm_unpacklo_epi8(b, _mm_setzero_si128()), _mm_setzero_si128());
++            else
++            {
++                const __m128i b8 = _mm_unpacklo_epi8(b, b);
++                v = _mm_srai_epi32(_mm_unpacklo_epi16(b8, b8), 24);
++            }
++        }
++        if constexpr (VN == 0u)
++            v = _mm_shuffle_epi32(v, _MM_SHUFFLE(0, 0, 0, 0));
++        else if constexpr (VN == 1u)
++            v = _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 1, 0));
++        return v;
++    }
++
++    struct UnpackSelect
++    {
++        __m128i data[4], row[4], col[4], keep[4], colAll[4];
++    };
++
++    // Writes from the current write on (cyclePos/blockIndex: those of the previous write) until the count or the
++    // first vector with less than 16 bytes of packet left; returns how many it wrote. Plain: no mask and mode 0.
++    template <uint32_t VL, uint32_t VN, bool Plain>
++    uint32_t unpackFast(uint8_t *vuData, const uint8_t *srcBase, uint32_t bytesPerVector, const uint8_t *packetEnd,
++                        uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl, bool zeroExtend, uint32_t addMode,
++                        const UnpackSelect &sel, uint32_t *row, uint32_t &cyclePos, uint32_t &blockIndex)
++    {
++        uint32_t w = 0u;
++        for (; w < count; ++w)
++        {
++            const uint8_t *src = srcBase + static_cast<size_t>(w) * bytesPerVector;
++            if (src + 16u > packetEnd)
++                break;
++            if (++cyclePos == wl)
++            {
++                cyclePos = 0u;
++                ++blockIndex;
++            }
++            uint8_t *dst = vuData + ((vuAddr + blockIndex * cl + cyclePos) & 0x3FFu) * 16u;
++            __m128i value = unpackDecode<VL, VN>(src, zeroExtend);
++            if constexpr (Plain)
++                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst), value);
++            else
++            {
++                const uint32_t mc = cyclePos > 3u ? 3u : cyclePos;
++                const __m128i rowV = _mm_loadu_si128(reinterpret_cast<const __m128i *>(row));
++                if (addMode == 1u || addMode == 2u)
++                    value = _mm_add_epi32(value, rowV);
++                const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dst));
++                const __m128i result =
++                    _mm_or_si128(_mm_or_si128(_mm_and_si128(sel.data[mc], value), _mm_and_si128(sel.row[mc], rowV)),
++                                 _mm_or_si128(_mm_and_si128(sel.col[mc], sel.colAll[mc]), _mm_and_si128(sel.keep[mc], old)));
++                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst), result);
++                if (addMode == 2u)
++                    _mm_storeu_si128(reinterpret_cast<__m128i *>(row),
++                                     _mm_or_si128(_mm_and_si128(sel.data[mc], value), _mm_andnot_si128(sel.data[mc], rowV)));
++            }
++        }
++        return w;
++    }
++
++    template <bool Plain>
++    uint32_t unpackFastFormat(uint32_t vl, uint32_t vn, uint8_t *vuData, const uint8_t *srcBase, uint32_t bytesPerVector,
++                              const uint8_t *packetEnd, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl,
++                              bool zeroExtend, uint32_t addMode, const UnpackSelect &sel, uint32_t *row,
++                              uint32_t &cyclePos, uint32_t &blockIndex)
++    {
++#define PS2_UNPACK_FAST(L, N)                                                                                         \
++    case (L << 2) | N:                                                                                                \
++        return unpackFast<L, N, Plain>(vuData, srcBase, bytesPerVector, packetEnd, count, vuAddr, cl, wl, zeroExtend, \
++                                       addMode, sel, row, cyclePos, blockIndex);
++        switch ((vl << 2) | vn)
++        {
++            PS2_UNPACK_FAST(0u, 0u)
++            PS2_UNPACK_FAST(0u, 1u)
++            PS2_UNPACK_FAST(0u, 2u)
++            PS2_UNPACK_FAST(0u, 3u)
++            PS2_UNPACK_FAST(1u, 0u)
++            PS2_UNPACK_FAST(1u, 1u)
++            PS2_UNPACK_FAST(1u, 2u)
++            PS2_UNPACK_FAST(1u, 3u)
++            PS2_UNPACK_FAST(2u, 0u)
++            PS2_UNPACK_FAST(2u, 1u)
++            PS2_UNPACK_FAST(2u, 2u)
++            PS2_UNPACK_FAST(2u, 3u)
++        default:
++            return 0u; // V4-5 and the unknown formats: the general loop
++        }
++#undef PS2_UNPACK_FAST
++    }
++}
++
+ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -787,15 +909,134 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     return value != nullptr && value[0] != '0';
+                 }();
+                 const bool fastUnpack = !maskEnable && (vif1_regs.mode & 3u) == 0u;
+-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
++                // Masked or adding UNPACKs (patch 0051): the four fields of a vector at once with SSE2 (sseFields
++                // below), with the per-field selections of each mask cycle worked out here once. A field takes the
++                // decoded value (plus ROW in modes 1 and 2, mode 2 keeping the sum in ROW), ROW, COL[cycle] or keeps
++                // its word (mask 0, 1, 2, 3); in a fill cycle without source a data field takes ROW. A/B mode 24: the
++                // per-field loop (and the cycle position by divisions). F1_VIF1_VERIFICAR=1 runs both and compares.
++                const bool abFieldLoop = g_ps2AbMode.load(std::memory_order_relaxed) == 24;
++                // PS2X_VIF1_FORMATOS=1: every 10 s, the vectors written per format (Vn-bits), mask, mode and CL/WL.
++                static const bool s_countFormats = []()
+                 {
+-                    const uint32_t cyclePos = writeIndex % wl;
++                    const char *value = std::getenv("PS2X_VIF1_FORMATOS");
++                    return value != nullptr && value[0] != '0';
++                }();
++                if (s_countFormats)
++                {
++                    static std::map<uint64_t, uint64_t> s_formats;
++                    static auto s_lastReport = std::chrono::steady_clock::now();
++                    const uint64_t key = (static_cast<uint64_t>(vn) << 40) | (static_cast<uint64_t>(vl) << 36) |
++                                         (static_cast<uint64_t>(maskEnable ? 1u : 0u) << 35) |
++                                         (static_cast<uint64_t>(vif1_regs.mode & 3u) << 32) | (cl << 8) | wl;
++                    s_formats[key] += writeVectorCount;
++                    const auto now = std::chrono::steady_clock::now();
++                    if (now - s_lastReport >= std::chrono::seconds(10))
++                    {
++                        s_lastReport = now;
++                        std::vector<std::pair<uint64_t, uint64_t>> sorted(s_formats.begin(), s_formats.end());
++                        std::sort(sorted.begin(), sorted.end(),
++                                  [](const auto &a, const auto &b) { return a.second > b.second; });
++                        std::cerr << "[vif1:formatos]";
++                        for (size_t i = 0; i < sorted.size() && i < 12u; ++i)
++                        {
++                            const uint64_t k = sorted[i].first;
++                            static const char *const kBits[4] = {"32", "16", "8", "5"};
++                            std::cerr << " V" << (((k >> 40) & 3u) + 1u) << "-" << kBits[(k >> 36) & 3u]
++                                      << (((k >> 35) & 1u) ? "m" : "") << " modo" << ((k >> 32) & 3u) << " cl"
++                                      << ((k >> 8) & 0xFFu) << "wl" << (k & 0xFFu) << " x" << sorted[i].second / 10u
++                                      << "/s";
++                        }
++                        std::cerr << std::endl;
++                        s_formats.clear();
++                    }
++                }
++                __m128i selData[4], selRow[4], selCol[4], selKeep[4], colAll[4];
++                for (uint32_t c = 0u; c < 4u; ++c)
++                {
++                    uint32_t spec[4];
++                    for (uint32_t f = 0u; f < 4u; ++f)
++                        spec[f] = maskEnable ? (vif1_regs.mask >> (((c * 4u) + f) * 2u)) & 0x3u : 0u;
++                    const auto sel = [&](uint32_t s)
++                    {
++                        return _mm_setr_epi32(spec[0] == s ? -1 : 0, spec[1] == s ? -1 : 0, spec[2] == s ? -1 : 0,
++                                              spec[3] == s ? -1 : 0);
++                    };
++                    selData[c] = sel(0u);
++                    selRow[c] = sel(1u);
++                    selCol[c] = sel(2u);
++                    selKeep[c] = sel(3u);
++                    colAll[c] = _mm_set1_epi32(static_cast<int>(vif1_regs.col[c]));
++                }
++                const uint32_t addMode = (vl != 3u || vn != 3u) ? (vif1_regs.mode & 3u) : 0u; // V4-5 adds nothing
++                uint32_t cyclePos = wl - 1u, blockIndex = ~0u; // advanced at the top of each write
++                // By format first (unpackFast; A/B mode 24: never): with CL >= WL, every write while 16 bytes of the
++                // packet remain; the general loop below goes on from there. F1_VIF1_VERIFICAR=1: into a copy of the
++                // micro memory, compared after the general loop has written everything ("[vif1:verificar] formato").
++                uint32_t firstWrite = 0u;
++                const bool plainUnpack = !maskEnable && (vif1_regs.mode & 3u) == 0u;
++                const bool byFormat = cl >= wl && !abFieldLoop && vl != 3u;
++                static uint8_t *s_verifyCopy = nullptr;
++                uint32_t verifyRow[4] = {};
++                uint32_t verifyCount = 0u;
++                if (byFormat)
++                {
++                    UnpackSelect sel;
++                    for (uint32_t c = 0u; c < 4u; ++c)
++                    {
++                        sel.data[c] = selData[c];
++                        sel.row[c] = selRow[c];
++                        sel.col[c] = selCol[c];
++                        sel.keep[c] = selKeep[c];
++                        sel.colAll[c] = colAll[c];
++                    }
++                    uint8_t *target = m_vu1Data;
++                    uint32_t *row = vif1_regs.row;
++                    uint32_t fastCycle = cyclePos, fastBlock = blockIndex;
++                    if (s_verifyUnpack)
++                    {
++                        if (s_verifyCopy == nullptr)
++                            s_verifyCopy = new uint8_t[PS2_VU1_DATA_SIZE];
++                        std::memcpy(s_verifyCopy, m_vu1Data, PS2_VU1_DATA_SIZE);
++                        std::memcpy(verifyRow, vif1_regs.row, sizeof(verifyRow));
++                        target = s_verifyCopy;
++                        row = verifyRow;
++                    }
++                    const uint32_t done =
++                        plainUnpack
++                            ? unpackFastFormat<true>(vl, vn, target, srcBase, bytesPerVector, data + sizeBytes,
++                                                     writeVectorCount, vuAddr, cl, wl, zeroExtend, addMode, sel, row,
++                                                     fastCycle, fastBlock)
++                            : unpackFastFormat<false>(vl, vn, target, srcBase, bytesPerVector, data + sizeBytes,
++                                                      writeVectorCount, vuAddr, cl, wl, zeroExtend, addMode, sel, row,
++                                                      fastCycle, fastBlock);
++                    if (s_verifyUnpack)
++                        verifyCount = done;
++                    else
++                    {
++                        firstWrite = done;
++                        srcIndex = done; // with CL >= WL, one source vector per write
++                        cyclePos = fastCycle;
++                        blockIndex = fastBlock;
++                    }
++                }
++                for (uint32_t writeIndex = firstWrite; writeIndex < writeVectorCount; ++writeIndex)
++                {
++                    if (++cyclePos == wl)
++                    {
++                        cyclePos = 0u;
++                        ++blockIndex;
++                    }
++                    if (abFieldLoop)
++                    {
++                        cyclePos = writeIndex % wl;
++                        blockIndex = writeIndex / wl;
++                    }
+                     const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
+ 
+                     uint32_t destVec = 0;
+                     if (cl >= wl)
+                     {
+-                        destVec = (vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu;
++                        destVec = (vuAddr + blockIndex * cl + cyclePos) & 0x3FFu;
+                     }
+                     else
+                     {
+@@ -927,6 +1168,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
+                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
+ 
++                    const bool sseFields = (handledFormat || !decoded) && !abFieldLoop;
++                    __m128i sseLanes = _mm_setzero_si128(), sseRow = _mm_setzero_si128();
++                    if (sseFields)
++                    {
++                        const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lanes));
++                        const __m128i row = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vif1_regs.row));
++                        __m128i sData = selData[maskCycle];
++                        __m128i sRow = selRow[maskCycle];
++                        __m128i value = _mm_setzero_si128();
++                        sseRow = row;
++                        if (decoded)
++                        {
++                            value = _mm_setr_epi32(static_cast<int>(decompressed[0]), static_cast<int>(decompressed[1]),
++                                                   static_cast<int>(decompressed[2]), static_cast<int>(decompressed[3]));
++                            if (addMode == 1u || addMode == 2u)
++                                value = _mm_add_epi32(value, row);
++                            if (addMode == 2u)
++                                sseRow = _mm_or_si128(_mm_and_si128(sData, value), _mm_andnot_si128(sData, row));
++                        }
++                        else
++                        {
++                            sRow = _mm_or_si128(sRow, sData);
++                            sData = _mm_setzero_si128();
++                        }
++                        sseLanes = _mm_or_si128(_mm_or_si128(_mm_and_si128(sData, value), _mm_and_si128(sRow, row)),
++                                                _mm_or_si128(_mm_and_si128(selCol[maskCycle], colAll[maskCycle]),
++                                                             _mm_and_si128(selKeep[maskCycle], old)));
++                        if (!s_verifyUnpack)
++                        {
++                            _mm_storeu_si128(reinterpret_cast<__m128i *>(m_vu1Data + destOff), sseLanes);
++                            if (addMode == 2u && decoded)
++                                _mm_storeu_si128(reinterpret_cast<__m128i *>(vif1_regs.row), sseRow);
++                            continue;
++                        }
++                    }
++
+                     for (uint32_t field = 0u; field < 4u; ++field)
+                     {
+                         uint32_t maskSpec = 0u;
+@@ -986,8 +1263,45 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                             std::cerr << "[vif1:verificar] " << s_checked << " vectores, " << s_different << " distintos"
+                                       << std::endl;
+                     }
++                    if (s_verifyUnpack && sseFields)
++                    {
++                        static uint64_t s_checkedSse = 0u, s_differentSse = 0u;
++                        alignas(16) uint32_t sse[4], sseRowWords[4];
++                        _mm_store_si128(reinterpret_cast<__m128i *>(sse), sseLanes);
++                        _mm_store_si128(reinterpret_cast<__m128i *>(sseRowWords), sseRow);
++                        if ((std::memcmp(sse, lanes, sizeof(lanes)) != 0 ||
++                             std::memcmp(sseRowWords, vif1_regs.row, sizeof(sseRowWords)) != 0) &&
++                            s_differentSse++ < 20u)
++                            std::cerr << "[vif1:verificar] SSE DISTINTO vl=" << static_cast<uint32_t>(vl) << " vn="
++                                      << static_cast<uint32_t>(vn) << " modo=" << mode << " mascara=0x" << std::hex
++                                      << vif1_regs.mask << std::dec << " ciclo=" << cyclePos << " fuente="
++                                      << (decoded ? 1 : 0) << std::endl;
++                        if (++s_checkedSse % 1000000u == 0u)
++                            std::cerr << "[vif1:verificar] SSE " << s_checkedSse << " vectores, " << s_differentSse
++                                      << " distintos" << std::endl;
++                    }
+                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                 }
++                if (s_verifyUnpack && byFormat)
++                {
++                    // Only the UNPACKs written whole by format can be compared whole (micro memory and ROW).
++                    static uint64_t s_whole = 0u, s_partial = 0u, s_differentFormat = 0u;
++                    if (verifyCount == writeVectorCount && verifyCount != 0u)
++                    {
++                        if ((std::memcmp(s_verifyCopy, m_vu1Data, PS2_VU1_DATA_SIZE) != 0 ||
++                             std::memcmp(verifyRow, vif1_regs.row, sizeof(verifyRow)) != 0) &&
++                            s_differentFormat++ < 20u)
++                            std::cerr << "[vif1:verificar] formato DISTINTO vl=" << static_cast<uint32_t>(vl)
++                                      << " vn=" << static_cast<uint32_t>(vn) << " mascara=" << (maskEnable ? 1 : 0)
++                                      << " modo=" << (vif1_regs.mode & 3u) << " cl=" << cl << " wl=" << wl
++                                      << " num=" << writeVectorCount << std::endl;
++                        if (++s_whole % 100000u == 0u)
++                            std::cerr << "[vif1:verificar] formato: " << s_whole << " UNPACK enteros comparados ("
++                                      << s_partial << " a medias), " << s_differentFormat << " distintos" << std::endl;
++                    }
++                    else
++                        ++s_partial;
++                }
+             }
+             pos += totalBytes;
+ 

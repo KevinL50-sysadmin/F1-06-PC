@@ -1,0 +1,201 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1fda7d9..4b87a4c 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -540,7 +540,9 @@ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+ )
+ 
+-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++# F1 06: FFmpeg en PRIVATE para que sus rutas de cabeceras no cambien la compilacion del codigo traducido (y su PCH).
++target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop)
++target_link_libraries(ps2_runtime PRIVATE ffmpeg)
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..cbef11d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -512,6 +512,10 @@ namespace ps2_stubs
+             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+             int64_t firstPresentedPts90k = -1;
+             uint64_t ptsPresentationBaseTickQ32 = 0u;
++            // F1 06: bytes de PSS que el juego ha pasado a sceMpegDemuxPss/Ring y si la ultima llamada a su
++            // callback "sin datos" no trajo ninguno (ver sceMpegGetPicture).
++            uint64_t pssBytesIn = 0u;
++            bool nodataStalled = false;
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -561,6 +565,9 @@ namespace ps2_stubs
+         constexpr uint8_t kMpegPrivateStream1 = 0xBDu;
+         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
+         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
++        constexpr uint32_t kMpegCbNodata = 1u;                     // sceMpegCbNodata
++        constexpr uint32_t kMpegCbBackground = 4u;                 // sceMpegCbBackground
++        constexpr uint64_t kMpegNodataInvocationTag = 0x4D504E44u; // "MPND"
+ 
+         uint64_t mpegPictureIntervalQ32(uint8_t frameRateCode, uint8_t frameRateExtensionN = 0u, uint8_t frameRateExtensionD = 0u)
+         {
+@@ -1589,6 +1596,19 @@ namespace ps2_stubs
+             {
+                 return;
+             }
++            // F1 06: el callback del audio de los videos (sceMpegStrPCM/ADPCM, 0x29AAB0) espera activamente a que la
++            // libreria de sonido del IOP haga sitio, y sin SPU2 no lo hace nunca: como corre en el hilo de
++            // invocaciones, ninguna otra (respuestas SIF de las lecturas) volvia a entrar. Hasta que haya sonido, el
++            // audio de los videos no se entrega; PS2X_MPEG_AUDIO=1 lo vuelve a entregar.
++            static const bool s_audio = []
++            {
++                const char *valor = std::getenv("PS2X_MPEG_AUDIO");
++                return valor && std::atoi(valor) != 0;
++            }();
++            if (!s_audio && (event.streamType == 2u || event.streamType == 3u))
++            {
++                return;
++            }
+ 
+             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+             if (cbDataAddr == 0u)
+@@ -2007,6 +2027,7 @@ namespace ps2_stubs
+         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
+ 
+         mpegGuestWrite32(rdram, param_1 + 0x40, uVar3);
++        mpegGuestWrite32(rdram, uVar3 + 0x00, 0u); // F1 06: sys->isEnd, que su sceMpegIsEnd lee directamente
+ 
+         const uint32_t a1_init = uVar3 + 0x118u;
+         mpegGuestWrite32(rdram, puVar4 + 0x0, a1_init);
+@@ -2099,6 +2120,7 @@ namespace ps2_stubs
+             {
+                 consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                playback.pssBytesIn += consumed;
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
+@@ -2190,6 +2212,7 @@ namespace ps2_stubs
+                     ringSize,
+                     callbackEvents);
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                playback.pssBytesIn += consumed;
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+@@ -2288,6 +2311,7 @@ namespace ps2_stubs
+         uint32_t height = kStubMovieHeight;
+         uint32_t frameCount = 0u;
+         bool haveFrame = false;
++        bool streamFinished = false;
+         MpegDecodedFrame frame;
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+@@ -2307,6 +2331,89 @@ namespace ps2_stubs
+                     });
+                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                 }
++                // F1 06: el juego no demultiplexa desde otro hilo, sino en sus callbacks de libmpeg, a los que la
++                // libmpeg real llama desde dentro de sceMpegGetPicture: "segundo plano" (sceMpegCbBackground,
++                // 0x29ACE8: lee lo que haya llegado del archivo y llama a sceMpegDemuxPss, sin esperar) y "sin datos"
++                // (sceMpegCbNodata, 0x29ABE0: lo mismo, pero espera activamente a que lleguen; aqui eso bloquea el
++                // hilo del EE, porque las respuestas de la lectura son invocaciones que no entran mientras dura).
++                // Sin esto el hilo se quedaba esperando imagenes para siempre. Se llama al de segundo plano (o, si
++                // no hay, al de sin datos) como una invocacion del hilo actual y al volver se repite
++                // sceMpegGetPicture; si no trajo datos, se reintenta en el siguiente VBLANK.
++                uint32_t nodataFunc = 0u;
++                uint32_t nodataData = 0u;
++                uint32_t nodataType = 0u;
++                const auto callbacks = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++                if (callbacks != g_mpeg_stub_state.callbacksByMpeg.end())
++                {
++                    for (const uint32_t wanted : {kMpegCbBackground, kMpegCbNodata})
++                    {
++                        for (const MpegRegisteredCallback &callback : callbacks->second)
++                        {
++                            if (!callback.stream && callback.type == wanted && callback.func != 0u)
++                            {
++                                nodataFunc = callback.func;
++                                nodataData = callback.data;
++                                nodataType = wanted;
++                                break;
++                            }
++                        }
++                        if (nodataFunc != 0u)
++                        {
++                            break;
++                        }
++                    }
++                }
++                EeScheduler &scheduler = runtime->eeScheduler();
++                if (nodataFunc != 0u && runtime->hasFunction(nodataFunc) &&
++                    !scheduler.hasInvocation(GuestInvocationKind::HleCall, kMpegNodataInvocationTag))
++                {
++                    if (playback.nodataStalled)
++                    {
++                        playback.nodataStalled = false;
++                        const uint64_t tick = scheduler.currentVSyncTick();
++                        lock.unlock();
++                        scheduler.waitVSync(
++                            tick,
++                            -1,
++                            [rdram, runtime](R5900Context &resumeContext)
++                            {
++                                sceMpegGetPicture(rdram, &resumeContext, runtime);
++                            });
++                    }
++                    const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++                    if (cbDataAddr != 0u)
++                    {
++                        if (uint8_t *cbData = getMemPtr(rdram, cbDataAddr))
++                        {
++                            std::memset(cbData, 0, kMpegCallbackDataSize);
++                            *reinterpret_cast<uint32_t *>(cbData) = nodataType;
++                        }
++                        const uint64_t bytesBefore = playback.pssBytesIn;
++                        GuestInvocation invocation{};
++                        invocation.kind = GuestInvocationKind::HleCall;
++                        invocation.tag = kMpegNodataInvocationTag;
++                        invocation.context = *ctx;
++                        invocation.context.pc = nodataFunc;
++                        SET_GPR_U32(&invocation.context, 4, mpegAddr);
++                        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
++                        SET_GPR_U32(&invocation.context, 6, nodataData);
++                        SET_GPR_U32(&invocation.context, 29, 0u);
++                        SET_GPR_U32(&invocation.context, 31, 0u);
++                        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, bytesBefore](
++                                                    const R5900Context &, R5900Context &parent)
++                        {
++                            runtime->guestFree(cbDataAddr);
++                            {
++                                std::lock_guard<std::mutex> relock(g_mpeg_stub_mutex);
++                                MpegPlaybackState &state = getPlaybackState(mpegAddr);
++                                state.nodataStalled = state.pssBytesIn == bytesBefore;
++                            }
++                            sceMpegGetPicture(rdram, &parent, runtime);
++                        };
++                        lock.unlock();
++                        scheduler.invokeCurrent(std::move(invocation));
++                    }
++                }
+                 lock.unlock();
+                 runtime->eeScheduler().waitExternal(
+                     EeWaitReason::Mpeg,
+@@ -2386,6 +2493,10 @@ namespace ps2_stubs
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
++                // F1 06: su sceMpegIsEnd es codigo del juego (0x2EAF18) y devuelve sys->isEnd (*(mp+0x40)+0),
++                // que la libmpeg real pone al llegar al final: sin imagenes pendientes y con el flujo acabado.
++                streamFinished = playback.streamEnded || playback.decoderFailed ||
++                                 g_mpeg_stub_state.currentCdStreamEofSeen;
+             }
+         }
+ 
+@@ -2403,6 +2514,7 @@ namespace ps2_stubs
+                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
+                 *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
+                 *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
++                *reinterpret_cast<uint32_t *>(inner + 0x00) = streamFinished ? 1u : 0u;
+             }
+         }
+ 

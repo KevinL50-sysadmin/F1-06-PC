@@ -1,0 +1,301 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 7c18ce9..95e5849 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -56,7 +56,9 @@
+ // the untextured triangles of mode 64), 63 the GS diagnostic texts of the waits (requestText) written always, 64 the GS
+ // untextured CT32/Z24 triangles through rasterTriangleSpan4 (both before patch 0077), 65 the VU decode cache
+ // compared pair by pair after a code change, 66 the VU run timing with steady_clock, 67 the GS upload copies without
+-// the pool, 69 modes 65, 66 and 67 together (all before patch 0078).
++// the pool, 69 modes 65, 66 and 67 together (all before patch 0078), 70 (VU1 and VU0) the compiled
++// schedules with MAX/MINI, ITOF, FTOI, ABS and CLIP through calls (before patch 0080; like 40, 43 and 44 it keeps
++// the VU modes of runBlocks).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 7f567c4..8e39b8f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1878,7 +1878,8 @@ namespace
+         // code. Until patch 0069 they ran the schedules without their compiled code (only mode 0 used it), so their B
+         // windows were also slower by the whole JIT: the A/B of patches 0063-0067 (modes 36-39, 41, 42) came out too big.
+         const int abModeAll = g_ps2AbMode.load(std::memory_order_relaxed);
+-        const int abMode = abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 ? abModeAll : 0;
++        const int abMode =
++            abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 || abModeAll == 70 ? abModeAll : 0;
+         if (engine.storage.size() > 200000u)
+         {
+             // Too many schedules (code that keeps changing): start again, keeping the current timing state.
+@@ -1974,14 +1975,14 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 || abMode == 43 || abMode == 44) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 || abMode == 43 || abMode == 44 || abMode == 70) && s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+             else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40 ||
+-                     abMode == 43 || abMode == 44)
++                     abMode == 43 || abMode == 44 || abMode == 70)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 028e296..ead0e38 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3341,6 +3341,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         int32_t backupValueOffset() const { return stateOffset(&vu.m_viBranchBackupValue); }
+         int32_t backupRegOffset() const { return stateOffset(&vu.m_viBranchBackupReg); }
+         int32_t backupValidOffset() const { return stateOffset(&vu.m_viBranchBackupValid); }
++        int32_t workingClipOffset() const { return stateOffset(&vu.m_workingClip); } // patch 0080: inline CLIP
+         float normalizeResult(float value) const
+         {
+             uint32_t ignoredFlags = 0u;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 88c7ec4..862c3d3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -374,12 +374,21 @@
+         JcOne,     // 1
+         JcBinades, // 23
+         JcSign,    // 0x80000000
++        JcScale0,  // 1.0f, 16.0f, 4096.0f, 32768.0f: the ITOF divisors and FTOI scales (patch 0080)
++        JcScale1,
++        JcScale2,
++        JcScale3,
++        JcTwo31,   // 2147483648.0f
++        JcClipBytes, // pshufb: bytes 0, 4, 1, 5, 2, 6 (x+ x- y+ y- z+ z-), the rest zero
+     };
+-    alignas(16) const uint32_t kJitConst[9][4] = {
++    alignas(16) const uint32_t kJitConst[15][4] = {
+         {0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u}, {0u, 0u, 0u, 0u},
+         {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu}, {0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu},
+         {0xFFu, 0xFFu, 0xFFu, 0xFFu}, {254u, 254u, 254u, 254u}, {1u, 1u, 1u, 1u}, {23u, 23u, 23u, 23u},
+-        {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u}};
++        {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u},
++        {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}, {0x41800000u, 0x41800000u, 0x41800000u, 0x41800000u},
++        {0x45800000u, 0x45800000u, 0x45800000u, 0x45800000u}, {0x47000000u, 0x47000000u, 0x47000000u, 0x47000000u},
++        {0x4F000000u, 0x4F000000u, 0x4F000000u, 0x4F000000u}, {0x05010400u, 0x80800602u, 0x80808080u, 0x80808080u}};
+ 
+     // normalize4 on xmm x (rax = kJitConst), with xmm3-xmm5 as scratch: bits & ~(D & 0x7FFFFFFF) | (maxE & 0x7F7FFFFF)
+     // with D = zero exponent | maximum exponent. The same as normalize4: a zero exponent keeps the sign alone, the
+@@ -674,6 +683,115 @@
+         return true;
+     }
+ 
++    // Patch 0080: the SimpleOp upper instructions (MAX/MINI with a register, a lane or I; ITOF; FTOI; ABS) inline, as
++    // upperEarly<upperSimple<Kind>, Dst> does them (simpleOpSse2: the same SSE operations, in the rounding mode the
++    // run set; no flags). False (the call stays) for anything else.
++    inline bool jitEmitSimple(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known)
++    {
++        const SimpleOp &op = p.simple;
++        if (p.upperPath != UpperSimple || !s_jitSse41 || p.upperFlags != 0u)
++            return false;
++        if (p.upperDst != DstVf && p.upperDst != DstVfPending && p.upperDst != DstAcc)
++            return false;
++        if (op.kind < SimpleMaxBc || op.kind > SimpleAbs || op.param > 3u)
++            return false;
++        const uint8_t comp = jitLanesToComponents(p.upperLanes);
++        e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
++        e.loadXmm(0, JitEmitter::Vu, offsetof(VU1State, vf) + 16u * op.fs);
++        uint8_t result = 0u;
++        switch (op.kind)
++        {
++        case SimpleMaxBc:
++        case SimpleMiniBc:
++        case SimpleMaxI:
++        case SimpleMiniI:
++        case SimpleMax:
++        case SimpleMini:
++        {
++            if (op.kind == SimpleMaxBc || op.kind == SimpleMiniBc)
++            {
++                e.loadSs(1, JitEmitter::Vu, offsetof(VU1State, vf) + 16u * op.ft + 4u * op.param);
++                e.shufps(1, 1, 0x00);
++            }
++            else if (op.kind == SimpleMaxI || op.kind == SimpleMiniI)
++            {
++                e.loadSs(1, JitEmitter::Vu, offsetof(VU1State, i));
++                e.shufps(1, 1, 0x00);
++            }
++            else
++                e.loadXmm(1, JitEmitter::Vu, offsetof(VU1State, vf) + 16u * op.ft);
++            const bool max = op.kind == SimpleMaxBc || op.kind == SimpleMaxI || op.kind == SimpleMax;
++            // maxMiniBits4: aGreater = a > b (signed words); larger, smaller; bothNegative = (a & b) >> 31.
++            e.movaps(2, 0);
++            e.rr({0x66, 0x0F, 0x66}, 2, 1); // pcmpgtd: aGreater
++            e.movaps(3, 2);
++            e.rr({0x66, 0x0F, 0xDB}, 3, 0); // pand: aGreater & a
++            e.movaps(4, 2);
++            e.rr({0x66, 0x0F, 0xDF}, 4, 1); // pandn: ~aGreater & b
++            e.rr({0x66, 0x0F, 0xEB}, 3, 4); // por: larger
++            e.movaps(4, 2);
++            e.rr({0x66, 0x0F, 0xDB}, 4, 1); // aGreater & b
++            e.movaps(5, 2);
++            e.rr({0x66, 0x0F, 0xDF}, 5, 0); // ~aGreater & a
++            e.rr({0x66, 0x0F, 0xEB}, 4, 5); // smaller
++            e.movaps(5, 0);
++            e.rr({0x66, 0x0F, 0xDB}, 5, 1); // a & b
++            e.rr({0x66, 0x0F, 0x72}, 4u, 5); // psrad xmm5, 31: bothNegative
++            e.bytes({31});
++            const uint8_t normal = max ? 3u : 4u, negative = max ? 4u : 3u;
++            e.movaps(2, 5);
++            e.rr({0x66, 0x0F, 0xDB}, 2, negative); // bothNegative & negative
++            e.rr({0x66, 0x0F, 0xDF}, 5, normal);   // ~bothNegative & normal
++            e.rr({0x66, 0x0F, 0xEB}, 2, 5);
++            result = 2u;
++            break;
++        }
++        case SimpleItof:
++            e.rr({0x0F, 0x5B}, 0, 0); // cvtdq2ps
++            if (op.param != 0u)
++                e.cst({0x0F, 0x5E}, 0, JcScale0 + op.param); // divps
++            result = 0u;
++            break;
++        case SimpleFtoi:
++            if ((known.vf[op.fs] & comp) != comp)
++                jitNormalize(e, 0);
++            e.cst({0x0F, 0x59}, 0, JcScale0 + op.param); // mulps: scaled
++            e.rr({0xF3, 0x0F, 0x5B}, 1, 0);             // cvttps2dq: truncated
++            e.cst({0x0F, 0x28}, 2, JcTwo31);            // movaps xmm2, 2^31
++            e.rr({0x0F, 0xC2}, 2, 0);                   // cmpleps xmm2, scaled: positive overflow
++            e.bytes({0x02});
++            e.movaps(3, 2);
++            e.rr({0x66, 0x0F, 0xDF}, 3, 1);             // pandn: ~overflow & truncated
++            e.cst({0x66, 0x0F, 0xDB}, 2, JcAbs);        // pand: overflow & 0x7FFFFFFF
++            e.rr({0x66, 0x0F, 0xEB}, 3, 2);
++            result = 3u;
++            break;
++        default: // SimpleAbs
++            if ((known.vf[op.fs] & comp) != comp)
++                jitNormalize(e, 0);
++            e.cst({0x66, 0x0F, 0xDB}, 0, JcAbs);
++            result = 0u;
++            break;
++        }
++
++        const JitEmitter::Base base = p.upperDst == DstVfPending ? JitEmitter::St : JitEmitter::Vu;
++        const size_t target = p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
++                              : p.upperDst == DstVfPending ? offsetof(BlockState, pendingVf) + 16u * p.upperReg
++                                                           : offsetof(VU1State, acc);
++        const uint8_t lanes = static_cast<uint8_t>(((p.upperLanes >> 3) & 1u) | (((p.upperLanes >> 2) & 1u) << 1) |
++                                                   (((p.upperLanes >> 1) & 1u) << 2) | ((p.upperLanes & 1u) << 3));
++        if (lanes == 0xFu)
++            e.storeXmm(base, target, result);
++        else if (lanes != 0u)
++        {
++            const uint8_t other = result == 1u ? 0u : 1u;
++            e.loadXmm(other, base, target);
++            e.bytes({0x66, 0x0F, 0x3A, 0x0C, static_cast<uint8_t>(0xC0u | (other << 3) | result), lanes}); // blendps
++            e.storeXmm(base, target, other);
++        }
++        return true;
++    }
++
+     // Upper through upperFn: the result waits in st.jitUp until after the lower instruction (jitUpperDst).
+     template <typename Host>
+     void jitUpperLate(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
+@@ -842,8 +960,61 @@
+         // interpreter around it, so they may be negative).
+         uint32_t pcMask;
+         int32_t backupValue, backupReg, backupValid;
++        int32_t workingClip; // patch 0080: the interpreter's working clip flags, from the VU1State
+     };
+ 
++    // Patch 0080: jitClip inline. vuClipFlags on x, y, z against the limit from w (signed compares of the raw words,
++    // and of the words with the sign flipped for the minus side), the six bits in x+ x- y+ y- z+ z- order, shifted
++    // into the working clip flags (24 bits) and queued in the flag entry of issue + 4 as setFlagSlot does.
++    inline void jitEmitClip(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        const SimpleOp &op = p.simple;
++        e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
++        e.load32(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft + 12u); // ecx = w
++        e.bytes({0x89, 0xCA});                                          // mov edx, ecx
++        e.bytes({0x81, 0xE2});                                          // and edx, 0x7FFFFFFF
++        e.imm32(0x7FFFFFFFu);
++        e.bytes({0xF7, 0xC1});                                          // test ecx, 0x7F800000
++        e.imm32(0x7F800000u);
++        e.bytes({0xB9});                                                // mov ecx, 0x007FFFFF
++        e.imm32(0x007FFFFFu);
++        e.bytes({0x0F, 0x45, 0xCA});                                    // cmovnz ecx, edx: the limit
++        e.rr({0x66, 0x0F, 0x6E}, 1, 1);                                 // movd xmm1, ecx
++        e.rr({0x66, 0x0F, 0x70}, 1, 1);                                 // pshufd xmm1, xmm1, 0
++        e.bytes({0x00});
++        e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * op.fs);
++        e.movaps(2, 0);
++        e.cst({0x66, 0x0F, 0xEF}, 2, JcSign);  // pxor: the sign flipped
++        e.rr({0x66, 0x0F, 0x66}, 0, 1);        // pcmpgtd: plus
++        e.rr({0x66, 0x0F, 0x66}, 2, 1);        // minus
++        e.rr({0x66, 0x0F, 0x6B}, 0, 2);        // packssdw
++        e.rr({0x66, 0x0F, 0x63}, 0, 0);        // packsswb
++        e.cst({0x66, 0x0F, 0x38, 0x00}, 0, JcClipBytes); // pshufb
++        e.rr({0x66, 0x0F, 0xD7}, 0, 0);        // pmovmskb eax, xmm0: the six bits
++        e.load32(1, B::Vu, static_cast<uint32_t>(h.workingClip)); // ecx = working clip
++        e.shlEcx(6);
++        e.bytes({0x09, 0xC1});                 // or ecx, eax
++        e.andEcx(0xFFFFFFu);
++        e.store32(B::Vu, static_cast<uint32_t>(h.workingClip), 1);
++        jitEmitFlagRow(e, p.issue + 4u);
++        const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
++        const auto storeSlotImm = [&](uint32_t field, uint32_t value) // mov dword [rax + slot + field], imm32
++        {
++            e.bytes({0xC7, 0x80});
++            e.imm32(slot + field);
++            e.imm32(value);
++        };
++        storeSlotImm(static_cast<uint32_t>(offsetof(FlagSlot, mac)), 0u);
++        storeSlotImm(static_cast<uint32_t>(offsetof(FlagSlot, status)), 0u);
++        storeSlotImm(static_cast<uint32_t>(offsetof(FlagSlot, sticky)), 0u);
++        e.bytes({0x89, 0x88}); // mov [rax + slot + clip], ecx
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, clip)));
++        e.bytes({0xC6, 0x80}); // mov byte [rax + slot + kind], kFlagClip
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, kind)));
++        e.bytes({kFlagClip});
++    }
++
+     // eax = (vi[base] + imm) * 16 & (dataBytes - 1); rcx = data (offsetAddress of fastLowerBody).
+     inline void jitDataAddress(JitEmitter &e, const JitHostLayout &h, uint8_t base, int16_t imm)
+     {
+@@ -1146,11 +1317,13 @@
+         const bool inlineFlags = alternative != 32 && s_jitInlineFlags;
+         const bool trackNormal = alternative != 34; // A/B mode 34: every FMAC operand normalized
+         const bool inlineMore = alternative != 43 && alternative != 44 && inlineLower; // A/B modes 43 and 44: as before
++        const bool inlineSimple = alternative != 70; // patch 0080 (A/B mode 70: through upperEarly)
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.dataSize) - hostBase), host.codeSize(),
+-            host.pcMask(), host.backupValueOffset(), host.backupRegOffset(), host.backupValidOffset()};
++            host.pcMask(), host.backupValueOffset(), host.backupRegOffset(), host.backupValidOffset(),
++            host.workingClipOffset()};
+         (alternative == 0 ? s.jitTried : s.jitCallsTried) = true;
+         s.jitRanges.clear();
+         s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
+@@ -1205,13 +1378,19 @@
+             if (upperDone)
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+-                      jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40)))
++                      jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40)) &&
++                    !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+             else if (p.upperFn != nullptr)
+                 e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             else if (p.upperPath == UpperClip)
+-                e.call(reinterpret_cast<const void *>(&jitClip<Host>), &p);
++            {
++                if (inlineSimple && s_jitSse41)
++                    jitEmitClip(e, layout, p);
++                else
++                    e.call(reinterpret_cast<const void *>(&jitClip<Host>), &p);
++            }
+ 
+             if (p.lowerExec == LowerExec)
+                 e.call(reinterpret_cast<const void *>(&jitLowerExec<Host>), &p); // its backup too

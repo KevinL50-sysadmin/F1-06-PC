@@ -1,0 +1,94 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 201c129..ac3db60 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -32,7 +32,8 @@
+ // compiled schedules normalizing every FMAC operand, without JitKnownNormal (before patch 0061), 35 the compiled
+ // schedules with the exact zeros of the inline FMAC through calls (before patch 0062), 36 the GS coordinator waiting
+ // for the band jobs a draw or an image upload depends on (before patch 0063), 37 the same for the image uploads only
+-// (the draws wait in the band workers). A
++// (the draws wait in the band workers), 38 the GS bilinear samples reading each texel through samplerPoint (before
++// patch 0064). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 4fbc505..68e8132 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1946,6 +1946,65 @@ namespace
+         return samplerTexel<P>(ts, sampleU, sampleV);
+     }
+ 
++    // The four texels of a bilinear sample (patch 0064; in a race, sampling was half of the band workers' time): the
++    // same texels as four samplerPoint calls, with each coordinate wrapped once instead of twice, and the page row,
++    // page column and in-page parts of PixelStorageTraits::Address worked out once per texel row and column. The
++    // address and the read are Address and Read's expressions, split.
++    template <GSMem::PixelStorageMode P>
++    PS2_GS_INLINE uint32_t samplerBilinear(const TextureSampler &ts, int u0, int v0, float fx, float fy)
++    {
++        const int wu0 = wrapTextureCoordinate(u0, ts.texW, ts.wrapU, ts.minU, ts.maxU);
++        const int wu1 = wrapTextureCoordinate(u0 + 1, ts.texW, ts.wrapU, ts.minU, ts.maxU);
++        const int wv0 = wrapTextureCoordinate(v0, ts.texH, ts.wrapV, ts.minV, ts.maxV);
++        const int wv1 = wrapTextureCoordinate(v0 + 1, ts.texH, ts.wrapV, ts.minV, ts.maxV);
++        if constexpr (P == GSMem::PixelStorageMode::Max)
++        {
++            return bilinearRgba(samplerTexel<P>(ts, wu0, wv0), samplerTexel<P>(ts, wu1, wv0), samplerTexel<P>(ts, wu0, wv1),
++                                samplerTexel<P>(ts, wu1, wv1), fx, fy);
++        }
++        else
++        {
++            using Traits = GSMem::PixelStorageTraits<P>;
++            using Packed = typename Traits::PackedT;
++            constexpr GSMem::Extent2D extent = Traits::PageExtent();
++            const auto &table = *static_cast<const typename Traits::PageLookupTableT *>(ts.pageTable);
++            const uint32_t block = ts.tbp0;
++            const uint32_t basePage = static_cast<uint32_t>(block / Traits::BlocksPerPage());
++            const auto &blockTable = table[block % Traits::BlocksPerPage()];
++            const uint32_t rowPages = (ts.tbw * 64u) / extent.x;
++            const uint32_t x0 = static_cast<uint32_t>(wu0), x1 = static_cast<uint32_t>(wu1);
++            const uint32_t y0 = static_cast<uint32_t>(wv0), y1 = static_cast<uint32_t>(wv1);
++            const uint32_t page0 = basePage + (y0 / extent.y) * rowPages, page1 = basePage + (y1 / extent.y) * rowPages;
++            const uint32_t col0 = x0 / extent.x, col1 = x1 / extent.x;
++            const uint32_t yIn0 = y0 % extent.y, yIn1 = y1 % extent.y, xIn0 = x0 % extent.x, xIn1 = x1 % extent.x;
++            const auto read = [&](uint32_t page, uint32_t yIn, uint32_t xIn) -> uint32_t
++            {
++                const uint32_t pixelAddr =
++                    static_cast<uint32_t>(static_cast<size_t>(page) * Traits::PixelsPerPage() + blockTable[yIn][xIn]);
++                const uint32_t bits = pixelAddr * static_cast<uint32_t>(GSMem::UnpackedBitWidth(P)) +
++                                      static_cast<uint32_t>(Traits::BitOffset());
++                const uint32_t byteAddr = (bits / 8u) & static_cast<uint32_t>(GSMem::MEMORY_SIZE - sizeof(Packed));
++                Packed value;
++                std::memcpy(&value, ts.vram + byteAddr, sizeof(Packed));
++                uint32_t raw;
++                if constexpr (P == GSMem::C24 || P == GSMem::Z24)
++                    raw = static_cast<uint32_t>(value & 0x00FFFFFFu);
++                else if constexpr (P == GSMem::P4 || P == GSMem::P4HL || P == GSMem::P4HH)
++                    raw = static_cast<uint32_t>((value >> (bits % 8u)) & 0x0Fu);
++                else
++                    raw = static_cast<uint32_t>(value);
++                if constexpr (P == GSMem::C32 || P == GSMem::C24 || P == GSMem::Z32 || P == GSMem::Z24)
++                    return applyTexa(ts.texa, ts.psm, raw);
++                else if constexpr (P == GSMem::C16 || P == GSMem::C16S || P == GSMem::Z16 || P == GSMem::Z16S)
++                    return applyTexa(ts.texa, ts.psm, Rgba5551ToRgba8888(static_cast<u16>(raw)));
++                else
++                    return ts.palette[static_cast<uint8_t>(raw)];
++            };
++            return bilinearRgba(read(page0 + col0, yIn0, xIn0), read(page0 + col1, yIn0, xIn1),
++                                read(page1 + col0, yIn1, xIn0), read(page1 + col1, yIn1, xIn1), fx, fy);
++        }
++    }
++
+     template <GSMem::PixelStorageMode P>
+     PS2_GS_INLINE uint32_t samplerSample(const TextureSampler &ts, float s, float t, float q, uint16_t u, uint16_t v)
+     {
+@@ -1971,6 +2030,9 @@ namespace
+         const int v0 = fastFloorToInt(sampleV);
+         const float fx = sampleU - static_cast<float>(u0);
+         const float fy = sampleV - static_cast<float>(v0);
++        if (g_ps2AbMode.load(std::memory_order_relaxed) != 38)
++            return samplerBilinear<P>(ts, u0, v0, fx, fy);
++        // A/B mode 38: each texel through samplerPoint, as before patch 0064.
+         return bilinearRgba(samplerPoint<P>(ts, u0, v0), samplerPoint<P>(ts, u0 + 1, v0), samplerPoint<P>(ts, u0, v0 + 1),
+                             samplerPoint<P>(ts, u0 + 1, v0 + 1), fx, fy);
+     }

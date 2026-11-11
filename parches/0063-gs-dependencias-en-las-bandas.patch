@@ -1,0 +1,598 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 9b82409..db65ef2 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -68,6 +68,8 @@ private:
+     void WaitBandsForWrite(int reason, uint32_t baseBlock, uint32_t bw, uint32_t psm, int x0, int y0, int x1, int y1);
+     void BandTransferBegin(const GSTransferCommand &command);
+     void BandTransferWait();
++    // An image chunk that would wait for pending jobs, queued as a band job instead (patch 0063). False: write it now.
++    bool BandUploadJob(const uint8_t *data, uint32_t sizeBytes);
+     void CloseBandVerification();
+     // Previous rasterizers, kept to check the current ones pixel for pixel (F1_GS_VERIFICAR) and for A/B timing.
+     void DrawSpriteReference(const GSPrimitiveBatch &batch);
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 8eda224..201c129 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -30,7 +30,9 @@
+ // SQ, the pc and the block end through calls (before patch 0059), 32 the compiled
+ // schedules with every flag commit through a call (before patch 0060), 34 the
+ // compiled schedules normalizing every FMAC operand, without JitKnownNormal (before patch 0061), 35 the compiled
+-// schedules with the exact zeros of the inline FMAC through calls (before patch 0062). A
++// schedules with the exact zeros of the inline FMAC through calls (before patch 0062), 36 the GS coordinator waiting
++// for the band jobs a draw or an image upload depends on (before patch 0063), 37 the same for the image uploads only
++// (the draws wait in the band workers). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index ddf39fe..4fbc505 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2073,8 +2073,18 @@ namespace
+         SpriteSetup sprite;  // when isSprite
+         int minX = 0, maxX = -1, minY = 0, maxY = -1; // pixels it may touch
+         bool isSprite = false;
++        // Patch 0063: an image upload (BandState::uploads of its slot), run by worker uploadWorker alone.
++        bool isUpload = false;
++        uint8_t uploadWorker = 0u;
++        // Patch 0063: before running it, a worker waits until every worker has finished the jobs below this (what the
++        // coordinator used to wait for before queueing it). 0: nothing.
++        uint64_t waitAll = 0u;
+     };
+ 
++    // UploadImage's pixel loop (below), also run by a band worker for an upload job.
++    void uploadPixels(const GSTransferCommand &transfer, GSTransferSnapshot &state, const uint8_t *data,
++                      uint32_t sizeBytes, uint8_t *vram, WriteVramFn write);
++
+     // The PixelPipeline, sampler and combiner of a job (`palette`: the CLUT lookup of an indexed texture).
+     void prepareJobPixelState(BandJob &job, const GSDrawState &state, uint8_t *vram, const ReadVramFn *readFuncs,
+                               const WriteVramFn *writeFuncs, const uint32_t *palette)
+@@ -2777,6 +2787,7 @@ struct GSCpuBackend::BandState
+     std::atomic<uint32_t> wake{0u};
+     std::atomic<bool> stop{false};
+     alignas(64) std::atomic<bool> coordinatorWaiting{false};
++    std::atomic<uint32_t> bandWaiters{0u}; // workers waiting for another one (patch 0063)
+ 
+     struct alignas(64) Worker
+     {
+@@ -2784,7 +2795,20 @@ struct GSCpuBackend::BandState
+         std::atomic<uint64_t> busyNs{0u};
+         std::atomic<uint32_t> chunks{0u};       // batches of jobs it ran ...
+         std::atomic<uint32_t> onEfficiency{0u}; // ... starting on an efficiency core
++        std::atomic<uint64_t> dependencyWaits{0u}; // waits for the other workers (BandJob::waitAll) ...
++        std::atomic<uint64_t> dependencyNs{0u};    // ... and their time
+     };
++    // Image uploads queued as jobs (patch 0063), by job slot.
++    struct Upload
++    {
++        GSTransferCommand transfer{};
++        GSTransferSnapshot start{};
++        std::vector<uint8_t> data;
++        uint8_t *vram = nullptr;
++        WriteVramFn write = nullptr;
++    };
++    std::unique_ptr<Upload[]> uploads;
++    uint64_t deferredJobs = 0u, uploadJobs = 0u; // since the last report (coordinator)
+     std::unique_ptr<Worker[]> worker;
+ 
+     // Coordinator side (always under GSCpuBackend::m_mutex).
+@@ -2943,8 +2967,21 @@ struct GSCpuBackend::BandState
+     double verifyFrom = 0.0;
+     std::chrono::steady_clock::time_point verifyStart = std::chrono::steady_clock::now();
+     std::vector<GSPrimitiveBatch> verifyBatches;
++    // Upload jobs of the batch (patch 0063), replayed before the draw at `position` (verifyBatches.size() then).
++    struct VerifyUpload
++    {
++        size_t position = 0u;
++        Upload upload;
++    };
++    std::vector<VerifyUpload> verifyUploads;
+     std::vector<uint8_t> verifyBefore, verifyBands;
+-    uint64_t verifyChecked = 0u, verifyBatchesChecked = 0u, verifyDifferent = 0u;
++    bool VerifyNow() const
++    {
++        return verifyLeft != 0u &&
++               std::chrono::duration<double>(std::chrono::steady_clock::now() - verifyStart).count() >= verifyFrom;
++    }
++    bool VerifyOpen() const { return !verifyBatches.empty() || !verifyUploads.empty(); }
++    uint64_t verifyChecked = 0u, verifyBatchesChecked = 0u, verifyDifferent = 0u, verifyUploadsChecked = 0u;
+ 
+     ~BandState()
+     {
+@@ -3008,6 +3045,53 @@ struct GSCpuBackend::BandState
+         RefreshMinDone();
+     }
+ 
++    // A worker's wait for a job's dependency (patch 0063): every worker has finished the jobs below `target`. Its own
++    // jobs below it are done (target <= the job it is on), and the others only wait for earlier jobs, so the one that
++    // is furthest behind never waits: no deadlock.
++    void WaitAll(uint64_t target, unsigned self)
++    {
++        std::chrono::steady_clock::time_point start{};
++        bool waited = false;
++        for (unsigned k = 0; k < threads; ++k)
++        {
++            if (k == self)
++                continue;
++            std::atomic<uint64_t> &done = worker[k].done;
++            uint64_t value = done.load(std::memory_order_acquire);
++            if (value >= target)
++                continue;
++            if (!waited)
++            {
++                waited = true;
++                start = std::chrono::steady_clock::now();
++            }
++            for (int i = 0; value < target && i < kCoordinatorSpin; ++i)
++            {
++                spinPause();
++                value = done.load(std::memory_order_acquire);
++            }
++            while (value < target)
++            {
++                // As the coordinator in WaitDone: the worker stores `done` and then loads bandWaiters (seq_cst).
++                bandWaiters.fetch_add(1u, std::memory_order_seq_cst);
++                value = done.load(std::memory_order_seq_cst);
++                if (value < target)
++                    done.wait(value, std::memory_order_acquire);
++                bandWaiters.fetch_sub(1u, std::memory_order_seq_cst);
++                value = done.load(std::memory_order_acquire);
++            }
++        }
++        if (waited)
++        {
++            worker[self].dependencyWaits.fetch_add(1u, std::memory_order_relaxed);
++            worker[self].dependencyNs.fetch_add(
++                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                          std::chrono::steady_clock::now() - start)
++                                          .count()),
++                std::memory_order_relaxed);
++        }
++    }
++
+     void Publish(uint64_t count)
+     {
+         // Pairs with the worker's sleepers increment and published load (both seq_cst): either it sees the new count,
+@@ -3202,10 +3286,25 @@ struct GSCpuBackend::BandState
+             for (; next < available; ++next)
+             {
+                 const BandJob &job = jobs[next % kJobCapacity];
+-                if (jobTouchesBand(job, shift, count, index))
++                if (job.isUpload)
++                {
++                    if (job.uploadWorker == index)
++                    {
++                        WaitAll(job.waitAll, index);
++                        Upload &upload = uploads[next % kJobCapacity];
++                        GSTransferSnapshot state = upload.start;
++                        uploadPixels(upload.transfer, state, upload.data.data(),
++                                     static_cast<uint32_t>(upload.data.size()), upload.vram, upload.write);
++                    }
++                }
++                else if (jobTouchesBand(job, shift, count, index))
++                {
++                    if (job.waitAll != 0u)
++                        WaitAll(job.waitAll, index);
+                     rasterJobRows(job, shift, count, index);
++                }
+                 me.done.store(next + 1u, std::memory_order_seq_cst);
+-                if (coordinatorWaiting.load(std::memory_order_seq_cst))
++                if (coordinatorWaiting.load(std::memory_order_seq_cst) || bandWaiters.load(std::memory_order_seq_cst) != 0u)
+                     me.done.notify_all();
+             }
+             me.busyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+@@ -3221,7 +3320,7 @@ struct GSCpuBackend::BandState
+         const double seconds = std::chrono::duration<double>(now - reportStart).count();
+         if (seconds < 10.0)
+             return;
+-        char line[1100];
++        char line[1400];
+         int length = std::snprintf(line, sizeof(line), "[gs:bandas] trabajos/s=%.0f ocupados=",
+                                    static_cast<double>(jobsSinceReport) / seconds);
+         for (unsigned k = 0; k < threads && length < 900; ++k)
+@@ -3239,9 +3338,23 @@ struct GSCpuBackend::BandState
+             length += std::snprintf(line + length, sizeof(line) - length, " %s=%llu/%.0fms", kWaitReasonNames[r],
+                                     static_cast<unsigned long long>(waits[r]), ms);
+         }
+-        length += std::snprintf(line + length, sizeof(line) - length, " (coordinador esperando %.0f%%) nucleosE=",
++        length += std::snprintf(line + length, sizeof(line) - length, " (coordinador esperando %.0f%%)",
+                                 0.1 * waitedMs / seconds);
+-        for (unsigned k = 0; k < threads && length < 1000; ++k)
++        {
++            uint64_t dependencyWaits = 0u, dependencyNs = 0u;
++            for (unsigned k = 0; k < threads; ++k)
++            {
++                dependencyWaits += worker[k].dependencyWaits.exchange(0u, std::memory_order_relaxed);
++                dependencyNs += worker[k].dependencyNs.exchange(0u, std::memory_order_relaxed);
++            }
++            length += std::snprintf(line + length, sizeof(line) - length,
++                                    " diferidos=%llu subidas=%llu esperasBandas=%llu/%.0fms nucleosE=",
++                                    static_cast<unsigned long long>(deferredJobs),
++                                    static_cast<unsigned long long>(uploadJobs),
++                                    static_cast<unsigned long long>(dependencyWaits), 1e-6 * static_cast<double>(dependencyNs));
++            deferredJobs = uploadJobs = 0u;
++        }
++        for (unsigned k = 0; k < threads && length < 1300; ++k)
+         {
+             const uint32_t chunks = worker[k].chunks.exchange(0u, std::memory_order_relaxed);
+             const uint32_t onEfficiency = worker[k].onEfficiency.exchange(0u, std::memory_order_relaxed);
+@@ -3277,6 +3390,7 @@ void GSCpuBackend::StartBandWorkers(unsigned threads)
+         bands->bandShift = shift; // a power of two between 2 and 256 rows
+     }
+     bands->jobs.reset(new BandJob[BandState::kJobCapacity]);
++    bands->uploads.reset(new BandState::Upload[BandState::kJobCapacity]);
+     bands->palettes.reset(new std::array<uint32_t, 256>[BandState::kPaletteCount]);
+     bands->worker.reset(new BandState::Worker[bands->threads]);
+     if (const char *value = std::getenv("F1_GS_VERIFICAR_BANDAS"))
+@@ -3424,6 +3538,8 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     // The slot of `index` is free: the job that used it before is done. Nothing reads it until it is published.
+     BandJob &job = bs.jobs[index % BandState::kJobCapacity];
+     job.isSprite = sprite;
++    job.isUpload = false;
++    job.waitAll = 0u;
+     if (sprite)
+     {
+         if (!prepareSprite(batch, job.sprite))
+@@ -3533,7 +3649,15 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+                       job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.minX, job.minY, job.maxX, job.maxY,
+                       job.sampler.tbp0, job.sampler.tbw, job.sampler.psm);
+         bs.NoteWait(reason, 0u, need, reason == kWaitTextureRead);
+-        bs.WaitDone(need, reason);
++        // Patch 0063: the band workers wait for it before drawing this job, so this thread goes on preparing the
++        // next ones (A/B mode 36: here, as before).
++        if (g_ps2AbMode.load(std::memory_order_relaxed) == 36)
++            bs.WaitDone(need, reason);
++        else if (bs.RefreshMinDone() < need)
++        {
++            job.waitAll = need;
++            ++bs.deferredJobs;
++        }
+     }
+     if (bs.checkWaits)
+     {
+@@ -3543,10 +3667,9 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     }
+ 
+     // F1_GS_VERIFICAR_BANDAS: a batch starts from local memory with nothing pending.
+-    if (bs.verifyLeft != 0u &&
+-        std::chrono::duration<double>(std::chrono::steady_clock::now() - bs.verifyStart).count() >= bs.verifyFrom)
++    if (bs.VerifyNow())
+     {
+-        if (bs.verifyBatches.empty())
++        if (!bs.VerifyOpen())
+         {
+             bs.WaitDone(index, kWaitVerify);
+             bs.verifyBefore.assign(m_vram, m_vram + m_vramSize);
+@@ -3596,19 +3719,32 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+ 
+ void GSCpuBackend::CloseBandVerification()
+ {
+-    if (!m_bands || m_bands->verifyBatches.empty())
++    if (!m_bands || !m_bands->VerifyOpen())
+         return;
+     BandState &bs = *m_bands;
+     bs.WaitDone(bs.prepared, kWaitVerify);
+     bs.verifyBands.assign(m_vram, m_vram + m_vramSize);
+     std::memcpy(m_vram, bs.verifyBefore.data(), m_vramSize);
+-    for (const GSPrimitiveBatch &batch : bs.verifyBatches)
++    size_t nextUpload = 0u;
++    for (size_t k = 0; k <= bs.verifyBatches.size(); ++k)
+     {
++        for (; nextUpload < bs.verifyUploads.size() && bs.verifyUploads[nextUpload].position == k; ++nextUpload)
++        {
++            BandState::Upload &upload = bs.verifyUploads[nextUpload].upload;
++            GSTransferSnapshot state = upload.start;
++            uploadPixels(upload.transfer, state, upload.data.data(), static_cast<uint32_t>(upload.data.size()), m_vram,
++                         upload.write);
++        }
++        if (k == bs.verifyBatches.size())
++            break;
++        const GSPrimitiveBatch &batch = bs.verifyBatches[k];
+         if (batch.state.prim.type == GS_PRIM_SPRITE)
+             DrawSpriteReference(batch);
+         else
+             DrawTriangleReference(batch);
+     }
++    bs.verifyUploadsChecked += bs.verifyUploads.size();
++    bs.verifyUploads.clear();
+     const uint64_t count = bs.verifyBatches.size();
+     bs.verifyChecked += count;
+     ++bs.verifyBatchesChecked;
+@@ -3630,8 +3766,11 @@ void GSCpuBackend::CloseBandVerification()
+     bs.verifyBatches.clear();
+     bs.verifyLeft = bs.verifyLeft > count ? bs.verifyLeft - count : 0u;
+     if (bs.verifyBatchesChecked % 50u == 0u || bs.verifyLeft == 0u)
+-        std::fprintf(stderr, "[gs:bandas] verificar: %llu primitivas en %llu lotes comprobadas, %llu lotes distintos\n",
++        std::fprintf(stderr,
++                     "[gs:bandas] verificar: %llu primitivas y %llu subidas en %llu lotes comprobadas, %llu lotes "
++                     "distintos\n",
+                      static_cast<unsigned long long>(bs.verifyChecked),
++                     static_cast<unsigned long long>(bs.verifyUploadsChecked),
+                      static_cast<unsigned long long>(bs.verifyBatchesChecked),
+                      static_cast<unsigned long long>(bs.verifyDifferent));
+ }
+@@ -3937,105 +4076,197 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+         return;
+     if (m_bands)
+-        BandTransferWait();
+-
+-    const uint32_t dbp = m_transfer.bitbltbuf.dbp;
+-    const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
+-    const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
+-    const uint32_t rrw = m_transfer.trxreg.rrw;
+-    const uint32_t dsax = m_transfer.trxpos.dsax;
+-    uint32_t offset = 0u;
+-
+-    auto advancePixel = [&](uint32_t count)
+     {
+-        const uint32_t totalPixels = m_transferState.totalPixels;
+-        m_transferState.copiedPixels =
+-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
+-
+-        if (m_transferState.copiedPixels >= totalPixels)
+-        {
+-            m_transferState.direction = 3u;
+-            m_transferState.totalPixels = 0u;
++        if (BandUploadJob(data, sizeBytes))
+             return;
+-        }
+-
+-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
+-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
+-    };
++        BandTransferWait();
++    }
++    uploadPixels(m_transfer, m_transferState, data, sizeBytes, m_vram,
++                 m_writeVramFuncs[m_transfer.bitbltbuf.dpsm & 0x3Fu]);
++}
+ 
+-    while (offset < sizeBytes && m_transferState.direction == 0u)
++namespace
++{
++    // The pixels of one image chunk of a host-to-local transfer (UploadImage), from `state` on, which advances as the
++    // transfer goes. write == nullptr: only the state (an upload queued as a band job, patch 0063).
++    void uploadPixels(const GSTransferCommand &m_transfer, GSTransferSnapshot &m_transferState, const uint8_t *data,
++                      uint32_t sizeBytes, uint8_t *vram, WriteVramFn write)
+     {
+-        switch (dpsm)
+-        {
+-        case GS_PSM_CT32:
+-        case GS_PSM_Z32:
+-        {
+-            if (sizeBytes - offset < 4u)
+-                return;
+-            uint32_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 4u;
+-            advancePixel(1u);
+-            break;
+-        }
+-        case GS_PSM_CT24:
+-        case GS_PSM_Z24:
++        const auto WriteVramUnlocked = [&](uint8_t, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+         {
+-            if (sizeBytes - offset < 3u)
+-                return;
+-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
+-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 3u;
+-            advancePixel(1u);
+-            break;
+-        }
+-        case GS_PSM_CT16:
+-        case GS_PSM_CT16S:
+-        case GS_PSM_Z16:
+-        case GS_PSM_Z16S:
++            if (write != nullptr)
++                write(vram, base, bw, x, y, value);
++        };
++        const uint32_t dbp = m_transfer.bitbltbuf.dbp;
++        const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
++        const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
++        const uint32_t rrw = m_transfer.trxreg.rrw;
++        const uint32_t dsax = m_transfer.trxpos.dsax;
++        uint32_t offset = 0u;
++
++        auto advancePixel = [&](uint32_t count)
+         {
+-            if (sizeBytes - offset < 2u)
++            const uint32_t totalPixels = m_transferState.totalPixels;
++            m_transferState.copiedPixels =
++                std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
++
++            if (m_transferState.copiedPixels >= totalPixels)
++            {
++                m_transferState.direction = 3u;
++                m_transferState.totalPixels = 0u;
+                 return;
+-            uint16_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 2u;
+-            advancePixel(1u);
+-            break;
+-        }
+-        case GS_PSM_T8:
+-        case GS_PSM_T8H:
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
+-            advancePixel(1u);
+-            break;
+-        case GS_PSM_T4:
+-        case GS_PSM_T4HL:
+-        case GS_PSM_T4HH:
++            }
++
++            m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
++            m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
++        };
++
++        while (offset < sizeBytes && m_transferState.direction == 0u)
+         {
+-            const uint8_t packed = data[offset++];
+-            const uint32_t firstPixel = m_transferState.copiedPixels;
+-            WriteVramUnlocked(dpsm, dbp, dbw,
+-                              dsax + (firstPixel % rrw),
+-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
+-                              packed & 0x0Fu);
+-            if (firstPixel + 1u < m_transferState.totalPixels)
++            switch (dpsm)
++            {
++            case GS_PSM_CT32:
++            case GS_PSM_Z32:
++            {
++                if (sizeBytes - offset < 4u)
++                    return;
++                uint32_t value = 0u;
++                std::memcpy(&value, data + offset, sizeof(value));
++                WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++                offset += 4u;
++                advancePixel(1u);
++                break;
++            }
++            case GS_PSM_CT24:
++            case GS_PSM_Z24:
++            {
++                if (sizeBytes - offset < 3u)
++                    return;
++                const uint32_t value = static_cast<uint32_t>(data[offset]) |
++                                       (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
++                                       (static_cast<uint32_t>(data[offset + 2u]) << 16u);
++                WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++                offset += 3u;
++                advancePixel(1u);
++                break;
++            }
++            case GS_PSM_CT16:
++            case GS_PSM_CT16S:
++            case GS_PSM_Z16:
++            case GS_PSM_Z16S:
++            {
++                if (sizeBytes - offset < 2u)
++                    return;
++                uint16_t value = 0u;
++                std::memcpy(&value, data + offset, sizeof(value));
++                WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++                offset += 2u;
++                advancePixel(1u);
++                break;
++            }
++            case GS_PSM_T8:
++            case GS_PSM_T8H:
++                WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
++                advancePixel(1u);
++                break;
++            case GS_PSM_T4:
++            case GS_PSM_T4HL:
++            case GS_PSM_T4HH:
+             {
+-                const uint32_t secondPixel = firstPixel + 1u;
++                const uint8_t packed = data[offset++];
++                const uint32_t firstPixel = m_transferState.copiedPixels;
+                 WriteVramUnlocked(dpsm, dbp, dbw,
+-                                  dsax + (secondPixel % rrw),
+-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
+-                                  (packed >> 4u) & 0x0Fu);
++                                  dsax + (firstPixel % rrw),
++                                  m_transfer.trxpos.dsay + (firstPixel / rrw),
++                                  packed & 0x0Fu);
++                if (firstPixel + 1u < m_transferState.totalPixels)
++                {
++                    const uint32_t secondPixel = firstPixel + 1u;
++                    WriteVramUnlocked(dpsm, dbp, dbw,
++                                      dsax + (secondPixel % rrw),
++                                      m_transfer.trxpos.dsay + (secondPixel / rrw),
++                                      (packed >> 4u) & 0x0Fu);
++                }
++                advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
++                break;
++            }
++            default:
++                return;
+             }
+-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
+-            break;
+         }
+-        default:
+-            return;
++    }
++}
++
++bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
++{
++    // A/B modes 36 and 37: the coordinator waits and writes, as before. Also with the union or page tracking (A/B
++    // modes 15 and 19) and while F1_GS_VERIFICAR_BANDAS checks batches (they replay draws only).
++    BandState &bs = *m_bands;
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (mode == 36 || mode == 37 || !BandState::LastJobs())
++        return false;
++    // What BandTransferWait would wait for: the last pending job writing the destination blocks or reading them as
++    // a texture. Nothing pending: the caller writes it at once.
++    // PS2X_GS_SUBIDAS_SIEMPRE=1 (diagnostic): every chunk as a job, so that F1_GS_VERIFICAR_BANDAS checks them (with
++    // it the workers keep up and almost nothing conflicts).
++    static const bool s_always = []
++    {
++        const char *value = std::getenv("PS2X_GS_SUBIDAS_SIEMPRE");
++        return value != nullptr && value[0] == '1';
++    }();
++    uint32_t page = 0u;
++    uint64_t need = bs.LastBlockWrite(bs.transferBlocks, page);
++    need = std::max(need, bs.LastBlockRead(bs.transferBlocks, page));
++    if (!s_always && (need <= bs.minDone || bs.RefreshMinDone() >= need))
++        return false;
++
++    const uint64_t index = bs.prepared;
++    if (index - bs.minDone >= BandState::kJobCapacity)
++        bs.WaitDone(index + 1u - BandState::kJobCapacity, kWaitRing);
++    const size_t slot = static_cast<size_t>(index % BandState::kJobCapacity);
++    BandJob &job = bs.jobs[slot];
++    job.isSprite = false;
++    job.isUpload = true;
++    job.uploadWorker = static_cast<uint8_t>(index % bs.threads);
++    job.waitAll = need;
++    job.minX = job.minY = 0;
++    job.maxX = job.maxY = -1;
++    BandState::Upload &upload = bs.uploads[slot];
++    upload.transfer = m_transfer;
++    upload.start = m_transferState;
++    upload.data.assign(data, data + sizeBytes);
++    upload.vram = m_vram;
++    upload.write = m_writeVramFuncs[m_transfer.bitbltbuf.dpsm & 0x3Fu];
++    // F1_GS_VERIFICAR_BANDAS: replayed in order with the batch's draws.
++    if (bs.VerifyNow())
++    {
++        if (!bs.VerifyOpen())
++        {
++            bs.WaitDone(index, kWaitVerify);
++            bs.verifyBefore.assign(m_vram, m_vram + m_vramSize);
+         }
++        bs.verifyUploads.push_back({bs.verifyBatches.size(), upload});
+     }
++    // The transfer state after this chunk, as writing it here would leave it.
++    uploadPixels(m_transfer, m_transferState, data, sizeBytes, nullptr, nullptr);
++
++    // It writes the destination blocks: later jobs and commands order themselves after it like after a draw. Layout
++    // 0 matches no buffer, so a draw writing those pages waits for it too.
++    const uint64_t tag = index + 1u;
++    bs.transferPages.forEach([&](uint32_t p)
++                             { bs.pageWriteJob[p] = tag; bs.pageWriteLayout[p] = 0u; });
++    bs.pendingWrites |= bs.transferPages;
++    bs.RecordBlockWrites(bs.transferBlocks, tag);
++    bs.CheckRecord(tag, bs.transferBlocks, nullptr);
++    for (const auto &[p, mask] : bs.transferBlocks)
++        bs.pendingWriteBlocks[p] |= mask;
++    ++bs.uploadJobs;
++    bs.prepared = tag;
++    if (tag - bs.published.load(std::memory_order_relaxed) >= BandState::kPublishBatch)
++        bs.Publish(tag);
++    if (bs.verifyUploads.size() >= 64u)
++        CloseBandVerification();
++    return true;
+ }
+ 
+ void GSCpuBackend::PerformLocalToLocalTransfer()

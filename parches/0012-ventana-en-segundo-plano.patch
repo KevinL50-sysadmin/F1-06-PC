@@ -1,0 +1,59 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..1e0dd2a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -16,6 +17,7 @@
+ 
+ #include <iostream>
+ #include <stdexcept>
++#include <cstdlib>
+ #include <fstream>
+ #include <algorithm>
+ #include <array>
+@@ -27,6 +29,19 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++#if defined(_WIN32) && !defined(PLATFORM_VITA)
++// Declared by hand: <windows.h> clashes with raylib names (Rectangle, CloseWindow, DrawText...).
++extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hWndInsertAfter, int x, int y, int cx,
++                                                            int cy, unsigned int flags);
++namespace
++{
++    void ps2xSetWindowPos(void *hwnd, void *insertAfter, int x, int y, int cx, int cy, unsigned int flags)
++    {
++        SetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags);
++    }
++}
++#endif
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -731,8 +746,25 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        // PS2X_BACKGROUND_WINDOW=1: for automated runs the window never takes the focus or covers the desktop.
++        // It is created hidden and unfocused, then shown off-screen at the bottom of the z-order without being
++        // activated. PrintWindow can still capture it, and it keeps running while unfocused.
++        const char *backgroundEnv = std::getenv("PS2X_BACKGROUND_WINDOW");
++        const bool backgroundWindow = backgroundEnv && backgroundEnv[0] != '\0' && backgroundEnv[0] != '0';
++        unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
++        if (backgroundWindow)
++        {
++            windowFlags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED | FLAG_WINDOW_ALWAYS_RUN;
++        }
++        SetConfigFlags(windowFlags);
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++#if defined(_WIN32)
++        if (backgroundWindow)
++        {
++            ps2xSetWindowPos(GetWindowHandle(), reinterpret_cast<void *>(1) /* HWND_BOTTOM */, -4000, 0, 0, 0,
++                             0x0001u /* SWP_NOSIZE */ | 0x0010u /* SWP_NOACTIVATE */ | 0x0040u /* SWP_SHOWWINDOW */);
++        }
++#endif
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif

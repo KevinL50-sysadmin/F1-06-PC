@@ -1,0 +1,211 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_intc_queue.h b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+index f158ebd..5abe7fa 100644
+--- a/ps2xRuntime/include/runtime/ps2_intc_queue.h
++++ b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+@@ -2,6 +2,7 @@
+ #define PS2_INTC_QUEUE_H
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ // INTC causes raised by hardware emulation (for example the VIF 'i' bit) travel through
+ // PS2Memory's completed-DMAC queue tagged with this bit, so they keep their order relative to
+@@ -20,6 +21,14 @@ bool ps2Vif1TakeDmaEndPending();
+ bool ps2Vif1TakeStall(const uint8_t *&data, uint32_t &size);
+ void ps2Vif1ReleaseStallData();
+ void ps2Vif1ResetStall();
++// The data of the next processVIF1Data calls is the whole content of this vector (a gathered DMA chain): a stall
++// inside it takes the vector over (swap) instead of copying what is left. Null when the data lives elsewhere.
++void ps2Vif1SetSourceBuffer(std::vector<uint8_t> *buffer);
++
++// Gathered DMA chains (ps2_memory.cpp) reuse the vectors of earlier ones: a race sends VIF1 chains of up to ~5 MB, and
++// a new vector for each one grew by steps and touched fresh pages every time.
++std::vector<uint8_t> ps2TakeChainBuffer();
++void ps2RecycleChainBuffer(std::vector<uint8_t> &&buffer);
+ 
+ // A DMA completion or a hardware INTC cause was queued (ps2_memory.cpp). The EE scheduler then stops at its next
+ // checkpoint and dispatches it: a guest loop that only reads (waiting for an interrupt) never reaches the drain that
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..2e187f6 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -2,6 +2,13 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++namespace
++{
++    // Packet buffers of earlier submits, emptied but keeping their capacity: every XGKICK goes through submit, and a
++    // new vector for each packet was a heap allocation and a free per packet.
++    thread_local std::vector<std::vector<uint8_t>> t_packetBuffers;
++}
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -27,6 +34,11 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     pkt.pathId = pathId;
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
+     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
++    if (!t_packetBuffers.empty())
++    {
++        pkt.data = std::move(t_packetBuffers.back());
++        t_packetBuffers.pop_back();
++    }
+     pkt.data.resize(sizeBytes);
+     std::memcpy(pkt.data.data(), data, sizeBytes);
+     m_queue.push_back(std::move(pkt));
+@@ -59,6 +71,12 @@ void GifArbiter::drain()
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
++    for (auto &pkt : m_queue)
++        if (t_packetBuffers.size() < 16u && pkt.data.capacity() != 0u && pkt.data.capacity() <= (1u << 20))
++        {
++            pkt.data.clear();
++            t_packetBuffers.push_back(std::move(pkt.data));
++        }
+     m_queue.clear();
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 569dac7..4d0ff7c 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,10 +2,12 @@
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_intc_queue.h"
++#include "runtime/ps2_ab.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <cstring>
+ #include <limits>
++#include <mutex>
+ #include <stdexcept>
+ #include <algorithm>
+ #include <string>
+@@ -229,6 +231,28 @@ namespace
+         return nreg == 0u ? 16u : nreg;
+     }
+ 
++    std::mutex g_chainBufferMutex;
++    std::vector<std::vector<uint8_t>> g_chainBuffers; // emptied, keeping their capacity
++}
++
++std::vector<uint8_t> ps2TakeChainBuffer()
++{
++    std::lock_guard<std::mutex> lock(g_chainBufferMutex);
++    if (g_chainBuffers.empty() || g_ps2AbMode.load(std::memory_order_relaxed) == 6)
++        return {};
++    std::vector<uint8_t> buffer = std::move(g_chainBuffers.back());
++    g_chainBuffers.pop_back();
++    return buffer;
++}
++
++void ps2RecycleChainBuffer(std::vector<uint8_t> &&buffer)
++{
++    if (buffer.capacity() == 0u)
++        return;
++    buffer.clear();
++    std::lock_guard<std::mutex> lock(g_chainBufferMutex);
++    if (g_chainBuffers.size() < 4u)
++        g_chainBuffers.push_back(std::move(buffer));
+ }
+ 
+ // Helpers for GS VRAM addressing (PSMCT32 path).
+@@ -1386,7 +1410,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     // Only a guard against looping chains: hardware has no limit, and a race in F1 06 sends VIF1
+                     // chains with more than 4096 tags (cutting them lost the end-of-packet mark).
+                     const int kMaxChainTags = 1 << 20;
+-                    std::vector<uint8_t> chainBuf;
++                    std::vector<uint8_t> chainBuf = ps2TakeChainBuffer();
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -1607,6 +1631,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             m_pendingVif0Transfers.push_back(std::move(pt));
+                         }
+                     }
++                    ps2RecycleChainBuffer(std::move(chainBuf));
+                     // else if (channelBase == 0x10009000u)
+                     // {
+ 
+@@ -1802,6 +1827,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingGifTransfers)
++        ps2RecycleChainBuffer(std::move(p.chainData));
+     m_pendingGifTransfers.clear();
+ 
+     const bool hadVif0 = !m_pendingVif0Transfers.empty();
+@@ -1860,6 +1887,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif0Transfers)
++        ps2RecycleChainBuffer(std::move(p.chainData));
+     m_pendingVif0Transfers.clear();
+ 
+     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+@@ -1867,7 +1896,10 @@ void PS2Memory::processPendingTransfers()
+     {
+         if (!p.chainData.empty())
+         {
++            // A stall inside the chain takes its vector over instead of copying the rest.
++            ps2Vif1SetSourceBuffer(&p.chainData);
+             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
++            ps2Vif1SetSourceBuffer(nullptr);
+         }
+         else if (p.qwc > 0)
+         {
+@@ -1918,6 +1950,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif1Transfers)
++        ps2RecycleChainBuffer(std::move(p.chainData));
+     m_pendingVif1Transfers.clear();
+ 
+     if (m_gifArbiter)
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 50b74dd..594feb1 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,7 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_intc_queue.h"
++#include "runtime/ps2_ab.h"
+ #include <cstdlib>
+ #include <cstring>
+ #include <emmintrin.h>
+@@ -341,6 +342,12 @@ namespace
+     size_t g_vif1StallOffset = 0;
+     bool g_vif1Stalled = false;
+     bool g_vif1DmaEndPending = false; // the DMA ended while stalled: signal it once the remainder is processed
++    std::vector<uint8_t> *g_vif1Source = nullptr; // ps2Vif1SetSourceBuffer
++}
++
++void ps2Vif1SetSourceBuffer(std::vector<uint8_t> *buffer)
++{
++    g_vif1Source = buffer;
+ }
+ 
+ bool ps2Vif1IsStalled()
+@@ -427,6 +434,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             // Resuming from the stall buffer: keep it and just move past what was processed.
+             g_vif1StallOffset = static_cast<size_t>(data - own) + from;
+         }
++        else if (g_vif1Source != nullptr && data == g_vif1Source->data() && sizeBytes == g_vif1Source->size() &&
++                 g_vif1StallBuffer.empty() && g_ps2AbMode.load(std::memory_order_relaxed) != 6)
++        {
++            // A whole gathered chain: take its vector (the caller only recycles it) instead of copying the rest;
++            // the chain gets the empty stall buffer back.
++            g_vif1StallBuffer.swap(*g_vif1Source);
++            g_vif1StallOffset = from;
++        }
+         else
+         {
+             g_vif1StallBuffer.assign(data + from, data + sizeBytes);

@@ -1,0 +1,356 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 62bf4bf..31faeb5 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -9,7 +9,8 @@
+ // upper instruction dispatched as before BlockPair::upperFn, 6 the VIF1 DMA chains gathered in a new vector each time
+ // and copied again by an 'i' bit stall (before patch 0039), 7 (game hook) the host cores as Windows decides, 8 the GS
+ // worker sleeping as soon as its queue is empty (no spinning first), 9 the VU1 pairs decoded and planned again after
+-// every microcode upload (no cache by content). A
++// every microcode upload (no cache by content), 10 the VU1 block lower instructions WAITQ, B, IBxx, FCEQ, FCAND and
++// FCOR through execLower (before patch 0042), 11 the VU1 block DIV, SQRT and RSQRT through execLower. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 3991ac0..ccb5439 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -126,7 +126,7 @@ namespace
+         e.kind = kind;
+     }
+ 
+-    inline void applyFlagSlot(const FlagSlot &e, VU1State &s)
++    PS2_VU_FORCEINLINE void applyFlagSlot(const FlagSlot &e, VU1State &s)
+     {
+         if ((e.kind & kFlagMac) != 0u)
+             s.mac = e.mac;
+@@ -244,7 +244,23 @@ namespace
+         FastIlw,    // ILW.dest viT, imm(viS): A = viS, imm
+         FastIsw,    // ISW.dest viT, imm(viS): A = viS, B = viT, imm
+         FastIlwr,   // ILWR.dest viT, (viS): A = viS
+-        FastIswr    // ISWR.dest viT, (viS): A = viS, B = viT
++        FastIswr,   // ISWR.dest viT, (viS): A = viS, B = viT
++        // Patch 0042 (A/B mode 10: through execLower as before). FCEQ/FCAND/FCOR read the immediate from the word.
++        FastWaitq,  // WAITQ: the wait is in the schedule, nothing else to do
++        FastFceq,   // vi1 = (clip & 0xFFFFFF) == imm24
++        FastFcand,  // vi1 = (clip & imm24) != 0
++        FastFcor,   // vi1 = (clip | imm24) == 0xFFFFFF
++        FastB,      // B imm: imm
++        FastIbeq,   // IBEQ viT, viS, imm: A = viS, B = viT, imm (the branch "old value" rule: readBranchVi)
++        FastIbne,
++        FastIbltz,  // IBLTZ viS, imm: A = viS, imm
++        FastIbgtz,
++        FastIblez,
++        FastIbgez,
++        // A/B mode 11: through execLower as before. A = vfS, B = vfT, dest = fsf | ftf << 2 (bits 21-24 of the word).
++        FastDiv,
++        FastSqrt,
++        FastRsqrt
+     };
+ 
+     // The FastLower operation of a lower instruction (0: execLower).
+@@ -278,6 +294,28 @@ namespace
+             a = VIS(lower);
+             imm = static_cast<int16_t>(static_cast<int16_t>(lower & 0x7FFu) | static_cast<int16_t>((lower >> 10) & 0x7800u));
+             return opHi == 0x08 ? FastIaddiu : FastIsubiu;
++        case 0x10:
++            return FastFceq;
++        case 0x12:
++            return FastFcand;
++        case 0x13:
++            return FastFcor;
++        case 0x20:
++            imm = IMM11(lower);
++            return FastB;
++        case 0x28:
++        case 0x29:
++            a = VIS(lower);
++            b = VIT(lower);
++            imm = IMM11(lower);
++            return opHi == 0x28 ? FastIbeq : FastIbne;
++        case 0x2C:
++        case 0x2D:
++        case 0x2E:
++        case 0x2F:
++            a = VIS(lower);
++            imm = IMM11(lower);
++            return static_cast<uint8_t>(FastIbltz + (opHi - 0x2Cu));
+         case 0x40:
+             break;
+         default:
+@@ -311,6 +349,10 @@ namespace
+         case 0x3D: a = VIS(lower); return FastMfir;
+         case 0x3E: a = VIS(lower); return FastIlwr;
+         case 0x3F: a = VIS(lower); b = VIT(lower); return FastIswr;
++        case 0x3B: return FastWaitq;
++        case 0x38: a = FS(lower); b = FT(lower); return FastDiv;
++        case 0x39: b = FT(lower); return FastSqrt;
++        case 0x3A: a = FS(lower); b = FT(lower); return FastRsqrt;
+         default:
+             return 0u;
+         }
+@@ -1042,6 +1084,27 @@ namespace
+     };
+     BlockRedirect *s_blockRedirect = nullptr;
+ 
++    // PS2X_VU1_CONTAR=1: how many lower instructions of each kind the blocks still run through execLower ("[vu1:inferiores]"
++    // with [vu1:ritmo]), with one instruction word of each kind to disassemble. Kind: opHi for the 0x00-0x3F
++    // opcodes, 0x80 | funct for the 0x40 group below 0x3C, 0x100 | extended code otherwise.
++    const bool s_countLower = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_CONTAR");
++        return value != nullptr && value[0] == '1';
++    }();
++    uint64_t s_lowerExecCount[0x200] = {};
++    uint32_t s_lowerExecSample[0x200] = {};
++    inline uint32_t lowerKind(uint32_t lower)
++    {
++        const uint32_t opHi = (lower >> 25) & 0x7Fu;
++        if (opHi != 0x40u)
++            return opHi;
++        const uint32_t funct = lower & 0x3Fu;
++        if (funct < 0x3Cu)
++            return 0x80u | funct;
++        return 0x100u | ((lower & 0x3u) | ((lower >> 4) & 0x7Cu));
++    }
++
+     struct BlockStats
+     {
+         uint64_t pairs = 0u;     // pairs run in blocks
+@@ -1092,12 +1155,11 @@ namespace
+     {
+         uint8_t *const data = host.data();
+         const uint32_t dataMask = host.dataBytes() - 1u;
++        // One blend to the register or to pendingVf (two inlined blends made the lambda too big to inline).
+         const auto writeVf = [&](const void *value)
+         {
+-            if (p.lowerDst == DstVf)
+-                blendLanes(vu.vf[p.lowerReg], value, p.lowerLanes);
+-            else if (p.lowerDst == DstVfPending)
+-                blendLanes(st.pendingVf[p.lowerReg], value, p.lowerLanes);
++            if (p.lowerDst == DstVf || p.lowerDst == DstVfPending)
++                blendLanes(p.lowerDst == DstVf ? vu.vf[p.lowerReg] : st.pendingVf[p.lowerReg], value, p.lowerLanes);
+         };
+         const auto writeVi = [&](int32_t value)
+         {
+@@ -1127,6 +1189,19 @@ namespace
+         {
+             return (static_cast<uint32_t>(static_cast<uint16_t>(base)) * 16u) & dataMask;
+         };
++        const auto branchTo = [&]()
++        {
++            vu.branchPending = true;
++            vu.branchTarget = (p.pc + 8u + static_cast<uint32_t>(static_cast<int32_t>(p.fastImm) * 8)) & host.pcMask();
++            vu.branchDelay = 1;
++        };
++        // Q as queueQ leaves it in a block (it completes at the cycle of the schedule). DIV and RSQRT normalize the
++        // result before queueQ, which normalizes it again; SQRT only in queueQ.
++        const auto setQ = [&](float value, uint32_t statusDi)
++        {
++            st.fdivValue = host.normalizeResult(value);
++            st.fdivDi = statusDi & 0x30u;
++        };
+         switch (p.fastOp)
+         {
+         case FastLq:
+@@ -1223,7 +1298,7 @@ namespace
+         case FastIlwr:
+             writeVi(wordOf(plainAddress(vu.vi[p.fastA])));
+             break;
+-        default: // FastIswr
++        case FastIswr:
+         {
+             alignas(16) uint32_t words[4];
+             _mm_store_si128(reinterpret_cast<__m128i *>(words),
+@@ -1231,6 +1306,84 @@ namespace
+             store(plainAddress(vu.vi[p.fastA]), words);
+             break;
+         }
++        case FastWaitq:
++            break;
++        case FastFceq:
++            writeVi((vu.clip & 0xFFFFFFu) == (p.lower & 0xFFFFFFu) ? 1 : 0);
++            break;
++        case FastFcand:
++            writeVi((vu.clip & (p.lower & 0xFFFFFFu)) != 0u ? 1 : 0);
++            break;
++        case FastFcor:
++            writeVi((vu.clip | (p.lower & 0xFFFFFFu)) == 0xFFFFFFu ? 1 : 0);
++            break;
++        case FastB:
++            branchTo();
++            break;
++        case FastIbeq:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) == static_cast<int16_t>(host.readBranchVi(p.fastB)))
++                branchTo();
++            break;
++        case FastIbne:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) != static_cast<int16_t>(host.readBranchVi(p.fastB)))
++                branchTo();
++            break;
++        case FastIbltz:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) < 0)
++                branchTo();
++            break;
++        case FastIbgtz:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) > 0)
++                branchTo();
++            break;
++        case FastIblez:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) <= 0)
++                branchTo();
++            break;
++        case FastIbgez:
++            if (static_cast<int16_t>(host.readBranchVi(p.fastA)) >= 0)
++                branchTo();
++            break;
++        case FastDiv:
++        {
++            const float num = vuNormalizeOperand(vu.vf[p.fastA][p.fastDest & 0x3u]);
++            const float den = vuNormalizeOperand(vu.vf[p.fastB][(p.fastDest >> 2) & 0x3u]);
++            uint32_t statusDi = 0u;
++            float result = 0.0f;
++            if (den == 0.0f)
++            {
++                statusDi = num == 0.0f ? 0x10u : 0x20u;
++                result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
++                                                                : std::numeric_limits<float>::max();
++            }
++            else
++                result = num / den;
++            setQ(host.normalizeResult(result), statusDi);
++            break;
++        }
++        case FastSqrt:
++        {
++            const float val = vuNormalizeOperand(vu.vf[p.fastB][(p.fastDest >> 2) & 0x3u]);
++            setQ(std::sqrt(std::fabs(val)), val < 0.0f ? 0x10u : 0u);
++            break;
++        }
++        default: // FastRsqrt
++        {
++            const float num = vuNormalizeOperand(vu.vf[p.fastA][p.fastDest & 0x3u]);
++            const float radicand = vuNormalizeOperand(vu.vf[p.fastB][(p.fastDest >> 2) & 0x3u]);
++            const float den = std::sqrt(std::fabs(radicand));
++            uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
++            float result = 0.0f;
++            if (den != 0.0f)
++                result = num / den;
++            else
++            {
++                statusDi = num == 0.0f ? 0x10u : 0x20u;
++                result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
++            }
++            setQ(host.normalizeResult(result), statusDi);
++            break;
++        }
+         }
+     }
+ 
+@@ -1240,7 +1393,8 @@ namespace
+     {
+         VU1State &vu = host.state();
+         const uint64_t entry = st.cycle;
+-        const bool oldDispatch = g_ps2AbMode.load(std::memory_order_relaxed) == 5;
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        const bool oldDispatch = abMode == 5;
+         BlockRedirect redirect;
+         redirect.state = &st;
+         const auto commit = [&](const BlockCommit &c)
+@@ -1307,7 +1461,11 @@ namespace
+ 
+             // Lower instruction.
+             const int32_t oldVi = vu.vi[p.viReg];
+-            if (p.lowerExec == LowerFast)
++            // A/B modes 10 and 11: the lower instructions of patch 0042 through execLower, as before.
++            const bool fastLower = p.lowerExec == LowerFast &&
++                                   !(p.fastOp >= FastWaitq && ((abMode == 10 && p.fastOp < FastDiv) ||
++                                                               (abMode == 11 && p.fastOp >= FastDiv)));
++            if (fastLower)
+                 runFastLower(p, vu, st, host, issue);
+             else if (p.lowerExec == LowerImmediate)
+             {
+@@ -1315,7 +1473,7 @@ namespace
+                 std::memcpy(&immediate, &p.lower, sizeof(immediate));
+                 vu.i = vuNormalizeOperand(immediate);
+             }
+-            else if (p.lowerExec == LowerExec)
++            else if (p.lowerExec == LowerExec || p.lowerExec == LowerFast)
+             {
+                 alignas(16) float oldVf[4];
+                 if (p.lowerDst == DstVfPending || p.lowerDst == DstDiscard)
+@@ -1325,6 +1483,12 @@ namespace
+                 redirect.upperFlag = p.upperFlags != 0u;
+                 if (p.branch)
+                     vu.pc = p.pc; // the target and the BAL/JALR link come from it
++                if (s_countLower)
++                {
++                    const uint32_t kind = lowerKind(p.lower);
++                    ++s_lowerExecCount[kind];
++                    s_lowerExecSample[kind] = p.lower;
++                }
+                 s_blockRedirect = &redirect;
+                 host.execLower(p.lower, p.upper);
+                 s_blockRedirect = nullptr;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index d07aa7b..d1ed845 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3217,6 +3217,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 vu.recordViWriteForBranch(reg, oldValue);
+         }
+         uint32_t codeSize() const { return codeBytesSize; }
++        int32_t readBranchVi(uint8_t reg) const { return vu.readBranchVi(reg); }
++        float normalizeResult(float value) const
++        {
++            uint32_t ignoredFlags = 0u;
++            return vu.normalizeResult(value, ignoredFlags);
++        }
+         uint32_t pcMask() const { return vu.microAddressMask(); }
+         bool xgkickActive() const { return vu.m_xgkick.active; }
+         void progressXgkickOneCycle() { vu.progressXgkick(); }
+@@ -3828,7 +3834,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             const uint64_t paresBloques = bloques.pairs - s_bloquesAntes.pairs;
+             std::fprintf(stderr,
+                          "[vu1:ritmo] pares/s=%.0f ns/par=%.1f ocupado=%.0f%% bloques=%.0f%% esquemas=%zu(+%llu, "
+-                         "variantes +%llu) estados=%zu esperasXgkick=%llu vueltas=%llu\n",
++                         "variantes +%llu) estados=%zu esperasXgkick=%llu vueltas=%llu pares/bloque=%.1f\n",
+                          s_ritmoPares / segundos,
+                          s_ritmoPares != 0u ? 1e9 * ocupado / static_cast<double>(s_ritmoPares) : 0.0,
+                          100.0 * ocupado / segundos,
+@@ -3838,7 +3844,33 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          static_cast<unsigned long long>(bloques.rebuilt - s_bloquesAntes.rebuilt),
+                          s_blockEngines[1].sigs.size(),
+                          static_cast<unsigned long long>(bloques.xgkickWaits - s_bloquesAntes.xgkickWaits),
+-                         static_cast<unsigned long long>(bloques.fallbacks - s_bloquesAntes.fallbacks));
++                         static_cast<unsigned long long>(bloques.fallbacks - s_bloquesAntes.fallbacks),
++                         bloques.blocks != s_bloquesAntes.blocks
++                             ? static_cast<double>(paresBloques) / static_cast<double>(bloques.blocks - s_bloquesAntes.blocks)
++                             : 0.0);
++            if (s_countLower)
++            {
++                // The 12 kinds of lower instruction run most through execLower in the last 10 s.
++                uint64_t total = 0u;
++                for (uint64_t c : s_lowerExecCount)
++                    total += c;
++                std::fprintf(stderr, "[vu1:inferiores] execLower=%.0f/s (%.1f%% de los pares):", total / segundos,
++                             paresBloques != 0u ? 100.0 * static_cast<double>(total) / static_cast<double>(paresBloques) : 0.0);
++                for (int k = 0; k < 12; ++k)
++                {
++                    uint32_t best = 0u;
++                    for (uint32_t i = 1; i < 0x200u; ++i)
++                        if (s_lowerExecCount[i] > s_lowerExecCount[best])
++                            best = i;
++                    if (s_lowerExecCount[best] == 0u)
++                        break;
++                    std::fprintf(stderr, " %03x(0x%08x)=%.1f%%", best, s_lowerExecSample[best],
++                                 100.0 * static_cast<double>(s_lowerExecCount[best]) / static_cast<double>(total));
++                    s_lowerExecCount[best] = 0u;
++                }
++                std::fprintf(stderr, "\n");
++                std::memset(s_lowerExecCount, 0, sizeof(s_lowerExecCount));
++            }
+             s_bloquesAntes = bloques;
+             s_ritmoDesde = finRitmo;
+             s_ritmoTiempo = {};

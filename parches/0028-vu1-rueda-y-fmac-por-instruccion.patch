@@ -1,0 +1,1690 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index dbb85ab..936f2d3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -16,6 +16,14 @@
+ #include <limits>
+ #include <ps2_log.h>
+ 
++// The FMAC fast path computes the four lanes with SSE2. It does the same IEEE operations as the scalar code (float for
++// the value, double for the exact result that sets the flags), so the results are identical; it is only used where
++// long double is double (MSVC), the precision the scalar reference uses for the exact result.
++#if !defined(PS2_VU_FMAC_SCALAR) && (defined(_M_X64) || defined(_M_AMD64) || defined(__SSE2__))
++#include <emmintrin.h>
++#define PS2_VU_FMAC_SSE2 1
++#endif
++
+ namespace
+ {
+     // Trazas temporales de diagnóstico (F1 06): historial de los últimos pares ejecutados.
+@@ -40,19 +48,62 @@ namespace
+ 
+     // Pending-entry index of each interpreter, kept outside the class because ps2_vu1.h is included by the
+     // translated code. The runtime has one interpreter per unit (VU0 and VU1). Bit i of a mask is set while entry i
+-    // of that pipeline array is valid, and nextReady is the earliest readyCycle among every pending entry (FDIV
+-    // included), so commitReadyPipelines returns at once on the cycles where nothing completes and the queues find a
+-    // free slot without scanning. Entries are still visited in array order, as before.
++    // of that pipeline array is valid, so the queues find a free slot without scanning.
++    //
++    // Timing wheel: wheel[c % 64] has one bit per entry due at cycle c (layout below) and bit c % 64 of `occupied`
++    // says that slot is not empty. Every latency is below 64 cycles and the clock never jumps over a due cycle, so
++    // each entry is found exactly at its readyCycle, which is when the old scan of every pending entry applied it;
++    // within a cycle the entries are applied in the same order (pipeline by pipeline, by array slot). An entry whose
++    // readyCycle is later than the cycle being committed stays in its slot (never happens with the current
++    // latencies, but stays correct for any).
++    constexpr unsigned kDueFlags = 0u;   // 8 flag entries
++    constexpr unsigned kDueFdiv = 8u;    // the FDIV result
++    constexpr unsigned kDueEfu = 9u;     // 2 EFU entries
++    constexpr unsigned kDueStores = 11u; // 8 stores
++    constexpr unsigned kDueVf = 19u;     // 16 VF writes
++    constexpr unsigned kDueVi = 35u;     // 8 VI writes
++    constexpr unsigned kDueAcc = 43u;    // 8 ACC writes (up to bit 50)
++
+     struct PipelineIndex
+     {
+-        uint64_t nextReady = UINT64_MAX;
++        uint64_t occupied = 0u;
++        uint64_t wheel[64] = {};
+         uint32_t flags = 0u;
+         uint32_t efu = 0u;
+         uint32_t stores = 0u;
+         uint32_t vf = 0u;
+         uint32_t vi = 0u;
+         uint32_t acc = 0u;
++        // Pending VF writes of each register (bit = entry). A new write takes its lanes away from the older
++        // pending ones, so a commit applies its whole lane mask: the same as the old check that a lane's latest
++        // write sequence (m_vfLatestWrite / m_accLatestWrite) is the entry's own.
++        uint16_t vfByReg[32] = {};
+     };
++
++    // dst lanes in `laneMask` (x = bit 3) = src lanes, as raw 32-bit words.
++    inline void blendLanes(void *dst, const void *src, uint8_t laneMask)
++    {
++#if PS2_VU_FMAC_SSE2
++        alignas(16) static constexpr uint32_t kMasks[16][4] = {
++            {0, 0, 0, 0}, {0, 0, 0, ~0u}, {0, 0, ~0u, 0}, {0, 0, ~0u, ~0u},
++            {0, ~0u, 0, 0}, {0, ~0u, 0, ~0u}, {0, ~0u, ~0u, 0}, {0, ~0u, ~0u, ~0u},
++            {~0u, 0, 0, 0}, {~0u, 0, 0, ~0u}, {~0u, 0, ~0u, 0}, {~0u, 0, ~0u, ~0u},
++            {~0u, ~0u, 0, 0}, {~0u, ~0u, 0, ~0u}, {~0u, ~0u, ~0u, 0}, {~0u, ~0u, ~0u, ~0u}};
++        const __m128i mask = _mm_load_si128(reinterpret_cast<const __m128i *>(kMasks[laneMask & 0xFu]));
++        const __m128i oldValue = _mm_loadu_si128(static_cast<const __m128i *>(dst));
++        const __m128i newValue = _mm_loadu_si128(static_cast<const __m128i *>(src));
++        _mm_storeu_si128(static_cast<__m128i *>(dst),
++                         _mm_or_si128(_mm_and_si128(mask, newValue), _mm_andnot_si128(mask, oldValue)));
++#else
++        uint32_t words[4];
++        std::memcpy(words, dst, sizeof(words));
++        const uint32_t *source = static_cast<const uint32_t *>(src);
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((laneMask & (1u << (3u - component))) != 0u)
++                words[component] = source[component];
++        std::memcpy(dst, words, sizeof(words));
++#endif
++    }
+     PipelineIndex s_pipelineIndex[2];
+ 
+     inline PipelineIndex &pipelineIndexFor(VU1Interpreter::Unit unit)
+@@ -71,11 +122,701 @@ namespace
+         return slot;
+     }
+ 
+-    inline void noteReadyCycle(PipelineIndex &index, uint64_t readyCycle)
++    // Puts entry `bit` (wheel layout) in the slot of its ready cycle. An entry that is already due is applied by the
++    // next commit, at cycle + 1, like the old scan did (no current latency is 0).
++    inline void scheduleDue(PipelineIndex &index, uint64_t cycle, uint64_t readyCycle, unsigned bit)
++    {
++        const uint64_t due = readyCycle > cycle ? readyCycle : cycle + 1u;
++        const unsigned slot = static_cast<unsigned>(due & 63u);
++        index.wheel[slot] |= 1ull << bit;
++        index.occupied |= 1ull << slot;
++    }
++
++    // First cycle after `cycle` whose wheel slot has entries, or UINT64_MAX when nothing is pending.
++    inline uint64_t nextDueCycle(const PipelineIndex &index, uint64_t cycle)
++    {
++        if (index.occupied == 0u)
++            return UINT64_MAX;
++        const int start = static_cast<int>((cycle + 1u) & 63u);
++        return cycle + 1u + static_cast<uint64_t>(std::countr_zero(std::rotr(index.occupied, start)));
++    }
++
++    // Queues the flags of an FMAC operation (what updateFmacFlags does). False when the flag pipeline is full.
++    template <typename FlagEntries>
++    inline bool pushFmacFlags(FlagEntries &pipeline, PipelineIndex &index, uint64_t cycle, uint32_t latency,
++                              uint32_t mac, uint32_t status, uint32_t extraSticky)
++    {
++        const int slot = allocateSlot(index.flags, static_cast<uint32_t>(pipeline.size()));
++        if (slot < 0)
++            return false;
++        auto &entry = pipeline[static_cast<size_t>(slot)];
++        entry.valid = true;
++        entry.issueCycle = cycle;
++        entry.readyCycle = cycle + latency;
++        entry.mac = mac;
++        entry.status = status;
++        entry.extraSticky = extraSticky;
++        entry.clip = 0u;
++        entry.writesMac = true;
++        entry.writesStatus = true;
++        entry.writesSticky = false;
++        entry.writesClip = false;
++        scheduleDue(index, cycle, entry.readyCycle, kDueFlags + static_cast<unsigned>(slot));
++        return true;
++    }
++
++    // ---------------------------------------------------------------------------------------------------------
++    // FMAC operations with flags (ADD/SUB/MUL/MADD/MSUB/OPMSUB/OPMULA and their bc/q/i/ACC forms), decoded once
++    // per instruction and computed for the four lanes together. Same arithmetic as execUpper (float, rounded as
++    // the caller set) and as calculateFmacExactResult / calculateFmacProductSticky (long double), same flags as
++    // normalizeFmacExactResult / updateFmacFlags.
++    enum FmacKind : uint8_t
++    {
++        FmacNone = 0, // not one of these: execUpper
++        FmacAdd,
++        FmacSub,
++        FmacMul,
++        FmacMadd,
++        FmacMsub,
++        FmacOpmsub,
++        FmacOpmula
++    };
++
++    enum FmacSource : uint8_t
++    {
++        FmacSourceVt = 0, // vt lane by lane (crossed for OPMSUB/OPMULA)
++        FmacSourceBc,     // one vt lane for all
++        FmacSourceQ,
++        FmacSourceI
++    };
++
++    struct FmacOp
++    {
++        uint8_t kind = FmacNone;
++        uint8_t source = FmacSourceVt;
++        uint8_t bc = 0u;
++        bool toAcc = false;
++        uint8_t fs = 0u;
++        uint8_t ft = 0u;
++        uint8_t fd = 0u;
++        uint8_t dest = 0u;       // as encoded: x = bit 3
++        uint8_t components = 0u; // the same lanes as component bits: x = bit 0
++    };
++
++    constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE, 0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
++
++    FmacOp decodeFmacOp(uint32_t upper)
++    {
++        FmacOp op;
++        uint8_t selector = static_cast<uint8_t>(upper & 0x3Fu);
++        if (selector >= 0x3Cu)
++        {
++            selector = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++            op.toAcc = true;
++        }
++        else if (selector >= 0x30u)
++        {
++            return op;
++        }
++
++        uint8_t kind = FmacNone;
++        uint8_t source = FmacSourceVt;
++        if (selector <= 0x0Fu || (selector >= 0x18u && selector <= 0x1Bu))
++        {
++            static constexpr uint8_t kBcKinds[8] = {FmacAdd, FmacSub, FmacMadd, FmacMsub, FmacNone, FmacNone, FmacMul, FmacNone};
++            kind = kBcKinds[selector >> 2];
++            source = FmacSourceBc;
++            op.bc = static_cast<uint8_t>(selector & 3u);
++        }
++        else
++        {
++            switch (selector)
++            {
++            case 0x1Cu: kind = FmacMul; source = FmacSourceQ; break;
++            case 0x1Eu: kind = FmacMul; source = FmacSourceI; break;
++            case 0x20u: kind = FmacAdd; source = FmacSourceQ; break;
++            case 0x21u: kind = FmacMadd; source = FmacSourceQ; break;
++            case 0x22u: kind = FmacAdd; source = FmacSourceI; break;
++            case 0x23u: kind = FmacMadd; source = FmacSourceI; break;
++            case 0x24u: kind = FmacSub; source = FmacSourceQ; break;
++            case 0x25u: kind = FmacMsub; source = FmacSourceQ; break;
++            case 0x26u: kind = FmacSub; source = FmacSourceI; break;
++            case 0x27u: kind = FmacMsub; source = FmacSourceI; break;
++            case 0x28u: kind = FmacAdd; break;
++            case 0x29u: kind = FmacMadd; break;
++            case 0x2Au: kind = FmacMul; break;
++            case 0x2Cu: kind = FmacSub; break;
++            case 0x2Du: kind = FmacMsub; break;
++            case 0x2Eu: kind = op.toAcc ? FmacOpmula : FmacOpmsub; break;
++            default: break;
++            }
++        }
++        if (kind == FmacNone)
++            return FmacOp{};
++        op.kind = kind;
++        op.source = source;
++        op.fs = FS(upper);
++        op.ft = FT(upper);
++        op.fd = FD(upper);
++        op.dest = DEST(upper);
++        op.components = kReverse4[op.dest];
++        return op;
++    }
++
++    struct FmacResult
++    {
++        float value[4];
++        uint32_t mac;
++        uint32_t status;
++        uint32_t sticky;
++    };
++
++    // normalizeFmacExactResult, for a free function.
++    inline uint8_t fmacExactFlags(float &value, long double exactResult)
++    {
++        bool negative = exactResult < 0.0L;
++        if (exactResult == 0.0L)
++        {
++            const double asDouble = static_cast<double>(exactResult);
++            uint64_t bits = 0u;
++            std::memcpy(&bits, &asDouble, sizeof(bits));
++            negative = (bits >> 63) != 0u;
++        }
++        const long double magnitude = negative ? -exactResult : exactResult;
++        const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
++        const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
++        uint8_t flags = negative ? 0x2u : 0u;
++        uint32_t bits = negative ? 0x80000000u : 0u;
++        if (magnitude == 0.0L)
++        {
++            flags |= 0x1u;
++            std::memcpy(&value, &bits, sizeof(value));
++        }
++        else if (magnitude > maximum)
++        {
++            flags |= 0x8u;
++            bits |= 0x7F7FFFFFu;
++            std::memcpy(&value, &bits, sizeof(value));
++        }
++        else if (magnitude < minimum)
++        {
++            flags |= 0x5u;
++            std::memcpy(&value, &bits, sizeof(value));
++        }
++        return flags;
++    }
++
++    // Lane flags (Z, S, U, O in bits 0-3) to MAC bits and status, for the lanes in `components`.
++    inline void fmacFlagsFromLanes(const uint8_t laneFlags[4], uint8_t components, uint32_t &mac, uint32_t &status)
++    {
++        mac = 0u;
++        status = 0u;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((components & (1u << component)) == 0u)
++                continue;
++            const uint32_t lane = 1u << (3u - component);
++            const uint32_t flags = laneFlags[component];
++            if ((flags & 0x1u) != 0u)
++                mac |= lane;
++            if ((flags & 0x2u) != 0u)
++                mac |= lane << 4;
++            if ((flags & 0x4u) != 0u)
++                mac |= lane << 8;
++            if ((flags & 0x8u) != 0u)
++                mac |= lane << 12;
++            status |= flags;
++        }
++    }
++
++    // Scalar version: per lane, the same expressions as execUpper (value) and calculateFmacExactResult (exact).
++    // a, b, c are the normalized operands already arranged per lane (crossed for OPMSUB/OPMULA).
++    inline void fmacScalar(uint8_t kind, const float a[4], const float b[4], const float c[4], uint8_t components,
++                           FmacResult &out)
++    {
++        uint8_t laneFlags[4] = {};
++        uint32_t sticky = 0u;
++        const bool productSum = kind == FmacMadd || kind == FmacMsub || kind == FmacOpmsub;
++        const bool cross = kind == FmacOpmsub || kind == FmacOpmula;
++        for (uint32_t lane = 0; lane < 4u; ++lane)
++        {
++            const long double la = a[lane];
++            const long double lb = b[lane];
++            float value = 0.0f;
++            long double exact = 0.0L;
++            switch (kind)
++            {
++            case FmacAdd: value = a[lane] + b[lane]; exact = la + lb; break;
++            case FmacSub: value = a[lane] - b[lane]; exact = la - lb; break;
++            case FmacMul:
++            case FmacOpmula: value = a[lane] * b[lane]; exact = la * lb; break;
++            case FmacMadd: value = c[lane] + a[lane] * b[lane]; exact = static_cast<long double>(c[lane]) + la * lb; break;
++            default: value = c[lane] - a[lane] * b[lane]; exact = static_cast<long double>(c[lane]) - la * lb; break;
++            }
++            if (cross && lane == 3u)
++            {
++                value = 0.0f;
++                exact = 0.0L;
++            }
++            if ((components & (1u << lane)) == 0u)
++            {
++                out.value[lane] = value; // not written
++                continue;
++            }
++            laneFlags[lane] = fmacExactFlags(value, exact);
++            out.value[lane] = value;
++            if (productSum)
++            {
++                float product = a[lane] * b[lane];
++                sticky |= fmacExactFlags(product, la * lb) & 0xFu;
++            }
++        }
++        fmacFlagsFromLanes(laneFlags, components, out.mac, out.status);
++        out.sticky = sticky;
++    }
++
++#if PS2_VU_FMAC_SSE2
++    // vuNormalizeOperand on four lanes.
++    inline __m128 normalize4(__m128 value)
++    {
++        const __m128i bits = _mm_castps_si128(value);
++        const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        const __m128i exponent = _mm_and_si128(bits, exponentMask);
++        const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
++        const __m128i maxExponent = _mm_cmpeq_epi32(exponent, exponentMask);
++        __m128i result = _mm_andnot_si128(_mm_or_si128(zeroExponent, maxExponent), bits);
++        result = _mm_or_si128(result, _mm_and_si128(zeroExponent, sign));
++        result = _mm_or_si128(result, _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
++        return _mm_castsi128_ps(result);
++    }
++
++    // Classifies four exact results (two halves) as normalizeFmacExactResult does: sign bit, zero, below FLT_MIN
++    // (zero included) and above FLT_MAX, one bit per lane (x = bit 0). Exact results are always finite.
++    struct ExactClass
++    {
++        uint32_t sign;
++        uint32_t zero;
++        uint32_t small;
++        uint32_t big;
++    };
++
++    inline ExactClass classifyExact(__m128d low, __m128d high)
++    {
++        const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
++        const __m128d maximum = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
++        const __m128d minimum = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
++        const __m128d zero = _mm_setzero_pd();
++        const __m128d absLow = _mm_and_pd(low, absMask);
++        const __m128d absHigh = _mm_and_pd(high, absMask);
++        ExactClass c;
++        c.sign = static_cast<uint32_t>(_mm_movemask_pd(low) | (_mm_movemask_pd(high) << 2));
++        c.zero = static_cast<uint32_t>(_mm_movemask_pd(_mm_cmpeq_pd(absLow, zero)) |
++                                       (_mm_movemask_pd(_mm_cmpeq_pd(absHigh, zero)) << 2));
++        c.small = static_cast<uint32_t>(_mm_movemask_pd(_mm_cmplt_pd(absLow, minimum)) |
++                                        (_mm_movemask_pd(_mm_cmplt_pd(absHigh, minimum)) << 2));
++        c.big = static_cast<uint32_t>(_mm_movemask_pd(_mm_cmpgt_pd(absLow, maximum)) |
++                                      (_mm_movemask_pd(_mm_cmpgt_pd(absHigh, maximum)) << 2));
++        return c;
++    }
++
++    template <uint8_t Kind>
++    inline void fmacSse2(__m128 a, __m128 b, __m128 c, uint8_t components, FmacResult &out)
++    {
++        const __m128d aLow = _mm_cvtps_pd(a);
++        const __m128d aHigh = _mm_cvtps_pd(_mm_movehl_ps(a, a));
++        const __m128d bLow = _mm_cvtps_pd(b);
++        const __m128d bHigh = _mm_cvtps_pd(_mm_movehl_ps(b, b));
++        __m128 value;
++        __m128d exactLow;
++        __m128d exactHigh;
++        __m128d productLow = _mm_setzero_pd();
++        __m128d productHigh = _mm_setzero_pd();
++        if constexpr (Kind == FmacAdd)
++        {
++            value = _mm_add_ps(a, b);
++            exactLow = _mm_add_pd(aLow, bLow);
++            exactHigh = _mm_add_pd(aHigh, bHigh);
++        }
++        else if constexpr (Kind == FmacSub)
++        {
++            value = _mm_sub_ps(a, b);
++            exactLow = _mm_sub_pd(aLow, bLow);
++            exactHigh = _mm_sub_pd(aHigh, bHigh);
++        }
++        else if constexpr (Kind == FmacMul || Kind == FmacOpmula)
++        {
++            value = _mm_mul_ps(a, b);
++            exactLow = _mm_mul_pd(aLow, bLow);
++            exactHigh = _mm_mul_pd(aHigh, bHigh);
++        }
++        else
++        {
++            productLow = _mm_mul_pd(aLow, bLow);
++            productHigh = _mm_mul_pd(aHigh, bHigh);
++            const __m128d cLow = _mm_cvtps_pd(c);
++            const __m128d cHigh = _mm_cvtps_pd(_mm_movehl_ps(c, c));
++            if constexpr (Kind == FmacMadd)
++            {
++                value = _mm_add_ps(c, _mm_mul_ps(a, b));
++                exactLow = _mm_add_pd(cLow, productLow);
++                exactHigh = _mm_add_pd(cHigh, productHigh);
++            }
++            else
++            {
++                value = _mm_sub_ps(c, _mm_mul_ps(a, b));
++                exactLow = _mm_sub_pd(cLow, productLow);
++                exactHigh = _mm_sub_pd(cHigh, productHigh);
++            }
++        }
++        if constexpr (Kind == FmacOpmsub || Kind == FmacOpmula)
++        {
++            // w is 0 (an exact +0).
++            value = _mm_and_ps(value, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
++            exactHigh = _mm_unpacklo_pd(exactHigh, _mm_setzero_pd());
++        }
++
++        const ExactClass r = classifyExact(exactLow, exactHigh);
++        const uint32_t z = r.small & components; // zero, or underflow (which also sets Z)
++        const uint32_t s = r.sign & components;
++        const uint32_t u = r.small & ~r.zero & components;
++        const uint32_t o = r.big & components;
++        out.mac = static_cast<uint32_t>(kReverse4[z]) | (static_cast<uint32_t>(kReverse4[s]) << 4) |
++                  (static_cast<uint32_t>(kReverse4[u]) << 8) | (static_cast<uint32_t>(kReverse4[o]) << 12);
++        out.status = (z != 0u ? 0x1u : 0u) | (s != 0u ? 0x2u : 0u) | (u != 0u ? 0x4u : 0u) | (o != 0u ? 0x8u : 0u);
++        _mm_storeu_ps(out.value, value);
++        // Zero, underflow and overflow replace the value with a signed zero or the signed maximum.
++        for (uint32_t fix = (r.small | r.big) & components; fix != 0u; fix &= fix - 1u)
++        {
++            const uint32_t lane = static_cast<uint32_t>(std::countr_zero(fix));
++            uint32_t bits = ((r.sign >> lane) & 1u) != 0u ? 0x80000000u : 0u;
++            if (((r.big >> lane) & 1u) != 0u)
++                bits |= 0x7F7FFFFFu;
++            std::memcpy(&out.value[lane], &bits, sizeof(bits));
++        }
++
++        out.sticky = 0u;
++        if constexpr (Kind == FmacMadd || Kind == FmacMsub || Kind == FmacOpmsub)
++        {
++            // Every product condition goes to the sticky flags.
++            const ExactClass p = classifyExact(productLow, productHigh);
++            const uint32_t pz = p.small & components;
++            const uint32_t ps = p.sign & components;
++            const uint32_t pu = p.small & ~p.zero & components;
++            const uint32_t po = p.big & components;
++            out.sticky = (pz != 0u ? 0x1u : 0u) | (ps != 0u ? 0x2u : 0u) | (pu != 0u ? 0x4u : 0u) | (po != 0u ? 0x8u : 0u);
++        }
++    }
++#endif
++
++    // The whole FMAC operation: operands from the state, lanes arranged, kernel.
++#if PS2_VU_FMAC_SSE2
++    inline void runFmacOpSse2(const FmacOp &op, const float (*vf)[4], const float *acc, float q, float i,
++                              FmacResult &out)
++    {
++        __m128 a = normalize4(_mm_loadu_ps(vf[op.fs]));
++        __m128 b;
++        switch (op.source)
++        {
++        case FmacSourceBc: b = _mm_set1_ps(vuNormalizeOperand(vf[op.ft][op.bc])); break;
++        case FmacSourceQ: b = _mm_set1_ps(vuNormalizeOperand(q)); break;
++        case FmacSourceI: b = _mm_set1_ps(vuNormalizeOperand(i)); break;
++        default: b = normalize4(_mm_loadu_ps(vf[op.ft])); break;
++        }
++        __m128 c = _mm_setzero_ps();
++        if (op.kind == FmacMadd || op.kind == FmacMsub || op.kind == FmacOpmsub)
++            c = normalize4(_mm_loadu_ps(acc));
++        if (op.kind == FmacOpmsub || op.kind == FmacOpmula)
++        {
++            // x = ys * zt, y = zs * xt, z = xs * yt; the w products (used only by OPMSUB's sticky flags) are ws * wt.
++            a = _mm_shuffle_ps(a, a, _MM_SHUFFLE(3, 0, 2, 1));
++            b = _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2));
++        }
++        switch (op.kind)
++        {
++        case FmacAdd: fmacSse2<FmacAdd>(a, b, c, op.components, out); break;
++        case FmacSub: fmacSse2<FmacSub>(a, b, c, op.components, out); break;
++        case FmacMul: fmacSse2<FmacMul>(a, b, c, op.components, out); break;
++        case FmacMadd: fmacSse2<FmacMadd>(a, b, c, op.components, out); break;
++        case FmacMsub: fmacSse2<FmacMsub>(a, b, c, op.components, out); break;
++        case FmacOpmsub: fmacSse2<FmacOpmsub>(a, b, c, op.components, out); break;
++        default: fmacSse2<FmacOpmula>(a, b, c, op.components, out); break;
++        }
++    }
++#endif
++
++    inline void runFmacOpScalar(const FmacOp &op, const float (*vf)[4], const float *acc, float q, float i,
++                                FmacResult &out)
++    {
++        float a[4];
++        float b[4];
++        float c[4] = {};
++        for (uint32_t lane = 0; lane < 4u; ++lane)
++        {
++            a[lane] = vuNormalizeOperand(vf[op.fs][lane]);
++            switch (op.source)
++            {
++            case FmacSourceBc: b[lane] = vuNormalizeOperand(vf[op.ft][op.bc]); break;
++            case FmacSourceQ: b[lane] = vuNormalizeOperand(q); break;
++            case FmacSourceI: b[lane] = vuNormalizeOperand(i); break;
++            default: b[lane] = vuNormalizeOperand(vf[op.ft][lane]); break;
++            }
++            c[lane] = vuNormalizeOperand(acc[lane]);
++        }
++        if (op.kind == FmacOpmsub || op.kind == FmacOpmula)
++        {
++            const float as[4] = {a[1], a[2], a[0], a[3]};
++            const float bs[4] = {b[2], b[0], b[1], b[3]};
++            std::memcpy(a, as, sizeof(a));
++            std::memcpy(b, bs, sizeof(b));
++        }
++        fmacScalar(op.kind, a, b, c, op.components, out);
++    }
++
++    inline void runFmacOp(const FmacOp &op, const float (*vf)[4], const float *acc, float q, float i, FmacResult &out)
++    {
++#if PS2_VU_FMAC_SSE2
++        if constexpr (sizeof(long double) == sizeof(double))
++            runFmacOpSse2(op, vf, acc, q, i, out);
++        else
++            runFmacOpScalar(op, vf, acc, q, i, out);
++#else
++        runFmacOpScalar(op, vf, acc, q, i, out);
++#endif
++    }
++
++    // Upper operations without flags, computed as execUpper does: MAX/MINI (bit compares of the raw values),
++    // ITOF/FTOI and ABS. They write `target`: fd for MAX/MINI, ft for the others.
++    enum SimpleKind : uint8_t
++    {
++        SimpleNone = 0,
++        SimpleMaxBc,
++        SimpleMiniBc,
++        SimpleMaxI,
++        SimpleMiniI,
++        SimpleMax,
++        SimpleMini,
++        SimpleItof,
++        SimpleFtoi,
++        SimpleAbs
++    };
++
++    struct SimpleOp
++    {
++        uint8_t kind = SimpleNone;
++        uint8_t param = 0u; // MAXbc/MINIbc: the lane; ITOF/FTOI: 0-3 for 0, 4, 12 or 15 fraction bits
++        uint8_t fs = 0u;
++        uint8_t ft = 0u;
++        uint8_t target = 0u;
++    };
++
++    SimpleOp decodeSimpleOp(uint32_t upper)
++    {
++        SimpleOp s;
++        s.fs = FS(upper);
++        s.ft = FT(upper);
++        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++        if (op < 0x3Cu)
++        {
++            s.target = FD(upper);
++            if (op >= 0x10u && op <= 0x13u)
++                s.kind = SimpleMaxBc;
++            else if (op >= 0x14u && op <= 0x17u)
++                s.kind = SimpleMiniBc;
++            else if (op == 0x1Du)
++                s.kind = SimpleMaxI;
++            else if (op == 0x1Fu)
++                s.kind = SimpleMiniI;
++            else if (op == 0x2Bu)
++                s.kind = SimpleMax;
++            else if (op == 0x2Fu)
++                s.kind = SimpleMini;
++            s.param = static_cast<uint8_t>(op & 3u);
++            return s;
++        }
++        const uint8_t selector = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++        s.target = FT(upper);
++        if (selector >= 0x10u && selector <= 0x13u)
++            s.kind = SimpleItof;
++        else if (selector >= 0x14u && selector <= 0x17u)
++            s.kind = SimpleFtoi;
++        else if (selector == 0x1Du)
++            s.kind = SimpleAbs;
++        s.param = static_cast<uint8_t>(selector & 3u);
++        return s;
++    }
++
++    inline void runSimpleOp(const SimpleOp &s, const float (*vf)[4], float i, float out[4])
++    {
++        const float *vs = vf[s.fs];
++        switch (s.kind)
++        {
++        case SimpleMaxBc:
++        case SimpleMiniBc:
++        case SimpleMaxI:
++        case SimpleMiniI:
++        {
++            const float other = (s.kind == SimpleMaxI || s.kind == SimpleMiniI) ? i : vf[s.ft][s.param];
++            const bool max = s.kind == SimpleMaxBc || s.kind == SimpleMaxI;
++            for (uint32_t c = 0; c < 4u; ++c)
++                out[c] = max ? vuMaxBits(vs[c], other) : vuMinBits(vs[c], other);
++            break;
++        }
++        case SimpleMax:
++            for (uint32_t c = 0; c < 4u; ++c)
++                out[c] = vuMaxBits(vs[c], vf[s.ft][c]);
++            break;
++        case SimpleMini:
++            for (uint32_t c = 0; c < 4u; ++c)
++                out[c] = vuMinBits(vs[c], vf[s.ft][c]);
++            break;
++        case SimpleItof:
++        {
++            static constexpr float kDivisors[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++            for (uint32_t c = 0; c < 4u; ++c)
++            {
++                int32_t iv;
++                std::memcpy(&iv, &vs[c], 4);
++                out[c] = s.param == 0u ? static_cast<float>(iv) : static_cast<float>(iv) / kDivisors[s.param];
++            }
++            break;
++        }
++        case SimpleFtoi:
++        {
++            static constexpr float kScales[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++            for (uint32_t c = 0; c < 4u; ++c)
++            {
++                const int32_t iv = vuFloatToInt(vuNormalizeOperand(vs[c]), kScales[s.param]);
++                std::memcpy(&out[c], &iv, 4);
++            }
++            break;
++        }
++        default: // SimpleAbs
++            for (uint32_t c = 0; c < 4u; ++c)
++                out[c] = std::fabs(vuNormalizeOperand(vs[c]));
++            break;
++        }
++    }
++
++    // How run() executes the upper instruction of a pair.
++    enum UpperPath : uint8_t
+     {
+-        if (readyCycle < index.nextReady)
+-            index.nextReady = readyCycle;
++        UpperSlow = 0, // execUpper, writing the register and restoring it around the lower instruction
++        UpperNop,
++        UpperFmac,     // FMAC operation with flags, straight to its pending write
++        UpperSimple,   // SimpleOp, straight to its pending write
++        UpperClip      // CLIP judgement, queued before the lower instruction runs
++    };
++
++    // ---------------------------------------------------------------------------------------------------------
++    // Per-pair plan, built with the decode cache: the stall check as a flat list of (register, lane) reads, the
++    // ready-cycle updates of the pair's writes and the FMAC operation of the upper instruction.
++    struct PairPlan
++    {
++        FmacOp fmac;
++        SimpleOp simple; // also the registers of CLIP
++        // UpperFmac and UpperSimple only when the destination is ACC, a VF register other than vf0, or nothing:
++        // execUpper writes vf0 at once (the lower instruction sees it until vf0 is reset after the pair).
++        uint8_t upperPath = UpperSlow;
++        // The lower instruction waits for FDIV/EFU/XGKICK (see calculatePairReadyCycle).
++        bool lowerWaits = false;
++        uint8_t vfReadCount = 0u;
++        uint8_t accReadCount = 0u;
++        uint8_t upperWriteCount = 0u;
++        uint8_t lowerWriteCount = 0u;
++        uint8_t accWriteCount = 0u;
++        uint8_t upperLatency = 0u;
++        uint8_t lowerLatency = 0u;
++        uint8_t viLatency = 0u;
++        uint16_t viRead = 0u;
++        uint16_t viWrite = 0u;
++        uint8_t vfRead[16] = {};     // register * 4 + component
++        uint8_t accRead[4] = {};     // components
++        uint8_t upperWrite[4] = {};  // register * 4 + component
++        uint8_t lowerWrite[4] = {};  // register * 4 + component
++        uint8_t accWrite[4] = {};    // components
++    };
++
++    // `lowerWaits` comes from the caller, which can name the (private) pipeline kinds.
++    template <typename Decoded>
++    void buildPairPlan(const Decoded &decoded, bool lowerWaits, PairPlan &plan)
++    {
++        plan = PairPlan{};
++        plan.lowerWaits = lowerWaits;
++        for (const auto *usage : {&decoded.upperUsage, &decoded.lowerUsage})
++        {
++            for (uint32_t index = 0; index < usage->vfReadCount; ++index)
++            {
++                const auto &access = usage->vfRead[index];
++                if (access.reg == 0u) // vf0 never has a pending write
++                    continue;
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    if ((access.lanes & (1u << (3u - component))) != 0u && plan.vfReadCount < 16u)
++                        plan.vfRead[plan.vfReadCount++] = static_cast<uint8_t>(access.reg * 4u + component);
++                }
++            }
++            plan.viRead = static_cast<uint16_t>(plan.viRead | (usage->viRead & 0xFFFEu));
++            for (uint32_t component = 0; component < 4u; ++component)
++            {
++                if ((usage->accRead & (1u << (3u - component))) != 0u && plan.accReadCount < 4u)
++                    plan.accRead[plan.accReadCount++] = static_cast<uint8_t>(component);
++            }
++        }
++        const auto &lower = decoded.lowerUsage;
++        const auto &upper = decoded.upperUsage;
++        if (lower.vfWrite.reg != 0u && decoded.suppressedLowerVf != lower.vfWrite.reg)
++        {
++            plan.lowerLatency = lower.vfLatency != 0u ? lower.vfLatency : lower.latency;
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((lower.vfWrite.lanes & (1u << (3u - component))) != 0u)
++                    plan.lowerWrite[plan.lowerWriteCount++] = static_cast<uint8_t>(lower.vfWrite.reg * 4u + component);
++        }
++        if (upper.vfWrite.reg != 0u)
++        {
++            plan.upperLatency = upper.vfLatency != 0u ? upper.vfLatency : upper.latency;
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((upper.vfWrite.lanes & (1u << (3u - component))) != 0u)
++                    plan.upperWrite[plan.upperWriteCount++] = static_cast<uint8_t>(upper.vfWrite.reg * 4u + component);
++        }
++        plan.viWrite = static_cast<uint16_t>(lower.viWrite & 0xFFFEu);
++        plan.viLatency = lower.viLatency != 0u ? lower.viLatency : lower.latency;
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((upper.accWrite & (1u << (3u - component))) != 0u)
++                plan.accWrite[plan.accWriteCount++] = static_cast<uint8_t>(component);
++
++        const uint32_t upperInstruction = decoded.upper;
++        const uint8_t op = static_cast<uint8_t>(upperInstruction & 0x3Fu);
++        const uint8_t selector = static_cast<uint8_t>((upperInstruction & 3u) | ((upperInstruction >> 4) & 0x7Cu));
++        plan.fmac = decodeFmacOp(upperInstruction);
++        plan.simple = decodeSimpleOp(upperInstruction);
++        if (plan.fmac.kind != FmacNone)
++        {
++            if (plan.fmac.toAcc || plan.fmac.fd != 0u || plan.fmac.dest == 0u)
++                plan.upperPath = UpperFmac;
++        }
++        else if (op >= 0x3Cu && (selector == 0x2Fu || selector == 0x30u))
++        {
++            plan.upperPath = UpperNop;
++        }
++        else if (op >= 0x3Cu && selector == 0x1Fu)
++        {
++            plan.upperPath = UpperClip;
++        }
++        else if (plan.simple.kind != SimpleNone && (plan.simple.target != 0u || DEST(upperInstruction) == 0u))
++        {
++            plan.upperPath = UpperSimple;
++        }
+     }
++
++    // Plans of the decode cache of each unit (same index). `owner` is the interpreter whose current cache they were
++    // built from; rebuilding the cache clears it.
++    struct PlanTable
++    {
++        const void *owner = nullptr;
++        PairPlan plans[0x4000u / 8u];
++    };
++    PlanTable s_planTables[2];
+ }
+ 
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+@@ -122,14 +863,21 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ void VU1Interpreter::resetScheduler()
+ {
+-    m_flagPipeline = {};
++    // The flag, store, VF, VI and ACC entries are only reached through the masks of PipelineIndex and are written
++    // whole when queued, so clearing the masks empties them (FDIV and EFU entries are read by their valid flag).
+     m_fdiv = {};
+     m_efu = {};
+-    m_storePipeline = {};
+-    m_vfWritePipeline = {};
+-    m_viWritePipeline = {};
+-    m_accWritePipeline = {};
+-    pipelineIndexFor(m_unit) = {};
++    PipelineIndex &index = pipelineIndexFor(m_unit);
++    for (uint64_t occupied = index.occupied; occupied != 0u; occupied &= occupied - 1u)
++        index.wheel[std::countr_zero(occupied)] = 0u;
++    index.occupied = 0u;
++    index.flags = 0u;
++    index.efu = 0u;
++    index.stores = 0u;
++    index.vf = 0u;
++    index.vi = 0u;
++    index.acc = 0u;
++    std::memset(index.vfByReg, 0, sizeof(index.vfByReg));
+     // The packet buffer (64 KB) is always filled before it is read: clearing it on every run was a large part of
+     // the cost of short microprograms.
+     m_xgkick.sourceAddress = 0u;
+@@ -143,9 +891,8 @@ void VU1Interpreter::resetScheduler()
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+-    m_vfLatestWrite = {};
++    // m_vfLatestWrite and m_accLatestWrite are no longer used (see PipelineIndex::vfByReg).
+     m_viLatestWrite = {};
+-    m_accLatestWrite = {};
+     m_nextWriteSequence = 0;
+     m_efuResourceReady = 0;
+     m_workingClip = m_state.clip;
+@@ -576,27 +1323,8 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+         status |= flags;
+     }
+ 
+-    PipelineIndex &index = pipelineIndexFor(m_unit);
+-    const int slot = allocateSlot(index.flags, kMaxFlagEntries);
+-    if (slot < 0)
+-    {
++    if (!pushFmacFlags(m_flagPipeline, pipelineIndexFor(m_unit), m_cycle, kFmacLatency, mac, status, extraSticky))
+         reportReservedInstruction(true, 0xFFFFFFFFu);
+-        return;
+-    }
+-
+-    FlagPipelineEntry *entry = &m_flagPipeline[static_cast<size_t>(slot)];
+-    entry->valid = true;
+-    entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency;
+-    entry->mac = mac;
+-    entry->status = status;
+-    entry->extraSticky = extraSticky;
+-    entry->clip = 0u;
+-    entry->writesMac = true;
+-    entry->writesStatus = true;
+-    entry->writesSticky = false;
+-    entry->writesClip = false;
+-    noteReadyCycle(index, entry->readyCycle);
+ }
+ 
+ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+@@ -643,7 +1371,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+     entry.writesStatus = false;
+     entry.writesSticky = true;
+     entry.writesClip = false;
+-    noteReadyCycle(index, entry.readyCycle);
++    scheduleDue(index, m_cycle, entry.readyCycle, kDueFlags + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueClip(uint32_t clip)
+@@ -668,7 +1396,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+     entry.writesStatus = false;
+     entry.writesSticky = false;
+     entry.writesClip = true;
+-    noteReadyCycle(index, entry.readyCycle);
++    scheduleDue(index, m_cycle, entry.readyCycle, kDueFlags + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -699,7 +1427,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+     entry.writesStatus = false;
+     entry.writesSticky = false;
+     entry.writesClip = true;
+-    noteReadyCycle(index, entry.readyCycle);
++    scheduleDue(index, m_cycle, entry.readyCycle, kDueFlags + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+@@ -710,7 +1438,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     m_fdiv.readyCycle = m_cycle + latency;
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+-    noteReadyCycle(pipelineIndexFor(m_unit), m_fdiv.readyCycle);
++    scheduleDue(pipelineIndexFor(m_unit), m_cycle, m_fdiv.readyCycle, kDueFdiv);
+ }
+ 
+ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -730,7 +1458,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+     entry.value = value;
+     // EFU throughput is one cycle shorter than result visibility.
+     m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+-    noteReadyCycle(index, entry.readyCycle);
++    scheduleDue(index, m_cycle, entry.readyCycle, kDueEfu + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+@@ -748,7 +1476,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+     store.address = address;
+     store.laneMask = laneMask;
+     std::copy(words, words + 4, store.words.begin());
+-    noteReadyCycle(index, store.readyCycle);
++    scheduleDue(index, m_cycle, store.readyCycle, kDueStores + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -769,13 +1497,12 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+     write.sequence = ++m_nextWriteSequence;
+     write.reg = reg;
+     write.laneMask = laneMask;
+-    std::copy(value, value + 4, write.value.begin());
+-    for (uint32_t component = 0; component < 4u; ++component)
+-    {
+-        if ((laneMask & laneForComponent(component)) != 0u)
+-            m_vfLatestWrite[reg][component] = write.sequence;
+-    }
+-    noteReadyCycle(index, write.readyCycle);
++    std::memcpy(write.value.data(), value, sizeof(float) * 4u);
++    // Older pending writes of these lanes will not be applied (see PipelineIndex::vfByReg).
++    for (uint32_t older = index.vfByReg[reg]; older != 0u; older &= older - 1u)
++        m_vfWritePipeline[static_cast<size_t>(std::countr_zero(older))].laneMask &= static_cast<uint8_t>(~laneMask);
++    index.vfByReg[reg] = static_cast<uint16_t>(index.vfByReg[reg] | (1u << slot));
++    scheduleDue(index, m_cycle, write.readyCycle, kDueVf + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -796,7 +1523,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+     write.reg = reg;
+     write.value = value;
+     m_viLatestWrite[reg] = write.sequence;
+-    noteReadyCycle(index, write.readyCycle);
++    scheduleDue(index, m_cycle, write.readyCycle, kDueVi + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency)
+@@ -804,6 +1531,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+     if (laneMask == 0u)
+         return;
+     PipelineIndex &index = pipelineIndexFor(m_unit);
++    const uint32_t older = index.acc;
+     const int slot = allocateSlot(index.acc, kMaxPendingAccWrites);
+     if (slot < 0)
+     {
+@@ -815,29 +1543,31 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+     write.readyCycle = m_cycle + latency;
+     write.sequence = ++m_nextWriteSequence;
+     write.laneMask = laneMask;
+-    std::copy(value, value + 4, write.value.begin());
+-    for (uint32_t component = 0; component < 4u; ++component)
+-    {
+-        if ((laneMask & laneForComponent(component)) != 0u)
+-            m_accLatestWrite[component] = write.sequence;
+-    }
+-    noteReadyCycle(index, write.readyCycle);
++    std::memcpy(write.value.data(), value, sizeof(float) * 4u);
++    // Older pending writes of these lanes will not be applied (as with VF, see PipelineIndex::vfByReg).
++    for (uint32_t mask = older; mask != 0u; mask &= mask - 1u)
++        m_accWritePipeline[static_cast<size_t>(std::countr_zero(mask))].laneMask &= static_cast<uint8_t>(~laneMask);
++    scheduleDue(index, m_cycle, write.readyCycle, kDueAcc + static_cast<unsigned>(slot));
+ }
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+     PipelineIndex &index = pipelineIndexFor(m_unit);
+-    if (m_cycle < index.nextReady)
++    const unsigned wheelSlot = static_cast<unsigned>(m_cycle & 63u);
++    if (((index.occupied >> wheelSlot) & 1u) == 0u)
+         return;
+-    uint64_t nextReady = UINT64_MAX;
++    const uint64_t due = index.wheel[wheelSlot];
++    uint64_t kept = 0u; // entries of this wheel slot that are due on a later lap
+ 
+-    for (uint32_t mask = index.flags; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueFlags) & 0xFFu; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.flags >> slot) & 1u) == 0u)
++            continue;
+         FlagPipelineEntry &entry = m_flagPipeline[slot];
+         if (entry.readyCycle > m_cycle)
+         {
+-            nextReady = std::min(nextReady, entry.readyCycle);
++            kept |= 1ull << (kDueFlags + slot);
+             continue;
+         }
+ 
+@@ -858,7 +1588,8 @@ void VU1Interpreter::commitReadyPipelines()
+         index.flags &= ~(1u << slot);
+     }
+ 
+-    if (m_fdiv.valid)
++    // A DIV that replaced a pending one leaves the old bit behind: only the slot of the current one counts.
++    if (((due >> kDueFdiv) & 1u) != 0u && m_fdiv.valid)
+     {
+         if (m_fdiv.readyCycle <= m_cycle)
+         {
+@@ -867,15 +1598,17 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+             m_fdiv = {};
+         }
+-        else
++        else if ((m_fdiv.readyCycle & 63u) == wheelSlot)
+         {
+-            nextReady = std::min(nextReady, m_fdiv.readyCycle);
++            kept |= 1ull << kDueFdiv;
+         }
+     }
+ 
+-    for (uint32_t mask = index.efu; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueEfu) & 0x3u; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.efu >> slot) & 1u) == 0u)
++            continue;
+         ScalarPipelineEntry &entry = m_efu[slot];
+         if (entry.readyCycle <= m_cycle)
+         {
+@@ -885,62 +1618,53 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         else
+         {
+-            nextReady = std::min(nextReady, entry.readyCycle);
++            kept |= 1ull << (kDueEfu + slot);
+         }
+     }
+ 
+-    for (uint32_t mask = index.stores; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueStores) & 0xFFu; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.stores >> slot) & 1u) == 0u)
++            continue;
+         PendingStore &store = m_storePipeline[slot];
+         if (store.readyCycle > m_cycle)
+         {
+-            nextReady = std::min(nextReady, store.readyCycle);
++            kept |= 1ull << (kDueStores + slot);
+             continue;
+         }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+-        {
+-            uint32_t oldWords[4]{};
+-            std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                if ((store.laneMask & laneForComponent(component)) != 0u)
+-                    oldWords[component] = store.words[component];
+-            }
+-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+-        }
++            blendLanes(m_activeVuData + store.address, store.words.data(), store.laneMask);
+         store.valid = false;
+         index.stores &= ~(1u << slot);
+     }
+ 
+-    for (uint32_t mask = index.vf; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueVf) & 0xFFFFu; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.vf >> slot) & 1u) == 0u)
++            continue;
+         PendingVfWrite &write = m_vfWritePipeline[slot];
+         if (write.readyCycle > m_cycle)
+         {
+-            nextReady = std::min(nextReady, write.readyCycle);
++            kept |= 1ull << (kDueVf + slot);
+             continue;
+         }
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((write.laneMask & laneForComponent(component)) != 0u &&
+-                m_vfLatestWrite[write.reg][component] == write.sequence)
+-            {
+-                m_state.vf[write.reg][component] = write.value[component];
+-            }
+-        }
++        blendLanes(m_state.vf[write.reg], write.value.data(), write.laneMask);
+         write.valid = false;
+         index.vf &= ~(1u << slot);
++        index.vfByReg[write.reg] = static_cast<uint16_t>(index.vfByReg[write.reg] & ~(1u << slot));
+     }
+ 
+-    for (uint32_t mask = index.vi; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueVi) & 0xFFu; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.vi >> slot) & 1u) == 0u)
++            continue;
+         PendingViWrite &write = m_viWritePipeline[slot];
+         if (write.readyCycle > m_cycle)
+         {
+-            nextReady = std::min(nextReady, write.readyCycle);
++            kept |= 1ull << (kDueVi + slot);
+             continue;
+         }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+@@ -949,28 +1673,25 @@ void VU1Interpreter::commitReadyPipelines()
+         index.vi &= ~(1u << slot);
+     }
+ 
+-    for (uint32_t mask = index.acc; mask != 0u; mask &= mask - 1u)
++    for (uint32_t mask = static_cast<uint32_t>(due >> kDueAcc) & 0xFFu; mask != 0u; mask &= mask - 1u)
+     {
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(mask));
++        if (((index.acc >> slot) & 1u) == 0u)
++            continue;
+         PendingAccWrite &write = m_accWritePipeline[slot];
+         if (write.readyCycle > m_cycle)
+         {
+-            nextReady = std::min(nextReady, write.readyCycle);
++            kept |= 1ull << (kDueAcc + slot);
+             continue;
+         }
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((write.laneMask & laneForComponent(component)) != 0u &&
+-                m_accLatestWrite[component] == write.sequence)
+-            {
+-                m_state.acc[component] = write.value[component];
+-            }
+-        }
++        blendLanes(m_state.acc, write.value.data(), write.laneMask);
+         write.valid = false;
+         index.acc &= ~(1u << slot);
+     }
+ 
+-    index.nextReady = nextReady;
++    index.wheel[wheelSlot] = kept;
++    if (kept == 0u)
++        index.occupied &= ~(1ull << wheelSlot);
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -1090,7 +1811,8 @@ void VU1Interpreter::advanceOneCycle()
+     // LSU commits become visible at the cycle boundary before PATH1 consumes
+     // its next qword from VU memory.
+     commitReadyPipelines();
+-    progressXgkick();
++    if (m_xgkick.active)
++        progressXgkick();
+ }
+ 
+ void VU1Interpreter::advanceTo(uint64_t targetCycle)
+@@ -1101,7 +1823,7 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
+         // cycle before it (or before the target); advanceOneCycle then commits exactly as stepping would.
+         if (!m_xgkick.active)
+         {
+-            const uint64_t landing = std::min(targetCycle, pipelineIndexFor(m_unit).nextReady);
++            const uint64_t landing = std::min(targetCycle, nextDueCycle(pipelineIndexFor(m_unit), m_cycle));
+             if (landing > m_cycle + 1u)
+                 m_cycle = landing - 1u;
+         }
+@@ -1123,7 +1845,7 @@ void VU1Interpreter::flushPipelines()
+     {
+         if (!m_xgkick.active)
+         {
+-            const uint64_t nextReady = pipelineIndexFor(m_unit).nextReady;
++            const uint64_t nextReady = nextDueCycle(pipelineIndexFor(m_unit), m_cycle);
+             if (nextReady != UINT64_MAX && nextReady > m_cycle + 1u)
+                 m_cycle = nextReady - 1u;
+         }
+@@ -1689,6 +2411,8 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     m_cachedCodeSize = codeSize;
+     m_cachedCodeGeneration = generation;
+     m_decodedCodeCacheValid = true;
++    // The pair plans follow the cache: run() rebuilds them before using them.
++    s_planTables[m_unit == Unit::VU1 ? 1 : 0].owner = nullptr;
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
+@@ -1838,9 +2562,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             }
+         }
+     }
+-    // Pairs of tracked micro memory come from the decode cache. Validate it once: nothing can rewrite micro memory
+-    // while the program runs (the VIF only uploads between runs).
++    // Pairs of tracked micro memory come from the decode cache, with their plans. Validate both once: nothing can
++    // rewrite micro memory while the program runs (the VIF only uploads between runs).
++    static_assert(kMaxDecodedPairs == sizeof(PlanTable::plans) / sizeof(PairPlan), "one plan per cached pair");
++    const auto lowerWaits = [](const InstructionUsage &usage)
++    {
++        // The waits of calculatePairReadyCycle that are not register reads.
++        return usage.pipeline == PipelineFdiv || usage.pipeline == PipelineEfu ||
++               usage.pipeline == PipelineXgkick || usage.waitQ || usage.waitP;
++    };
+     const DecodedInstructionPair *decodedCache = nullptr;
++    const PairPlan *planCache = nullptr;
+     uint32_t decodedCount = 0u;
+     if (memory != nullptr &&
+         ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
+@@ -1857,8 +2589,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         decodedCache = m_decodedCodeCache.data();
+         decodedCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
++        PlanTable &table = s_planTables[m_unit == Unit::VU1 ? 1 : 0];
++        if (table.owner != this)
++        {
++            for (uint32_t pairIndex = 0; pairIndex < decodedCount; ++pairIndex)
++                buildPairPlan(decodedCache[pairIndex], lowerWaits(decodedCache[pairIndex].lowerUsage),
++                              table.plans[pairIndex]);
++            table.owner = this;
++        }
++        planCache = table.plans;
+     }
+     DecodedInstructionPair uncachedPair;
++    PairPlan uncachedPlan;
+ 
+     // Diagnostics: the history keeps pc and instructions of the last pairs (and the VI registers with
+     // F1_VU1_HISTORIAL_VI). F1_VU1_TRAZA_N/F1_VU1_TRAZA_MAX trace one run step by step.
+@@ -1874,14 +2616,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+ 
+         const DecodedInstructionPair *pair = nullptr;
++        const PairPlan *plan = nullptr;
+         if (decodedCache != nullptr && (m_state.pc & 7u) == 0u && (m_state.pc >> 3) < decodedCount)
+         {
+             pair = &decodedCache[m_state.pc >> 3];
++            plan = &planCache[m_state.pc >> 3];
+         }
+         else
+         {
+             uncachedPair = decodeInstructionPair(vuCode, m_state.pc);
++            buildPairPlan(uncachedPair, lowerWaits(uncachedPair.lowerUsage), uncachedPlan);
+             pair = &uncachedPair;
++            plan = &uncachedPlan;
+         }
+         const DecodedInstructionPair &decoded = *pair;
+         if (m_unit == Unit::VU1)
+@@ -1901,7 +2647,41 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+         }
+ 
+-        uint64_t readyCycle = calculatePairReadyCycle(decoded);
++        // calculatePairReadyCycle with the plan's flat lists of reads.
++        const auto pairReadyCycle = [&]()
++        {
++            uint64_t ready = m_cycle;
++            for (uint32_t k = 0; k < plan->vfReadCount; ++k)
++            {
++                const uint32_t lane = plan->vfRead[k];
++                ready = std::max(ready, m_vfReady[lane >> 2][lane & 3u]);
++            }
++            for (uint32_t mask = plan->viRead; mask != 0u; mask &= mask - 1u)
++                ready = std::max(ready, m_viReady[static_cast<size_t>(std::countr_zero(mask))]);
++            for (uint32_t k = 0; k < plan->accReadCount; ++k)
++                ready = std::max(ready, m_accReady[plan->accRead[k]]);
++            if (plan->lowerWaits)
++            {
++                const InstructionUsage &lower = decoded.lowerUsage;
++                if (lower.pipeline == PipelineFdiv && m_fdiv.valid)
++                    ready = std::max(ready, m_fdiv.readyCycle);
++                if (lower.pipeline == PipelineEfu)
++                    ready = std::max(ready, m_efuResourceReady);
++                if (lower.waitQ && m_fdiv.valid)
++                    ready = std::max(ready, m_fdiv.readyCycle);
++                if (lower.waitP)
++                {
++                    for (const ScalarPipelineEntry &entry : m_efu)
++                        if (entry.valid)
++                            ready = std::max(ready, entry.readyCycle);
++                }
++                if (lower.pipeline == PipelineXgkick && m_xgkick.active)
++                    ready = std::max(ready, m_cycle + 1u);
++            }
++            return ready;
++        };
++
++        uint64_t readyCycle = pairReadyCycle();
+         while (readyCycle > m_cycle)
+         {
+             if (readyCycle >= budgetEnd)
+@@ -1910,7 +2690,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 break;
+             }
+             advanceTo(readyCycle);
+-            readyCycle = calculatePairReadyCycle(decoded);
++            readyCycle = pairReadyCycle();
+         }
+         if (m_cycle >= budgetEnd)
+             break;
+@@ -1928,94 +2708,150 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const bool hasUpperWrite = upperWrite.reg != 0u;
+         const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+         const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+-        float oldUpperVf[4]{};
+-        float newUpperVf[4]{};
+-        float oldLowerVf[4]{};
+-        float newLowerVf[4]{};
+-        float oldAcc[4]{};
+-        float newAcc[4]{};
+-        if (hasUpperWrite)
+-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-        if (hasDistinctLowerWrite)
+-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
+-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+-
+-        if (decoded.iBit)
+-        {
+-            execUpper(decoded.upper);
+-            float immediate = 0.0f;
+-            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+-            m_state.i = vuNormalizeOperand(immediate);
+-        }
+-        else if (decoded.upperVfShadowReg != 0u)
+-        {
+-            float oldVf[4]{};
+-            float upperVf[4]{};
+-            std::memcpy(oldVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(oldVf));
+-            execUpper(decoded.upper);
+-            std::memcpy(upperVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(upperVf));
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        oldVf,
+-                        sizeof(oldVf));
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        upperVf,
+-                        sizeof(upperVf));
++        if (plan->upperPath != UpperSlow)
++        {
++            // The upper result goes straight to its pending write, so the lower instruction sees the registers as
++            // they were before the pair without execUpper's write and restore. Flag and clip entries are queued
++            // before the lower instruction runs, as execUpper did (FSSET/FCSET look at them).
++            m_currentUpperInstruction = decoded.upper;
++            FmacResult upperResult;
++            switch (plan->upperPath)
++            {
++            case UpperFmac:
++                runFmacOp(plan->fmac, m_state.vf, m_state.acc, m_state.q, m_state.i, upperResult);
++                if (plan->fmac.dest != 0u &&
++                    !pushFmacFlags(m_flagPipeline, pipelineIndexFor(m_unit), m_cycle, kFmacLatency, upperResult.mac,
++                                   upperResult.status, upperResult.sticky))
++                {
++                    reportReservedInstruction(true, 0xFFFFFFFFu);
++                }
++                break;
++            case UpperSimple:
++                runSimpleOp(plan->simple, m_state.vf, m_state.i, upperResult.value);
++                break;
++            case UpperClip:
++                queueClip(vuClipFlags(m_state.vf[plan->simple.fs], m_state.vf[plan->simple.ft][3]));
++                break;
++            default: // NOP
++                break;
++            }
++
++            float oldLowerVf[4];
++            if (lowerWrite.reg != 0u)
++                std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++            if (decoded.iBit)
++            {
++                float immediate = 0.0f;
++                std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++                m_state.i = vuNormalizeOperand(immediate);
++            }
++            else
++            {
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            }
++
++            m_viBranchBackupValid = false;
++            ++paresEjecutados;
++
++            if (hasUpperWrite)
++                queueVfWrite(upperWrite.reg, upperWrite.lanes, upperResult.value, plan->upperLatency);
++            if (lowerWrite.reg != 0u)
++            {
++                // A lower write to the upper's destination is dropped (suppressedLowerVf), as before.
++                if (hasDistinctLowerWrite)
++                {
++                    float newLowerVf[4];
++                    std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
++                    std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++                    queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, plan->lowerLatency);
++                }
++                else
++                {
++                    std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++                }
++            }
++            if (decoded.upperUsage.accWrite != 0u)
++                queueAccWrite(decoded.upperUsage.accWrite, upperResult.value, kAccForwardLatency);
+         }
+         else
+         {
+-            execUpper(decoded.upper);
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-        }
++            float oldUpperVf[4]{};
++            float newUpperVf[4]{};
++            float oldLowerVf[4]{};
++            float newLowerVf[4]{};
++            float oldAcc[4]{};
++            float newAcc[4]{};
++            if (hasUpperWrite)
++                std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++            if (hasDistinctLowerWrite)
++                std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++            if (decoded.upperUsage.accWrite != 0u)
++                std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++
++            if (decoded.iBit)
++            {
++                execUpper(decoded.upper);
++                float immediate = 0.0f;
++                std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++                m_state.i = vuNormalizeOperand(immediate);
++            }
++            else if (decoded.upperVfShadowReg != 0u)
++            {
++                float oldVf[4]{};
++                float upperVf[4]{};
++                std::memcpy(oldVf, m_state.vf[decoded.upperVfShadowReg], sizeof(oldVf));
++                execUpper(decoded.upper);
++                std::memcpy(upperVf, m_state.vf[decoded.upperVfShadowReg], sizeof(upperVf));
++                std::memcpy(m_state.vf[decoded.upperVfShadowReg], oldVf, sizeof(oldVf));
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++                std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
++            }
++            else
++            {
++                execUpper(decoded.upper);
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            }
+ 
+-        m_viBranchBackupValid = false;
+-        ++paresEjecutados;
++            m_viBranchBackupValid = false;
++            ++paresEjecutados;
+ 
+-        if (hasUpperWrite)
+-        {
+-            std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+-            std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+-            const uint32_t latency =
+-                decoded.upperUsage.vfLatency != 0u
+-                    ? decoded.upperUsage.vfLatency
+-                    : decoded.upperUsage.latency;
+-            queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
+-        }
+-        if (hasDistinctLowerWrite)
+-        {
+-            std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
+-            std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+-            const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
+-                                         ? decoded.lowerUsage.vfLatency
+-                                         : decoded.lowerUsage.latency;
+-            queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+-        }
+-        if (decoded.upperUsage.accWrite != 0u)
+-        {
+-            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+-            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+-            // ACC is forwarded to the next upper instruction. Its arithmetic
+-            // flags still use the normal four-cycle FMAC timeline.
+-            queueAccWrite(decoded.upperUsage.accWrite, newAcc,
+-                          kAccForwardLatency);
++            if (hasUpperWrite)
++            {
++                std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
++                std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
++                queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, plan->upperLatency);
++            }
++            if (hasDistinctLowerWrite)
++            {
++                std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
++                std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++                queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, plan->lowerLatency);
++            }
++            if (decoded.upperUsage.accWrite != 0u)
++            {
++                std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
++                std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
++                // ACC is forwarded to the next upper instruction. Its arithmetic
++                // flags still use the normal four-cycle FMAC timeline.
++                queueAccWrite(decoded.upperUsage.accWrite, newAcc, kAccForwardLatency);
++            }
+         }
+         if (writtenVi != 0u)
+         {
+             const int32_t newVi = m_state.vi[writtenVi];
+             m_state.vi[writtenVi] = oldVi;
+-            const uint32_t latency =
+-                decoded.lowerUsage.viLatency != 0u
+-                    ? decoded.lowerUsage.viLatency
+-                    : decoded.lowerUsage.latency;
+-            queueViWrite(writtenVi, newVi, latency);
+-        }
+-
+-        markPairWrites(decoded);
++            queueViWrite(writtenVi, newVi, plan->viLatency);
++        }
++
++        // markPairWrites with the plan's lists: lower VF, upper VF, VI, ACC.
++        for (uint32_t k = 0; k < plan->lowerWriteCount; ++k)
++            m_vfReady[plan->lowerWrite[k] >> 2][plan->lowerWrite[k] & 3u] = m_cycle + plan->lowerLatency;
++        for (uint32_t k = 0; k < plan->upperWriteCount; ++k)
++            m_vfReady[plan->upperWrite[k] >> 2][plan->upperWrite[k] & 3u] = m_cycle + plan->upperLatency;
++        for (uint32_t mask = plan->viWrite; mask != 0u; mask &= mask - 1u)
++            m_viReady[static_cast<size_t>(std::countr_zero(mask))] = m_cycle + plan->viLatency;
++        for (uint32_t k = 0; k < plan->accWriteCount; ++k)
++            m_accReady[plan->accWrite[k]] = m_cycle + kAccForwardLatency;
+         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+             recordViWriteForBranch(writtenVi, oldVi);
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index efb2ed2..0713665 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -3,6 +3,7 @@
+ 
+ #include <cstdint>
+ #include <cstring>
++#include <limits>
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+@@ -42,4 +43,73 @@ static inline float vuNormalizeOperand(float value)
+     return value;
+ }
+ 
++// FTOIn: truncates value * scale, saturating to the int32 range.
++static inline int32_t vuFloatToInt(float value, float scale)
++{
++    const double scaled = static_cast<double>(value) * static_cast<double>(scale);
++    if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
++        return std::numeric_limits<int32_t>::max();
++    if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
++        return std::numeric_limits<int32_t>::min();
++    return static_cast<int32_t>(scaled);
++}
++
++// MAX/MINI compare the raw bit patterns as signed integers and return one of the operands
++// untouched (PCSX2 fp_max/fp_min). Games use "max vfD, vfS, vfS" to move integer data (for
++// example FTOI4 texture coordinates), which float normalisation would flush to zero.
++static inline float vuMaxBits(float a, float b)
++{
++    int32_t ia = 0, ib = 0;
++    std::memcpy(&ia, &a, sizeof(ia));
++    std::memcpy(&ib, &b, sizeof(ib));
++    const int32_t r = (ia < 0 && ib < 0) ? (ia < ib ? ia : ib) : (ia > ib ? ia : ib);
++    float out;
++    std::memcpy(&out, &r, sizeof(out));
++    return out;
++}
++
++static inline float vuMinBits(float a, float b)
++{
++    int32_t ia = 0, ib = 0;
++    std::memcpy(&ia, &a, sizeof(ia));
++    std::memcpy(&ib, &b, sizeof(ib));
++    const int32_t r = (ia < 0 && ib < 0) ? (ia > ib ? ia : ib) : (ia < ib ? ia : ib);
++    float out;
++    std::memcpy(&out, &r, sizeof(out));
++    return out;
++}
++
++// CLIP: +x -x +y -y +z -z judgements of vs against |w| (raw bit patterns), as six flag bits.
++static inline uint32_t vuClipFlags(const float *vs, float w)
++{
++    uint32_t wBits = 0u;
++    std::memcpy(&wBits, &w, sizeof(wBits));
++    const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++
++    const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
++    {
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &value, sizeof(bits));
++        bits ^= signMask;
++        int32_t orderedBits = 0;
++        std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
++        return orderedBits > limit;
++    };
++
++    uint32_t flags = 0u;
++    if (exceedsClipPlane(vs[0], 0x00000000u))
++        flags |= 0x01u;
++    if (exceedsClipPlane(vs[0], 0x80000000u))
++        flags |= 0x02u;
++    if (exceedsClipPlane(vs[1], 0x00000000u))
++        flags |= 0x04u;
++    if (exceedsClipPlane(vs[1], 0x80000000u))
++        flags |= 0x08u;
++    if (exceedsClipPlane(vs[2], 0x00000000u))
++        flags |= 0x10u;
++    if (exceedsClipPlane(vs[2], 0x80000000u))
++        flags |= 0x20u;
++    return flags;
++}
++
+ #endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 6b5124f..67b277c 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -5,44 +5,6 @@
+ #include <cstring>
+ #include <limits>
+ 
+-namespace
+-{
+-    int32_t vuFloatToInt(float value, float scale)
+-    {
+-        const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+-        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+-            return std::numeric_limits<int32_t>::max();
+-        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+-            return std::numeric_limits<int32_t>::min();
+-        return static_cast<int32_t>(scaled);
+-    }
+-
+-    // MAX/MINI compare the raw bit patterns as signed integers and return one of the operands
+-    // untouched (PCSX2 fp_max/fp_min). Games use "max vfD, vfS, vfS" to move integer data (for
+-    // example FTOI4 texture coordinates), which float normalisation would flush to zero.
+-    float vuMaxBits(float a, float b)
+-    {
+-        int32_t ia = 0, ib = 0;
+-        std::memcpy(&ia, &a, sizeof(ia));
+-        std::memcpy(&ib, &b, sizeof(ib));
+-        const int32_t r = (ia < 0 && ib < 0) ? (ia < ib ? ia : ib) : (ia > ib ? ia : ib);
+-        float out;
+-        std::memcpy(&out, &r, sizeof(out));
+-        return out;
+-    }
+-
+-    float vuMinBits(float a, float b)
+-    {
+-        int32_t ia = 0, ib = 0;
+-        std::memcpy(&ia, &a, sizeof(ia));
+-        std::memcpy(&ib, &b, sizeof(ib));
+-        const int32_t r = (ia < 0 && ib < 0) ? (ia > ib ? ia : ib) : (ia < ib ? ia : ib);
+-        float out;
+-        std::memcpy(&out, &r, sizeof(out));
+-        return out;
+-    }
+-}
+-
+ // ============================================================================
+ // Upper instructions (FMAC pipeline)
+ // ============================================================================
+@@ -408,37 +370,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x1F: // CLIP
+-        {
+-            uint32_t wBits = 0u;
+-            std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
+-            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+-
+-            const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
+-            {
+-                uint32_t bits = 0u;
+-                std::memcpy(&bits, &value, sizeof(bits));
+-                bits ^= signMask;
+-                int32_t orderedBits = 0;
+-                std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
+-                return orderedBits > limit;
+-            };
+-
+-            uint32_t flags = 0u;
+-            if (exceedsClipPlane(m_state.vf[fs][0], 0x00000000u))
+-                flags |= 0x01u;
+-            if (exceedsClipPlane(m_state.vf[fs][0], 0x80000000u))
+-                flags |= 0x02u;
+-            if (exceedsClipPlane(m_state.vf[fs][1], 0x00000000u))
+-                flags |= 0x04u;
+-            if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
+-                flags |= 0x08u;
+-            if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
+-                flags |= 0x10u;
+-            if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
+-                flags |= 0x20u;
+-            queueClip(flags);
++            queueClip(vuClipFlags(m_state.vf[fs], m_state.vf[ft][3]));
+             return;
+-        }
+         case 0x20: // ADDAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + q;

@@ -1,0 +1,50 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 17316ac..2eb311f 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -99,6 +99,7 @@ private:
+     static constexpr uint64_t kNotifyCost = 200000u;
+     static constexpr uint32_t kWorkerPollUs = 100u;
+     static constexpr uint32_t kWorkerSpinUs = 30u;
++    static constexpr uint64_t kFenceEvery = 16u; // Publish: a full fence every this many commands (power of two)
+ 
+     template <typename T>
+     void Push(T &&command, uint32_t cost);
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index ecf5be2..ddc0aea 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -17,7 +17,7 @@
+ // instead of a function per operation, 17 the VU1 block BAL, JR, JALR, FCSET, MFP, XTOP, XITOP and XGKICK through
+ // execLower (before patch 0045), 18 the VU1 block schedules run through a call of their own (runSchedule) instead of
+ // inside runBlocks, 19 the GS band dependencies by the unions of the pending blocks instead of the last job of each
+-// block (before patch 0046). A
++// block (before patch 0046), 20 the GS queue published with a full barrier on every command (before patch 0047). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 5553026..5692ffd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -248,7 +248,19 @@ void GSThreadedBackend::Publish(T &&command, uint32_t cost, bool wakeNow)
+     if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
+         m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
+     ++m_tail;
+-    m_published.store(m_tail, std::memory_order_seq_cst);
++    // Published with a plain release store: a seq_cst store (an xchg, a full barrier) on every command was ~2 % of the
++    // EE thread in a race. Without the barrier the load of m_workerWaiting below may come before the store, so a
++    // worker going to sleep right then is not woken by this command; it is woken anyway once per kNotifyBatch commands
++    // and looks at the queue every kWorkerPollUs by itself, so a full fence every kFenceEvery commands (and for
++    // wakeNow) is enough to keep that exact. A/B mode 20: the seq_cst store on every command, as before.
++    if (g_ps2AbMode.load(std::memory_order_relaxed) == 20)
++        m_published.store(m_tail, std::memory_order_seq_cst);
++    else
++    {
++        m_published.store(m_tail, std::memory_order_release);
++        if (wakeNow || (m_tail & (kFenceEvery - 1u)) == 0u)
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++    }
+     // A waiting worker is woken once per kNotifyBatch commands or kNotifyCost pixels (it also looks at the queue every
+     // kWorkerPollUs, and Drain() wakes it at once).
+     if (m_workerWaiting.load(std::memory_order_seq_cst) &&

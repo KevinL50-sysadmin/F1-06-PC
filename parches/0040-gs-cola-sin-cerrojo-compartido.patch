@@ -1,0 +1,411 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 8e63226..84d7650 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -83,34 +83,53 @@ private:
+     static constexpr uint64_t kMaxPendingCost = 2000000u; // about 5 full 640x448 screens of pixels
+     static constexpr uint32_t kPublishCost = 65536u;       // the worker reports progress at least this often
+     // Waking the worker costs the producer a kernel call: a waiting worker is woken once per kNotifyBatch commands
+-    // (or kNotifyCost pixels), and otherwise looks at the queue every kWorkerPollUs by itself.
+-    static constexpr uint32_t kNotifyBatch = 32u;
+-    static constexpr uint64_t kNotifyCost = 50000u;
+-    static constexpr uint32_t kWorkerPollUs = 500u;
++    // (or kNotifyCost pixels), and otherwise looks at the queue every kWorkerPollUs by itself. Before sleeping, the
++    // worker watches the queue for kWorkerSpinUs (in race a command arrives every few microseconds), so it is rarely
++    // asleep when commands come.
++    static constexpr uint32_t kNotifyBatch = 256u;
++    static constexpr uint64_t kNotifyCost = 200000u;
++    static constexpr uint32_t kWorkerPollUs = 100u;
++    static constexpr uint32_t kWorkerSpinUs = 30u;
+ 
+     template <typename T>
+     void Push(T &&command, uint32_t cost);
+     // Push without waiting: false (and nothing queued) when the queue has no room.
+     template <typename T>
+     bool TryPush(T &&command, uint32_t cost);
++    // With m_producing held: room for a command of this cost (reload: read the worker's progress again).
++    bool HasRoom(uint64_t cost, bool reload);
++    // With m_producing held and room: queue the command and make it visible to the worker.
++    template <typename T>
++    void Publish(T &&command, uint32_t cost, bool wakeNow);
++    void WakeWorker() const;
+     void Drain() const;
+     void WorkerLoop();
+     void Execute(Command &command, uint64_t index);
+ 
+     std::unique_ptr<GSCpuBackend> m_cpu;
+     std::vector<Slot> m_ring;
++    // The queue without a lock shared with the worker (patch 0039): a mutex taken by the EE thread on every
++    // primitive and by the worker on every chunk moved its cache line between cores each time (~3 % of the EE thread
++    // in race). Producers (the EE thread; the window thread for snapshots) serialize on m_producing, a spin lock the
++    // worker never takes (the window thread only tries it), and publish with m_published; the worker reports its progress with m_head and m_costOut.
++    // m_mutex and the condition variables are only for sleeping and waking.
++    std::atomic<bool> m_producing{false};
++    uint64_t m_tail = 0u;        // next free slot (producers)
++    uint64_t m_costIn = 0u;      // total cost queued so far (producers)
++    uint64_t m_seenHead = 0u;    // m_head and m_costOut as producers last read them
++    uint64_t m_seenCostOut = 0u;
++    uint32_t m_unnotified = 0u;  // commands queued since the waiting worker was last woken (producers)
++    alignas(64) std::atomic<uint64_t> m_published{0u}; // commands [0, m_published) can run
++    alignas(64) std::atomic<uint64_t> m_head{0u};      // commands [0, m_head) have run (worker)
++    std::atomic<uint64_t> m_costOut{0u};               // ... and their total cost
++    std::atomic<bool> m_workerBusy{false};
++    alignas(64) std::atomic<bool> m_workerWaiting{false};
++    std::atomic<uint32_t> m_producersWaiting{0u};
++    std::atomic<bool> m_stop{false};
+     mutable std::mutex m_mutex;
+     mutable std::condition_variable m_notEmpty;
+     mutable std::condition_variable m_notFull;
+     mutable std::condition_variable m_idle;
+-    uint64_t m_head = 0u;        // next command the worker runs
+-    uint64_t m_tail = 0u;        // next free slot
+-    uint64_t m_pendingCost = 0u; // cost of the commands in [m_head, m_tail)
+-    uint32_t m_producersWaiting = 0u;
+-    uint32_t m_unnotified = 0u;  // commands queued since the waiting worker was last woken
+-    bool m_workerBusy = false;
+-    bool m_workerWaiting = false;
+-    bool m_stop = false;
+     std::atomic<uint64_t> m_lastSnapshotIndex{UINT64_MAX}; // ring index of the newest queued snapshot
+     mutable std::atomic<uint64_t> m_fullWaits{0u};          // pushes that found the queue full (statistics)
+     mutable std::atomic<uint64_t> m_drains{0u};             // drains that had to wait for the worker (statistics)
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index b244970..52b6ad0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -6,6 +6,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <emmintrin.h>
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -85,97 +86,135 @@ GSThreadedBackend::GSThreadedBackend()
+ 
+ GSThreadedBackend::~GSThreadedBackend()
+ {
++    m_stop.store(true, std::memory_order_seq_cst);
++    WakeWorker();
++    if (m_worker.joinable())
++        m_worker.join();
++}
++
++bool GSThreadedBackend::HasRoom(uint64_t cost, bool reload)
++{
++    if (reload)
++    {
++        // Stale values only make the check stricter: m_head and m_costOut only grow.
++        m_seenHead = m_head.load(std::memory_order_acquire);
++        m_seenCostOut = m_costOut.load(std::memory_order_acquire);
++    }
++    // A command larger than the bound still goes in when the queue is empty.
++    return m_tail - m_seenHead < kCapacity &&
++           (m_seenHead == m_tail || m_costIn - m_seenCostOut + cost <= kMaxPendingCost);
++}
++
++void GSThreadedBackend::WakeWorker() const
++{
++    // Through the mutex: the worker checks m_published under it before waiting, so the wake-up cannot fall between
++    // its check and its wait.
+     {
+         std::lock_guard<std::mutex> lock(m_mutex);
+-        m_stop = true;
+     }
+-    m_notEmpty.notify_all();
+-    if (m_worker.joinable())
+-        m_worker.join();
++    m_notEmpty.notify_one();
+ }
+ 
+ template <typename T>
+-void GSThreadedBackend::Push(T &&command, uint32_t cost)
++void GSThreadedBackend::Publish(T &&command, uint32_t cost, bool wakeNow)
+ {
+-    cost += kCommandCost;
+-    std::unique_lock<std::mutex> lock(m_mutex);
+-    // Wait for a free slot and for the queued work to fall under the bound (a command larger than the bound still
+-    // goes in when the queue is empty).
+-    const auto hasRoom = [this, cost]()
++    Slot &slot = m_ring[m_tail % kCapacity];
++    slot.command = std::forward<T>(command);
++    slot.cost = cost;
++    m_costIn += cost;
++    if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
++        m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
++    ++m_tail;
++    m_published.store(m_tail, std::memory_order_seq_cst);
++    // A waiting worker is woken once per kNotifyBatch commands or kNotifyCost pixels (it also looks at the queue every
++    // kWorkerPollUs, and Drain() wakes it at once).
++    if (m_workerWaiting.load(std::memory_order_seq_cst) &&
++        (wakeNow || ++m_unnotified >= kNotifyBatch || m_costIn - m_seenCostOut >= kNotifyCost))
+     {
+-        return m_tail - m_head < kCapacity && (m_head == m_tail || m_pendingCost + cost <= kMaxPendingCost);
+-    };
+-    if (!hasRoom())
++        m_unnotified = 0u;
++        WakeWorker();
++    }
++}
++
++namespace
++{
++    // m_producing: taken by the EE thread on every command, so a plain flag (std::mutex went through Mtx_lock and
++    // the SRW lock functions each time). The window thread only tries it (TryPush), so nobody spins for long.
++    struct ProduceLock
+     {
+-        if (m_workerWaiting)
++        std::atomic<bool> &flag;
++        explicit ProduceLock(std::atomic<bool> &f) : flag(f)
+         {
+-            m_unnotified = 0u;
+-            m_notEmpty.notify_one();
++            while (flag.exchange(true, std::memory_order_acquire))
++                _mm_pause();
+         }
++        ~ProduceLock() { flag.store(false, std::memory_order_release); }
++    };
++}
++
++template <typename T>
++void GSThreadedBackend::Push(T &&command, uint32_t cost)
++{
++    cost += kCommandCost;
++    ProduceLock produce(m_producing);
++    if (!HasRoom(cost, false) && !HasRoom(cost, true))
++    {
++        // Full: wait for the worker to make room (it notifies m_notFull; rechecked every 200 us anyway).
+         m_fullWaits.fetch_add(1u, std::memory_order_relaxed);
+         const auto waitStart = std::chrono::steady_clock::now();
+-        ++m_producersWaiting;
+-        m_notFull.wait(lock, hasRoom);
+-        --m_producersWaiting;
++        m_producersWaiting.fetch_add(1u, std::memory_order_seq_cst);
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            while (!HasRoom(cost, true))
++            {
++                if (m_workerWaiting.load(std::memory_order_seq_cst))
++                    m_notEmpty.notify_one();
++                m_notFull.wait_for(lock, std::chrono::microseconds(200));
++            }
++        }
++        m_producersWaiting.fetch_sub(1u, std::memory_order_seq_cst);
+         const auto waited = std::chrono::steady_clock::now() - waitStart;
+         m_producerWaitNs.fetch_add(
+             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+             std::memory_order_relaxed);
+     }
+-    Slot &slot = m_ring[m_tail % kCapacity];
+-    slot.command = std::forward<T>(command);
+-    slot.cost = cost;
+-    m_pendingCost += cost;
+-    if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
+-        m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
+-    ++m_tail;
+-    // Waking a waiting worker costs a kernel call, and two when done inside the lock (the woken worker then finds the
+-    // mutex taken): once per kNotifyBatch commands or kNotifyCost pixels, after unlocking. A waiting worker also looks
+-    // at the queue every kWorkerPollUs, and Drain() wakes it at once.
+-    bool wake = false;
+-    if (m_workerWaiting && (++m_unnotified >= kNotifyBatch || m_pendingCost >= kNotifyCost))
+-    {
+-        m_unnotified = 0u;
+-        wake = true;
+-    }
+-    lock.unlock();
+-    if (wake)
+-        m_notEmpty.notify_one();
++    Publish(std::forward<T>(command), cost, false);
+ }
+ 
+ template <typename T>
+ bool GSThreadedBackend::TryPush(T &&command, uint32_t cost)
+ {
+     cost += kCommandCost;
+-    std::unique_lock<std::mutex> lock(m_mutex);
+-    if (!(m_tail - m_head < kCapacity && (m_head == m_tail || m_pendingCost + cost <= kMaxPendingCost)))
++    if (m_producing.exchange(true, std::memory_order_acquire))
++        return false; // the EE thread is queueing (or waiting for room): try again with the next presentation
++    if (!HasRoom(cost, false) && !HasRoom(cost, true))
++    {
++        m_producing.store(false, std::memory_order_release);
+         return false;
+-    Slot &slot = m_ring[m_tail % kCapacity];
+-    slot.command = std::forward<T>(command);
+-    slot.cost = cost;
+-    m_pendingCost += cost;
+-    if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
+-        m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
+-    ++m_tail;
+-    const bool wake = m_workerWaiting;
+-    if (wake)
+-        m_unnotified = 0u;
+-    lock.unlock();
+-    if (wake)
+-        m_notEmpty.notify_one();
++    }
++    Publish(std::forward<T>(command), cost, true);
++    m_producing.store(false, std::memory_order_release);
+     return true;
+ }
+ 
+ void GSThreadedBackend::Drain() const
+ {
+-    std::unique_lock<std::mutex> lock(m_mutex);
+-    if (m_head == m_tail && !m_workerBusy)
++    // Everything queued so far has run (m_head only moves after a command runs) and the worker is between chunks.
++    const uint64_t target = m_published.load(std::memory_order_seq_cst);
++    const auto done = [this, target]()
++    {
++        return m_head.load(std::memory_order_acquire) >= target && !m_workerBusy.load(std::memory_order_seq_cst);
++    };
++    if (done())
+         return;
+     m_drains.fetch_add(1u, std::memory_order_relaxed);
+-    if (m_workerWaiting)
+-        m_notEmpty.notify_one(); // the commands since the last wake-up
+-    m_idle.wait(lock, [this]()
+-                { return m_head == m_tail && !m_workerBusy; });
++    std::unique_lock<std::mutex> lock(m_mutex);
++    while (!done())
++    {
++        if (m_workerWaiting.load(std::memory_order_seq_cst))
++            m_notEmpty.notify_one(); // the commands since the last wake-up
++        m_idle.wait_for(lock, std::chrono::microseconds(200));
++    }
+ }
+ 
+ void GSThreadedBackend::WorkerLoop()
+@@ -187,34 +226,63 @@ void GSThreadedBackend::WorkerLoop()
+     Clock::time_point reportStart = Clock::now();
+     Clock::duration busyTime{};
+     uint64_t commandsRun = 0u;
++    uint64_t sleeps = 0u;
+ 
+-    std::unique_lock<std::mutex> lock(m_mutex);
+-    for (;;)
++    uint64_t head = 0u;
++    uint64_t costOut = 0u;
++    const auto publish = [&](uint64_t newHead)
+     {
+-        if (m_head == m_tail && !m_stop)
++        m_costOut.store(costOut, std::memory_order_release);
++        m_head.store(newHead, std::memory_order_seq_cst);
++        if (m_producersWaiting.load(std::memory_order_seq_cst) != 0u)
+         {
+-            // Out of commands: the band workers get the jobs prepared so far before this thread sleeps.
+-            lock.unlock();
+-            m_cpu->FlushBands();
+-            lock.lock();
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++            }
++            m_notFull.notify_all();
+         }
+-        while (m_head == m_tail && !m_stop)
++    };
++    for (;;)
++    {
++        uint64_t tail = m_published.load(std::memory_order_acquire);
++        if (tail == head)
+         {
+-            m_workerWaiting = true;
+-            m_idle.notify_all();
+-            m_notEmpty.wait_for(lock, std::chrono::microseconds(kWorkerPollUs)); // producers wake it once per batch
+-            m_workerWaiting = false;
++            // Out of commands: the band workers get the jobs prepared so far, then this thread watches the queue
++            // for a moment before sleeping (A/B mode 8: sleep at once, as before).
++            m_cpu->FlushBands();
++            if (g_ps2AbMode.load(std::memory_order_relaxed) != 8)
++            {
++                const Clock::time_point spinEnd = Clock::now() + std::chrono::microseconds(kWorkerSpinUs);
++                while ((tail = m_published.load(std::memory_order_acquire)) == head &&
++                       !m_stop.load(std::memory_order_relaxed) && Clock::now() < spinEnd)
++                    for (int i = 0; i < 8; ++i)
++                        _mm_pause();
++            }
++            if (tail == head)
++            {
++                std::unique_lock<std::mutex> lock(m_mutex);
++                for (;;)
++                {
++                    m_workerWaiting.store(true, std::memory_order_seq_cst);
++                    tail = m_published.load(std::memory_order_seq_cst);
++                    if (tail != head || m_stop.load(std::memory_order_seq_cst))
++                        break;
++                    m_idle.notify_all();
++                    ++sleeps;
++                    m_notEmpty.wait_for(lock, std::chrono::microseconds(kWorkerPollUs)); // producers wake it per batch
++                }
++                m_workerWaiting.store(false, std::memory_order_seq_cst);
++            }
++            if (tail == head)
++                break; // stopping
+         }
+-        if (m_head == m_tail)
+-            break;
+ 
+-        // Producers only write slots at m_tail and later, so [begin, end) can run without the lock. Progress (m_head
+-        // and the pending cost) is published every kPublishCost of work, so producers waiting on the work bound resume
+-        // while the chunk is still running.
+-        const uint64_t begin = m_head;
+-        const uint64_t end = std::min<uint64_t>(m_tail, begin + kChunk);
+-        m_workerBusy = true;
+-        lock.unlock();
++        // Producers only write slots at m_tail and later (never before m_head + kCapacity), so [begin, end) runs
++        // without any lock. Progress is published every kPublishCost of work, so producers waiting on the work bound
++        // resume while the chunk is still running.
++        const uint64_t begin = head;
++        const uint64_t end = std::min<uint64_t>(tail, begin + kChunk);
++        m_workerBusy.store(true, std::memory_order_seq_cst);
+         const Clock::time_point chunkStart = Clock::now();
+         uint64_t unpublishedCost = 0u;
+         for (uint64_t index = begin; index < end; ++index)
+@@ -224,13 +292,9 @@ void GSThreadedBackend::WorkerLoop()
+             unpublishedCost += slot.cost;
+             if (unpublishedCost >= kPublishCost && index + 1u < end)
+             {
+-                lock.lock();
+-                m_head = index + 1u;
+-                m_pendingCost -= unpublishedCost;
+-                if (m_producersWaiting != 0u)
+-                    m_notFull.notify_all();
+-                lock.unlock();
++                costOut += unpublishedCost;
+                 unpublishedCost = 0u;
++                publish(index + 1u);
+             }
+         }
+         const Clock::time_point chunkEnd = Clock::now();
+@@ -240,21 +304,24 @@ void GSThreadedBackend::WorkerLoop()
+         {
+             const double seconds = std::chrono::duration<double>(chunkEnd - reportStart).count();
+             const double producerWait = 1e-9 * static_cast<double>(m_producerWaitNs.exchange(0u, std::memory_order_relaxed));
+-            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu\n",
++            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu dormidas/s=%.0f\n",
+                          100.0 * std::chrono::duration<double>(busyTime).count() / seconds, commandsRun / seconds,
+                          static_cast<unsigned long long>(m_fullWaits.exchange(0u, std::memory_order_relaxed)),
+                          100.0 * producerWait / seconds,
+-                         static_cast<unsigned long long>(m_drains.exchange(0u, std::memory_order_relaxed)));
++                         static_cast<unsigned long long>(m_drains.exchange(0u, std::memory_order_relaxed)),
++                         sleeps / seconds);
+             reportStart = chunkEnd;
+             busyTime = {};
+             commandsRun = 0u;
++            sleeps = 0u;
+         }
+-        lock.lock();
+-        m_head = end;
+-        m_pendingCost -= unpublishedCost;
+-        m_workerBusy = false;
+-        if (m_producersWaiting != 0u)
+-            m_notFull.notify_all();
++        costOut += unpublishedCost;
++        head = end;
++        publish(end);
++        m_workerBusy.store(false, std::memory_order_seq_cst);
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
+     }
+     m_idle.notify_all();
+ }

@@ -1,0 +1,926 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 615720d..609bb84 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/ps2_ab.h"
+ #include "runtime/ps2_intc_queue.h"
++#include "../ps2_iop_transport.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -321,6 +322,12 @@ void EeScheduler::run()
+                 // Patch 0147: and all its real-time debt. Paid at 2 ms per call, it stayed pinned near the 100 ms cap
+                 // through the boot (the EE sleeps 69 % of the time there), the IOP dropped 5-80 % of its time and the
+                 // SPU2 output ring ran dry; an idle IOP jumps to its next event, so this costs only the work it has.
++                // Patch 0201: first the batch on the IOP worker (mode 178) and the effects it left for the EE (a SIF
++                // command queues its handler); the rest runs here, on the idle EE thread.
++                if (PS2IopTransport::iopSync(&m_runtime))
++                {
++                    continue;
++                }
+                 if (g_iopBatchCycles != 0u || g_iopDebtCycles != 0u)
+                 {
+                     const uint64_t batch = g_iopBatchCycles + g_iopDebtCycles;
+@@ -793,6 +800,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     // and whether 1 ms of IOP latency behind the EE is harmless (the step before moving the IOP to a worker thread).
+     // It only stretches the batches made of executed EE cycles: a call that pays real-time debt adds up to 2 ms to the
+     // batch, which then runs at once as with 32 us, and run() still hands the IOP the rest before the EE goes idle.
++    // A/B mode 178 (patch 0201): the same 1 ms batches (debt included), run by the IOP worker thread in parallel with
++    // the EE (PS2IopHostAdapter::handOffBatch): the EE waits only if the previous batch is still running, and before
++    // touching the IOP. "[iop:hilo]" (every 10 s, with a worker): batches handed off per second, the EE's waits for
++    // the worker (count and ms per second) and the worker's busy time (ms per second).
+     {
+         static const bool s_iopRealTime = []
+         {
+@@ -827,16 +838,26 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             s_iopDropped += catchUp;
+         }
+         g_iopBatchCycles += iopCycles;
+-        const bool iopDue = g_iopBatchCycles >= s_iopBatch
+-                                ? g_iopBatchCycles >= kIopBatchMode177 ||
+-                                      g_ps2AbMode.load(std::memory_order_relaxed) != 177
+-                                : g_ps2AbMode.load(std::memory_order_relaxed) == 4;
++        int mode = 0;
++        bool iopDue = false;
++        if (g_iopBatchCycles >= s_iopBatch)
++        {
++            mode = g_ps2AbMode.load(std::memory_order_relaxed);
++            iopDue = g_iopBatchCycles >= kIopBatchMode177 || (mode != 177 && mode != 178);
++        }
++        else
++        {
++            iopDue = g_ps2AbMode.load(std::memory_order_relaxed) == 4;
++        }
+         if (iopDue)
+         {
+             const uint64_t batch = g_iopBatchCycles;
+             g_iopBatchCycles = 0u;
+             g_iopGivenCycles += batch;
+-            m_runtime.advanceIopEeCycles(batch);
++            if (mode == 178)
++                PS2IopTransport::handOffIopBatch(&m_runtime, batch);
++            else
++                m_runtime.advanceIopEeCycles(batch);
+         }
+         if (report)
+         {
+@@ -847,6 +868,15 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+                          static_cast<double>(g_iopGivenCycles) / 8.0 / seconds,
+                          1000.0 * static_cast<double>(g_iopDebtCycles) / static_cast<double>(EeScheduler::kEeClockHz),
+                          total > 0.0 ? 100.0 * static_cast<double>(s_iopDropped) / total : 0.0);
++            const PS2IopHostAdapter::WorkerStats worker = PS2IopTransport::takeIopWorkerStats(&m_runtime);
++            if (worker.handOffs != 0u || worker.waits != 0u)
++            {
++                std::fprintf(stderr, "[iop:hilo] entregas/s=%.0f esperas/s=%.0f esperaEE=%.2fms/s trabajo=%.1fms/s\n",
++                             static_cast<double>(worker.handOffs) / seconds,
++                             static_cast<double>(worker.waits) / seconds,
++                             static_cast<double>(worker.waitNs) / 1e6 / seconds,
++                             static_cast<double>(worker.busyNs) / 1e6 / seconds);
++            }
+             s_iopReportStart = now;
+             g_iopGivenCycles = 0u;
+             s_iopDropped = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 23bb503..892d9cd 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -7,8 +7,11 @@
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
+ #include "ps2x/iop/ps2_iso_image.h"
++#include "ps2x/iop/iop_subsystem.h"
++#include "ThreadNaming.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ #include <filesystem>
+ #include <iostream>
+@@ -19,6 +22,38 @@
+ #include <sys/types.h>
+ #endif
+ 
++namespace
++{
++    // Patch 0201: true on the IOP worker thread (see PS2IopHostAdapter::handOffBatch).
++    thread_local bool t_onIopWorker = false;
++
++    // Pauses this many times for the state to leave `from`, then sleeps on it (both sides of the hand-off: a batch
++    // lasts tens of microseconds and the next one comes about 1 ms later).
++    constexpr uint32_t kHandOffSpins = 256u;
++
++    uint32_t waitWhile(std::atomic<uint32_t> &state, uint32_t from, uint32_t spins)
++    {
++        uint32_t value = state.load(std::memory_order_acquire);
++        for (uint32_t i = 0u; value == from && i < spins; ++i)
++        {
++            _mm_pause();
++            value = state.load(std::memory_order_acquire);
++        }
++        while (value == from)
++        {
++            state.wait(from, std::memory_order_acquire);
++            value = state.load(std::memory_order_acquire);
++        }
++        return value;
++    }
++
++    uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start)
++    {
++        return static_cast<uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++    }
++}
++
+ PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
+     : m_lock(owner.m_callMutex),
+       m_owner(&owner),
+@@ -84,6 +119,7 @@ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+ 
+ PS2IopHostAdapter::~PS2IopHostAdapter()
+ {
++    stopIopWorker();
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     for (auto &[handle, file] : m_hostFiles)
+     {
+@@ -104,7 +140,8 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
+ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
+ {
+     begin = nullptr;
+-    uint8_t *const rdram = m_activeRdram
++    // Patch 0201: m_activeRdram belongs to the EE thread's calls; the worker uses the runtime's RDRAM.
++    uint8_t *const rdram = m_activeRdram && !t_onIopWorker
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+     if (!rdram)
+@@ -159,6 +196,11 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t
+     {
+         return false;
+     }
++    if (t_onIopWorker)
++    {
++        queueEffect(0u, address, source, size); // patch 0201: written on the EE thread by iopSync
++        return true;
++    }
+     if (size != 0)
+     {
+         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+@@ -175,6 +217,11 @@ bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
+     {
+         return false;
+     }
++    if (t_onIopWorker)
++    {
++        queueEffect(1u, address, nullptr, size); // patch 0201: cleared on the EE thread by iopSync
++        return true;
++    }
+     if (size != 0)
+     {
+         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+@@ -551,6 +598,13 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize)
+ {
++    if (t_onIopWorker)
++    {
++        // Patch 0201: the EE's handler is queued (queueInvocation) on the EE thread by iopSync. The IOP does not look
++        // at the result.
++        queueEffect(2u, commandId, packet, packet ? packetSize : 0u);
++        return true;
++    }
+     uint8_t *const rdram = m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+@@ -561,6 +615,137 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                          packetSize);
+ }
+ 
++void PS2IopHostAdapter::queueEffect(uint8_t kind, uint32_t value, const void *bytes, size_t size)
++{
++    IopEffect effect;
++    effect.kind = kind;
++    effect.value = value;
++    effect.offset = static_cast<uint32_t>(m_effectBytes.size());
++    effect.size = static_cast<uint32_t>(size);
++    if (bytes && size != 0u)
++    {
++        const auto *first = static_cast<const uint8_t *>(bytes);
++        m_effectBytes.insert(m_effectBytes.end(), first, first + size);
++    }
++    m_effects.push_back(effect);
++}
++
++void PS2IopHostAdapter::applyEffects()
++{
++    m_applyingEffects = true;
++    for (const IopEffect &effect : m_effects)
++    {
++        const uint8_t *const bytes = m_effectBytes.data() + effect.offset;
++        switch (effect.kind)
++        {
++        case 0u:
++            (void)writeGuest(effect.value, bytes, effect.size);
++            break;
++        case 1u:
++            (void)zeroGuest(effect.value, effect.size);
++            break;
++        default:
++            (void)sendSifCommand(effect.value, effect.size != 0u ? bytes : nullptr, effect.size);
++            break;
++        }
++    }
++    m_effects.clear();
++    m_effectBytes.clear();
++    m_applyingEffects = false;
++}
++
++void PS2IopHostAdapter::workerMain()
++{
++    ThreadNaming::SetCurrentThreadName("IOP");
++    t_onIopWorker = true;
++    for (;;)
++    {
++        if (waitWhile(m_batchState, 0u, kHandOffSpins) == 2u)
++        {
++            return;
++        }
++        const auto start = std::chrono::steady_clock::now();
++        m_batchIop->runEeCycles(m_batchCycles);
++        m_workerBusyNs.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
++        m_batchState.store(0u, std::memory_order_release);
++        m_batchState.notify_all();
++    }
++}
++
++void PS2IopHostAdapter::handOffBatch(ps2x::iop::IopSubsystem &iop, uint64_t eeCycles)
++{
++    if (!m_workerStarted.load(std::memory_order_acquire))
++    {
++        m_handOffThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
++        m_worker = std::thread(&PS2IopHostAdapter::workerMain, this);
++        m_workerStarted.store(true, std::memory_order_release);
++    }
++    else
++    {
++        m_handOffThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
++        (void)iopSync();
++    }
++    m_batchIop = &iop;
++    m_batchCycles = eeCycles;
++    ++m_stats.handOffs;
++    m_batchState.store(1u, std::memory_order_release);
++    m_batchState.notify_all();
++}
++
++bool PS2IopHostAdapter::iopSync()
++{
++    if (!m_workerStarted.load(std::memory_order_acquire) ||
++        m_handOffThread.load(std::memory_order_relaxed) != std::this_thread::get_id())
++    {
++        return false;
++    }
++    if (m_batchState.load(std::memory_order_acquire) == 1u)
++    {
++        const auto start = std::chrono::steady_clock::now();
++        (void)waitWhile(m_batchState, 1u, kHandOffSpins);
++        ++m_stats.waits;
++        m_stats.waitNs += nanosecondsSince(start);
++    }
++    if (m_effects.empty() || m_applyingEffects)
++    {
++        return false;
++    }
++    applyEffects();
++    return true;
++}
++
++bool PS2IopHostAdapter::iopBatchInFlight() const noexcept
++{
++    return m_batchState.load(std::memory_order_acquire) == 1u;
++}
++
++void PS2IopHostAdapter::stopIopWorker()
++{
++    if (!m_workerStarted.load(std::memory_order_acquire))
++    {
++        return;
++    }
++    (void)waitWhile(m_batchState, 1u, 0u);
++    m_batchState.store(2u, std::memory_order_release);
++    m_batchState.notify_all();
++    if (m_worker.joinable())
++    {
++        m_worker.join();
++    }
++    m_batchState.store(0u, std::memory_order_release);
++    m_workerStarted.store(false, std::memory_order_release);
++    m_effects.clear();
++    m_effectBytes.clear();
++}
++
++PS2IopHostAdapter::WorkerStats PS2IopHostAdapter::takeWorkerStats()
++{
++    WorkerStats stats = m_stats;
++    stats.busyNs = m_workerBusyNs.exchange(0u, std::memory_order_relaxed);
++    m_stats = WorkerStats{};
++    return stats;
++}
++
+ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
+ {
+     const char *prefix = "[ps2xIOP]";
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index b5331c2..1cb3fd1 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -2,11 +2,14 @@
+ 
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <unordered_map>
++#include <vector>
+ 
+ class PS2Runtime;
+ struct R5900Context;
+@@ -14,6 +17,7 @@ struct R5900Context;
+ namespace ps2x::iop
+ {
+     class IsoImage;
++    class IopSubsystem;
+ }
+ 
+ class PS2IopHostAdapter final : public ps2x::iop::IopHost
+@@ -93,10 +97,36 @@ public:
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
++    // Patch 0201 (A/B mode 178): the IOP on its own worker thread, in parallel with the EE.
++    // handOffBatch gives the worker (named "IOP", started on first use) one batch of eeCycles and returns at once; at
++    // most one batch is in flight, so it first waits for the previous one (iopSync). Inside a batch the IOP's effects
++    // on the EE side (writeGuest, zeroGuest, sendSifCommand: SIF DMA, the extra data of a SIF command and the command
++    // itself) are only checked and queued; iopSync applies them on the EE thread, in the order the IOP produced them.
++    // iopSync must come before every EE contact with the IOP's state (PS2Runtime's IOP calls do it); it only acts on
++    // the thread that hands the batches off, and returns true when it applied queued effects. The other host calls
++    // (memory card, libsd, files of the HLE services, module loading) only run inside EE calls, behind the barrier.
++    void handOffBatch(ps2x::iop::IopSubsystem &iop, uint64_t eeCycles);
++    bool iopSync();
++    [[nodiscard]] bool iopBatchInFlight() const noexcept;
++    // Waits for the batch in flight (its effects are dropped) and stops the worker. Shutdown and the destructor.
++    void stopIopWorker();
++    struct WorkerStats
++    {
++        uint64_t handOffs = 0u; // batches given to the worker
++        uint64_t waits = 0u;    // iopSync calls that found the batch still running
++        uint64_t waitNs = 0u;   // time the EE spent in those waits
++        uint64_t busyNs = 0u;   // time the worker spent running batches
++    };
++    // The counts since the last call (the EE thread).
++    WorkerStats takeWorkerStats();
++
+ private:
+     friend class CallScope;
+ 
+     bool guestRange(uint32_t address, size_t size, uint8_t *&begin) const;
++    void queueEffect(uint8_t kind, uint32_t value, const void *bytes, size_t size);
++    void applyEffects();
++    void workerMain();
+ 
+     PS2Runtime &m_runtime;
+     std::recursive_mutex m_callMutex;
+@@ -115,4 +145,25 @@ private:
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+     uint64_t m_nextHostFileHandle = 1u;
++
++    // Patch 0201: the worker. m_batchState: 0 idle, 1 a batch in flight, 2 stop. The batch fields and the effect
++    // queue belong to the worker while the state is 1 and to the EE thread otherwise.
++    struct IopEffect
++    {
++        uint8_t kind = 0u;  // 0 writeGuest, 1 zeroGuest, 2 sendSifCommand
++        uint32_t value = 0u; // guest address, or the command id
++        uint32_t offset = 0u; // bytes in m_effectBytes
++        uint32_t size = 0u;
++    };
++    std::thread m_worker;
++    std::atomic<uint32_t> m_batchState{0u};
++    std::atomic<bool> m_workerStarted{false};
++    std::atomic<std::thread::id> m_handOffThread{};
++    ps2x::iop::IopSubsystem *m_batchIop = nullptr;
++    uint64_t m_batchCycles = 0u;
++    std::vector<IopEffect> m_effects;
++    std::vector<uint8_t> m_effectBytes;
++    bool m_applyingEffects = false;
++    WorkerStats m_stats{};
++    std::atomic<uint64_t> m_workerBusyNs{0u};
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+index 1f8012a..ffdf7fa 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -41,6 +41,7 @@ public:
+         {
+             return false;
+         }
++        (void)runtime->m_iopHost->iopSync(); // patch 0201
+         auto scope = runtime->m_iopHost->enterCall(context, rdram);
+         return runtime->m_iopSubsystem->handleSifCommand(commandId, packet, packetSize);
+     }
+@@ -68,4 +69,37 @@ public:
+             runtime->resetIop();
+         }
+     }
++
++    // Patch 0201 (A/B mode 178): one IOP batch on the IOP worker thread, and the barrier before the EE touches the IOP
++    // (see PS2IopHostAdapter::handOffBatch). runIopBatch runs one on the calling thread, as mode 0 does.
++    static void runIopBatch(PS2Runtime *runtime, uint64_t eeCycles)
++    {
++        if (runtime)
++        {
++            runtime->advanceIopEeCycles(eeCycles);
++        }
++    }
++
++    static void handOffIopBatch(PS2Runtime *runtime, uint64_t eeCycles)
++    {
++        if (runtime)
++        {
++            runtime->m_iopHost->handOffBatch(*runtime->m_iopSubsystem, eeCycles);
++        }
++    }
++
++    static bool iopSync(PS2Runtime *runtime)
++    {
++        return runtime && runtime->m_iopHost->iopSync();
++    }
++
++    [[nodiscard]] static bool iopBatchInFlight(const PS2Runtime *runtime)
++    {
++        return runtime && runtime->m_iopHost->iopBatchInFlight();
++    }
++
++    [[nodiscard]] static PS2IopHostAdapter::WorkerStats takeIopWorkerStats(PS2Runtime *runtime)
++    {
++        return runtime ? runtime->m_iopHost->takeWorkerStats() : PS2IopHostAdapter::WorkerStats{};
++    }
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4579b72..ff0165a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1728,6 +1728,8 @@ PS2Runtime::~PS2Runtime()
+     try
+     {
+         requestStop();
++        if (m_iopHost)
++            m_iopHost->stopIopWorker(); // patch 0201: before the IOP it runs goes away
+         m_iopSubsystem.reset();
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+@@ -1763,36 +1765,45 @@ PS2Runtime::~PS2Runtime()
+     }
+ }
+ 
++// Patch 0201 (A/B mode 178): with the IOP on its worker thread, every EE call into the IOP first waits for the batch in
++// flight and applies the effects it left for the EE (PS2IopHostAdapter::iopSync; nothing to do without the worker,
++// and nothing on other threads). isIopMemoryRange only checks the address.
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+ {
++    m_iopHost->iopSync();
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
+ }
+ 
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+ {
++    m_iopHost->iopSync();
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
+ }
+ 
+ bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
+ {
++    m_iopHost->iopSync();
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+     return m_iopSubsystem->stopModule(moduleId, result);
+ }
+ 
+ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
+ {
++    m_iopHost->iopSync();
+     return m_iopSubsystem->selectRpcAbi(request);
+ }
+ 
+ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
+ {
++    m_iopHost->iopSync();
+     return m_iopSubsystem->canBindRpc(sid);
+ }
+ 
+ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+ {
++    m_iopHost->iopSync();
+     auto scope = m_iopHost->enterCall(ctx, rdram);
+     request.callToken = scope.token();
+     return m_iopSubsystem->handleRpc(request);
+@@ -1800,47 +1811,61 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
+ 
+ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+ {
++    m_iopHost->iopSync();
+     auto scope = m_iopHost->enterCall(nullptr, rdram);
+     m_iopSubsystem->onSifTransfer(transfer);
+ }
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    m_iopHost->iopSync(); // a batch on this thread (mode 0) after one on the worker (mode 178): in order
+     m_iopSubsystem->runEeCycles(eeCycles);
+ }
+ 
+ void PS2Runtime::resetIop()
+ {
++    m_iopHost->iopSync();
+     m_iopSubsystem->reset();
+ }
+ 
+ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+ {
++    m_iopHost->iopSync();
+     return m_iopSubsystem->debugSnapshot();
+ }
+ 
+ uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
+ {
++    if (m_iopHost)
++        m_iopHost->iopSync();
+     return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
+ }
+ 
+ bool PS2Runtime::freeIopMemory(uint32_t address)
+ {
++    if (m_iopHost)
++        m_iopHost->iopSync();
+     return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
+ }
+ 
+ bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
+ {
++    if (m_iopHost)
++        m_iopHost->iopSync();
+     return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
+ }
+ 
+ bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
+ {
++    if (m_iopHost)
++        m_iopHost->iopSync();
+     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
+ }
+ 
+ bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
+ {
++    if (m_iopHost)
++        m_iopHost->iopSync();
+     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
+ }
+ 
+@@ -2272,7 +2297,7 @@ bool PS2Runtime::loadELF(const std::vector<uint8_t> &elfBytes, const std::string
+         return false;
+     }
+ 
+-    m_iopSubsystem->reset();
++    resetIop();
+ 
+     ps2_game_overrides::applyMatching(*this,
+                                       displayName,
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index ec6f86b..5e87452 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -5,12 +5,15 @@
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_ab.h"
+ 
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ using namespace ps2_syscalls;
+@@ -170,6 +173,188 @@ namespace
+         }
+     };
+ 
++    // Patch 0201 (A/B mode 178): an IRX whose thread loops forever: counter += 1 (IOP 0x10400), a SIF command to the
++    // EE with the counter in its packet and as 4 bytes of extra data into ring A, a SIF DMA of the counter into ring B
++    // (both rings: 64 words, entry counter & 63), then 300 turns of a busy loop. Its entry also registers an RPC
++    // server (kWorkerSid) that returns the counter. Every IOP-to-EE effect the IOP host has, in a known order.
++    constexpr uint32_t kWorkerIrxEe = 0x00200000u;
++    constexpr uint32_t kWorkerRingA = 0x00180000u;
++    constexpr uint32_t kWorkerRingB = 0x00190000u;
++    constexpr uint32_t kWorkerCounter = 0x00010400u;
++    constexpr uint32_t kWorkerCid = 0x12u;
++    constexpr uint32_t kWorkerSid = 0x0F0F0201u;
++    constexpr uint32_t kWorkerEeHandler = 0x00120000u;
++    constexpr uint64_t kWorkerBatch = 294912u; // 1 ms of EE time, as mode 178
++
++    void writeWorkerIrx(uint8_t *rdram)
++    {
++        constexpr uint32_t kBase = 0x00010000u;
++        constexpr uint32_t kImage = 0x600u;
++        std::vector<uint32_t> image(kImage / 4u, 0u);
++        const auto put = [&](uint32_t address, std::initializer_list<uint32_t> words)
++        {
++            uint32_t index = (address - kBase) / 4u;
++            for (const uint32_t word : words)
++                image[index++] = word;
++        };
++        const auto I = [](uint32_t op, uint32_t rs, uint32_t rt, uint32_t imm)
++        { return (op << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFFu); };
++        const auto addiu = [&](uint32_t rt, uint32_t rs, int32_t imm) { return I(9u, rs, rt, static_cast<uint32_t>(imm)); };
++        const auto ori = [&](uint32_t rt, uint32_t rs, uint32_t imm) { return I(13u, rs, rt, imm); };
++        const auto andi = [&](uint32_t rt, uint32_t rs, uint32_t imm) { return I(12u, rs, rt, imm); };
++        const auto lui = [&](uint32_t rt, uint32_t imm) { return I(15u, 0u, rt, imm); };
++        const auto lw = [&](uint32_t rt, uint32_t offset, uint32_t base) { return I(35u, base, rt, offset); };
++        const auto sw = [&](uint32_t rt, uint32_t offset, uint32_t base) { return I(43u, base, rt, offset); };
++        const auto bne = [&](uint32_t rs, uint32_t rt, int32_t offset) { return I(5u, rs, rt, static_cast<uint32_t>(offset)); };
++        const auto sll = [](uint32_t rd, uint32_t rt, uint32_t sa) { return (rt << 16) | (rd << 11) | (sa << 6); };
++        const auto addu = [](uint32_t rd, uint32_t rs, uint32_t rt) { return (rs << 21) | (rt << 16) | (rd << 11) | 0x21u; };
++        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
++        const auto j = [](uint32_t target) { return 0x08000000u | ((target >> 2u) & 0x03FFFFFFu); };
++        constexpr uint32_t zero = 0u, v0 = 2u, a0 = 4u, a1 = 5u, a2 = 6u, a3 = 7u, t0 = 8u, t1 = 9u, t2 = 10u, t3 = 11u,
++                           t4 = 12u, sp = 29u, ra = 31u;
++        constexpr uint32_t kCreateThread = 0x10214u, kStartThread = 0x1021Cu, kSendCmd = 0x10254u,
++                           kRegisterRpc = 0x1025Cu, kSetDma = 0x10294u, kThread = 0x10080u, kServer = 0x101E0u;
++
++        put(kBase, {
++            addiu(sp, sp, -32), sw(ra, 28u, sp),
++            sw(zero, 16u, sp), sw(zero, 20u, sp), sw(zero, 24u, sp),
++            lui(a0, 1u), ori(a0, a0, 0x500u),
++            lui(a1, kWorkerSid >> 16u), ori(a1, a1, kWorkerSid & 0xFFFFu),
++            lui(a2, 1u), ori(a2, a2, kServer & 0xFFFFu),
++            lui(a3, 1u), ori(a3, a3, 0x400u),
++            jal(kRegisterRpc), 0u,
++            lui(a0, 1u), ori(a0, a0, 0x300u), jal(kCreateThread), 0u,
++            addu(a0, v0, zero), addu(a1, zero, zero), jal(kStartThread), 0u,
++            lw(ra, 28u, sp), addu(v0, zero, zero), addiu(sp, sp, 32), 0x03E00008u, 0u,
++        });
++        put(kThread, {
++            addiu(sp, sp, -32),
++            // top:
++            lui(t0, 1u), lw(t1, 0x400u, t0), addiu(t1, t1, 1), sw(t1, 0x400u, t0), sw(t1, 0x450u, t0),
++            andi(t2, t1, 63u), sll(t2, t2, 2u), lui(t3, kWorkerRingA >> 16u), addu(t3, t3, t2),
++            sw(t3, 16u, sp), addiu(t4, zero, 4), sw(t4, 20u, sp),
++            addiu(a0, zero, static_cast<int32_t>(kWorkerCid)), ori(a1, t0, 0x440u), addiu(a2, zero, 32), ori(a3, t0, 0x400u),
++            jal(kSendCmd), 0u,
++            lui(t0, 1u), lw(t1, 0x400u, t0), andi(t2, t1, 63u), sll(t2, t2, 2u), lui(t3, kWorkerRingB >> 16u),
++            addu(t3, t3, t2), sw(t3, 0x484u, t0), ori(a0, t0, 0x480u), addiu(a1, zero, 1),
++            jal(kSetDma), 0u,
++            addiu(t4, zero, 300),
++            addiu(t4, t4, -1), bne(t4, zero, -2), 0u, // spin
++            j(kThread + 4u), 0u,
++        });
++        put(kServer, {lui(v0, 1u), ori(v0, v0, 0x400u), 0x03E00008u, 0u});
++        put(0x10200u, {0x41E00000u, 0u, 0x00000101u, 0x61626874u, 0x00006573u, // "thbase"
++                       0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        put(0x10240u, {0x41E00000u, 0u, 0x00000101u, 0x63666973u, 0x0000646Du, // "sifcmd"
++                       0x03E00008u, 0x2400000Cu, 0x03E00008u, 0x24000011u, 0u, 0u});
++        put(0x10280u, {0x41E00000u, 0u, 0x00000101u, 0x6D666973u, 0x00006E61u, // "sifman"
++                       0x03E00008u, 0x24000007u, 0u, 0u});
++        put(0x10300u, {0u, 0u, kThread, 0x400u, 20u});
++        put(0x10480u, {kWorkerCounter, 0u, 4u, 0u});
++
++        std::vector<uint8_t> elf(0x100u + kImage, 0u);
++        const auto put32 = [&](uint32_t offset, uint32_t value) { std::memcpy(elf.data() + offset, &value, 4u); };
++        put32(0u, 0x464C457Fu);
++        elf[4] = elf[5] = elf[6] = 1u;
++        put32(16u, 2u | (8u << 16u)); // ET_EXEC, MIPS
++        put32(20u, 1u);
++        put32(24u, kBase);
++        put32(28u, 52u);
++        put32(40u, 52u | (32u << 16u));
++        put32(44u, 1u);
++        put32(52u, 1u);
++        put32(56u, 0x100u);
++        put32(60u, kBase);
++        put32(64u, kBase);
++        put32(68u, kImage);
++        put32(72u, kImage);
++        put32(76u, 7u);
++        put32(80u, 4u);
++        std::memcpy(elf.data() + 0x100u, image.data(), kImage);
++        std::memcpy(rdram + kWorkerIrxEe, elf.data(), elf.size());
++    }
++
++    void workerEeHandler(uint8_t *, R5900Context *, PS2Runtime *) {}
++
++    // A runtime with the IRX loaded and an EE handler for its SIF command.
++    struct WorkerEnv
++    {
++        PS2Runtime runtime;
++        uint8_t *rdram = nullptr;
++        bool ready = false;
++
++        WorkerEnv()
++        {
++            ps2_stubs::resetSifState();
++            if (!runtime.memory().initialize())
++                return;
++            rdram = runtime.memory().getRDRAM();
++            runtime.registerFunction(kWorkerEeHandler, workerEeHandler);
++            R5900Context ctx{};
++            setRegU32(ctx, 4, kWorkerCid);
++            setRegU32(ctx, 5, kWorkerEeHandler);
++            setRegU32(ctx, 6, 0u);
++            ps2_stubs::sceSifAddCmdHandler(rdram, &ctx, &runtime);
++            writeWorkerIrx(rdram);
++            const auto loaded = runtime.loadIopModuleBuffer(kWorkerIrxEe);
++            ready = loaded.moduleId > 0;
++        }
++
++        uint32_t counter()
++        {
++            uint32_t value = 0u;
++            (void)runtime.readIopMemory(kWorkerCounter, &value, sizeof(value));
++            return value;
++        }
++
++        std::vector<uint8_t> iopRam()
++        {
++            std::vector<uint8_t> ram(2u * 1024u * 1024u, 0u);
++            (void)runtime.readIopMemory(0u, ram.data(), ram.size());
++            return ram;
++        }
++
++        uint32_t eeWord(uint32_t address) const
++        {
++            uint32_t value = 0u;
++            std::memcpy(&value, rdram + address, sizeof(value));
++            return value;
++        }
++
++        // The counters in the SIF command packets the EE received (guestMalloc'd in order), by address.
++        std::vector<uint32_t> packetCounters() const
++        {
++            std::vector<uint32_t> counters;
++            for (uint32_t address = 0u; address + 32u <= PS2_GUEST_RAM_SIZE; address += 16u)
++            {
++                uint32_t words[5];
++                std::memcpy(words, rdram + address, sizeof(words));
++                if (words[0] == (32u | (4u << 8u)) && words[2] == kWorkerCid &&
++                    words[1] >= kWorkerRingA && words[1] < kWorkerRingA + 256u)
++                    counters.push_back(words[4]);
++            }
++            return counters;
++        }
++    };
++
++    // The EE side after `count` loops of the IRX: packets 1..count in order, and each ring word holds the last counter
++    // that went there.
++    void checkWorkerEffects(TestCase &t, const WorkerEnv &env, uint32_t count, const std::string &what)
++    {
++        const std::vector<uint32_t> packets = env.packetCounters();
++        bool inOrder = packets.size() == count;
++        for (size_t i = 0; inOrder && i < packets.size(); ++i)
++            inOrder = packets[i] == i + 1u;
++        t.IsTrue(inOrder, what + ": one SIF command per loop, in order");
++        bool rings = true;
++        for (uint32_t slot = 0u; slot < 64u; ++slot)
++        {
++            const uint32_t expected = count >= slot ? (count - slot) / 64u * 64u + slot : 0u;
++            rings = rings && env.eeWord(kWorkerRingA + slot * 4u) == expected &&
++                    env.eeWord(kWorkerRingB + slot * 4u) == expected;
++        }
++        t.IsTrue(rings, what + ": the rings hold the last counter of each slot");
++    }
+     template <typename T>
+     void writeGuestStruct(uint8_t *rdram, uint32_t addr, const T &value)
+     {
+@@ -205,6 +390,113 @@ void register_ps2_sif_rpc_tests()
+                      "SifInitRpc must not reboot or reset the IOP");
+         });
+ 
++        tc.Run("IOP batches on the worker thread match the same batches run on the EE thread", [](TestCase &t)
++        {
++            // Patch 0201 (A/B mode 178): inline (mode 0), all on the worker, and switching every batch.
++            constexpr int kBatches = 24;
++            WorkerEnv inlineEnv, worker, mixed;
++            t.IsTrue(inlineEnv.ready && worker.ready && mixed.ready, "the synthetic IRX should load");
++            for (int i = 0; i < kBatches; ++i)
++            {
++                const uint64_t batch = kWorkerBatch + static_cast<uint64_t>(i) * 1000u;
++                PS2IopTransport::runIopBatch(&inlineEnv.runtime, batch);
++                PS2IopTransport::handOffIopBatch(&worker.runtime, batch);
++                if (i % 3 == 0)
++                    PS2IopTransport::runIopBatch(&mixed.runtime, batch);
++                else
++                    PS2IopTransport::handOffIopBatch(&mixed.runtime, batch);
++            }
++            (void)PS2IopTransport::iopSync(&worker.runtime);
++            (void)PS2IopTransport::iopSync(&mixed.runtime);
++
++            const uint32_t count = inlineEnv.counter();
++            t.IsTrue(count > static_cast<uint32_t>(kBatches), "the IRX thread should loop several times per batch");
++            const auto reference = inlineEnv.runtime.iopDebugSnapshot();
++            const std::vector<uint8_t> referenceIop = inlineEnv.iopRam();
++            for (WorkerEnv *env : {&worker, &mixed})
++            {
++                const std::string what = env == &worker ? "worker" : "mixed";
++                const auto snapshot = env->runtime.iopDebugSnapshot();
++                t.Equals(snapshot.emulatorCycles, reference.emulatorCycles, what + ": IOP cycles");
++                t.Equals(snapshot.emulatorInstructions, reference.emulatorInstructions, what + ": IOP instructions");
++                t.IsTrue(env->iopRam() == referenceIop, what + ": IOP RAM");
++                t.IsTrue(std::memcmp(env->rdram, inlineEnv.rdram, PS2_GUEST_RAM_SIZE) == 0,
++                         what + ": EE RAM (rings and SIF command packets)");
++                checkWorkerEffects(t, *env, count, what);
++            }
++            checkWorkerEffects(t, inlineEnv, count, "inline");
++        });
++
++        tc.Run("IOP effects of a batch on the worker reach the EE only at iopSync", [](TestCase &t)
++        {
++            WorkerEnv env;
++            t.IsTrue(env.ready, "the synthetic IRX should load");
++            PS2IopTransport::handOffIopBatch(&env.runtime, kWorkerBatch);
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++            while (PS2IopTransport::iopBatchInFlight(&env.runtime) && std::chrono::steady_clock::now() < deadline)
++                std::this_thread::yield();
++            t.IsFalse(PS2IopTransport::iopBatchInFlight(&env.runtime), "the batch should finish");
++            t.Equals(env.eeWord(kWorkerRingA + 4u), 0u, "no extra data in EE RAM before iopSync");
++            t.Equals(env.eeWord(kWorkerRingB + 4u), 0u, "no SIF DMA in EE RAM before iopSync");
++            t.IsTrue(env.packetCounters().empty(), "no SIF command before iopSync");
++
++            t.IsTrue(PS2IopTransport::iopSync(&env.runtime), "iopSync should apply the queued effects");
++            checkWorkerEffects(t, env, env.counter(), "after iopSync");
++            t.IsFalse(PS2IopTransport::iopSync(&env.runtime), "nothing left to apply");
++        });
++
++        tc.Run("an EE call into the IOP waits for the batch on the worker", [](TestCase &t)
++        {
++            // A long batch (100 ms of EE time): the RPC and the read come while it runs and must see its end.
++            constexpr uint64_t kLong = kWorkerBatch * 100u;
++            WorkerEnv reference, env;
++            t.IsTrue(reference.ready && env.ready, "the synthetic IRX should load");
++            PS2IopTransport::runIopBatch(&reference.runtime, kWorkerBatch);
++            PS2IopTransport::runIopBatch(&reference.runtime, kLong);
++            const uint32_t expected = reference.counter();
++
++            PS2IopTransport::runIopBatch(&env.runtime, kWorkerBatch);
++            PS2IopTransport::handOffIopBatch(&env.runtime, kLong);
++            const bool inFlight = PS2IopTransport::iopBatchInFlight(&env.runtime);
++            constexpr uint32_t kReceive = 0x00170000u;
++            ps2x::iop::RpcRequest request{};
++            request.sid = kWorkerSid;
++            request.function = 1u;
++            request.receive = {kReceive, 4u};
++            R5900Context ctx{};
++            const auto result = PS2IopTransport::handleRpc(&env.runtime, env.rdram, &ctx, std::move(request));
++            t.IsTrue(inFlight, "the long batch should still be running when the RPC comes");
++            t.IsTrue(result.handled, "the IRX's RPC server should answer");
++            t.Equals(env.eeWord(kReceive), expected, "the RPC should see the IOP after the whole batch");
++
++            PS2IopTransport::runIopBatch(&reference.runtime, kLong);
++            const uint32_t expectedAfter = reference.counter();
++            PS2IopTransport::handOffIopBatch(&env.runtime, kLong);
++            const bool readInFlight = PS2IopTransport::iopBatchInFlight(&env.runtime);
++            const uint32_t read = env.counter();
++            t.IsTrue(readInFlight, "the second long batch should still be running when the read comes");
++            t.Equals(read, expectedAfter, "readIopMemory should wait for the batch in flight");
++            (void)PS2IopTransport::iopSync(&env.runtime);
++            checkWorkerEffects(t, env, env.counter(), "after the reads");
++        });
++
++        tc.Run("A/B mode 178 hands the IOP batches to the worker and back to mode 0 safely", [](TestCase &t)
++        {
++            WorkerEnv env;
++            t.IsTrue(env.ready, "the synthetic IRX should load");
++            const int previous = g_ps2AbMode.load();
++            for (int i = 0; i < 60; ++i)
++            {
++                g_ps2AbMode.store((i / 5) % 2 == 0 ? 178 : 0);
++                env.runtime.eeScheduler().accountCycles(100000u);
++            }
++            g_ps2AbMode.store(previous);
++            (void)PS2IopTransport::iopSync(&env.runtime);
++            const uint32_t count = env.counter();
++            t.IsTrue(count > 10u, "the IOP should run in both modes");
++            checkWorkerEffects(t, env, count, "switching modes");
++        });
++
+         tc.Run("SifLoadModule validates ROM modules and activates their HLE service", [](TestCase &t)
+         {
+             TestEnv env;

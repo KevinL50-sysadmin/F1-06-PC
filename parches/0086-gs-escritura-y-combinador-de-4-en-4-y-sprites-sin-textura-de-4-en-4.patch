@@ -1,0 +1,496 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f99e630..e9226f3 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -404,6 +404,36 @@ namespace
+ #endif
+     }
+ 
++#if defined(_M_X64) || defined(_M_AMD64) || defined(__SSE2__)
++    // Patch 0086: combineTexturePacked for four pixels (lane i: vertex[i] and texel[i]), two per register with the
++    // same 16-bit operations; `masks` (combineMasks4) are the combiner's masks for both halves.
++    struct CombineMasks4
++    {
++        __m128i product, texel, vertex, addAlpha;
++    };
++
++    CombineMasks4 combineMasks4(const TextureCombiner &tc)
++    {
++        return {_mm_unpacklo_epi64(tc.product, tc.product), _mm_unpacklo_epi64(tc.texel, tc.texel),
++                _mm_unpacklo_epi64(tc.vertex, tc.vertex), _mm_unpacklo_epi64(tc.addAlpha, tc.addAlpha)};
++    }
++
++    PS2_GS_INLINE __m128i combineTexture4(const CombineMasks4 &m, __m128i vertex, __m128i texel)
++    {
++        const __m128i zero = _mm_setzero_si128();
++        const auto pair = [&](__m128i v, __m128i t)
++        {
++            const __m128i product = _mm_srli_epi16(_mm_mullo_epi16(t, v), 7);
++            const __m128i va = _mm_shufflehi_epi16(_mm_shufflelo_epi16(v, 0xFF), 0xFF);
++            const __m128i out = _mm_or_si128(_mm_or_si128(_mm_and_si128(product, m.product), _mm_and_si128(t, m.texel)),
++                                             _mm_and_si128(v, m.vertex));
++            return _mm_add_epi16(out, _mm_and_si128(va, m.addAlpha));
++        };
++        return _mm_packus_epi16(pair(_mm_unpacklo_epi8(vertex, zero), _mm_unpacklo_epi8(texel, zero)),
++                                pair(_mm_unpackhi_epi8(vertex, zero), _mm_unpackhi_epi8(texel, zero)));
++    }
++#endif
++
+     uint32_t swizzleClutIndexCSM1(uint32_t index)
+     {
+         // CSM1 swaps address bits 3 and 4. Preserve the remaining bits:
+@@ -2696,22 +2726,242 @@ namespace
+         return (bits / 8u) & static_cast<uint32_t>(GSMem::MEMORY_SIZE - sizeof(Packed));
+     }
+ 
+-    // What the fast paths need to write through writePixelCt32Z24At (nullptr: writePixelBody, as patch 0075; A/B mode 61).
++    // Patch 0086: what writePixels4Ct32Z24 reads of the pipeline, worked out once per job. The blend masks cover the R,
++    // G and B lanes of two pixels (eight 16-bit lanes); `fail*` are TEST.AFAIL's writes for a failing pixel
++    // (classifyAlphaTest).
++    struct FastWrite4
++    {
++        __m128i aSrc, aDst, bSrc, bDst, dSrc, dDst;
++        __m128i fogColor; // fogR, fogG, fogB, 0 for two pixels
++        __m128i fbmsk, aref;
++        uint8_t atst = 1u; // the alpha test's method; 1 (ALWAYS) when TEST.ATE is off
++        bool failRgb = false, failAlpha = false, failDepth = false;
++        bool fge = false, abe = false, pabe = false, fbaSetsAlpha = false, dateCt32 = false, datm = false;
++        bool readAlways = false; // dateNeedsRead
++        bool readForFrame = false; // fbmsk != 0 || abe: every pixel that writes the frame reads it
++        bool frameCt32 = false, frameCt24 = false, writeZ = false, fbmskOn = false, scalar = false;
++        uint8_t csel = 0u, fix = 0u;
++    };
++
++    // What the fast paths need to write through writePixelCt32Z24At (nullptr: writePixelBody, as patch 0075; A/B mode 61)
++    // and, since patch 0086, writePixels4Ct32Z24.
+     struct FastWrite
+     {
+         BlendLanes blend;
+         BufferLanes frame, depth;
++        FastWrite4 w4;
+     };
+ 
++    FastWrite4 makeFastWrite4(const PixelPipeline &pp)
++    {
++        FastWrite4 w;
++        const auto lanes = [](bool on) { return on ? _mm_setr_epi16(-1, -1, -1, 0, -1, -1, -1, 0) : _mm_setzero_si128(); };
++        w.aSrc = lanes(pp.asel == 0), w.aDst = lanes(pp.asel == 1);
++        w.bSrc = lanes(pp.bsel == 0), w.bDst = lanes(pp.bsel == 1);
++        w.dSrc = lanes(pp.dsel == 0), w.dDst = lanes(pp.dsel == 1);
++        w.fogColor = _mm_setr_epi16(pp.fogR, pp.fogG, pp.fogB, 0, pp.fogR, pp.fogG, pp.fogB, 0);
++        w.fbmsk = _mm_set1_epi32(static_cast<int>(pp.fbmsk));
++        w.aref = _mm_set1_epi32(static_cast<int>((pp.test >> 4) & 0xFFu));
++        w.atst = (pp.test & 0x1u) != 0u ? static_cast<uint8_t>((pp.test >> 1) & 0x7u) : 1u;
++        PixelWriteMask fail{false, false, false};
++        switch (static_cast<uint8_t>((pp.test >> 12) & 0x3u)) // classifyAlphaTest's
++        {
++        case 1: fail = {true, true, false}; break;
++        case 2: fail = {false, false, true}; break;
++        case 3: fail = static_cast<uint8_t>(pp.fpsm) == GS_PSM_CT32 ? PixelWriteMask{true, false, false}
++                                                                     : PixelWriteMask{true, true, false};
++            break;
++        default: break;
++        }
++        w.failRgb = fail.writeRgb, w.failAlpha = fail.writeAlpha, w.failDepth = fail.writeDepth;
++        w.fge = pp.fge, w.abe = pp.abe, w.pabe = pp.pabe, w.fbaSetsAlpha = pp.fbaSetsAlpha;
++        // passesDestinationAlphaTest: only CT32 can fail here (frame16 goes through writePixelCt32Z24At).
++        w.dateCt32 = ((pp.test >> 14) & 0x1u) != 0u && static_cast<uint8_t>(pp.fpsm) == GS_PSM_CT32;
++        w.datm = ((pp.test >> 15) & 0x1u) != 0u;
++        w.readAlways = pp.dateNeedsRead;
++        w.readForFrame = pp.fbmsk != 0u || pp.abe;
++        w.fbmskOn = pp.fbmsk != 0u;
++        w.frameCt32 = pp.frameCt32, w.frameCt24 = pp.frameCt24;
++        w.writeZ = !pp.zmask;
++        w.csel = pp.csel, w.fix = pp.fix;
++        // A/B mode 80: writePixelCt32Z24At for each pixel, as before patch 0086.
++        w.scalar = pp.frame16 || g_ps2AbMode.load(std::memory_order_relaxed) == 80;
++        return w;
++    }
++
+     FastWrite makeFastWrite(const PixelPipeline &pp)
+     {
+         FastWrite fw;
+         fw.blend = makeBlendLanes(pp);
+         fw.frame = makeBufferLanes<GSMem::C32>(pp.fbp, pp.fbw);
+         fw.depth = makeBufferLanes<GSMem::Z24>(pp.zbp, pp.fbw);
++        fw.w4 = makeFastWrite4(pp);
+         return fw;
+     }
+ 
++    // Patch 0086: writePixelCt32Z24At for the pixels `live` of a group of four (lane i: colour rgba[i] after the
++    // texture combiner, fog[i] 0..255, depth z[i], byte addresses frameByte[i] and zByte[i]; the depth test already
++    // done), with the fog, the alpha test, the blend and the masks of the four lanes at once in SSE2, each lane with
++    // writePixelCt32Z24At's operations (the products and shifts of the fog and the blend exact in 16 and 32 bits, the
++    // same saturations). The frame values of the group are read before any of its pixels is written, which the
++    // job's separate pages (BandJob::unordered) make irrelevant, and the writes go in x order, frame then depth.
++    PS2_GS_INLINE void writePixels4Ct32Z24(const PixelPipeline &pp, const FastWrite &fw, unsigned live, __m128i rgba,
++                                           __m128i fog, const uint32_t *z, const uint32_t *frameByte,
++                                           const uint32_t *zByte)
++    {
++        const FastWrite4 &w = fw.w4;
++        uint8_t *const vram = pp.vram;
++        if (w.scalar)
++        {
++            alignas(16) uint32_t c[4], f[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(c), rgba);
++            _mm_store_si128(reinterpret_cast<__m128i *>(f), fog);
++            for (; live != 0u; live &= live - 1u)
++            {
++                const unsigned i = static_cast<unsigned>(std::countr_zero(live));
++                writePixelCt32Z24At(pp, fw.blend, frameByte[i], zByte[i], z[i], c[i], static_cast<uint8_t>(f[i]));
++            }
++            return;
++        }
++        const __m128i zero = _mm_setzero_si128();
++        const __m128i rgbLanes = _mm_setr_epi16(-1, -1, -1, 0, -1, -1, -1, 0);
++        if (w.fge)
++        {
++            // applyFog: ((fog * c) >> 8) + (((255 - fog) * fogColor) >> 8) on R, G and B (each product < 2^16, the sum
++            // at most 254).
++            const __m128i f8 = _mm_or_si128(fog, _mm_slli_epi32(fog, 8));
++            const __m128i f32 = _mm_or_si128(f8, _mm_slli_epi32(f8, 16));
++            const __m128i c255 = _mm_set1_epi16(255);
++            const auto applyFog = [&](__m128i c, __m128i f)
++            {
++                const __m128i fogged = _mm_add_epi16(_mm_srli_epi16(_mm_mullo_epi16(f, c), 8),
++                                                     _mm_srli_epi16(_mm_mullo_epi16(_mm_sub_epi16(c255, f), w.fogColor), 8));
++                return _mm_or_si128(_mm_and_si128(fogged, rgbLanes), _mm_andnot_si128(rgbLanes, c));
++            };
++            rgba = _mm_packus_epi16(applyFog(_mm_unpacklo_epi8(rgba, zero), _mm_unpacklo_epi8(f32, zero)),
++                                    applyFog(_mm_unpackhi_epi8(rgba, zero), _mm_unpackhi_epi8(f32, zero)));
++        }
++        const __m128i a = _mm_srli_epi32(rgba, 24);
++
++        // classifyAlphaTest, as lane bits.
++        unsigned pass;
++        switch (w.atst)
++        {
++        case 0: pass = 0u; break;
++        case 2: pass = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmplt_epi32(a, w.aref)))); break;
++        case 3: pass = ~static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(a, w.aref)))); break;
++        case 4: pass = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, w.aref)))); break;
++        case 5: pass = ~static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmplt_epi32(a, w.aref)))); break;
++        case 6: pass = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(a, w.aref)))); break;
++        case 7: pass = ~static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, w.aref)))); break;
++        default: pass = 0xFu; break;
++        }
++        const unsigned fail = ~pass;
++        const unsigned wRgb = (pass | (w.failRgb ? fail : 0u)) & live;
++        const unsigned wAlpha = (pass | (w.failAlpha ? fail : 0u)) & live;
++        const unsigned wDepth = (pass | (w.failDepth ? fail : 0u)) & live;
++        unsigned any = wRgb | wAlpha | wDepth;
++        if (any == 0u)
++            return;
++        const unsigned wFrame = wRgb | wAlpha;
++        const unsigned preserve = w.frameCt32 ? (wRgb & ~wAlpha) : 0u;
++        const unsigned read = w.readAlways ? any : (wFrame & (w.readForFrame ? 0xFu : preserve));
++
++        alignas(16) uint32_t raw[4] = {0u, 0u, 0u, 0u};
++        for (unsigned m = read; m != 0u; m &= m - 1u)
++        {
++            const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++            std::memcpy(&raw[i], vram + frameByte[i], sizeof(u32)); // PixelStorageTraits<C32>::Read
++            if (w.dateCt32 && ((raw[i] >> 31) != 0u) != w.datm) // passesDestinationAlphaTest
++                any &= ~(1u << i);
++        }
++        const unsigned frameLanes = wFrame & any;
++        if (frameLanes != 0u)
++        {
++            __m128i fb = _mm_load_si128(reinterpret_cast<const __m128i *>(raw));
++            if (w.frameCt24) // fbrgba |= 0x80000000 (the lanes not read are not used)
++                fb = _mm_or_si128(fb, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++            const __m128i lowMask = _mm_set1_epi32(0x00FFFFFF);
++            const auto laneMask = [](unsigned bits)
++            {
++                return _mm_cmpgt_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>(bits)), _mm_setr_epi32(1, 2, 4, 8)),
++                                       _mm_setzero_si128());
++            };
++            __m128i rgb = _mm_and_si128(rgba, lowMask);
++            if (w.abe)
++            {
++                // blendRgbLanes for two pixels per register: per channel clampU8(((A - B) * C >> 7) + D).
++                __m128i cAlpha;
++                if (w.csel == 0)
++                    cAlpha = a;
++                else if (w.csel == 1)
++                    cAlpha = _mm_srli_epi32(fb, 24);
++                else
++                    cAlpha = _mm_set1_epi32(w.fix);
++                const __m128i c2 = _mm_or_si128(cAlpha, _mm_slli_epi32(cAlpha, 16));
++                const auto blendPair = [&](__m128i s, __m128i d, __m128i c)
++                {
++                    const __m128i av = _mm_or_si128(_mm_and_si128(s, w.aSrc), _mm_and_si128(d, w.aDst));
++                    const __m128i bv = _mm_or_si128(_mm_and_si128(s, w.bSrc), _mm_and_si128(d, w.bDst));
++                    const __m128i dv = _mm_or_si128(_mm_and_si128(s, w.dSrc), _mm_and_si128(d, w.dDst));
++                    const __m128i diff = _mm_sub_epi16(av, bv);
++                    const __m128i lo = _mm_mullo_epi16(diff, c), hi = _mm_mulhi_epi16(diff, c);
++                    const __m128i p0 = _mm_srai_epi32(_mm_unpacklo_epi16(lo, hi), 7);
++                    const __m128i p1 = _mm_srai_epi32(_mm_unpackhi_epi16(lo, hi), 7);
++                    return _mm_add_epi16(_mm_packs_epi32(p0, p1), dv);
++                };
++                const __m128i blended = _mm_and_si128(
++                    _mm_packus_epi16(blendPair(_mm_unpacklo_epi8(rgba, zero), _mm_unpacklo_epi8(fb, zero),
++                                               _mm_unpacklo_epi32(c2, c2)),
++                                     blendPair(_mm_unpackhi_epi8(rgba, zero), _mm_unpackhi_epi8(fb, zero),
++                                               _mm_unpackhi_epi32(c2, c2))),
++                    lowMask);
++                // !(pabe && (a & 0x80) == 0)
++                const __m128i blendLanes =
++                    w.pabe ? _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7F)) : _mm_cmpeq_epi32(zero, zero);
++                rgb = _mm_or_si128(_mm_and_si128(blendLanes, blended), _mm_andnot_si128(blendLanes, rgb));
++            }
++            __m128i alpha = a;
++            if (w.fbaSetsAlpha)
++                alpha = _mm_or_si128(alpha, _mm_and_si128(laneMask(wAlpha), _mm_set1_epi32(0x80)));
++            __m128i pixel = _mm_or_si128(rgb, _mm_slli_epi32(alpha, 24));
++            if (w.fbmskOn)
++                pixel = _mm_or_si128(_mm_andnot_si128(w.fbmsk, pixel), _mm_and_si128(fb, w.fbmsk));
++            if (preserve != 0u)
++            {
++                const __m128i keep = laneMask(preserve);
++                pixel = _mm_or_si128(_mm_andnot_si128(keep, pixel),
++                                     _mm_and_si128(keep, _mm_or_si128(_mm_and_si128(pixel, lowMask), _mm_andnot_si128(lowMask, fb))));
++            }
++            alignas(16) uint32_t out[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(out), pixel);
++            const unsigned zLanes = w.writeZ ? wDepth & any : 0u;
++            for (unsigned m = frameLanes | zLanes; m != 0u; m &= m - 1u)
++            {
++                const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                if ((frameLanes >> i) & 1u)
++                    std::memcpy(vram + frameByte[i], &out[i], sizeof(u32)); // PixelStorageTraits<C32>::Write
++                if ((zLanes >> i) & 1u)
++                {
++                    u32 old; // PixelStorageTraits<Z24>::Write: the top byte kept
++                    std::memcpy(&old, vram + zByte[i], sizeof(u32));
++                    const u32 value = (old & 0xFF000000u) | (z[i] & 0x00FFFFFFu);
++                    std::memcpy(vram + zByte[i], &value, sizeof(u32));
++                }
++            }
++            return;
++        }
++        if (w.writeZ)
++            for (unsigned m = wDepth & any; m != 0u; m &= m - 1u)
++            {
++                const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                u32 old;
++                std::memcpy(&old, vram + zByte[i], sizeof(u32));
++                const u32 value = (old & 0xFF000000u) | (z[i] & 0x00FFFFFFu);
++                std::memcpy(vram + zByte[i], &value, sizeof(u32));
++            }
++    }
++
+     // Patch 0075: rasterTriangleSpan4 for a perspective-textured triangle (the race's P8/P4/CT32/CT16 triangles, ~half of
+     // a band worker's time) of a job whose pixels may be drawn in any order (BandJob::unordered), written by
+     // writePixelTyped<F, Z>. For each four pixels: the depth test first, for the covered pixels (it has no side effect
+@@ -2764,7 +3014,12 @@ namespace
+         alignas(16) float fxL[4], fyL[4];
+         alignas(16) uint32_t pre[4][4], idx[4][4]; // [texel 00, 10, 01, 11][lane]
+         alignas(16) uint32_t bufPre[4], bufIdx[4];
+-        uint32_t zi[4], zByte[4];
++        alignas(16) uint32_t texL[4] = {0u, 0u, 0u, 0u};
++        alignas(16) uint32_t zi[4];
++        uint32_t zByte[4], frameByte[4];
++        const bool four = fw != nullptr && !fw->w4.scalar;
++        const CombineMasks4 masks = combineMasks4(job.combiner);
++        const __m128i flatV = _mm_set1_epi32(static_cast<int>(t.flatRgba));
+         const __m128i rowY = _mm_set1_epi32(y);
+         for (int x = spanX0; x <= spanX1; x += 4)
+         {
+@@ -2873,6 +3128,9 @@ namespace
+                 texelLanes<P>(wu, wv, basePage, rowPages, pre[0], idx[0]);
+             }
+ 
++            // Patch 0086: the texels of the group, then combineTexture4 and writePixels4Ct32Z24 (A/B mode 80: the
++            // combiner and writePixelCt32Z24At for each pixel, as before).
++            const unsigned group = live;
+             do
+             {
+                 const unsigned i = static_cast<unsigned>(std::countr_zero(live));
+@@ -2885,6 +3143,12 @@ namespace
+                                          fetchTexel<P>(ts, blockTable, pre[3][i], idx[3][i]), fxL[i], fyL[i]);
+                 else
+                     texel = fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]);
++                if (four)
++                {
++                    texL[i] = texel;
++                    frameByte[i] = pixelByteAddr<F>(fw->frame.blockTable, bufPre[i], bufIdx[i]);
++                    continue;
++                }
+                 const uint32_t rgba = combineTexturePacked(job.combiner, t.iip ? rgbaL[i] : t.flatRgba, texel);
+                 if (fw != nullptr)
+                     writePixelCt32Z24At(pp, fw->blend, pixelByteAddr<F>(fw->frame.blockTable, bufPre[i], bufIdx[i]),
+@@ -2893,6 +3157,13 @@ namespace
+                     writePixelBody<F, Z, false>(pp, x + static_cast<int>(i), y, static_cast<int>(zi[i]), rgba,
+                                                 static_cast<uint8_t>(fogL[i]));
+             } while (live != 0u);
++            if (four)
++            {
++                const __m128i vertex = t.iip ? _mm_load_si128(reinterpret_cast<const __m128i *>(rgbaL)) : flatV;
++                writePixels4Ct32Z24(pp, *fw, group,
++                                    combineTexture4(masks, vertex, _mm_load_si128(reinterpret_cast<const __m128i *>(texL))),
++                                    _mm_load_si128(reinterpret_cast<const __m128i *>(fogL)), zi, frameByte, zByte);
++            }
+         }
+     }
+ 
+@@ -2927,7 +3198,8 @@ namespace
+         alignas(16) uint32_t fogL[4];
+         alignas(16) double zL[4];
+         alignas(16) uint32_t bufPre[4], bufIdx[4];
+-        uint32_t zi[4], zByte[4];
++        alignas(16) uint32_t zi[4];
++        uint32_t zByte[4], frameByte[4];
+         const __m128i rowY = _mm_set1_epi32(y);
+         for (int x = spanX0; x <= spanX1; x += 4)
+         {
+@@ -2993,13 +3265,16 @@ namespace
+                                 _mm_unpacklo_epi16(_mm_unpacklo_epi8(f8, _mm_setzero_si128()), _mm_setzero_si128()));
+             }
+ 
+-            do
++            // Patch 0086: writePixels4Ct32Z24 (A/B mode 80: writePixelCt32Z24At for each pixel, inside it).
++            for (unsigned m = live; m != 0u; m &= m - 1u)
+             {
+-                const unsigned i = static_cast<unsigned>(std::countr_zero(live));
+-                live &= live - 1u;
+-                writePixelCt32Z24At(pp, fw.blend, pixelByteAddr<GSMem::C32>(fw.frame.blockTable, bufPre[i], bufIdx[i]),
+-                                    zByte[i], zi[i], t.iip ? rgbaL[i] : t.flatRgba, static_cast<uint8_t>(fogL[i]));
+-            } while (live != 0u);
++                const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                frameByte[i] = pixelByteAddr<GSMem::C32>(fw.frame.blockTable, bufPre[i], bufIdx[i]);
++            }
++            writePixels4Ct32Z24(pp, fw, live,
++                                t.iip ? _mm_load_si128(reinterpret_cast<const __m128i *>(rgbaL))
++                                      : _mm_set1_epi32(static_cast<int>(t.flatRgba)),
++                                _mm_load_si128(reinterpret_cast<const __m128i *>(fogL)), zi, frameByte, zByte);
+         }
+     }
+ 
+@@ -3276,7 +3551,13 @@ namespace
+         alignas(16) float fxL[4];
+         alignas(16) uint32_t pre[4][4], idx[4][4]; // [texel 00, 10, 01, 11][lane]
+         alignas(16) uint32_t bufPre[4], bufIdx[4];
+-        uint32_t zByte[4];
++        alignas(16) uint32_t texL[4] = {0u, 0u, 0u, 0u};
++        uint32_t zByte[4], frameByte[4];
++        const uint32_t zL[4] = {z, z, z, z};
++        const __m128i fogV = _mm_set1_epi32(s.fog);
++        const bool four = fw != nullptr && !fw->w4.scalar;
++        const CombineMasks4 masks = combineMasks4(job.combiner);
++        const __m128i vertexV = _mm_set1_epi32(static_cast<int>(s.vertexRgba));
+         const int skip = static_cast<int>(count - 1u) << shift;
+         for (int y = firstBandRow(s.drawY0, shift, count, index); y <= s.drawY1; y = nextBandRow(y, shift, skip))
+         {
+@@ -3373,6 +3654,9 @@ namespace
+                     texelLanes<P>(wu, wv0, basePage, rowPages, pre[0], idx[0]);
+                 }
+ 
++                // Patch 0086: the texels of the group, then combineTexture4 and writePixels4Ct32Z24 (A/B mode 80:
++                // the combiner and writePixelCt32Z24At for each pixel, as before).
++                const unsigned group = live;
+                 do
+                 {
+                     const unsigned i = static_cast<unsigned>(std::countr_zero(live));
+@@ -3385,6 +3669,12 @@ namespace
+                                              fetchTexel<P>(ts, blockTable, pre[3][i], idx[3][i]), fxL[i], fy);
+                     else
+                         texel = fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]);
++                    if (four)
++                    {
++                        texL[i] = texel;
++                        frameByte[i] = pixelByteAddr<F>(fw->frame.blockTable, bufPre[i], bufIdx[i]);
++                        continue;
++                    }
+                     const uint32_t rgba = combineTexturePacked(job.combiner, s.vertexRgba, texel);
+                     if (fw != nullptr)
+                         writePixelCt32Z24At(pp, fw->blend, pixelByteAddr<F>(fw->frame.blockTable, bufPre[i], bufIdx[i]),
+@@ -3392,6 +3682,10 @@ namespace
+                     else
+                         writePixelBody<F, Z, false>(pp, x + static_cast<int>(i), y, s.z, rgba, s.fog);
+                 } while (live != 0u);
++                if (four)
++                    writePixels4Ct32Z24(pp, *fw, group,
++                                        combineTexture4(masks, vertexV, _mm_load_si128(reinterpret_cast<const __m128i *>(texL))),
++                                        fogV, zL, frameByte, zByte);
+             }
+         }
+     }
+@@ -3506,12 +3800,77 @@ namespace
+             }
+     }
+ 
++    // Patch 0086: spriteFillRows for a job whose pixels may be drawn in any order (BandJob::unordered) and that tests
++    // the depth (ZTST not NEVER), four pixels at a time: the depth test first for the four (the sprite's depth is the
++    // same everywhere), as spriteTexRows, then writePixels4Ct32Z24 with the sprite's colour and fog in every lane,
++    // the frame and Z addresses from texelLanes (spriteFillRows works them out through PixelStorageTraits for each
++    // read and write). The destination alpha test and the depth test have no side effect, so their order does not
++    // matter.
++    void spriteFill4Rows(const BandJob &job, int shift, unsigned count, unsigned index)
++    {
++        const SpriteSetup s = job.sprite;
++        const PixelPipeline &pp = job.pp;
++        uint8_t *const vram = pp.vram;
++        const FastWrite fw = makeFastWrite(pp);
++        const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3
++        const uint32_t z = static_cast<uint32_t>(s.z);
++        const uint32_t zL[4] = {z, z, z, z};
++        const __m128i rgba = _mm_set1_epi32(static_cast<int>(s.vertexRgba));
++        const __m128i fogV = _mm_set1_epi32(s.fog);
++        const __m128i lanes = _mm_setr_epi32(0, 1, 2, 3);
++        alignas(16) uint32_t bufPre[4], bufIdx[4];
++        uint32_t zByte[4], frameByte[4];
++        const int skip = static_cast<int>(count - 1u) << shift;
++        for (int y = firstBandRow(s.drawY0, shift, count, index); y <= s.drawY1; y = nextBandRow(y, shift, skip))
++        {
++            const __m128i rowY = _mm_set1_epi32(y);
++            for (int x = s.drawX0; x <= s.drawX1; x += 4)
++            {
++                const int lanesLeft = std::min(4, s.drawX1 - x + 1);
++                unsigned live = (1u << lanesLeft) - 1u;
++                const __m128i xs = _mm_add_epi32(_mm_set1_epi32(x), lanes);
++                texelLanes<GSMem::Z24>(xs, rowY, fw.depth.basePage, fw.depth.rowPages, bufPre, bufIdx);
++                for (unsigned m = live; m != 0u; m &= m - 1u)
++                {
++                    const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                    zByte[i] = pixelByteAddr<GSMem::Z24>(fw.depth.blockTable, bufPre[i], bufIdx[i]);
++                }
++                if (ztest != 1u)
++                {
++                    unsigned pass = 0u;
++                    for (unsigned m = live; m != 0u; m &= m - 1u)
++                    {
++                        const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                        uint32_t storedZ;
++                        std::memcpy(&storedZ, vram + zByte[i], sizeof(u32)); // PixelStorageTraits<Z24>::Read
++                        storedZ &= 0x00FFFFFFu;
++                        if (ztest == 2u ? z >= storedZ : z > storedZ)
++                            pass |= 1u << i;
++                    }
++                    live = pass;
++                    if (live == 0u)
++                        continue;
++                }
++                texelLanes<GSMem::C32>(xs, rowY, fw.frame.basePage, fw.frame.rowPages, bufPre, bufIdx);
++                for (unsigned m = live; m != 0u; m &= m - 1u)
++                {
++                    const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                    frameByte[i] = pixelByteAddr<GSMem::C32>(fw.frame.blockTable, bufPre[i], bufIdx[i]);
++                }
++                writePixels4Ct32Z24(pp, fw, live, rgba, fogV, zL, frameByte, zByte);
++            }
++        }
++    }
++
+     void rasterSpriteRows(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         constexpr WritePixelFn kCt32Z24 = &writePixelTyped<GSMem::C32, GSMem::Z24>;
+         if (job.pp.writePixel == kCt32Z24 && g_ps2AbMode.load(std::memory_order_relaxed) != 13)
+         {
+             const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++            // Patch 0086 (A/B mode 80: spriteFillRows, as before).
++            if (!job.sprite.tme && abMode != 58 && abMode != 80 && job.unordered && job.pp.ztestMethod != 0u)
++                return spriteFill4Rows(job, shift, count, index);
+             if (!job.sprite.tme && abMode != 58)
+                 return spriteFillRows<GSMem::C32, GSMem::Z24>(job, shift, count, index);
+             const SampleFn sample = job.sprite.tme ? job.sampler.sample : nullptr;

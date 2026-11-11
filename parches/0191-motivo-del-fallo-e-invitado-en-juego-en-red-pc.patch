@@ -1,0 +1,114 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index a0bde17..1b43a7c 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -133,6 +133,20 @@ namespace ps2x
+         return mode != UserPathsMode::Development;
+     }
+ 
++    // Nativizacion T14: a text of the host for the game's OPTIONS > PC NETPLAY page (the reason a start failed, the
++    // guest's address), which its Lua reads one character code at a time: printable ASCII (anything else is ?) and at
++    // most maxSize characters (a longer one ends in ...).
++    constexpr size_t kNetplayPageTextSize = 96;
++    inline std::string netplayPageText(std::string_view text, size_t maxSize)
++    {
++        std::string out;
++        for (const char c : text.substr(0, maxSize))
++            out += c >= 0x20 && c < 0x7F ? c : '?';
++        if (text.size() > maxSize && maxSize > 3u)
++            out.replace(maxSize - 3u, 3u, "...");
++        return out;
++    }
++
+     // PS2X_MENU_GUION (tests): "<seconds>:<action>,..." from the first frame of the window. Actions: abrir, cerrar,
+     // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido|juego>, tecla=<arriba|abajo|izquierda|derecha|
+     // aceptar>, foto (a photo, as tecla_foto) or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
+@@ -207,13 +221,16 @@ public:
+     // Nativizacion T6 (OPTIONS > PC NETPLAY): red_puerto, red_calidad and red_publicas do not change through the three
+     // functions above nor setGameOptionNumber while the host runs or is asked to start (ps2x::netplayOptionLocked).
+     // The page's read-only rows: the host's state (ps2x::netplay::HostPageState as a number), its port and the IPv4
+-    // addresses a guest can connect to. A start or stop asked for (red_anfitrion) is taken by update() on the main
+-    // thread: this waits up to waitMs for it first.
++    // addresses a guest can connect to; T14: why the last start failed (only in that state) and the connected guest's
++    // address (only while connected), as ps2x::netplayPageText. A start or stop asked for (red_anfitrion) is taken by
++    // update() on the main thread: this waits up to waitMs for it first.
+     struct GameNetplayState
+     {
+         int state = 0;
+         int port = 0;
+         std::vector<std::array<int, 4>> addresses;
++        std::string reason;
++        std::string guest;
+     };
+     static GameNetplayState gameNetplayState(int waitMs);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index f756f71..9c09ccf 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -261,7 +261,7 @@ namespace ps2x::netplay
+             }
+             text("Tab o flechas: cambiar de campo  ·  Intro: conectar  ·  Ctrl+V: pegar  ·  F4: ver la contraseña", 24,
+                  static_cast<float>(screenHeight) - 92, 18, LIGHTGRAY);
+-            text("El anfitrión ve su dirección, su puerto y la contraseña en su menú F2 > Juego en red.", 24,
++            text("El anfitrión ve su dirección en OPCIONES > OPCIONES PC > JUEGO EN RED PC y la contraseña en F2 > Juego en red.", 24,
+                  static_cast<float>(screenHeight) - 66, 18, LIGHTGRAY);
+             text("Cierra la ventana para salir.", 24, static_cast<float>(screenHeight) - 36, 16, GRAY);
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index e04efcf..fd5b54b 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -1253,5 +1253,9 @@ PS2OptionsMenu::GameNetplayState PS2OptionsMenu::gameNetplayState(int waitMs)
+     state.state = static_cast<int>(ps2x::netplay::hostPageState(status, request));
+     state.port = status.hosting ? status.port : 0;
+     state.addresses = ps2x::netplay::hostPageAddresses(status);
++    if (state.state == static_cast<int>(ps2x::netplay::HostPageState::Failed))
++        state.reason = ps2x::netplayPageText(status.error, ps2x::kNetplayPageTextSize);
++    if (state.state == static_cast<int>(ps2x::netplay::HostPageState::GuestConnected))
++        state.guest = ps2x::netplayPageText(status.guestAddress, ps2x::kNetplayPageTextSize);
+     return state;
+ }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 94cd98b..c77d725 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -777,6 +777,24 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(model.current == before, "the model as it was");
+         });
+ 
++        // Nativizacion T14: the reason a start failed and the connected guest's address reach the page's Lua one
++        // character code at a time, so they go out as printable ASCII and no longer than the page shows.
++        tc.Run("the PC NETPLAY page's texts from the host are printable ASCII and cut to their size", [](TestCase &t)
++        {
++            const std::string reason = "no se puede escuchar en el puerto 50650: direccion en uso";
++            t.Equals(ps2x::netplayPageText(reason, ps2x::kNetplayPageTextSize), reason, "a reason as it is");
++            t.Equals(ps2x::netplayPageText("192.168.1.20:51234", ps2x::kNetplayPageTextSize),
++                     std::string("192.168.1.20:51234"), "a guest's address as it is");
++            t.Equals(ps2x::netplayPageText("", ps2x::kNetplayPageTextSize), std::string(), "nothing: nothing");
++            t.Equals(ps2x::netplayPageText("a\tb\n\xC3\xA1~\x7F", 20), std::string("a?b???~?"),
++                     "control characters and bytes past ASCII become ?");
++            const std::string cut = ps2x::netplayPageText(std::string(200, 'x'), ps2x::kNetplayPageTextSize);
++            t.Equals(cut.size(), ps2x::kNetplayPageTextSize, "cut to its size");
++            t.Equals(cut, std::string(ps2x::kNetplayPageTextSize - 3, 'x') + "...", "with ... at the end");
++            t.Equals(ps2x::netplayPageText(std::string(10, 'y'), 10), std::string(10, 'y'), "just its size: whole");
++            t.Equals(ps2x::netplayPageText("abcdef", 2), std::string("ab"), "too small for ...: only cut");
++        });
++
+         // PS2OptionsMenu (ps2_options_menu.cpp) is built into the runner only, so its game setters are checked in the
+         // source: a number that is not finite is refused first (red_anfitrion would reach std::lround), and the netplay
+         // lock is read holding g_modelMutex (the host starts in update() holding it: no change between check and set).
+@@ -803,6 +821,13 @@ void register_ps2_options_menu_tests()
+                 t.IsTrue(lock != std::string::npos && check != std::string::npos && lock < check,
+                          std::string(name) + ": the netplay lock is read holding g_modelMutex");
+             }
++            // Nativizacion T14: the page's texts go through netplayPageText, the reason only when the start failed and
++            // the guest's address only while it is connected.
++            const std::string page = body("gameNetplayState");
++            t.IsTrue(contains(page, "state.reason = ps2x::netplayPageText(status.error"),
++                     "gameNetplayState: the reason through netplayPageText");
++            t.IsTrue(contains(page, "state.guest = ps2x::netplayPageText(status.guestAddress"),
++                     "gameNetplayState: the guest's address through netplayPageText");
+         });
+ 
+         tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)

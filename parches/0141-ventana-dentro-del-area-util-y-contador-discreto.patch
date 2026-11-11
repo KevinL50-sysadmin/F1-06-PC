@@ -1,0 +1,290 @@
+diff --git a/ps2xRuntime/include/ps2_display.h b/ps2xRuntime/include/ps2_display.h
+index 8b6cdfa..e9dcad4 100644
+--- a/ps2xRuntime/include/ps2_display.h
++++ b/ps2xRuntime/include/ps2_display.h
+@@ -78,6 +78,41 @@ namespace ps2x
+     // lines in a 960 pixel window would make moire; 224 field lines look right).
+     int crtScanlines(int frameHeight, float destinationHeight);
+ 
++    // A rectangle in desktop pixels (a monitor's work area, a window's client area).
++    struct DesktopRect
++    {
++        int x = 0;
++        int y = 0;
++        int width = 0;
++        int height = 0;
++    };
++    // The window's frame around its client area (title bar and borders), in pixels.
++    struct WindowFrame
++    {
++        int left = 0;
++        int top = 0;
++        int right = 0;
++        int bottom = 0;
++    };
++    // Windowed mode: the client area for a window of width x height in a monitor's work area (the desktop without the
++    // taskbar), centred with its frame. A window that does not fit, frame included, shrinks keeping its aspect ratio:
++    // Windows cuts a larger window to the screen and raylib kept drawing for the size asked (fase3 T5: a 1920x1080
++    // window on a 1920x1080 monitor got a 1920x1061 client area, the top 19 rows of the picture were never shown and
++    // the taskbar hid the bottom ones). Never smaller than kMinWindowWidth x kMinWindowHeight.
++    DesktopRect fitWindowToWorkArea(int width, int height, const DesktopRect &workArea, const WindowFrame &frame);
++
++    // The FPS counter: one line in the top band of the window, above the game's HUD (which keeps to the TV's title
++    // safe area, 5 % of the height: F1 06's position tower starts at 4.9 %). The box ends by 4 % of the height from
++    // 480 rows up (fase3 T5: the two-line box hid the top of the position tower).
++    struct OverlayLayout
++    {
++        int fontSize = 10;
++        int margin = 2;  // from the window's top left corner to the box
++        int padding = 2; // from the box to the text
++        int height = 14; // of the box
++    };
++    OverlayLayout fpsOverlayLayout(int windowHeight);
++
+     // The window changes to go from one mode to another, in order.
+     enum class WindowStep
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+index 772b6d3..8eec7e6 100644
+--- a/ps2xRuntime/src/lib/ps2_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -10,6 +10,25 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
++#if !defined(PLATFORM_VITA)
++// The GLFW calls raylib does not wrap (the work area, the window frame) or wraps without checking the video mode,
++// declared by hand: raylib builds GLFW in but does not ship its header.
++extern "C"
++{
++    struct GLFWwindow;
++    struct GLFWmonitor;
++    struct GLFWvidmode
++    {
++        int width, height, redBits, greenBits, blueBits, refreshRate;
++    };
++    GLFWwindow *glfwGetCurrentContext(void);
++    const GLFWvidmode *glfwGetVideoMode(GLFWmonitor *monitor);
++    GLFWmonitor **glfwGetMonitors(int *count);
++    void glfwGetMonitorWorkarea(GLFWmonitor *monitor, int *x, int *y, int *width, int *height);
++    void glfwGetWindowFrameSize(GLFWwindow *window, int *left, int *top, int *right, int *bottom);
++}
++#endif
++
+ namespace ps2x
+ {
+     namespace
+@@ -186,6 +205,41 @@ namespace ps2x
+         return lines;
+     }
+ 
++    DesktopRect fitWindowToWorkArea(int width, int height, const DesktopRect &workArea, const WindowFrame &frame)
++    {
++        const int roomWidth = workArea.width - frame.left - frame.right;
++        const int roomHeight = workArea.height - frame.top - frame.bottom;
++        DesktopRect client{0, 0, std::max(1, width), std::max(1, height)};
++        if (client.width > roomWidth || client.height > roomHeight)
++        {
++            // The axis with less room sets the scale; the other follows it, rounded down.
++            if (static_cast<int64_t>(roomWidth) * client.height <= static_cast<int64_t>(roomHeight) * client.width)
++            {
++                client.height = static_cast<int>(static_cast<int64_t>(client.height) * roomWidth / client.width);
++                client.width = roomWidth;
++            }
++            else
++            {
++                client.width = static_cast<int>(static_cast<int64_t>(client.width) * roomHeight / client.height);
++                client.height = roomHeight;
++            }
++        }
++        client.width = std::max(client.width, kMinWindowWidth);
++        client.height = std::max(client.height, kMinWindowHeight);
++        client.x = workArea.x + frame.left + std::max(0, (roomWidth - client.width) / 2);
++        client.y = workArea.y + frame.top + std::max(0, (roomHeight - client.height) / 2);
++        return client;
++    }
++
++    OverlayLayout fpsOverlayLayout(int windowHeight)
++    {
++        OverlayLayout layout;
++        layout.fontSize = std::max(10, windowHeight / 40);
++        layout.margin = layout.padding = std::max(2, layout.fontSize / 5);
++        layout.height = layout.fontSize + 2 * layout.padding;
++        return layout;
++    }
++
+     std::vector<WindowStep> windowModeSteps(WindowMode from, WindowMode to)
+     {
+         std::vector<WindowStep> steps;
+@@ -305,6 +359,54 @@ namespace ps2x
+         {
+             SetShaderValue(shader, GetShaderLocation(shader, name), &value, SHADER_UNIFORM_FLOAT);
+         }
++
++        // The monitor's refresh rate, or fallback when Windows cannot tell it: raylib's GetMonitorRefreshRate reads the
++        // video mode without checking it, and Windows has none while the display is asleep or being switched (fase3
++        // T5: "Failed to query display settings" and a crash in the FPS counter's once a second check).
++        int monitorRefreshRate(int monitor, int fallback)
++        {
++#if !defined(PLATFORM_VITA)
++            int count = 0;
++            GLFWmonitor **monitors = glfwGetMonitors(&count);
++            const GLFWvidmode *mode =
++                monitors != nullptr && monitor >= 0 && monitor < count ? glfwGetVideoMode(monitors[monitor]) : nullptr;
++            return mode != nullptr && mode->refreshRate > 0 ? mode->refreshRate : fallback;
++#else
++            const int refresh = GetMonitorRefreshRate(monitor);
++            return refresh > 0 ? refresh : fallback;
++#endif
++        }
++
++        // Windowed mode: the window at width x height, or shrunk to the work area of its monitor (fitWindowToWorkArea),
++        // and with move, centred there. raylib keeps drawing for the size it asked GLFW for: a window that Windows cuts
++        // to the screen loses rows of the picture, so the size asked is always one that fits.
++        void placeWindow(int width, int height, bool move)
++        {
++#if !defined(PLATFORM_VITA)
++            GLFWwindow *window = glfwGetCurrentContext();
++            int count = 0;
++            GLFWmonitor **monitors = glfwGetMonitors(&count);
++            const int monitor = GetCurrentMonitor();
++            if (window != nullptr && monitors != nullptr && monitor >= 0 && monitor < count)
++            {
++                DesktopRect work;
++                glfwGetMonitorWorkarea(monitors[monitor], &work.x, &work.y, &work.width, &work.height);
++                WindowFrame frame;
++                glfwGetWindowFrameSize(window, &frame.left, &frame.top, &frame.right, &frame.bottom);
++                const DesktopRect fitted = fitWindowToWorkArea(width, height, work, frame);
++                if (fitted.width != width || fitted.height != height)
++                    std::fprintf(stderr,
++                                 "[ventana] %dx%d no cabe en el area de trabajo del monitor (%dx%d con el marco de la "
++                                 "ventana): %dx%d\n",
++                                 width, height, work.width, work.height, fitted.width, fitted.height);
++                SetWindowSize(fitted.width, fitted.height);
++                if (move)
++                    SetWindowPosition(fitted.x, fitted.y);
++                return;
++            }
++#endif
++            SetWindowSize(width, height);
++        }
+     }
+ 
+     struct DisplayPresenter::State
+@@ -335,7 +437,7 @@ namespace ps2x
+     {
+         State &s = *m_state;
+         s.background = backgroundWindow;
+-        s.refreshRate = std::max(1, GetMonitorRefreshRate(GetCurrentMonitor()));
++        s.refreshRate = monitorRefreshRate(GetCurrentMonitor(), 60);
+         const char *curvature = std::getenv("PS2X_CRT_CURVATURA");
+         s.crtCurvature = curvature != nullptr && curvature[0] == '1' ? 1.0f : 0.0f;
+         // The window starts as a window of the settings' size, without VSync (raylib's default) and capped at 60.
+@@ -347,6 +449,10 @@ namespace ps2x
+             std::fprintf(stderr, "[ventana] pantalla = %s no se usa con la ventana en segundo plano\n",
+                          windowModeName(settings.windowMode));
+         apply(settings);
++        // InitWindow asked for the settings' size; Windows may have cut it to the screen (placeWindow). The background
++        // window of the automated runs stays where it is, off the desktop.
++        if (s.settings.windowMode == WindowMode::Windowed)
++            placeWindow(s.settings.windowWidth, s.settings.windowHeight, !backgroundWindow);
+         const int monitor = GetCurrentMonitor();
+         std::fprintf(stderr,
+                      "[ventana] filtro=%s vsync=%d mostrar_fps=%d pantalla=%s tamano=%dx%d; "
+@@ -410,7 +516,7 @@ namespace ps2x
+         if (next.windowMode == WindowMode::Windowed)
+         {
+             if (sizeChanged)
+-                SetWindowSize(next.windowWidth, next.windowHeight);
++                placeWindow(next.windowWidth, next.windowHeight, !s.background);
+             else if (leftFullscreen && s.windowedWidth > 0)
+                 SetWindowSize(s.windowedWidth, s.windowedHeight);
+         }
+@@ -533,7 +639,7 @@ namespace ps2x
+         if (now - s.refreshCheckedAt >= 1.0)
+         {
+             s.refreshCheckedAt = now;
+-            const int refresh = std::max(1, GetMonitorRefreshRate(GetCurrentMonitor()));
++            const int refresh = monitorRefreshRate(GetCurrentMonitor(), s.refreshRate);
+             if (refresh != s.refreshRate)
+             {
+                 s.refreshRate = refresh;
+@@ -542,17 +648,17 @@ namespace ps2x
+         }
+         if (!s.settings.showFps)
+             return;
+-        const int fontSize = std::max(20, GetScreenHeight() / 40);
++        const OverlayLayout layout = fpsOverlayLayout(GetScreenHeight());
+         char game[64], screen[96];
+         std::snprintf(game, sizeof(game), "Juego: %.1f fps", gameRate);
+-        std::snprintf(screen, sizeof(screen), "Monitor: %d Hz%s, ventana: %d fps", s.refreshRate,
++        std::snprintf(screen, sizeof(screen), "  |  Monitor: %d Hz%s, ventana: %d fps", s.refreshRate,
+                       s.settings.vsync ? " (vsync)" : "", GetFPS());
+-        const int margin = fontSize / 2;
+-        const int width = std::max(MeasureText(game, fontSize), MeasureText(screen, fontSize)) + 2 * margin;
+-        const int height = 2 * fontSize + 3 * margin;
+-        DrawRectangle(margin, margin, width, height, Fade(BLACK, 0.6f));
+-        DrawText(game, 2 * margin, 2 * margin, fontSize, YELLOW);
+-        DrawText(screen, 2 * margin, 3 * margin + fontSize, fontSize, RAYWHITE);
++        const int gameWidth = MeasureText(game, layout.fontSize);
++        const int width = gameWidth + MeasureText(screen, layout.fontSize) + 2 * layout.padding;
++        const int textX = layout.margin + layout.padding, textY = layout.margin + layout.padding;
++        DrawRectangle(layout.margin, layout.margin, width, layout.height, Fade(BLACK, 0.6f));
++        DrawText(game, textX, textY, layout.fontSize, YELLOW);
++        DrawText(screen, textX + gameWidth, textY, layout.fontSize, RAYWHITE);
+     }
+ 
+     void DisplayPresenter::unload()
+diff --git a/ps2xTest/src/ps2_display_tests.cpp b/ps2xTest/src/ps2_display_tests.cpp
+index 1fb4231..1f97912 100644
+--- a/ps2xTest/src/ps2_display_tests.cpp
++++ b/ps2xTest/src/ps2_display_tests.cpp
+@@ -302,6 +302,48 @@ void register_ps2_display_tests()
+             t.Equals(ps2x::crtScanlines(0, 960.0f), 1, "no frame: one line");
+         });
+ 
++        tc.Run("a window larger than the work area shrinks keeping its aspect and is centred with its frame", [](TestCase &t)
++        {
++            const auto text = [](const ps2x::DesktopRect &r)
++            {
++                return std::to_string(r.width) + "x" + std::to_string(r.height) + " at " + std::to_string(r.x) + "," +
++                       std::to_string(r.y);
++            };
++            // The user's desktop (fase3 T5): a 1920x1080 monitor, the taskbar below (work area 1920x1032), a window
++            // frame of 8 pixels on the sides and below and a 31 pixel title bar.
++            const ps2x::DesktopRect work{0, 0, 1920, 1032};
++            const ps2x::WindowFrame frame{8, 31, 8, 8};
++            t.Equals(text(ps2x::fitWindowToWorkArea(1920, 1080, work, frame)), std::string("1765x993 at 77,31"),
++                     "1920x1080 on a 1920x1080 monitor: 16:9 in the 1904x993 left");
++            t.Equals(text(ps2x::fitWindowToWorkArea(960, 720, work, frame)), std::string("960x720 at 480,167"),
++                     "a window that fits keeps its size, centred");
++            t.Equals(text(ps2x::fitWindowToWorkArea(1904, 993, work, frame)), std::string("1904x993 at 8,31"),
++                     "exactly the room left");
++            t.Equals(text(ps2x::fitWindowToWorkArea(2560, 1080, work, frame)), std::string("1904x803 at 8,126"),
++                     "too wide: limited by the width");
++            t.Equals(text(ps2x::fitWindowToWorkArea(1920, 1080, ps2x::DesktopRect{1920, 0, 2560, 1400}, frame)),
++                     std::string("1920x1080 at 2240,171"), "on a second monitor to the right");
++            t.Equals(text(ps2x::fitWindowToWorkArea(640, 480, ps2x::DesktopRect{0, 0, 300, 200}, frame)),
++                     std::string("320x240 at 8,31"), "never below the smallest window");
++        });
++
++        tc.Run("the FPS counter is one line above the game's HUD", [](TestCase &t)
++        {
++            for (const int height : {480, 720, 960, 993, 1080, 1440, 2160})
++            {
++                const ps2x::OverlayLayout layout = ps2x::fpsOverlayLayout(height);
++                const std::string name = std::to_string(height) + " rows: ";
++                t.IsTrue(layout.margin + layout.height <= height * 4 / 100,
++                         name + "the box ends by 4 % of the height (" + std::to_string(layout.margin + layout.height) + ")");
++                t.Equals(layout.height, layout.fontSize + 2 * layout.padding, name + "one line of text");
++                t.IsTrue(layout.fontSize >= 12, name + "readable: " + std::to_string(layout.fontSize));
++            }
++            // At 1080 rows F1 06's position tower starts at row 52 (4.9 %).
++            const ps2x::OverlayLayout full = ps2x::fpsOverlayLayout(1080);
++            t.IsTrue(full.margin + full.height < 52, "1080 rows: above the position tower");
++            t.IsTrue(ps2x::fpsOverlayLayout(240).fontSize >= 10, "the smallest window still has a 10 pixel font");
++        });
++
+         tc.Run("window mode changes and F11", [](TestCase &t)
+         {
+             t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Windowed, WindowMode::Windowed)), std::string(""), "none");

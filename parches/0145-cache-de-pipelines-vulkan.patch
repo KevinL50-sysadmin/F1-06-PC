@@ -1,0 +1,841 @@
+diff --git a/ps2xRuntime/include/ps2_user_paths.h b/ps2xRuntime/include/ps2_user_paths.h
+index 5a387e8..555e6ad 100644
+--- a/ps2xRuntime/include/ps2_user_paths.h
++++ b/ps2xRuntime/include/ps2_user_paths.h
+@@ -24,6 +24,9 @@ namespace ps2x
+         std::filesystem::path savesDirectory;  // mc0, mc1 (empty: next to the ELF)
+         std::filesystem::path logsDirectory;
+         std::filesystem::path modsDirectory; // empty in development mode
++        // Data the game can rebuild (the GPU's pipeline cache), made only when something is cached: next to the .exe
++        // (portable and development) or LocalAppData\F1-06\cache (installed). Deleting it is always safe.
++        std::filesystem::path cacheDirectory;
+     };
+ 
+     // Development when booting an ELF given by path; otherwise portable if portable.txt sits next to the .exe.
+@@ -79,4 +82,8 @@ namespace ps2x
+     // The folder of controles.ini and opciones.ini for the rest of the runtime (empty: next to the .exe).
+     void setUserConfigDirectory(const std::filesystem::path &directory);
+     std::filesystem::path userConfigDirectory();
++
++    // The cache folder (UserPaths::cacheDirectory) for the rest of the runtime (empty: nothing is cached).
++    void setUserCacheDirectory(const std::filesystem::path &directory);
++    std::filesystem::path userCacheDirectory();
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 4877111..788d873 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -6,6 +6,7 @@
+ #include <filesystem>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ struct GSRegisters;
+ 
+@@ -66,6 +67,45 @@ GSGpuQuality ps2GsGpuQualityFromEnvironment(const char *superSampling, const cha
+ GSGpuQuality ps2GsGpuQualityFromEnvironment();
+ uint32_t ps2GsGpuQualityIgnoredWarnings();
+ 
++// Phase 3: the Vulkan pipeline cache. Without one, every pipeline paraLLEl-GS needs is compiled when first used, at
++// every run ("Stalled compile" in the log, up to ~0.3 s each), unless the driver's own disk cache still has it (NVIDIA
++// keeps one per .exe path). The GS GPU thread reads <cache>\vulkan-pipelines.bin (ps2x::userCacheDirectory: portable
++// <exe>\cache, installed LocalAppData\F1-06\cache, development next to the runner) before creating the device; the
++// DLL only uses it on the GPU and driver it was saved on. It is saved again when the driver's cache grew, by a thread
++// of its own that looks every 10 s: once it stopped growing (or every minute while it keeps growing), so that a crash
++// keeps it; and at shutdown. Always written atomically. At 4x it is ~50 MB (paraLLEl-GS precompiles its shader
++// variants).
++// PS2X_GS_GPU_CACHE=0: no cache; =<file>: that file instead.
++// The file: a 64-byte header ("PS2XVKPC", format version 1, header size, the device, the payload's size and a 64-bit
++// FNV-1a hash of it over 8-byte words) and the payload, the DLL's data (pgs_get_pipeline_cache).
++struct GSGpuDeviceIdentity
++{
++    uint32_t vendorId = 0u;
++    uint32_t deviceId = 0u;
++    uint32_t driverVersion = 0u;
++    uint8_t pipelineCacheUuid[16] = {};
++};
++bool ps2GsGpuSameDevice(const GSGpuDeviceIdentity &a, const GSGpuDeviceIdentity &b);
++
++enum class GSGpuPipelineCacheStatus : uint8_t
++{
++    Missing,     // no file (or an empty one)
++    Corrupt,     // not ours, another format version, truncated or with a changed byte
++    OtherDevice, // saved on another GPU or with another driver
++    Valid,
++};
++std::vector<uint8_t> ps2GsGpuEncodePipelineCache(const GSGpuDeviceIdentity &device, const std::vector<uint8_t> &payload);
++// Checks file, and that it was saved on device (unless null). fileDevice: the device in a readable header; payload:
++// the data when Valid, else empty.
++GSGpuPipelineCacheStatus ps2GsGpuDecodePipelineCache(const std::vector<uint8_t> &file, const GSGpuDeviceIdentity *device,
++                                                     GSGpuDeviceIdentity &fileDevice, std::vector<uint8_t> &payload);
++// variable: PS2X_GS_GPU_CACHE. Empty when there is no cache (variable "0", or no cache folder).
++std::filesystem::path ps2GsGpuPipelineCachePath(const char *variable, const std::filesystem::path &cacheDirectory);
++std::filesystem::path ps2GsGpuPipelineCachePath();
++// Writes file.tmp and renames it over file (making the folder): a reader never sees half a file.
++bool ps2GsGpuWriteFileAtomically(const std::filesystem::path &file, const std::vector<uint8_t> &bytes,
++                                 std::string &error);
++
+ class GSGpuBackend final : public GSRasterBackend
+ {
+ public:
+@@ -74,6 +114,9 @@ public:
+     ~GSGpuBackend() override;
+ 
+     std::string DeviceName() const;
++    GSGpuDeviceIdentity DeviceIdentity() const;
++    // What became of the pipeline cache file at creation (Valid: loaded).
++    GSGpuPipelineCacheStatus PipelineCacheStatus() const;
+ 
+     // The quality in use (superSampling as the GPU runs it: at most its top rate).
+     GSGpuQuality Quality() const;
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 2b29c88..1feb2ee 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_gpu_bridge.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/ps2_memory.h"
++#include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -10,6 +11,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <functional>
+ #include <iterator>
+ #include <mutex>
+@@ -29,16 +31,24 @@ std::atomic<uint64_t> g_ps2GsGpuPublishedFrames{0u};
+ 
+ namespace
+ {
+-    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 4), declared here so that the runtime
++    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 5), declared here so that the runtime
+     // does not depend on the bridge's source tree.
+-    constexpr uint32_t kPgsApiVersion = 4u;
++    constexpr uint32_t kPgsApiVersion = 5u;
+     constexpr size_t kVramSize = 4u * 1024u * 1024u;
+     struct pgs_context;
++    struct PgsDeviceIdentity
++    {
++        uint32_t vendor_id, device_id, driver_version;
++        uint8_t pipeline_cache_uuid[16];
++    };
+     struct PgsCreateInfo
+     {
+         uint32_t struct_size;
+         uint32_t super_sampling;
+         uint32_t flags;
++        PgsDeviceIdentity pipeline_cache_device;
++        const void *pipeline_cache;
++        size_t pipeline_cache_size;
+     };
+     struct PgsPrivRegs
+     {
+@@ -82,6 +92,9 @@ namespace
+         pgs_context *(*create)(const PgsCreateInfo *, char *, size_t);
+         void (*destroy)(pgs_context *);
+         const char *(*device_name)(pgs_context *);
++        void (*get_device_identity)(pgs_context *, PgsDeviceIdentity *);
++        size_t (*get_pipeline_cache_size)(pgs_context *);
++        const void *(*get_pipeline_cache)(pgs_context *, size_t *);
+         void (*gif_transfer)(pgs_context *, uint32_t, const void *, size_t);
+         void (*write_register)(pgs_context *, uint32_t, uint64_t);
+         void (*reset_gif_path)(pgs_context *, uint32_t);
+@@ -106,6 +119,79 @@ namespace
+     std::atomic<uint32_t> g_qualityIgnoredWarnings{0u};
+     std::atomic<GSGpuBackend *> g_activeGpuBackend{nullptr}; // phase 3 (T3): for the options menu
+ 
++    // The pipeline cache file (ps2GsGpuEncodePipelineCache).
++    constexpr char kPipelineCacheMagic[8] = {'P', 'S', '2', 'X', 'V', 'K', 'P', 'C'};
++    constexpr uint32_t kPipelineCacheFormat = 1u;
++    constexpr uint32_t kPipelineCacheHeaderSize = 64u;
++    // The saver thread looks at the cache's size every kPipelineCacheCheck and writes it once it grew and then stayed
++    // the same for one check (compiles come in bursts: a new screen, the start of a race), or kPipelineCacheGrowing
++    // after the last write while it keeps growing (paraLLEl-GS's precompiled shader variants, in the first minutes).
++    constexpr auto kPipelineCacheCheck = std::chrono::seconds(10);
++    constexpr int64_t kPipelineCacheGrowingNs = 60'000'000'000ll;
++
++    // FNV-1a over 8-byte words (then the last bytes one by one): ~8 times faster than byte by byte, which took ~40 ms
++    // for a 50 MB cache at boot.
++    uint64_t fnv1a64(const uint8_t *data, size_t size)
++    {
++        uint64_t hash = 0xCBF29CE484222325ull;
++        size_t i = 0;
++        for (; i + 8u <= size; i += 8u)
++        {
++            uint64_t word = 0u;
++            std::memcpy(&word, data + i, sizeof(word));
++            hash = (hash ^ word) * 0x100000001B3ull;
++        }
++        for (; i < size; ++i)
++            hash = (hash ^ data[i]) * 0x100000001B3ull;
++        return hash;
++    }
++
++    template <typename T> void putAt(std::vector<uint8_t> &out, size_t offset, const T &value)
++    {
++        std::memcpy(out.data() + offset, &value, sizeof(value));
++    }
++
++    template <typename T> T getAt(const std::vector<uint8_t> &in, size_t offset)
++    {
++        T value{};
++        std::memcpy(&value, in.data() + offset, sizeof(value));
++        return value;
++    }
++
++    GSGpuDeviceIdentity identityFromPgs(const PgsDeviceIdentity &pgs)
++    {
++        GSGpuDeviceIdentity identity{};
++        identity.vendorId = pgs.vendor_id;
++        identity.deviceId = pgs.device_id;
++        identity.driverVersion = pgs.driver_version;
++        std::memcpy(identity.pipelineCacheUuid, pgs.pipeline_cache_uuid, sizeof(identity.pipelineCacheUuid));
++        return identity;
++    }
++
++    PgsDeviceIdentity identityToPgs(const GSGpuDeviceIdentity &identity)
++    {
++        PgsDeviceIdentity pgs{};
++        pgs.vendor_id = identity.vendorId;
++        pgs.device_id = identity.deviceId;
++        pgs.driver_version = identity.driverVersion;
++        std::memcpy(pgs.pipeline_cache_uuid, identity.pipelineCacheUuid, sizeof(pgs.pipeline_cache_uuid));
++        return pgs;
++    }
++
++    // The whole file, or nothing if it cannot be read (in one read: tens of MB).
++    std::vector<uint8_t> readFileBytes(const std::filesystem::path &file)
++    {
++        std::ifstream in(file, std::ios::binary | std::ios::ate);
++        const std::streamoff size = in ? static_cast<std::streamoff>(in.tellg()) : std::streamoff(-1);
++        if (size <= 0)
++            return {};
++        std::vector<uint8_t> bytes(static_cast<size_t>(size));
++        in.seekg(0);
++        if (!in.read(reinterpret_cast<char *>(bytes.data()), size))
++            return {};
++        return bytes;
++    }
++
+     bool isOne(const char *value)
+     {
+         return value != nullptr && std::strcmp(value, "1") == 0;
+@@ -424,6 +510,16 @@ struct GSGpuBackend::Impl
+     PgsApi api{};
+     pgs_context *context = nullptr;
+     std::string deviceName;
++    GSGpuDeviceIdentity deviceIdentity{};
++
++    // The pipeline cache (empty path: none); its payload size as loaded or last saved, and the thread writing it.
++    std::filesystem::path pipelineCacheFile;
++    GSGpuPipelineCacheStatus pipelineCacheStatus = GSGpuPipelineCacheStatus::Missing;
++    size_t pipelineCacheSize = 0u; // the saver thread's, then the GS GPU thread's after joining it
++    std::thread pipelineCacheSaver;
++    std::mutex pipelineCacheMutex;
++    std::condition_variable pipelineCacheWake;
++    bool pipelineCacheStop = false;
+ 
+     // The queue: producers append records to pending under mutex, the GS GPU thread swaps it with working.
+     std::thread worker;
+@@ -792,6 +888,53 @@ struct GSGpuBackend::Impl
+         }
+     }
+ 
++    // Writes the driver's pipeline cache if its size changed since it was loaded or written (the saver thread, or the
++    // GS GPU thread at shutdown). The copy alone takes ~60-75 ms for the ~50 MB of a 4x session: not on the GS GPU
++    // thread while the game runs.
++    void savePipelineCache()
++    {
++        const int64_t start = nowNs();
++        const size_t size = api.get_pipeline_cache_size(context);
++        if (size == 0u || size == pipelineCacheSize)
++            return;
++        size_t copied = 0u;
++        const auto *data = static_cast<const uint8_t *>(api.get_pipeline_cache(context, &copied));
++        if (data == nullptr || copied == 0u)
++            return;
++        pipelineCacheSize = copied;
++        const std::vector<uint8_t> bytes =
++            ps2GsGpuEncodePipelineCache(deviceIdentity, std::vector<uint8_t>(data, data + copied));
++        const double copyMs = static_cast<double>(nowNs() - start) / 1e6;
++        std::string error;
++        if (ps2GsGpuWriteFileAtomically(pipelineCacheFile, bytes, error))
++            std::fprintf(stderr, "[gs:gpu] cache de pipelines guardada: %s (%.0f KB; copia %.1f ms, total %.1f ms)\n",
++                         ps2x::pathForLog(pipelineCacheFile).c_str(), static_cast<double>(bytes.size()) / 1024.0, copyMs,
++                         static_cast<double>(nowNs() - start) / 1e6);
++        else
++            std::fprintf(stderr, "[gs:gpu] no se pudo guardar la cache de pipelines: %s\n", error.c_str());
++    }
++
++    // The saver thread (see kPipelineCacheCheck), so that a crash or a killed process keeps the cache.
++    void pipelineCacheLoop()
++    {
++        size_t previous = pipelineCacheSize;
++        int64_t written = nowNs();
++        std::unique_lock<std::mutex> lock(pipelineCacheMutex);
++        while (!pipelineCacheWake.wait_for(lock, kPipelineCacheCheck, [&]() { return pipelineCacheStop; }))
++        {
++            lock.unlock();
++            const size_t size = api.get_pipeline_cache_size(context);
++            const int64_t now = nowNs();
++            if (size != 0u && size != pipelineCacheSize && (size == previous || now - written >= kPipelineCacheGrowingNs))
++            {
++                savePipelineCache();
++                written = now;
++            }
++            previous = size;
++            lock.lock();
++        }
++    }
++
+     void workerLoop()
+     {
+         t_onGpuThread = true;
+@@ -799,10 +942,49 @@ struct GSGpuBackend::Impl
+         char error[256] = {};
+         const uint32_t createFlags = (dynamicSuperSampling ? kCreateDynamicSuperSampling : 0u) |
+                                      (requestedQuality.superSampledTextures ? kCreateSuperSampledTextures : 0u);
+-        PgsCreateInfo info{sizeof(PgsCreateInfo), requestedQuality.superSampling, createFlags};
++        PgsCreateInfo info{sizeof(PgsCreateInfo), requestedQuality.superSampling, createFlags, {}, nullptr, 0u};
++        // The device to come is unknown here: the DLL compares it with the one in the file.
++        GSGpuDeviceIdentity fileDevice{};
++        std::vector<uint8_t> payload;
++        const int64_t readStart = nowNs();
++        if (!pipelineCacheFile.empty())
++            pipelineCacheStatus = ps2GsGpuDecodePipelineCache(readFileBytes(pipelineCacheFile), nullptr, fileDevice,
++                                                              payload);
++        if (pipelineCacheStatus == GSGpuPipelineCacheStatus::Valid)
++        {
++            info.pipeline_cache_device = identityToPgs(fileDevice);
++            info.pipeline_cache = payload.data();
++            info.pipeline_cache_size = payload.size();
++        }
++        const int64_t createStart = nowNs();
+         context = api.create(&info, error, sizeof(error));
++        const double readMs = static_cast<double>(createStart - readStart) / 1e6;
++        const double createMs = static_cast<double>(nowNs() - createStart) / 1e6;
+         if (context != nullptr)
++        {
+             applyQuality(requestedQuality, api.get_super_sampling(context));
++            PgsDeviceIdentity identity{};
++            api.get_device_identity(context, &identity);
++            deviceIdentity = identityFromPgs(identity);
++            if (pipelineCacheStatus == GSGpuPipelineCacheStatus::Valid && !ps2GsGpuSameDevice(fileDevice, deviceIdentity))
++                pipelineCacheStatus = GSGpuPipelineCacheStatus::OtherDevice;
++            if (pipelineCacheStatus == GSGpuPipelineCacheStatus::Valid)
++                pipelineCacheSize = payload.size();
++            if (!pipelineCacheFile.empty())
++            {
++                const char *what = pipelineCacheStatus == GSGpuPipelineCacheStatus::Valid       ? "cargada"
++                                   : pipelineCacheStatus == GSGpuPipelineCacheStatus::Missing   ? "todavia no existe"
++                                   : pipelineCacheStatus == GSGpuPipelineCacheStatus::Corrupt   ? "danada: se descarta"
++                                                                                                : "de otra GPU o de otro "
++                                                                                                  "driver: se descarta";
++                std::fprintf(stderr, "[gs:gpu] cache de pipelines %s: %s (%.0f KB; lectura %.1f ms, dispositivo %.0f ms)\n",
++                             ps2x::pathForLog(pipelineCacheFile).c_str(), what,
++                             static_cast<double>(payload.size()) / 1024.0, readMs, createMs);
++            }
++            if (!pipelineCacheFile.empty())
++                pipelineCacheSaver = std::thread([this]() { pipelineCacheLoop(); });
++        }
++        payload = {};
+         {
+             std::lock_guard<std::mutex> lock(mutex);
+             created = true;
+@@ -843,6 +1025,16 @@ struct GSGpuBackend::Impl
+             busyNs += static_cast<uint64_t>(end - start);
+             report(end);
+         }
++        if (pipelineCacheSaver.joinable())
++        {
++            {
++                std::lock_guard<std::mutex> lock(pipelineCacheMutex);
++                pipelineCacheStop = true;
++            }
++            pipelineCacheWake.notify_all();
++            pipelineCacheSaver.join();
++            savePipelineCache();
++        }
+         api.destroy(context);
+         context = nullptr;
+     }
+@@ -933,6 +1125,9 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     resolve(api.create, "pgs_create");
+     resolve(api.destroy, "pgs_destroy");
+     resolve(api.device_name, "pgs_device_name");
++    resolve(api.get_device_identity, "pgs_get_device_identity");
++    resolve(api.get_pipeline_cache_size, "pgs_get_pipeline_cache_size");
++    resolve(api.get_pipeline_cache, "pgs_get_pipeline_cache");
+     resolve(api.gif_transfer, "pgs_gif_transfer");
+     resolve(api.write_register, "pgs_write_register");
+     resolve(api.reset_gif_path, "pgs_reset_gif_path");
+@@ -967,6 +1162,7 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     impl.requestedQuality = ps2GsGpuQualityFromEnvironment();
+     if (const char *value = std::getenv("PS2X_GS_SSAA_DINAMICO"))
+         impl.dynamicSuperSampling = std::strcmp(value, "0") != 0;
++    impl.pipelineCacheFile = ps2GsGpuPipelineCachePath();
+ 
+     impl.worker = std::thread([&impl]() { impl.workerLoop(); });
+     {
+@@ -1012,6 +1208,16 @@ std::string GSGpuBackend::DeviceName() const
+     return m_impl->deviceName;
+ }
+ 
++GSGpuDeviceIdentity GSGpuBackend::DeviceIdentity() const
++{
++    return m_impl->deviceIdentity;
++}
++
++GSGpuPipelineCacheStatus GSGpuBackend::PipelineCacheStatus() const
++{
++    return m_impl->pipelineCacheStatus;
++}
++
+ GSGpuQuality GSGpuBackend::Quality() const
+ {
+     std::lock_guard<std::mutex> lock(m_impl->qualityMutex);
+@@ -1058,6 +1264,106 @@ uint32_t ps2GsGpuQualityIgnoredWarnings()
+     return g_qualityIgnoredWarnings.load(std::memory_order_relaxed);
+ }
+ 
++bool ps2GsGpuSameDevice(const GSGpuDeviceIdentity &a, const GSGpuDeviceIdentity &b)
++{
++    return a.vendorId == b.vendorId && a.deviceId == b.deviceId && a.driverVersion == b.driverVersion &&
++           std::memcmp(a.pipelineCacheUuid, b.pipelineCacheUuid, sizeof(a.pipelineCacheUuid)) == 0;
++}
++
++// Header: 0 magic, 8 format, 12 header size, 16 vendor, 20 device, 24 driver, 28 UUID, 44 zero, 48 payload size,
++// 56 payload hash.
++std::vector<uint8_t> ps2GsGpuEncodePipelineCache(const GSGpuDeviceIdentity &device, const std::vector<uint8_t> &payload)
++{
++    std::vector<uint8_t> file(kPipelineCacheHeaderSize + payload.size(), 0u);
++    std::memcpy(file.data(), kPipelineCacheMagic, sizeof(kPipelineCacheMagic));
++    putAt(file, 8u, kPipelineCacheFormat);
++    putAt(file, 12u, kPipelineCacheHeaderSize);
++    putAt(file, 16u, device.vendorId);
++    putAt(file, 20u, device.deviceId);
++    putAt(file, 24u, device.driverVersion);
++    std::memcpy(file.data() + 28u, device.pipelineCacheUuid, sizeof(device.pipelineCacheUuid));
++    putAt(file, 48u, static_cast<uint64_t>(payload.size()));
++    putAt(file, 56u, fnv1a64(payload.data(), payload.size()));
++    if (!payload.empty())
++        std::memcpy(file.data() + kPipelineCacheHeaderSize, payload.data(), payload.size());
++    return file;
++}
++
++GSGpuPipelineCacheStatus ps2GsGpuDecodePipelineCache(const std::vector<uint8_t> &file, const GSGpuDeviceIdentity *device,
++                                                     GSGpuDeviceIdentity &fileDevice, std::vector<uint8_t> &payload)
++{
++    payload.clear();
++    fileDevice = GSGpuDeviceIdentity{};
++    if (file.empty())
++        return GSGpuPipelineCacheStatus::Missing;
++    if (file.size() < kPipelineCacheHeaderSize ||
++        std::memcmp(file.data(), kPipelineCacheMagic, sizeof(kPipelineCacheMagic)) != 0 ||
++        getAt<uint32_t>(file, 8u) != kPipelineCacheFormat || getAt<uint32_t>(file, 12u) != kPipelineCacheHeaderSize)
++        return GSGpuPipelineCacheStatus::Corrupt;
++    const uint64_t size = getAt<uint64_t>(file, 48u);
++    if (size == 0u || size != file.size() - kPipelineCacheHeaderSize ||
++        getAt<uint64_t>(file, 56u) != fnv1a64(file.data() + kPipelineCacheHeaderSize, static_cast<size_t>(size)))
++        return GSGpuPipelineCacheStatus::Corrupt;
++    fileDevice.vendorId = getAt<uint32_t>(file, 16u);
++    fileDevice.deviceId = getAt<uint32_t>(file, 20u);
++    fileDevice.driverVersion = getAt<uint32_t>(file, 24u);
++    std::memcpy(fileDevice.pipelineCacheUuid, file.data() + 28u, sizeof(fileDevice.pipelineCacheUuid));
++    if (device != nullptr && !ps2GsGpuSameDevice(fileDevice, *device))
++        return GSGpuPipelineCacheStatus::OtherDevice;
++    payload.assign(file.begin() + kPipelineCacheHeaderSize, file.end());
++    return GSGpuPipelineCacheStatus::Valid;
++}
++
++std::filesystem::path ps2GsGpuPipelineCachePath(const char *variable, const std::filesystem::path &cacheDirectory)
++{
++    if (variable != nullptr && variable[0] != '\0')
++        return std::strcmp(variable, "0") == 0 ? std::filesystem::path{} : std::filesystem::path(variable);
++    if (cacheDirectory.empty())
++        return {};
++    return cacheDirectory / "vulkan-pipelines.bin";
++}
++
++std::filesystem::path ps2GsGpuPipelineCachePath()
++{
++    return ps2GsGpuPipelineCachePath(std::getenv("PS2X_GS_GPU_CACHE"), ps2x::userCacheDirectory());
++}
++
++// As opciones.ini is saved (ps2_options.cpp), for bytes.
++bool ps2GsGpuWriteFileAtomically(const std::filesystem::path &file, const std::vector<uint8_t> &bytes,
++                                 std::string &error)
++{
++    std::error_code ignored;
++    if (file.has_parent_path())
++        std::filesystem::create_directories(file.parent_path(), ignored);
++    std::filesystem::path temporary = file;
++    temporary += ".tmp";
++    {
++        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++        if (out)
++        {
++            out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++            out.flush();
++        }
++        if (!out)
++        {
++            error = "no se pudo escribir " + ps2x::pathForLog(temporary);
++            out.close();
++            std::filesystem::remove(temporary, ignored);
++            return false;
++        }
++    }
++    std::error_code renameError;
++    std::filesystem::rename(temporary, file, renameError);
++    if (renameError)
++    {
++        error = "no se pudo sustituir " + ps2x::pathForLog(file) + ": " + renameError.message();
++        std::filesystem::remove(temporary, ignored);
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
+ void GSGpuBackend::SetPrivilegedRegisters(const GSRegisters *registers)
+ {
+     m_impl->privRegs = registers;
+diff --git a/ps2xRuntime/src/lib/ps2_user_paths.cpp b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+index 48668d5..af5cb09 100644
+--- a/ps2xRuntime/src/lib/ps2_user_paths.cpp
++++ b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+@@ -25,6 +25,7 @@ namespace ps2x
+ 
+         std::mutex g_configMutex;
+         fs::path g_configDirectory;
++        fs::path g_cacheDirectory;
+ 
+         bool pathExists(const fs::path &path)
+         {
+@@ -81,12 +82,14 @@ namespace ps2x
+         case UserPathsMode::Development:
+             paths.configDirectory = exeDirectory;
+             paths.logsDirectory = exeDirectory;
++            paths.cacheDirectory = exeDirectory / "cache";
+             break;
+         case UserPathsMode::Portable:
+             paths.configDirectory = exeDirectory / "config";
+             paths.savesDirectory = exeDirectory / "partidas";
+             paths.logsDirectory = exeDirectory / "registros";
+             paths.modsDirectory = exeDirectory / "mods";
++            paths.cacheDirectory = exeDirectory / "cache";
+             break;
+         case UserPathsMode::Installed:
+         {
+@@ -96,6 +99,7 @@ namespace ps2x
+             paths.savesDirectory = root / "partidas";
+             paths.modsDirectory = root / "mods";
+             paths.logsDirectory = localAppDataDirectory / kGameFolder / "registros";
++            paths.cacheDirectory = localAppDataDirectory / kGameFolder / "cache";
+             break;
+         }
+         }
+@@ -217,4 +221,16 @@ namespace ps2x
+         std::lock_guard<std::mutex> lock(g_configMutex);
+         return g_configDirectory;
+     }
++
++    void setUserCacheDirectory(const fs::path &directory)
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        g_cacheDirectory = directory;
++    }
++
++    fs::path userCacheDirectory()
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        return g_cacheDirectory;
++    }
+ }
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index f27beaf..b8e7747 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -221,6 +221,7 @@ namespace
+             messages.push_back(std::move(line));
+         ps2x::createUserDirectories(paths);
+         ps2x::setUserConfigDirectory(paths.configDirectory);
++        ps2x::setUserCacheDirectory(paths.cacheDirectory);
+         // Development (the test scripts) keeps its own defaults, e.g. the CPU GS (ps2_options.h).
+         ps2x::applyOptionsFile(paths.configDirectory / "opciones.ini", messages,
+                                paths.mode == ps2x::UserPathsMode::Development);
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index a1afc92..0b824c7 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -11,8 +11,10 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <functional>
+ #include <iostream>
++#include <iterator>
+ #include <map>
+ #include <string>
+ #include <thread>
+@@ -284,6 +286,49 @@ namespace
+     }
+ 
+     const auto kNoEnvironment = [](const char *) -> const char * { return nullptr; };
++
++    // A fresh folder under the system temp directory, removed at the end of the test.
++    struct ScratchDir
++    {
++        fs::path path;
++
++        ScratchDir()
++        {
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            path = fs::temp_directory_path() / ("ps2x-gs-cache-" + std::to_string(stamp));
++            fs::create_directories(path);
++        }
++        ~ScratchDir()
++        {
++            std::error_code error;
++            fs::remove_all(path, error);
++        }
++    };
++
++    std::vector<uint8_t> readBytes(const fs::path &file)
++    {
++        std::ifstream in(file, std::ios::binary);
++        return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    }
++
++    GSGpuDeviceIdentity testDevice()
++    {
++        GSGpuDeviceIdentity device{};
++        device.vendorId = 0x10DEu;
++        device.deviceId = 0x2782u;
++        device.driverVersion = 0x98580000u;
++        for (uint32_t i = 0; i < 16u; ++i)
++            device.pipelineCacheUuid[i] = static_cast<uint8_t>(0xA0u + i);
++        return device;
++    }
++
++    std::vector<uint8_t> testPayload()
++    {
++        std::vector<uint8_t> payload(1000u);
++        for (size_t i = 0; i < payload.size(); ++i)
++            payload[i] = static_cast<uint8_t>(i * 7u + 3u);
++        return payload;
++    }
+ }
+ 
+ void register_ps2_gs_gpu_tests()
+@@ -775,5 +820,166 @@ void register_ps2_gs_gpu_tests()
+             t.Equals(expected.height, 448u, "and 448 lines");
+             expectSamePresentation(t, expected, gpuScanout(*backend, request));
+         });
++
++        tc.Run("a pipeline cache file keeps its device and payload", [](TestCase &t)
++        {
++            const GSGpuDeviceIdentity device = testDevice();
++            const std::vector<uint8_t> file = ps2GsGpuEncodePipelineCache(device, testPayload());
++            t.Equals(file.size(), size_t{64u} + testPayload().size(), "a 64-byte header, then the payload");
++            t.IsTrue(std::memcmp(file.data(), "PS2XVKPC", 8u) == 0, "starts with PS2XVKPC");
++
++            GSGpuDeviceIdentity saved{};
++            std::vector<uint8_t> payload;
++            t.IsTrue(ps2GsGpuDecodePipelineCache(file, &device, saved, payload) == GSGpuPipelineCacheStatus::Valid,
++                     "valid on the same device");
++            t.IsTrue(payload == testPayload(), "the same payload");
++            t.IsTrue(ps2GsGpuSameDevice(saved, device), "the device it was saved on");
++            t.IsTrue(ps2GsGpuDecodePipelineCache(file, nullptr, saved, payload) == GSGpuPipelineCacheStatus::Valid,
++                     "valid without a device to compare");
++        });
++
++        tc.Run("a pipeline cache from another GPU or driver is discarded", [](TestCase &t)
++        {
++            const std::vector<uint8_t> file = ps2GsGpuEncodePipelineCache(testDevice(), testPayload());
++            const std::function<void(GSGpuDeviceIdentity &)> changes[] = {
++                [](GSGpuDeviceIdentity &d) { d.vendorId = 0x1002u; },
++                [](GSGpuDeviceIdentity &d) { d.deviceId += 1u; },
++                [](GSGpuDeviceIdentity &d) { d.driverVersion += 1u; },
++                [](GSGpuDeviceIdentity &d) { d.pipelineCacheUuid[15] ^= 1u; },
++            };
++            const char *names[] = {"vendor", "device", "driver", "pipeline cache UUID"};
++            for (size_t i = 0; i < std::size(changes); ++i)
++            {
++                GSGpuDeviceIdentity other = testDevice();
++                changes[i](other);
++                GSGpuDeviceIdentity saved{};
++                std::vector<uint8_t> payload{1u};
++                t.IsTrue(ps2GsGpuDecodePipelineCache(file, &other, saved, payload) ==
++                             GSGpuPipelineCacheStatus::OtherDevice,
++                         std::string("another ") + names[i]);
++                t.IsTrue(payload.empty(), std::string("no payload for another ") + names[i]);
++                t.IsFalse(ps2GsGpuSameDevice(saved, other), std::string("not the same device: ") + names[i]);
++            }
++        });
++
++        tc.Run("a damaged or truncated pipeline cache is discarded; an empty file is missing", [](TestCase &t)
++        {
++            const GSGpuDeviceIdentity device = testDevice();
++            const std::vector<uint8_t> good = ps2GsGpuEncodePipelineCache(device, testPayload());
++            const auto status = [&](const std::vector<uint8_t> &file) {
++                GSGpuDeviceIdentity saved{};
++                std::vector<uint8_t> payload{1u};
++                const GSGpuPipelineCacheStatus result = ps2GsGpuDecodePipelineCache(file, &device, saved, payload);
++                // A rejected file never hands out a payload (seen here as Valid, which fails the check).
++                if (result != GSGpuPipelineCacheStatus::Valid && !payload.empty())
++                    return GSGpuPipelineCacheStatus::Valid;
++                return result;
++            };
++            t.IsTrue(status({}) == GSGpuPipelineCacheStatus::Missing, "empty: missing");
++            std::vector<uint8_t> file = good;
++            file[0] = 'X';
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "another magic");
++            file = good;
++            file[8] = 2u;
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "another format version");
++            file = good;
++            file[64 + 500] ^= 0x10u;
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "a changed payload byte");
++            file.assign(good.begin(), good.end() - 1);
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "one byte short");
++            file.assign(good.begin(), good.begin() + 40);
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "half a header");
++            file = good;
++            file.push_back(0u);
++            t.IsTrue(status(file) == GSGpuPipelineCacheStatus::Corrupt, "one byte too many");
++            t.IsTrue(status(ps2GsGpuEncodePipelineCache(device, {})) == GSGpuPipelineCacheStatus::Corrupt,
++                     "no payload");
++        });
++
++        tc.Run("the pipeline cache is cache\\vulkan-pipelines.bin; PS2X_GS_GPU_CACHE=0 turns it off", [](TestCase &t)
++        {
++            const fs::path cache = "C:/Games/F1-06/cache";
++            t.Equals(ps2GsGpuPipelineCachePath(nullptr, cache).lexically_normal().string(),
++                     (cache / "vulkan-pipelines.bin").lexically_normal().string(), "in the user's cache folder");
++            t.Equals(ps2GsGpuPipelineCachePath("", cache).lexically_normal().string(),
++                     (cache / "vulkan-pipelines.bin").lexically_normal().string(), "an empty variable: the same");
++            t.IsTrue(ps2GsGpuPipelineCachePath("0", cache).empty(), "PS2X_GS_GPU_CACHE=0: no cache");
++            t.Equals(ps2GsGpuPipelineCachePath("D:/x/otra.bin", cache).string(), std::string("D:/x/otra.bin"),
++                     "another file");
++            t.IsTrue(ps2GsGpuPipelineCachePath(nullptr, {}).empty(), "no cache folder (tests): no cache");
++        });
++
++        tc.Run("the pipeline cache is written atomically, replacing the old file", [](TestCase &t)
++        {
++            ScratchDir dir;
++            const fs::path file = dir.path / "cache" / "vulkan-pipelines.bin";
++            std::string error;
++            t.IsTrue(ps2GsGpuWriteFileAtomically(file, {1u, 2u, 3u}, error), "written, making its folder: " + error);
++            t.IsTrue(readBytes(file) == std::vector<uint8_t>{1u, 2u, 3u}, "its bytes");
++            t.IsTrue(ps2GsGpuWriteFileAtomically(file, {9u}, error), "replaced: " + error);
++            t.IsTrue(readBytes(file) == std::vector<uint8_t>{9u}, "the new bytes");
++            size_t entries = 0u;
++            for (const auto &entry : fs::directory_iterator(file.parent_path()))
++                entries += entry.is_regular_file() ? 1u : 0u;
++            t.Equals(entries, size_t{1u}, "no temporary file left behind");
++
++            const fs::path blocked = dir.path / "a-file";
++            t.IsTrue(ps2GsGpuWriteFileAtomically(blocked, {5u}, error), "a plain file");
++            error.clear();
++            t.IsFalse(ps2GsGpuWriteFileAtomically(blocked / "inside.bin", {1u}, error), "a file is not a folder");
++            t.IsFalse(error.empty(), "with the reason");
++            t.IsTrue(readBytes(blocked) == std::vector<uint8_t>{5u}, "the file in the way is untouched");
++        });
++
++        tc.Run("the device saves its pipeline cache at shutdown and the next one loads it", [](TestCase &t)
++        {
++            ScratchDir dir;
++            const fs::path file = dir.path / "cache" / "vulkan-pipelines.bin";
++            ScopedEnvironment cache("PS2X_GS_GPU_CACHE", file.string().c_str());
++            {
++                std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++                if (!backend)
++                    return;
++                t.IsTrue(backend->PipelineCacheStatus() == GSGpuPipelineCacheStatus::Missing, "no file yet");
++                std::vector<uint8_t> vram = testFrameVram(640u, 448u);
++                backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++                gpuScanout(*backend, f1Request());
++            }
++            GSGpuDeviceIdentity saved{};
++            std::vector<uint8_t> payload;
++            const std::vector<uint8_t> bytes = readBytes(file);
++            const GSGpuPipelineCacheStatus status = ps2GsGpuDecodePipelineCache(bytes, nullptr, saved, payload);
++            t.IsTrue(status == GSGpuPipelineCacheStatus::Valid,
++                     "a valid file after the first device (status " + std::to_string(static_cast<int>(status)) +
++                         ", " + std::to_string(bytes.size()) + " bytes)");
++            t.IsTrue(payload.size() > 32u, "with the driver's data (" + std::to_string(payload.size()) + " bytes)");
++
++            std::unique_ptr<GSGpuBackend> second = testGpuBackend();
++            t.IsTrue(second && second->PipelineCacheStatus() == GSGpuPipelineCacheStatus::Valid,
++                     "the second device loads it");
++            t.IsTrue(second && ps2GsGpuSameDevice(second->DeviceIdentity(), saved), "saved on this device");
++        });
++
++        tc.Run("a pipeline cache of another device is discarded and replaced", [](TestCase &t)
++        {
++            ScratchDir dir;
++            const fs::path file = dir.path / "vulkan-pipelines.bin";
++            ScopedEnvironment cache("PS2X_GS_GPU_CACHE", file.string().c_str());
++            std::string error;
++            t.IsTrue(ps2GsGpuWriteFileAtomically(file, ps2GsGpuEncodePipelineCache(testDevice(), testPayload()), error),
++                     "a file from another GPU");
++            {
++                std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++                if (!backend)
++                    return;
++                t.IsTrue(backend->PipelineCacheStatus() == GSGpuPipelineCacheStatus::OtherDevice, "discarded");
++            }
++            GSGpuDeviceIdentity saved{};
++            std::vector<uint8_t> payload;
++            t.IsTrue(ps2GsGpuDecodePipelineCache(readBytes(file), nullptr, saved, payload) ==
++                         GSGpuPipelineCacheStatus::Valid,
++                     "rewritten");
++            t.IsFalse(ps2GsGpuSameDevice(saved, testDevice()), "for this device");
++        });
+     });
+ }
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 84ae9c3..4f59fec 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -162,6 +162,31 @@ void register_ps2_user_paths_tests()
+             t.IsTrue(paths.modsDirectory.empty(), "no mods folder");
+         });
+ 
++        tc.Run("the cache folder: next to the .exe (portable, development) or in LocalAppData\\F1-06", [](TestCase &t)
++        {
++            const fs::path exe = "C:/Games/F1-06";
++            const fs::path documents = "C:/Users/p/Documents";
++            const fs::path local = "C:/Users/p/AppData/Local";
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Portable, exe, documents, local).cacheDirectory),
++                     normal(exe / "cache"), "portable: <exe>\\cache");
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Installed, exe, documents, local).cacheDirectory),
++                     normal(local / "F1-06" / "cache"), "installed: LocalAppData\\F1-06\\cache");
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Installed, exe, {}, {}).cacheDirectory),
++                     normal(exe / "cache"), "installed without LocalAppData: the portable layout");
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Development, exe, documents, local).cacheDirectory),
++                     normal(exe / "cache"), "development: next to the runner");
++
++            TempDir dir;
++            const UserPaths portable = ps2x::resolveUserPaths(UserPathsMode::Portable, dir.path, {}, {});
++            ps2x::createUserDirectories(portable);
++            t.IsFalse(fs::exists(portable.cacheDirectory), "only made when something is cached (gs = gpu)");
++
++            const fs::path saved = ps2x::userCacheDirectory();
++            ps2x::setUserCacheDirectory(dir.path / "cache");
++            t.Equals(normal(ps2x::userCacheDirectory()), normal(dir.path / "cache"), "kept for the GS");
++            ps2x::setUserCacheDirectory(saved);
++        });
++
+         tc.Run("the mode: development wins, portable.txt picks portable, otherwise installed", [](TestCase &t)
+         {
+             TempDir dir;

@@ -1,0 +1,510 @@
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index 455affb..c5bd149 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -7,6 +7,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <string>
++#include <vector>
+ 
+ // Fase 5 (T13, F1 06): the photo mode (opciones.ini tecla_modo_foto: f8, f5, p or no). The key freezes the race (the
+ // game's simulation steps stop; it keeps drawing), hides the HUD, mutes the sound and hands the race camera to a free
+@@ -192,10 +193,11 @@ namespace ps2x
+     };
+ 
+     // PS2 pad bits (libpad order, as ps2_options_menu.h's).
+-    constexpr uint16_t kPhotoPadL3 = 1u << 1, kPhotoPadR3 = 1u << 2, kPhotoPadStart = 1u << 3, kPhotoPadUp = 1u << 4,
+-                       kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10, kPhotoPadR1 = 1u << 11,
+-                       kPhotoPadTriangle = 1u << 12, kPhotoPadCircle = 1u << 13, kPhotoPadCross = 1u << 14,
+-                       kPhotoPadSquare = 1u << 15;
++    constexpr uint16_t kPhotoPadSelect = 1u << 0, kPhotoPadL3 = 1u << 1, kPhotoPadR3 = 1u << 2,
++                       kPhotoPadStart = 1u << 3, kPhotoPadUp = 1u << 4, kPhotoPadRight = 1u << 5,
++                       kPhotoPadDown = 1u << 6, kPhotoPadLeft = 1u << 7, kPhotoPadL1 = 1u << 10,
++                       kPhotoPadR1 = 1u << 11, kPhotoPadTriangle = 1u << 12, kPhotoPadCircle = 1u << 13,
++                       kPhotoPadCross = 1u << 14, kPhotoPadSquare = 1u << 15;
+ 
+     // Foto y repeticion T3: what the game does not see of the photo mode's stick buttons: R3 where it turns the photo
+     // mode on or off (photoModeReady: a race camera drawing, or the photo mode on) and L3 in the replay, where it shows
+@@ -211,16 +213,144 @@ namespace ps2x
+     // Nativizacion T10: the pad's buttons that the camera does not use, on their press (previous: the last frame's
+     // buttons, kPhotoPadAllHeld on the first frame, so the button that chose it does not count): circle takes a photo
+     // (as tecla_foto) and START leaves (as tecla_modo_foto).
++    // Foto y repeticion T5: the d-pad's left and right another car (car: -1 the one before, 1 the next; none with
++    // both) and triangle the race's next camera, as in the race and the game's replay.
+     struct PhotoModePadActions
+     {
+         bool photo = false;
+         bool leave = false;
++        int car = 0;
++        bool camera = false;
+     };
+ 
+     inline PhotoModePadActions photoModePadActions(uint16_t previous, uint16_t pressed)
+     {
+         const uint16_t now = static_cast<uint16_t>(pressed & ~previous);
+-        return {(now & kPhotoPadCircle) != 0u, (now & kPhotoPadStart) != 0u};
++        PhotoModePadActions actions;
++        actions.photo = (now & kPhotoPadCircle) != 0u;
++        actions.leave = (now & kPhotoPadStart) != 0u;
++        actions.car = ((now & kPhotoPadRight) != 0u ? 1 : 0) - ((now & kPhotoPadLeft) != 0u ? 1 : 0);
++        actions.camera = (now & kPhotoPadTriangle) != 0u;
++        return actions;
++    }
++
++    // Foto y repeticion T5: the cars the photo mode goes through, as the game keeps them (its places, in the grid's
++    // order): valid (an empty place is not one) and the race position (0 the leader; -1 not known).
++    struct PhotoModeCar
++    {
++        bool valid = false;
++        int position = -1;
++    };
++
++    // The car step places from current in the race's order (the known positions first, then the rest in the game's
++    // order), round; from an empty place, the leader (or the last going back). -1 when there is none.
++    inline int stepPhotoModeCar(const std::vector<PhotoModeCar> &cars, int current, int step)
++    {
++        std::vector<int> order;
++        for (int i = 0; i < static_cast<int>(cars.size()); ++i)
++            if (cars[static_cast<size_t>(i)].valid)
++                order.push_back(i);
++        if (order.empty())
++            return -1;
++        std::stable_sort(order.begin(), order.end(), [&cars](int a, int b)
++                         {
++                             const int pa = cars[static_cast<size_t>(a)].position;
++                             const int pb = cars[static_cast<size_t>(b)].position;
++                             if ((pa < 0) != (pb < 0))
++                                 return pa >= 0;
++                             return pa >= 0 && pa < pb;
++                         });
++        const auto it = std::find(order.begin(), order.end(), current);
++        const int n = static_cast<int>(order.size());
++        if (it == order.end())
++            return step >= 0 ? order.front() : order.back();
++        const int rank = static_cast<int>(it - order.begin());
++        return order[static_cast<size_t>(((rank + step) % n + n) % n)];
++    }
++
++    // Foto y repeticion T5: the race's cameras in the photo mode: 0 to driving - 1 the game's driving cameras of the car
++    // (the ones triangle goes through in the race, in its order) and then, with tv, the TV camera (driving). The camera
++    // step places from current, round; from another of the game's cameras (the start's: -1, or out of range) the first
++    // (the last going back). -1 when there is none.
++    inline int stepPhotoModeCamera(int current, int driving, bool tv, int step)
++    {
++        const int total = std::max(driving, 0) + (tv ? 1 : 0);
++        if (total == 0)
++            return -1;
++        if (current < 0 || current >= total)
++            return step >= 0 ? 0 : total - 1;
++        return ((current + step) % total + total) % total;
++    }
++
++    namespace photo_mode_detail
++    {
++        // The game's text (Latin-1) in UTF-8 and in capitals, its accented letters too (the a and o of Raikkonen).
++        inline std::string upperLatin1(const std::string &text)
++        {
++            std::string out;
++            for (unsigned char c : text)
++            {
++                if (c >= 'a' && c <= 'z')
++                    c = static_cast<unsigned char>(c - 'a' + 'A');
++                else if (c >= 0xE0u && c != 0xF7u && c != 0xFFu)
++                    c = static_cast<unsigned char>(c - 0x20u);
++                if (c < 0x80u)
++                    out.push_back(static_cast<char>(c));
++                else
++                {
++                    out.push_back(static_cast<char>(0xC0u | (c >> 6)));
++                    out.push_back(static_cast<char>(0x80u | (c & 0x3Fu)));
++                }
++            }
++            return out;
++        }
++    }
++
++    // Foto y repeticion T5: the notice when the car changes: its driver's surname (the game's, Latin-1) in capitals and
++    // its race position (1 the leader; 0 not known): "BUTTON - 3" and the ordinal sign ("3rd"). A dash: the game's
++    // letter has no middle dot (logs/fyr-t5).
++    inline std::string photoModeCarNotice(const std::string &surname, int position, HostLanguage language)
++    {
++        const bool es = language == HostLanguage::Spanish;
++        std::string text = surname.empty() ? std::string(es ? "Coche" : "Car") : photo_mode_detail::upperLatin1(surname);
++        if (position <= 0)
++            return text;
++        text += " - " + std::to_string(position);
++        if (es)
++            return text + "\xC2\xBA";
++        const int tens = position % 100, units = position % 10;
++        const char *suffix = tens >= 11 && tens <= 13 ? "th"
++                             : units == 1             ? "st"
++                             : units == 2             ? "nd"
++                             : units == 3             ? "rd"
++                                                      : "th";
++        return text + suffix;
++    }
++
++    // The notice when the camera changes (camera, driving: stepPhotoModeCamera's): "Camera 3 of 5", or the TV camera.
++    inline std::string photoModeCameraNotice(int camera, int driving, HostLanguage language)
++    {
++        const bool es = language == HostLanguage::Spanish;
++        if (camera >= driving)
++            return es ? "C\xC3\xA1mara de televisi\xC3\xB3n" : "TV camera";
++        return (es ? "C\xC3\xA1mara " : "Camera ") + std::to_string(camera + 1) + (es ? " de " : " of ") +
++               std::to_string(driving);
++    }
++
++    // Foto y repeticion T5: after a car or camera change the free camera starts again from the game's, and follows it
++    // for kPhotoModeFollowSeconds (its cameras settle on the new car; sinceChange: seconds, negative when nothing changed
++    // since it went on) until the player moves it (moved: freeCameraInputMoves since the change); then it stays still.
++    constexpr double kPhotoModeFollowSeconds = 1.0;
++
++    inline bool photoModeFollows(double sinceChange, bool moved)
++    {
++        return !moved && sinceChange >= 0.0 && sinceChange < kPhotoModeFollowSeconds;
++    }
++
++    inline bool freeCameraInputMoves(const FreeCameraInput &input)
++    {
++        return input.reset || input.forward != 0.0f || input.right != 0.0f || input.up != 0.0f || input.yaw != 0.0f ||
++               input.pitch != 0.0f || input.roll != 0.0f || input.zoom != 0.0f;
+     }
+ 
+     // Aspecto T4: the help bar at the bottom of the picture when it goes on (from the pause or the key alike), for
+@@ -263,7 +393,11 @@ namespace ps2x
+             {keys({PadIcon::DpadUp, PadIcon::DpadDown}, {"Z", "X"}), "zoom"},
+             {keys({PadIcon::Cross}, {T("MAY\xC3\x9AS", "SHIFT")}), T("r\xC3\xA1pido", "fast")},
+             {keys({PadIcon::Square}, {"CTRL"}), T("lento", "slow")},
+-            {keys({PadIcon::Triangle}, {T("RETROCESO", "BACKSPACE")}), T("restablecer", "reset")},
++            {keys({PadIcon::Select}, {T("RETROCESO", "BACKSPACE")}), T("restablecer", "reset")},
++            // Foto y repeticion T5: the car and the race's camera, as in the race and the replay (keyboard: TAB, and
++            // Shift + TAB back; V, controles.ini's triangle).
++            {keys({PadIcon::DpadLeft, PadIcon::DpadRight}, {"TAB"}), T("coche", "car")},
++            {keys({PadIcon::Triangle}, {"V"}), T("c\xC3\xA1mara", "camera")},
+         };
+         const bool photo = !pad && !photoKey.empty() && photoKey != "no";
+         const bool mode = !pad && !modeKey.empty() && modeKey != "no" && modeKey != photoKey;
+@@ -307,7 +441,8 @@ namespace ps2x
+ 
+     // Keyboard: W S A D move, R F up and down, arrows turn, Q E roll, Z X zoom, Shift fast (x4), Ctrl slow (x0.25),
+     // Backspace back to the start. Pad: left stick moves, right stick turns, R2 L2 up and down, L1 R1 roll, the d-pad's
+-    // up and down zoom, cross fast, square slow, triangle back to the start.
++    // up and down zoom, cross fast, square slow, SELECT back to the start (Foto y repeticion T5: triangle is the race's
++    // camera, as in the race).
+     inline FreeCameraInput freeCameraInput(const PhotoModeKeys &keys, const PhotoModePad &pad)
+     {
+         using photo_mode_detail::clampUnit;
+@@ -323,7 +458,7 @@ namespace ps2x
+         input.zoom = clampUnit(axis(keys.zoomOut || held(kPhotoPadDown), keys.zoomIn || held(kPhotoPadUp)));
+         const bool fast = keys.fast || held(kPhotoPadCross), slow = keys.slow || held(kPhotoPadSquare);
+         input.speed = fast && !slow ? 4.0f : slow && !fast ? 0.25f : 1.0f;
+-        input.reset = keys.reset || held(kPhotoPadTriangle);
++        input.reset = keys.reset || held(kPhotoPadSelect);
+         return input;
+     }
+ 
+@@ -440,6 +575,17 @@ namespace ps2x
+     void photoModeCameraFrame();
+     void setPhotoModeInput(const FreeCameraInput &input);
+     FreeCameraInput photoModeInput();
++    // Foto y repeticion T5: the window asks for another car (car: steps) or camera (camera: steps); the game's thread
++    // takes what was asked since it last looked (src/f1_overrides.cpp) and tells what it chose with
++    // showPhotoModeMessage (the photo mode's notices). Dropped when the photo mode goes on or off.
++    struct PhotoModeViewRequest
++    {
++        int car = 0;
++        int camera = 0;
++    };
++    void requestPhotoModeView(int car, int camera);
++    PhotoModeViewRequest takePhotoModeViewRequest();
++    void showPhotoModeMessage(const std::string &message);
+ 
+     // ps2_pad.cpp (the window's thread): the pad of controles.ini for the free camera (not its keys, as readMenuPad).
+     PhotoModePad readPhotoModePad();
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b6ed5a6..1dde10f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -743,6 +743,7 @@ namespace
+     ps2x::PhotoModeSwitch g_photoModeSwitch;
+     ps2x::PhotoModeRequest g_photoModeRequest; // Nativizacion T10: the pause menu's PHOTO MODE
+     ps2x::FreeCameraInput g_photoModeInput;
++    ps2x::PhotoModeViewRequest g_photoModeView; // Foto y repeticion T5: the car and camera asked for
+     std::atomic<bool> g_photoModeOn{false};
+     std::chrono::steady_clock::time_point g_photoModeClockStart = std::chrono::steady_clock::now();
+ 
+@@ -845,6 +846,7 @@ namespace ps2x
+             was = g_photoModeSwitch.active();
+             on = g_photoModeSwitch.toggle(PhotoModeClock());
+             g_photoModeInput = {};
++            g_photoModeView = {};
+             g_photoModeOn.store(on, std::memory_order_relaxed);
+         }
+         if (!was && !on)
+@@ -881,6 +883,7 @@ namespace ps2x
+             if (step == ps2x::PhotoModeRequest::Step::Entered)
+             {
+                 g_photoModeInput = {};
++                g_photoModeView = {};
+                 g_photoModeOn.store(true, std::memory_order_relaxed);
+             }
+         }
+@@ -923,6 +926,26 @@ namespace ps2x
+         std::lock_guard<std::mutex> lock(g_photoModeMutex);
+         return g_photoModeInput;
+     }
++
++    void requestPhotoModeView(int car, int camera)
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        g_photoModeView.car += car;
++        g_photoModeView.camera += camera;
++    }
++
++    PhotoModeViewRequest takePhotoModeViewRequest()
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        const PhotoModeViewRequest request = g_photoModeView;
++        g_photoModeView = {};
++        return request;
++    }
++
++    void showPhotoModeMessage(const std::string &message)
++    {
++        SetPhotoMessage(message);
++    }
+ }
+ 
+ // Foto y repeticion T3 (main thread, once per frame): the pad's R3 alone turns the photo mode on and off as
+@@ -1008,10 +1031,14 @@ static void UpdatePhotoMode(bool optionsMenuOpen)
+         keys.fast = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+         keys.slow = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+         keys.reset = IsKeyDown(KEY_BACKSPACE);
++        // Foto y repeticion T5: TAB the next car (with Shift the one before) and V (controles.ini's triangle) the race's
++        // next camera, on their press.
++        const bool tab = IsKeyPressed(KEY_TAB), cameraKey = IsKeyPressed(KEY_V);
+         pad = ps2x::readPhotoModePad();
+         const bool keyboardUsed = keys.forward || keys.back || keys.left || keys.right || keys.up || keys.down ||
+                                   keys.turnLeft || keys.turnRight || keys.lookUp || keys.lookDown || keys.rollLeft ||
+-                                  keys.rollRight || keys.zoomIn || keys.zoomOut || keys.fast || keys.slow || keys.reset;
++                                  keys.rollRight || keys.zoomIn || keys.zoomOut || keys.fast || keys.slow || keys.reset ||
++                                  tab || cameraKey;
+         constexpr float kMoved = 0.35f;
+         const bool padUsed = (pad.pressed != 0u && s_padHeld != ps2x::kPhotoPadAllHeld) ||
+                              std::fabs(pad.leftX) > kMoved || std::fabs(pad.leftY) > kMoved ||
+@@ -1022,6 +1049,10 @@ static void UpdatePhotoMode(bool optionsMenuOpen)
+         s_padHeld = pad.pressed;
+         if (actions.photo)
+             ps2x::requestPhoto();
++        const int car = actions.car + (tab ? (keys.fast ? -1 : 1) : 0);
++        const int camera = (actions.camera ? 1 : 0) + (cameraKey ? 1 : 0);
++        if (car != 0 || camera != 0)
++            ps2x::requestPhotoModeView(car, camera);
+         if (actions.leave)
+         {
+             ps2x::togglePhotoMode();
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index cb5229f..712d270 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1147,13 +1147,18 @@ void register_ps2_options_menu_tests()
+             pad.rightY = 0.5f; // down
+             pad.r2 = 0.75f;
+             pad.l2 = 0.25f;
+-            pad.pressed = ps2x::kPhotoPadL1 | ps2x::kPhotoPadUp | ps2x::kPhotoPadSquare | ps2x::kPhotoPadTriangle;
++            pad.pressed = ps2x::kPhotoPadL1 | ps2x::kPhotoPadUp | ps2x::kPhotoPadSquare | ps2x::kPhotoPadSelect;
+             const ps2x::FreeCameraInput stick = ps2x::freeCameraInput({}, pad);
+             t.IsTrue(stick.forward == 1.0f && stick.right == -0.5f, "left stick up and half left");
+             t.IsTrue(stick.yaw == 0.25f && stick.pitch == -0.5f, "right stick: turn right, look down");
+             t.IsTrue(std::fabs(stick.up - 0.5f) < 1e-6f, "R2 up minus L2 down");
+             t.IsTrue(stick.roll == -1.0f && stick.zoom == 1.0f, "L1 rolls left, the d-pad's up zooms in");
+-            t.IsTrue(stick.speed == 0.25f && stick.reset, "square slow, triangle reset");
++            t.IsTrue(stick.speed == 0.25f && stick.reset, "square slow, SELECT reset");
++            ps2x::PhotoModePad triangle;
++            triangle.pressed = ps2x::kPhotoPadTriangle | ps2x::kPhotoPadLeft | ps2x::kPhotoPadRight;
++            const ps2x::FreeCameraInput camera = ps2x::freeCameraInput({}, triangle);
++            t.IsTrue(!camera.reset && camera.zoom == 0.0f && camera.right == 0.0f && camera.yaw == 0.0f,
++                     "triangle (the camera) and the d-pad's left and right (the car) do not move the free camera");
+ 
+             ps2x::PhotoModeKeys forward;
+             forward.forward = true;
+@@ -1246,8 +1251,8 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(!a.photo && a.leave, "START pressed: leave");
+             a = photoModePadActions(ps2x::kPhotoPadAllHeld, ps2x::kPhotoPadCircle | ps2x::kPhotoPadStart);
+             t.IsTrue(!a.photo && !a.leave, "held when it went on (the button that chose it): nothing");
+-            a = photoModePadActions(0u, ps2x::kPhotoPadCross | ps2x::kPhotoPadTriangle | ps2x::kPhotoPadL1);
+-            t.IsTrue(!a.photo && !a.leave, "the camera's buttons do neither");
++            a = photoModePadActions(0u, ps2x::kPhotoPadCross | ps2x::kPhotoPadSelect | ps2x::kPhotoPadL1);
++            t.IsTrue(!a.photo && !a.leave && a.car == 0 && !a.camera, "the free camera's buttons do none of them");
+ 
+             ps2x::PhotoModePad pad;
+             pad.pressed = ps2x::kPhotoPadCircle | ps2x::kPhotoPadStart;
+@@ -1264,14 +1269,19 @@ void register_ps2_options_menu_tests()
+             const ps2x::HelpBar es = ps2x::photoModeHelp(L::Spanish, ps2x::HelpInput::Pad, "f12", "f8");
+             t.Equals(ps2x::helpBarText(es, L::Spanish),
+                      std::string("Modo foto: stick izquierdo mover, stick derecho mirar, L2 R2 bajar/subir, L1 R1 inclinar, "
+-                                 "arriba abajo zoom, cruz r\xC3\xA1pido, cuadrado lento, tri\xC3\xA1ngulo restablecer, "
++                                 "arriba abajo zoom, cruz r\xC3\xA1pido, cuadrado lento, SELECT restablecer, "
++                                 "izquierda derecha coche, tri\xC3\xA1ngulo c\xC3\xA1mara, "
+                                  "L3 ayuda, c\xC3\xADrculo foto, START R3 salir."),
+                      "Spanish, with its accents");
+-            t.Equals(es.left.size(), size_t(8), "the camera's eight controls on the left");
++            t.Equals(es.left.size(), size_t(10), "the free camera's eight controls, the car and the camera on the left");
+             t.Equals(es.right.size(), size_t(3), "help, photo and exit on the right, as the game's ACEPTA");
+-            t.IsTrue(es.left.size() == 8u && es.left[0].keys.size() == 1u && es.left[0].keys[0].icon == I::LeftStick &&
++            t.IsTrue(es.left.size() == 10u && es.left[0].keys.size() == 1u && es.left[0].keys[0].icon == I::LeftStick &&
+                          es.left[0].keys[0].key.empty(),
+                      "a pad button, not a key");
++            t.IsTrue(es.left.size() == 10u && es.left[8].keys.size() == 2u && es.left[8].keys[0].icon == I::DpadLeft &&
++                         es.left[8].keys[1].icon == I::DpadRight && es.left[9].keys.size() == 1u &&
++                         es.left[9].keys[0].icon == I::Triangle,
++                     "the d-pad's left and right the car, triangle the camera (as in the race and the replay)");
+             t.IsTrue(es.right.size() == 3u && es.right[0].keys.size() == 1u && es.right[0].keys[0].icon == I::L3 &&
+                          es.right[1].keys[0].icon == I::Circle && es.right[2].keys.size() == 2u &&
+                          es.right[2].keys[0].icon == I::Start && es.right[2].keys[1].icon == I::R3,
+@@ -1279,7 +1289,8 @@ void register_ps2_options_menu_tests()
+             const ps2x::HelpBar en = ps2x::photoModeHelp(L::English, ps2x::HelpInput::Pad, "f12", "f8");
+             t.Equals(ps2x::helpBarText(en, L::English),
+                      std::string("Photo mode: left stick move, right stick look, L2 R2 down/up, L1 R1 tilt, up down zoom, "
+-                                 "cross fast, square slow, triangle reset, L3 help, circle photo, START R3 exit."),
++                                 "cross fast, square slow, SELECT reset, left right car, triangle camera, L3 help, "
++                                 "circle photo, START R3 exit."),
+                      "English");
+             t.Equals(ps2x::helpBarText(ps2x::photoModeHelp(L::Spanish, ps2x::HelpInput::Pad, "no", "no"), L::Spanish),
+                      ps2x::helpBarText(es, L::Spanish), "the pad's bar does not depend on the keys");
+@@ -1291,12 +1302,13 @@ void register_ps2_options_menu_tests()
+             const ps2x::HelpBar es = ps2x::photoModeHelp(L::Spanish, ps2x::HelpInput::Keyboard, "f12", "f8");
+             t.Equals(ps2x::helpBarText(es, L::Spanish),
+                      std::string("Modo foto: WASD mover, FLECHAS mirar, F R bajar/subir, Q E inclinar, Z X zoom, "
+-                                 "MAY\xC3\x9AS r\xC3\xA1pido, CTRL lento, RETROCESO restablecer, F12 foto, F8 salir."),
++                                 "MAY\xC3\x9AS r\xC3\xA1pido, CTRL lento, RETROCESO restablecer, TAB coche, "
++                                 "V c\xC3\xA1mara, F12 foto, F8 salir."),
+                      "Spanish");
+             t.IsTrue(!es.left.empty() && es.left[0].keys[0].key == "WASD", "keys, not pad buttons");
+             t.Equals(ps2x::helpBarText(ps2x::photoModeHelp(L::English, ps2x::HelpInput::Keyboard, "f12", "f8"), L::English),
+                      std::string("Photo mode: WASD move, ARROWS look, F R down/up, Q E tilt, Z X zoom, SHIFT fast, "
+-                                 "CTRL slow, BACKSPACE reset, F12 photo, F8 exit."),
++                                 "CTRL slow, BACKSPACE reset, TAB car, V camera, F12 photo, F8 exit."),
+                      "English");
+             const ps2x::HelpBar noKeys = ps2x::photoModeHelp(L::Spanish, ps2x::HelpInput::Keyboard, "no", "p");
+             t.IsTrue(noKeys.right.size() == 2u && noKeys.right[0].keys[0].key.empty() &&
+@@ -1308,6 +1320,118 @@ void register_ps2_options_menu_tests()
+                      "the same key for both: it takes the photo, START leaves");
+         });
+ 
++        tc.Run("the photo mode's pad: the d-pad's left and right change the car and triangle the camera, on the press",
++               [](TestCase &t)
++        {
++            using ps2x::photoModePadActions;
++            t.IsTrue(ps2x::kPhotoPadLeft == (1u << 7) && ps2x::kPhotoPadRight == (1u << 5) &&
++                         ps2x::kPhotoPadSelect == (1u << 0),
++                     "the PS2's bits");
++            ps2x::PhotoModePadActions a = photoModePadActions(0u, ps2x::kPhotoPadRight);
++            t.IsTrue(a.car == 1 && !a.camera && !a.photo && !a.leave, "right: the next car");
++            a = photoModePadActions(0u, ps2x::kPhotoPadLeft);
++            t.IsTrue(a.car == -1 && !a.camera, "left: the previous car");
++            a = photoModePadActions(ps2x::kPhotoPadLeft, ps2x::kPhotoPadLeft);
++            t.IsTrue(a.car == 0, "held: only once");
++            a = photoModePadActions(0u, ps2x::kPhotoPadLeft | ps2x::kPhotoPadRight);
++            t.IsTrue(a.car == 0, "both at once: none");
++            a = photoModePadActions(0u, ps2x::kPhotoPadTriangle);
++            t.IsTrue(a.camera && a.car == 0 && !a.photo, "triangle: the next camera");
++            a = photoModePadActions(ps2x::kPhotoPadTriangle, ps2x::kPhotoPadTriangle);
++            t.IsFalse(a.camera, "held: only once");
++            a = photoModePadActions(ps2x::kPhotoPadAllHeld, ps2x::kPhotoPadTriangle | ps2x::kPhotoPadRight);
++            t.IsTrue(!a.camera && a.car == 0, "held when it went on: nothing");
++        });
++
++        tc.Run("the photo mode's cars go in the race's order, round, past the empty places", [](TestCase &t)
++        {
++            using ps2x::stepPhotoModeCar;
++            // Places 0-4 as the game keeps them (the grid's), their race positions (0 the leader) and one empty.
++            const std::vector<ps2x::PhotoModeCar> cars = {{true, 2}, {true, 0}, {false, 1}, {true, 3}, {true, 1}};
++            t.Equals(stepPhotoModeCar(cars, 1, 1), 4, "after the leader, the second");
++            t.Equals(stepPhotoModeCar(cars, 4, 1), 0, "then the third");
++            t.Equals(stepPhotoModeCar(cars, 0, 1), 3, "then the fourth (the empty place is not one)");
++            t.Equals(stepPhotoModeCar(cars, 3, 1), 1, "after the last, the leader again");
++            t.Equals(stepPhotoModeCar(cars, 1, -1), 3, "before the leader, the last");
++            t.Equals(stepPhotoModeCar(cars, 0, -1), 4, "back one");
++            t.Equals(stepPhotoModeCar(cars, 2, 1), 1, "from an empty place: the leader");
++            t.Equals(stepPhotoModeCar(cars, 2, -1), 3, "or back: the last");
++            t.Equals(stepPhotoModeCar(cars, 1, 0), 1, "no step: the same car");
++            const std::vector<ps2x::PhotoModeCar> unknown = {{true, -1}, {true, 0}, {true, -1}};
++            t.Equals(stepPhotoModeCar(unknown, 1, 1), 0, "no position: after the known ones, in the game's order");
++            t.Equals(stepPhotoModeCar(unknown, 0, 1), 2, "in the game's order");
++            t.Equals(stepPhotoModeCar(unknown, 2, 1), 1, "round");
++            t.Equals(stepPhotoModeCar({}, 0, 1), -1, "no cars: none");
++            t.Equals(stepPhotoModeCar({{false, 0}}, 0, 1), -1, "only empty places: none");
++            t.Equals(stepPhotoModeCar({{true, 0}}, 0, 1), 0, "one car: itself");
++        });
++
++        tc.Run("the photo mode's cameras: the race's driving cameras in the game's order, then the TV camera", [](TestCase &t)
++        {
++            using ps2x::stepPhotoModeCamera;
++            t.Equals(stepPhotoModeCamera(2, 5, true, 1), 3, "the next driving camera");
++            t.Equals(stepPhotoModeCamera(4, 5, true, 1), 5, "after the last driving camera, the TV camera");
++            t.Equals(stepPhotoModeCamera(5, 5, true, 1), 0, "after the TV camera, the first driving camera");
++            t.Equals(stepPhotoModeCamera(4, 5, false, 1), 0, "without a TV camera: round the driving cameras");
++            t.Equals(stepPhotoModeCamera(0, 5, true, -1), 5, "back from the first: the TV camera");
++            t.Equals(stepPhotoModeCamera(-1, 5, true, 1), 0, "from another of the game's (the start's): the first");
++            t.Equals(stepPhotoModeCamera(9, 5, false, 1), 0, "out of range: the first");
++            t.Equals(stepPhotoModeCamera(0, 0, true, 1), 0, "only the TV camera");
++            t.Equals(stepPhotoModeCamera(0, 0, false, 1), -1, "no camera: none");
++        });
++
++        tc.Run("the photo mode's notices for the car (surname and race position) and the camera", [](TestCase &t)
++        {
++            using L = ps2x::HostLanguage;
++            using ps2x::photoModeCarNotice;
++            t.Equals(photoModeCarNotice("Button", 22, L::Spanish), std::string("BUTTON - 22\xC2\xBA"),
++                     "Spanish: the surname in capitals, the position");
++            t.Equals(photoModeCarNotice("Button", 22, L::English), std::string("BUTTON - 22nd"), "English");
++            t.Equals(photoModeCarNotice("R\xE4ikk\xF6nen", 1, L::Spanish),
++                     std::string("R\xC3\x84IKK\xC3\x96NEN - 1\xC2\xBA"),
++                     "the game's names are Latin-1: shown in UTF-8, in capitals");
++            t.Equals(photoModeCarNotice("Alonso", 1, L::English), std::string("ALONSO - 1st"), "1st");
++            t.Equals(photoModeCarNotice("Alonso", 2, L::English), std::string("ALONSO - 2nd"), "2nd");
++            t.Equals(photoModeCarNotice("Alonso", 3, L::English), std::string("ALONSO - 3rd"), "3rd");
++            t.Equals(photoModeCarNotice("Alonso", 4, L::English), std::string("ALONSO - 4th"), "4th");
++            t.Equals(photoModeCarNotice("Alonso", 11, L::English), std::string("ALONSO - 11th"), "11th");
++            t.Equals(photoModeCarNotice("Alonso", 12, L::English), std::string("ALONSO - 12th"), "12th");
++            t.Equals(photoModeCarNotice("Alonso", 13, L::English), std::string("ALONSO - 13th"), "13th");
++            t.Equals(photoModeCarNotice("Alonso", 21, L::English), std::string("ALONSO - 21st"), "21st");
++            t.Equals(photoModeCarNotice("Alonso", 0, L::Spanish), std::string("ALONSO"), "no position: the name");
++            t.Equals(photoModeCarNotice("", 5, L::Spanish), std::string("Coche - 5\xC2\xBA"), "no name: Coche");
++            t.Equals(photoModeCarNotice("", 5, L::English), std::string("Car - 5th"), "no name: Car");
++
++            using ps2x::photoModeCameraNotice;
++            t.Equals(photoModeCameraNotice(2, 5, L::Spanish), std::string("C\xC3\xA1mara 3 de 5"), "a driving camera");
++            t.Equals(photoModeCameraNotice(2, 5, L::English), std::string("Camera 3 of 5"), "English");
++            t.Equals(photoModeCameraNotice(5, 5, L::Spanish), std::string("C\xC3\xA1mara de televisi\xC3\xB3n"),
++                     "past the driving cameras: the TV camera");
++            t.Equals(photoModeCameraNotice(5, 5, L::English), std::string("TV camera"), "English");
++        });
++
++        tc.Run("after a car or camera change the free camera follows the game's for a while, until it is moved",
++               [](TestCase &t)
++        {
++            using ps2x::photoModeFollows;
++            t.IsTrue(photoModeFollows(0.0, false), "just changed: it follows");
++            t.IsTrue(photoModeFollows(ps2x::kPhotoModeFollowSeconds - 0.01, false), "for a while");
++            t.IsFalse(photoModeFollows(ps2x::kPhotoModeFollowSeconds, false), "then it stays still");
++            t.IsFalse(photoModeFollows(0.1, true), "moved by the player: it stays theirs");
++            t.IsFalse(photoModeFollows(-1.0, false), "no change since it went on: still, as before");
++            using ps2x::freeCameraInputMoves;
++            t.IsFalse(freeCameraInputMoves({}), "nothing held");
++            ps2x::FreeCameraInput fast;
++            fast.speed = 4.0f;
++            t.IsFalse(freeCameraInputMoves(fast), "only the speed: no");
++            ps2x::FreeCameraInput look;
++            look.pitch = 0.5f;
++            t.IsTrue(freeCameraInputMoves(look), "looking: yes");
++            ps2x::FreeCameraInput reset;
++            reset.reset = true;
++            t.IsTrue(freeCameraInputMoves(reset), "reset: yes");
++        });
++
+         tc.Run("the photo mode's notices in the game's language", [](TestCase &t)
+         {
+             using L = ps2x::HostLanguage;

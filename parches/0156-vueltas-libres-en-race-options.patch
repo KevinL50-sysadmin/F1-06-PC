@@ -1,0 +1,177 @@
+diff --git a/ps2xRuntime/src/lib/ps2_race_laps.h b/ps2xRuntime/src/lib/ps2_race_laps.h
+new file mode 100644
+index 0000000..adea7b4
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_race_laps.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++// Fase 5 (T10, F1 06): any number of laps in RACE OPTIONS. The game keeps the race distance as a fraction of the
++// Grand Prix (game.racedistance, a float per options mode in the options singleton *0x49ED94 + 0x7C + mode * 8, saved
++// with the profile) and turns it into laps when the race starts; RACE OPTIONS only offers 3 laps, 10, 20, 30, 50 and
++// 75 % and the whole race. Writing the distance that gives the chosen laps keeps the rest of the game unchanged.
++namespace ps2x
++{
++    // The game's laps for a distance (func_1E5150, called by the race, the HUD and the strategy): 0.05 is the 3 laps
++    // setting; anything else is ceil(GP laps * distance), never more than the Grand Prix.
++    inline int raceLapsForDistance(int fullLaps, float distance)
++    {
++        if (distance == 0.05f)
++            return 3;
++        const int laps = static_cast<int>(std::ceil(static_cast<float>(fullLaps) * distance));
++        return laps < fullLaps ? laps : fullLaps;
++    }
++
++    // The distance that gives those laps (1 to the Grand Prix): (laps - 0.5) / GP laps, half a lap away from both
++    // roundings (it survives the profile's "%f"), 1 for the whole Grand Prix. 0 if the circuit is unknown.
++    inline float raceDistanceForLaps(int fullLaps, int laps)
++    {
++        if (fullLaps <= 0)
++            return 0.0f;
++        if (laps < 1)
++            laps = 1;
++        if (laps >= fullLaps)
++            return 1.0f;
++        const float distance = (static_cast<float>(laps) - 0.5f) / static_cast<float>(fullLaps);
++        if (std::fabs(distance - 0.05f) < 1e-4f) // the 3 laps setting, also once written with "%f" (4 of 70 laps)
++            return (static_cast<float>(laps) - 0.4f) / static_cast<float>(fullLaps);
++        return distance;
++    }
++
++    // The Grand Prix laps of a circuit (game.track(): 1 to 18, 19 the classic one) from the guest's RAM; 0 if unknown.
++    // The circuit list (the one game.trackinfo reads) is a vector of record pointers at 0x4A1068 (begin, end); the
++    // record's +0x40 is its laps (the race reads the same field through *0x49F1E8 + 0x57C).
++    inline int trackFullLaps(const uint8_t *ram, uint32_t ramSize, int track)
++    {
++        constexpr uint32_t kCircuitList = 0x004A1068u;
++        constexpr uint32_t kLapsField = 0x40u;
++        auto read = [ram, ramSize](uint32_t address, uint32_t &value)
++        {
++            address &= 0x01FFFFFFu;
++            if (ram == nullptr || ramSize < 4u || address > ramSize - 4u)
++                return false;
++            std::memcpy(&value, ram + address, sizeof(value));
++            return true;
++        };
++        uint32_t begin = 0u, end = 0u, record = 0u, laps = 0u;
++        if (track < 1 || !read(kCircuitList, begin) || !read(kCircuitList + 4u, end) || begin == 0u || end < begin ||
++            (end - begin) % 4u != 0u || (end - begin) / 4u > 64u || static_cast<uint32_t>(track) > (end - begin) / 4u)
++            return 0;
++        if (!read(begin + static_cast<uint32_t>(track - 1) * 4u, record) || record == 0u ||
++            !read(record + kLapsField, laps) || laps < 1u || laps > 200u)
++            return 0;
++        return static_cast<int>(laps);
++    }
++}
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 7ccf5e4..8e5a9e6 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1,15 +1,20 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
+ #include "ps2_options_menu.h"
++#include "ps2_race_laps.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <functional>
+ #include <map>
+ #include <sstream>
+ #include <string>
++#include <vector>
+ 
+ // Phase 3 (T3): the in-game options menu. Its pure parts: rewriting opciones.ini, the menu's values and the variables
+ // that fix some of them, the pad combo that opens it, the guest's input while it is open and the debug panel's mode.
+@@ -442,4 +447,82 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(ps2x::parseMenuScript("").empty(), "empty: no steps");
+         });
+     });
++
++    // Fase 5 (T10): any number of laps in RACE OPTIONS, stored as the game's own race distance.
++    MiniTest::Case("RaceLaps", [](TestCase &tc)
++    {
++        tc.Run("raceLapsForDistance gives the game's laps: ceil(GP laps * distance), 0.05 = 3 laps, at most the GP",
++               [](TestCase &t)
++        {
++            t.Equals(ps2x::raceLapsForDistance(60, 0.1f), 6, "Silverstone at 10 %: 6 laps");
++            t.Equals(ps2x::raceLapsForDistance(78, 0.1f), 8, "Monaco at 10 %: 7.8 rounds up to 8");
++            t.Equals(ps2x::raceLapsForDistance(53, 0.75f), 40, "Monza at 75 %: 39.75 rounds up to 40");
++            t.Equals(ps2x::raceLapsForDistance(60, 0.05f), 3, "the shortest setting is 3 laps");
++            t.Equals(ps2x::raceLapsForDistance(70, 0.05f), 3, "3 laps on any circuit");
++            t.Equals(ps2x::raceLapsForDistance(60, 1.0f), 60, "the whole Grand Prix");
++            t.Equals(ps2x::raceLapsForDistance(60, 2.0f), 60, "never more than the Grand Prix");
++        });
++
++        tc.Run("raceDistanceForLaps gives every lap count of every circuit, also after the profile's %f", [](TestCase &t)
++        {
++            int wrong = 0, wrongText = 0, wrongRange = 0;
++            for (int full = 1; full <= 120; ++full)
++            {
++                for (int laps = 1; laps <= full; ++laps)
++                {
++                    const float distance = ps2x::raceDistanceForLaps(full, laps);
++                    if (ps2x::raceLapsForDistance(full, distance) != laps)
++                        ++wrong;
++                    if (!(distance > 0.0f && distance <= 1.0f) || ((distance == 1.0f) != (laps == full)))
++                        ++wrongRange;
++                    char text[32];
++                    std::snprintf(text, sizeof(text), "%f", static_cast<double>(distance));
++                    if (ps2x::raceLapsForDistance(full, std::strtof(text, nullptr)) != laps)
++                        ++wrongText;
++                }
++            }
++            t.Equals(wrong, 0, "the game turns each distance back into its laps");
++            t.Equals(wrongText, 0, "also when written with %f and read again");
++            t.Equals(wrongRange, 0, "between 0 and 1, and 1 only for the whole Grand Prix");
++            t.Equals(ps2x::raceLapsForDistance(70, ps2x::raceDistanceForLaps(70, 4)), 4,
++                     "4 of 70 laps does not fall on 0.05 (3 laps)");
++            t.Equals(ps2x::raceDistanceForLaps(60, 0), ps2x::raceDistanceForLaps(60, 1), "0 laps: 1 lap");
++            t.Equals(ps2x::raceDistanceForLaps(60, 61), 1.0f, "more than the Grand Prix: the Grand Prix");
++            t.Equals(ps2x::raceDistanceForLaps(0, 5), 0.0f, "unknown circuit: 0");
++        });
++
++        tc.Run("trackFullLaps reads the circuit's Grand Prix laps from the game's circuit list", [](TestCase &t)
++        {
++            std::vector<uint8_t> ram(0x00600000u, 0u);
++            auto put = [&ram](uint32_t address, uint32_t value) { std::memcpy(ram.data() + address, &value, 4); };
++            const uint32_t list = 0x004F2D40u;
++            const uint32_t laps[3] = {57u, 56u, 60u};
++            for (uint32_t i = 0; i < 3u; ++i)
++            {
++                const uint32_t record = 0x0050ACD0u + i * 0x2D0u;
++                put(list + i * 4u, record);
++                put(record + 0x40u, laps[i]);
++            }
++            put(0x004A1068u, list);
++            put(0x004A106Cu, list + 12u);
++            const uint32_t size = static_cast<uint32_t>(ram.size());
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 1), 57, "circuit 1");
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 3), 60, "circuit 3");
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 0), 0, "no circuit 0");
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 4), 0, "past the end of the list");
++            put(0x00500000u + 0x40u, 0u);
++            put(list + 4u, 0x80000000u | 0x00500000u);
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 2), 0, "a record with 0 laps: unknown");
++            put(list + 4u, 0u);
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 2), 0, "no record");
++            put(list + 4u, 0x01FFFFF0u);
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 2), 0, "a record outside the RAM");
++            put(0x004A106Cu, list);
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 1), 0, "an empty list (not loaded yet)");
++            put(0x004A1068u, 0u);
++            put(0x004A106Cu, 0x00400000u);
++            t.Equals(ps2x::trackFullLaps(ram.data(), size, 1), 0, "a list that is not one");
++            t.Equals(ps2x::trackFullLaps(nullptr, 0u, 1), 0, "no RAM");
++        });
++    });
+ }

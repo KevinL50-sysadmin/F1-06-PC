@@ -1,0 +1,116 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 602241f..5e1ee15 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -15,7 +15,11 @@
+ #include <cstring>
+ #include <fstream>
+ #include <iostream>
++#include <map>
++#include <sstream>
+ #include <stdexcept>
++#include <string>
++#include <vector>
+ 
+ using namespace GSInternal;
+ 
+@@ -710,10 +714,99 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+     return result;
+ }
+ 
++namespace
++{
++    // Debug (F1 06): F1_GS_RESUMEN=<seconds since process start> groups every primitive drawn during the following
++    // second by draw state (primitive class, texture, CLUT, blending, tests, frame/Z buffers) and prints the 60
++    // groups with the largest bounding-box area to stderr ("[gs:resumen]"), with one example vertex of each. The
++    // 512-event GS history does not cover a race frame.
++    const auto s_resumenProcessStart = std::chrono::steady_clock::now();
++
++    struct ResumenGrupo
++    {
++        uint64_t count = 0;
++        double area = 0.0;
++        std::string example;
++    };
++
++    void resumenAnotar(const GSPrimitiveBatch &batch)
++    {
++        static const double s_from = []
++        {
++            const char *value = std::getenv("F1_GS_RESUMEN");
++            return value != nullptr ? std::atof(value) : -1.0;
++        }();
++        if (s_from < 0.0)
++            return;
++        static std::map<std::string, ResumenGrupo> s_groups;
++        static bool s_done = false;
++        if (s_done)
++            return;
++        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_resumenProcessStart).count();
++        if (now < s_from)
++            return;
++        const GSDrawState &state = batch.state;
++        const auto &ctx = state.context;
++        if (now >= s_from + 1.0)
++        {
++            s_done = true;
++            std::vector<std::pair<std::string, ResumenGrupo>> sorted(s_groups.begin(), s_groups.end());
++            std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.area > b.second.area; });
++            std::cerr << "[gs:resumen] " << s_groups.size() << " grupos entre " << s_from << " y " << s_from + 1.0 << " s" << std::endl;
++            for (size_t i = 0; i < sorted.size() && i < 60u; ++i)
++                std::cerr << "[gs:resumen] n=" << sorted[i].second.count << " area=" << static_cast<uint64_t>(sorted[i].second.area)
++                          << " " << sorted[i].first << " | " << sorted[i].second.example << std::endl;
++            return;
++        }
++        const uint32_t type = state.prim.type;
++        const char *cls = (type == GS_PRIM_SPRITE) ? "sprite" : (type >= GS_PRIM_TRIANGLE && type <= GS_PRIM_TRIFAN) ? "tri"
++                          : (type == GS_PRIM_POINT) ? "punto" : "linea";
++        std::ostringstream key;
++        key << cls << " tme=" << int(state.prim.tme) << " abe=" << int(state.prim.abe) << " fst=" << int(state.prim.fst)
++            << " fge=" << int(state.prim.fge) << " ctxt=" << int(state.prim.ctxt) << " fbp=" << ctx.frame.fbp
++            << " fpsm=" << int(ctx.frame.psm) << " fbmsk=0x" << std::hex << ctx.frame.fbmsk << std::dec
++            << " zbp=" << ctx.zbuf.zbp << " zmsk=" << int(ctx.zbuf.zmask) << " tbp=" << ctx.tex0.tbp0
++            << " tbw=" << int(ctx.tex0.tbw) << " tpsm=" << int(ctx.tex0.psm) << " tw=" << int(ctx.tex0.tw)
++            << " th=" << int(ctx.tex0.th) << " tcc=" << int(ctx.tex0.tcc) << " tfx=" << int(ctx.tex0.tfx)
++            << " cbp=" << ctx.tex0.cbp << " cpsm=" << int(ctx.tex0.cpsm) << " csa=" << int(ctx.tex0.csa)
++            << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << " clamp=0x" << ctx.clamp << std::dec;
++        const int vertices = (type == GS_PRIM_SPRITE || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP) ? 2
++                             : (type == GS_PRIM_POINT) ? 1 : 3;
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++        for (int i = 0; i < vertices; ++i)
++        {
++            x0 = std::min(x0, batch.vertices[i].x - ofx);
++            x1 = std::max(x1, batch.vertices[i].x - ofx);
++            y0 = std::min(y0, batch.vertices[i].y - ofy);
++            y1 = std::max(y1, batch.vertices[i].y - ofy);
++        }
++        x0 = std::max(x0, static_cast<float>(ctx.scissor.x0));
++        y0 = std::max(y0, static_cast<float>(ctx.scissor.y0));
++        x1 = std::min(x1, static_cast<float>(ctx.scissor.x1));
++        y1 = std::min(y1, static_cast<float>(ctx.scissor.y1));
++        ResumenGrupo &group = s_groups[key.str()];
++        ++group.count;
++        if (x1 >= x0 && y1 >= y0)
++            group.area += static_cast<double>(x1 - x0 + 1.0f) * static_cast<double>(y1 - y0 + 1.0f);
++        if (group.example.empty())
++        {
++            std::ostringstream ex;
++            const GSVertex &v = batch.vertices[0];
++            ex << "v0=(" << v.x - ofx << "," << v.y - ofy << "," << v.z << ") stq=(" << v.s << "," << v.t << "," << v.q
++               << ") uv=(" << (v.u >> 4) << "," << (v.v >> 4) << ") rgba=(" << int(v.r) << "," << int(v.g) << ","
++               << int(v.b) << "," << int(v.a) << ") caja=[" << x0 << "," << y0 << "]-[" << x1 << "," << y1 << "]";
++            group.example = ex.str();
++        }
++    }
++}
++
+ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
++    resumenAnotar(batch);
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)

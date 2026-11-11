@@ -1,0 +1,98 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 5f66dcd..c8b71fa 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -829,8 +829,51 @@ namespace ps2x
+         return connected;
+     }
+ 
++    namespace
++    {
++        // Fase 5 (T6): opciones.ini vibracion; -1 until the first rumble reads PS2X_VIBRACION (opciones.ini sets the
++        // variables after the static objects are built).
++        std::atomic<int> g_rumblePercent{-1};
++
++        int rumblePercent()
++        {
++            int percent = g_rumblePercent.load(std::memory_order_relaxed);
++            if (percent < 0)
++            {
++                const int fromEnvironment = rumbleIntensityFromText(std::getenv("PS2X_VIBRACION"));
++                g_rumblePercent.compare_exchange_strong(percent, fromEnvironment, std::memory_order_relaxed);
++                percent = g_rumblePercent.load(std::memory_order_relaxed);
++            }
++            return percent;
++        }
++    }
++
++    float scaledRumble(float motor, int percent)
++    {
++        return std::clamp(motor, 0.0f, 1.0f) * static_cast<float>(std::clamp(percent, 0, 100)) / 100.0f;
++    }
++
++    int rumbleIntensityFromText(const char *text)
++    {
++        if (text == nullptr || *text == '\0')
++            return 100;
++        char *end = nullptr;
++        const long value = std::strtol(text, &end, 10);
++        if (end == text || *end != '\0')
++            return 100;
++        return static_cast<int>(std::clamp<long>(value, 0, 100));
++    }
++
++    void setRumbleIntensity(int percent)
++    {
++        g_rumblePercent.store(std::clamp(percent, 0, 100), std::memory_order_relaxed);
++    }
++
+     void setPadPortRumble(int port, float smallMotor, float largeMotor)
+     {
++        const int percent = rumblePercent();
++        smallMotor = scaledRumble(smallMotor, percent);
++        largeMotor = scaledRumble(largeMotor, percent);
+         if (port == 0)
+         {
+             ps2_pad_win::setRumble(smallMotor, largeMotor);
+diff --git a/ps2xRuntime/src/lib/ps2_pad_players.h b/ps2xRuntime/src/lib/ps2_pad_players.h
+index e668e3a..f744535 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_players.h
++++ b/ps2xRuntime/src/lib/ps2_pad_players.h
+@@ -34,4 +34,12 @@ namespace ps2x
+     // The game's controles.ini: whether a PS2 port (0 or 1) has a controller, and the motors of that port's pad.
+     bool padPortConnected(int port);
+     void setPadPortRumble(int port, float smallMotor, float largeMotor);
++
++    // Fase 5 (T6): opciones.ini vibracion (0-100 %) on every rumble path (XInput, the DualSense over HID, the wheel's
++    // effect, player 2's XInput pad). scaledRumble: a motor (0..1) at that percentage, never more than the game asks.
++    // rumbleIntensityFromText: PS2X_VIBRACION, 100 when unset or not a number. setRumbleIntensity: any thread, from
++    // the next change of the motors.
++    float scaledRumble(float motor, int percent);
++    int rumbleIntensityFromText(const char *text);
++    void setRumbleIntensity(int percent);
+ }
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 269be65..e0bb394 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -680,5 +680,20 @@ void register_pad_input_tests()
+             t.Equals(info.messages.size(), size_t{1}, "only X");
+             t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=tecla:X,tecla:K"), "the key stays");
+         });
++
++        // Fase 5 (T6): opciones.ini vibracion = 0-100 % scales the motors of every rumble path.
++        tc.Run("the vibration intensity scales both motors and 0 turns them off", [](TestCase &t)
++               {
++            t.IsTrue(std::fabs(ps2x::scaledRumble(0.8f, 50) - 0.4f) < 1e-6f, "50 % halves a motor");
++            t.Equals(ps2x::scaledRumble(1.0f, 100), 1.0f, "100 % leaves it as the game asks");
++            t.Equals(ps2x::scaledRumble(1.0f, 0), 0.0f, "0 % turns it off");
++            t.Equals(ps2x::scaledRumble(0.5f, 250), 0.5f, "never more than the game asks");
++            t.Equals(ps2x::scaledRumble(1.5f, 100), 1.0f, "clamped to 0..1");
++            t.Equals(ps2x::scaledRumble(0.5f, -5), 0.0f, "a negative percentage is off");
++            t.Equals(ps2x::rumbleIntensityFromText("40"), 40, "PS2X_VIBRACION=40");
++            t.Equals(ps2x::rumbleIntensityFromText(nullptr), 100, "unset: 100 %");
++            t.Equals(ps2x::rumbleIntensityFromText("mucha"), 100, "not a number: 100 %");
++            t.Equals(ps2x::rumbleIntensityFromText("150"), 100, "clamped to 100");
++        });
+     });
+ }

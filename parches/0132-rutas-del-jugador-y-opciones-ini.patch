@@ -1,0 +1,1418 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 8a8b3a1..910eae1 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -392,6 +392,8 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
++    src/lib/ps2_options.cpp
++    src/lib/ps2_user_paths.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+@@ -545,6 +547,10 @@ target_include_directories(ps2_runtime PUBLIC
+ # F1 06: FFmpeg en PRIVATE para que sus rutas de cabeceras no cambien la compilacion del codigo traducido (y su PCH).
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop)
+ target_link_libraries(ps2_runtime PRIVATE ffmpeg)
++# F1 06: SHGetKnownFolderPath (Documents, LocalAppData) for the player's folders.
++if(WIN32)
++    target_link_libraries(ps2_runtime PRIVATE shell32 ole32)
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+new file mode 100644
+index 0000000..e6f79cc
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include <filesystem>
++#include <functional>
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// Phase 1 (F1 06): opciones.ini, the player's settings. Each option stands for a PS2X_* variable; a variable that is
++// already set wins over the file (tests), and the file wins over the default. The runtime applies the file by setting
++// the variables that are not set yet, before anything reads them.
++namespace ps2x
++{
++    struct OptionChoice
++    {
++        const char *value;       // as written in opciones.ini
++        const char *environment; // value of the variable; nullptr leaves it unset
++    };
++
++    struct OptionSpec
++    {
++        const char *key;
++        const char *environment;
++        const char *defaultValue;
++        std::vector<OptionChoice> choices; // empty: an integer from minimum to maximum, passed as is
++        int minimum = 0;
++        int maximum = 0;
++        const char *comment; // Spanish, written above the key in the default file ('\n' between lines)
++    };
++
++    const std::vector<OptionSpec> &optionSpecs();
++
++    // The file written the first time: every option with its default value and a comment.
++    std::string defaultOptionsText();
++
++    struct OptionsFile
++    {
++        std::map<std::string, std::string> values; // every known key: its valid value or the default
++        std::vector<std::string> warnings;          // unknown keys and bad values, one line each
++    };
++
++    // Pure: '#' comments, spaces, CRLF and a UTF-8 BOM are accepted; keys and choices are case-insensitive.
++    OptionsFile parseOptions(std::string_view text, std::string_view fileName = "opciones.ini");
++
++    struct EnvironmentSetting
++    {
++        std::string variable;
++        std::string value;
++    };
++
++    // The variables to set: one per option whose variable is not set (getEnvironment returns null) and whose value
++    // maps to one.
++    std::vector<EnvironmentSetting> optionsEnvironment(
++        const OptionsFile &options, const std::function<const char *(const char *)> &getEnvironment);
++
++    // Reads opciones.ini (creating it with the defaults if missing) and sets the variables it decides. The lines for
++    // the log ("[opciones] ...") are appended to messages.
++    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages);
++}
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 0cbaad6..7e4a9f3 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -364,11 +364,13 @@ public:
+     // A non-empty cardDirectory puts mc0/mc1 there instead of next to the ELF (PS2X_TARJETAS still wins).
+     static void configureIoPathsFromElf(const std::string &elfPath,
+                                         const std::filesystem::path &cardDirectory = {});
+-    // Image mode: the disc is the ISO at imageOffset inside imagePath; host:, mc0/mc1 live in baseDirectory.
++    // Image mode: the disc is the ISO at imageOffset inside imagePath; host: lives in baseDirectory, mc0/mc1 in
++    // cardDirectory (baseDirectory if empty; PS2X_TARJETAS still wins).
+     static void configureIoPathsForImage(const std::filesystem::path &imagePath,
+                                          uint64_t imageOffset,
+                                          const std::filesystem::path &baseDirectory,
+-                                         const std::string &elfName);
++                                         const std::string &elfName,
++                                         const std::filesystem::path &cardDirectory = {});
+     // The ISO 9660 image of IoPaths::cdImage (opened by setIoPaths), or null without one or if it is not an ISO.
+     static std::shared_ptr<const ps2x::iop::IsoImage> cdIsoImage();
+ 
+diff --git a/ps2xRuntime/include/ps2_user_paths.h b/ps2xRuntime/include/ps2_user_paths.h
+new file mode 100644
+index 0000000..5a387e8
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_user_paths.h
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <filesystem>
++#include <string>
++#include <vector>
++
++// Phase 1 (F1 06): where the player's files live. A packaged game (datos folder or ISO) keeps them in its own folder
++// with portable.txt next to the .exe, or in Documents\My Games\F1-06 and LocalAppData\F1-06\registros without it.
++// Development runs (an ELF path argument) keep the old layout: cards next to the ELF, controles.ini and the log next
++// to the .exe.
++namespace ps2x
++{
++    enum class UserPathsMode
++    {
++        Development,
++        Portable,
++        Installed
++    };
++
++    struct UserPaths
++    {
++        UserPathsMode mode = UserPathsMode::Development;
++        std::filesystem::path configDirectory; // controles.ini, opciones.ini
++        std::filesystem::path savesDirectory;  // mc0, mc1 (empty: next to the ELF)
++        std::filesystem::path logsDirectory;
++        std::filesystem::path modsDirectory; // empty in development mode
++    };
++
++    // Development when booting an ELF given by path; otherwise portable if portable.txt sits next to the .exe.
++    UserPathsMode chooseUserPathsMode(bool development, const std::filesystem::path &exeDirectory);
++
++    // Pure: the folders of each mode. Installed mode without a Documents folder falls back to the portable layout.
++    UserPaths resolveUserPaths(UserPathsMode mode, const std::filesystem::path &exeDirectory,
++                               const std::filesystem::path &documentsDirectory,
++                               const std::filesystem::path &localAppDataDirectory);
++
++    enum class MigrationItem
++    {
++        Cards,
++        Controls,
++        Log
++    };
++
++    enum class MigrationAction
++    {
++        Move,
++        Copy
++    };
++
++    struct MigrationStep
++    {
++        MigrationItem item = MigrationItem::Cards;
++        MigrationAction action = MigrationAction::Move;
++        std::filesystem::path source;
++        std::filesystem::path target;
++    };
++
++    // The old layout next to the .exe (mc0, mc1, controles.ini, <exe>.log, <exe>.anterior.log) that exists and whose
++    // new place does not: moved in portable mode, copied in installed mode, nothing in development mode.
++    std::vector<MigrationStep> planUserDataMigration(const std::filesystem::path &exeDirectory,
++                                                     const std::string &exeStem, const UserPaths &paths);
++
++    // Runs the plan, never overwriting a target that exists by then. One "[rutas] ..." line per step.
++    std::vector<std::string> runUserDataMigration(const std::vector<MigrationStep> &steps);
++
++    // Creates the folders of the mode (config, partidas\mc0 and mc1, registros, mods).
++    void createUserDirectories(const UserPaths &paths);
++
++    // "[rutas] modo portable|instalado|desarrollo: config=... partidas=... registros=... mods=..."
++    std::string describeUserPaths(const UserPaths &paths);
++
++    // A path for the log that never throws on characters outside the console code page.
++    std::string pathForLog(const std::filesystem::path &path);
++
++    // Documents and LocalAppData of the current user (empty if unknown).
++    std::filesystem::path knownDocumentsDirectory();
++    std::filesystem::path knownLocalAppDataDirectory();
++
++    // The folder of controles.ini and opciones.ini for the rest of the runtime (empty: next to the .exe).
++    void setUserConfigDirectory(const std::filesystem::path &directory);
++    std::filesystem::path userConfigDirectory();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+new file mode 100644
+index 0000000..fa5f099
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -0,0 +1,207 @@
++#include "ps2_options.h"
++#include "ps2_user_paths.h"
++
++#include <cctype>
++#include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <system_error>
++
++namespace ps2x
++{
++    namespace
++    {
++        const char *const kOptionsHeader =
++            "# Opciones de F1 06 (PC). Este archivo se crea solo la primera vez; borralo para volver a los valores por\n"
++            "# defecto. Formato: <opcion> = <valor>. Lo que va detras de # es un comentario.\n"
++            "# Las variables de entorno PS2X_* (pruebas) mandan sobre este archivo.\n";
++
++        std::string trim(std::string_view text)
++        {
++            size_t begin = 0u, end = text.size();
++            while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
++                ++begin;
++            while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1u])))
++                --end;
++            return std::string(text.substr(begin, end - begin));
++        }
++
++        std::string lower(std::string text)
++        {
++            for (char &c : text)
++                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            return text;
++        }
++
++        bool validValue(const OptionSpec &spec, const std::string &value)
++        {
++            if (!spec.choices.empty())
++            {
++                for (const OptionChoice &choice : spec.choices)
++                    if (value == choice.value)
++                        return true;
++                return false;
++            }
++            if (value.empty() || value.size() > 9u)
++                return false;
++            for (char c : value)
++                if (!std::isdigit(static_cast<unsigned char>(c)))
++                    return false;
++            const int number = std::atoi(value.c_str());
++            return number >= spec.minimum && number <= spec.maximum;
++        }
++
++        std::string allowedValues(const OptionSpec &spec)
++        {
++            if (spec.choices.empty())
++                return std::to_string(spec.minimum) + " a " + std::to_string(spec.maximum);
++            std::string text;
++            for (const OptionChoice &choice : spec.choices)
++                text += (text.empty() ? "" : ", ") + std::string(choice.value);
++            return text;
++        }
++    }
++
++    // One line per option. A new option needs its PS2X_* variable to be read by the runtime as usual.
++    const std::vector<OptionSpec> &optionSpecs()
++    {
++        static const std::vector<OptionSpec> specs = {
++            {"pantalla_completa", "PS2X_PANTALLA_COMPLETA", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Pantalla completa sin bordes al arrancar: 0 = ventana, 1 = pantalla completa (F11 la cambia jugando)."},
++            {"aspecto", "PS2X_ASPECTO", "auto", {{"auto", nullptr}, {"4:3", "4:3"}, {"16:9", "16:9"}, {"pixel", "pixel"}}, 0, 0,
++             "Forma de la imagen: auto (la que se elija en las opciones del juego), 4:3, 16:9 o pixel (pixeles\n"
++             "cuadrados, sin ajustar). F10 la cambia jugando."},
++            {"filtro", "PS2X_FILTRO", "bilineal", {{"bilineal", "1"}, {"cercano", "0"}}, 0, 0,
++             "Filtro al ampliar la imagen a la ventana: bilineal (suave) o cercano (pixeles nitidos)."},
++            {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
++            {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
++        };
++        return specs;
++    }
++
++    std::string defaultOptionsText()
++    {
++        std::string text = kOptionsHeader;
++        for (const OptionSpec &spec : optionSpecs())
++        {
++            text += "\n";
++            std::istringstream comment(spec.comment);
++            std::string line;
++            while (std::getline(comment, line))
++                text += "# " + line + "\n";
++            text += std::string(spec.key) + " = " + spec.defaultValue + "\n";
++        }
++        return text;
++    }
++
++    OptionsFile parseOptions(std::string_view text, std::string_view fileName)
++    {
++        OptionsFile result;
++        for (const OptionSpec &spec : optionSpecs())
++            result.values[spec.key] = spec.defaultValue;
++        if (text.substr(0, 3) == "\xEF\xBB\xBF")
++            text.remove_prefix(3);
++
++        const std::string where = "[opciones] " + std::string(fileName) + ":";
++        int lineNumber = 0;
++        size_t position = 0u;
++        while (position <= text.size())
++        {
++            const size_t newline = text.find('\n', position);
++            std::string_view line = text.substr(position, newline == std::string_view::npos ? std::string_view::npos
++                                                                                             : newline - position);
++            position = newline == std::string_view::npos ? text.size() + 1u : newline + 1u;
++            ++lineNumber;
++            if (const size_t hash = line.find('#'); hash != std::string_view::npos)
++                line = line.substr(0, hash);
++            if (trim(line).empty())
++                continue;
++            const size_t equals = line.find('=');
++            if (equals == std::string_view::npos)
++            {
++                result.warnings.push_back(where + std::to_string(lineNumber) + ": linea sin '=' ('" + trim(line) +
++                                          "'); se ignora");
++                continue;
++            }
++            const std::string key = lower(trim(line.substr(0, equals)));
++            const std::string value = lower(trim(line.substr(equals + 1u)));
++            const OptionSpec *spec = nullptr;
++            for (const OptionSpec &candidate : optionSpecs())
++                if (key == candidate.key)
++                    spec = &candidate;
++            if (spec == nullptr)
++            {
++                result.warnings.push_back(where + std::to_string(lineNumber) + ": opcion desconocida '" + key +
++                                          "'; se ignora");
++                continue;
++            }
++            if (!validValue(*spec, value))
++            {
++                result.warnings.push_back(where + std::to_string(lineNumber) + ": valor no valido '" + value +
++                                          "' para " + spec->key + "; se usa " + spec->defaultValue + " (valores: " +
++                                          allowedValues(*spec) + ")");
++                result.values[spec->key] = spec->defaultValue;
++                continue;
++            }
++            result.values[spec->key] = value;
++        }
++        return result;
++    }
++
++    std::vector<EnvironmentSetting> optionsEnvironment(
++        const OptionsFile &options, const std::function<const char *(const char *)> &getEnvironment)
++    {
++        std::vector<EnvironmentSetting> settings;
++        for (const OptionSpec &spec : optionSpecs())
++        {
++            if (getEnvironment(spec.environment) != nullptr)
++                continue;
++            const auto found = options.values.find(spec.key);
++            const std::string value = found == options.values.end() ? spec.defaultValue : found->second;
++            if (spec.choices.empty())
++            {
++                settings.push_back({spec.environment, value});
++                continue;
++            }
++            for (const OptionChoice &choice : spec.choices)
++                if (value == choice.value && choice.environment != nullptr)
++                    settings.push_back({spec.environment, choice.environment});
++        }
++        return settings;
++    }
++
++    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages)
++    {
++        std::string text;
++        if (std::ifstream in(file, std::ios::binary); in)
++        {
++            std::stringstream content;
++            content << in.rdbuf();
++            text = content.str();
++            messages.push_back("[opciones] " + pathForLog(file));
++        }
++        else
++        {
++            text = defaultOptionsText();
++            std::error_code error;
++            std::filesystem::create_directories(file.parent_path(), error);
++            std::ofstream out(file, std::ios::binary);
++            out << text;
++            messages.push_back("[opciones] " + pathForLog(file) +
++                               (out ? " creado con los valores por defecto" : " no se pudo crear; valores por defecto"));
++        }
++
++        const OptionsFile options = parseOptions(text, file.filename().string());
++        messages.insert(messages.end(), options.warnings.begin(), options.warnings.end());
++        for (const EnvironmentSetting &setting :
++             optionsEnvironment(options, [](const char *name) { return static_cast<const char *>(std::getenv(name)); }))
++        {
++#if defined(_WIN32)
++            _putenv_s(setting.variable.c_str(), setting.value.c_str());
++#else
++            setenv(setting.variable.c_str(), setting.value.c_str(), 0);
++#endif
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 834158e..5bb5171 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_win.h"
++#include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -9,6 +10,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <fstream>
+ #include <mutex>
+ #include <sstream>
+@@ -69,7 +71,7 @@ namespace
+     };
+ 
+     const char *const kDefaultConfig =
+-        "# Controles de F1 06 (PC). Este archivo se crea solo junto al .exe; borralo para volver a los valores por\n"
++        "# Controles de F1 06 (PC). Este archivo se crea solo la primera vez; borralo para volver a los valores por\n"
+         "# defecto. Formato: <control del mando de PS2> = <entrada>, <entrada>, ...  (sin entradas = nada).\n"
+         "#\n"
+         "# Controles del mando de PS2: cruz circulo cuadrado triangulo l1 l2 r1 r2 l3 r3 start select\n"
+@@ -324,8 +326,14 @@ namespace
+             Config c;
+             parseConfig(kDefaultConfig, c);
+             const char *override = std::getenv("PS2X_CONTROLES"); // otro archivo (pruebas)
+-            const std::string path = override ? std::string(override) : ps2_pad_win::exeDirectory() + "controles.ini";
+-            std::ifstream file(path, std::ios::binary);
++            // Fase 1: la carpeta config del jugador (ps2_user_paths); sin ella, junto al .exe como antes.
++            const std::filesystem::path configDirectory = ps2x::userConfigDirectory();
++            const std::filesystem::path filePath =
++                override                  ? std::filesystem::path(override)
++                : configDirectory.empty() ? std::filesystem::path(ps2_pad_win::exeDirectory() + "controles.ini")
++                                          : configDirectory / "controles.ini";
++            const std::string path = ps2x::pathForLog(filePath);
++            std::ifstream file(filePath, std::ios::binary);
+             if (file)
+             {
+                 std::stringstream text;
+@@ -335,7 +343,7 @@ namespace
+             }
+             else if (!override)
+             {
+-                std::ofstream out(path, std::ios::binary);
++                std::ofstream out(filePath, std::ios::binary);
+                 out << kDefaultConfig;
+                 std::fprintf(stderr, "[pad] controles: %s creado con los valores por defecto\n", path.c_str());
+             }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 25008e5..a9e3204 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1254,7 +1254,7 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::
+         paths.cdRoot = paths.elfDirectory;
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
+-    // Packaged game: the disc files are in datos\ but the cards live next to the .exe.
++    // Packaged game: the disc files are in datos\ but the cards live in the player's partidas folder.
+     if (!cardDirectory.empty())
+     {
+         paths.mcRoot = cardDirectory / "mc0";
+@@ -1279,14 +1279,15 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::
+ void PS2Runtime::configureIoPathsForImage(const std::filesystem::path &imagePath,
+                                           uint64_t imageOffset,
+                                           const std::filesystem::path &baseDirectory,
+-                                          const std::string &elfName)
++                                          const std::string &elfName,
++                                          const std::filesystem::path &cardDirectory)
+ {
+     IoPaths paths = runtimeIoPaths();
+     paths.elfDirectory = normalizeAbsolutePath(baseDirectory);
+     paths.elfPath = paths.elfDirectory / elfName;
+     paths.hostRoot = paths.elfDirectory;
+     paths.cdRoot = paths.elfDirectory;
+-    paths.mcRoot = paths.elfDirectory / "mc0";
++    paths.mcRoot = (cardDirectory.empty() ? paths.elfDirectory : cardDirectory) / "mc0";
+     if (const char *cards = std::getenv("PS2X_TARJETAS"); cards && *cards)
+     {
+         paths.mcRoot = std::filesystem::path(cards) / "mc0";
+diff --git a/ps2xRuntime/src/lib/ps2_user_paths.cpp b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+new file mode 100644
+index 0000000..48668d5
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+@@ -0,0 +1,220 @@
++#include "ps2_user_paths.h"
++
++#include <mutex>
++#include <system_error>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <knownfolders.h>
++#include <shlobj.h>
++#endif
++
++namespace ps2x
++{
++    namespace
++    {
++        namespace fs = std::filesystem;
++
++        constexpr const char *kGameFolder = "F1-06";
++
++        std::mutex g_configMutex;
++        fs::path g_configDirectory;
++
++        bool pathExists(const fs::path &path)
++        {
++            std::error_code error;
++            return fs::exists(path, error);
++        }
++
++        // Moves source to target; across volumes (rename fails) it copies and leaves the source in place.
++        bool moveOrCopy(const fs::path &source, const fs::path &target, bool move, std::error_code &error)
++        {
++            fs::create_directories(target.parent_path(), error);
++            if (error)
++                return false;
++            if (move)
++            {
++                fs::rename(source, target, error);
++                if (!error)
++                    return true;
++                error.clear();
++            }
++            fs::copy(source, target, fs::copy_options::recursive, error);
++            return !error;
++        }
++
++#if defined(_WIN32)
++        fs::path knownFolder(const KNOWNFOLDERID &id)
++        {
++            PWSTR raw = nullptr;
++            fs::path result;
++            if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) && raw != nullptr)
++                result = fs::path(raw);
++            CoTaskMemFree(raw);
++            return result;
++        }
++#endif
++    }
++
++    UserPathsMode chooseUserPathsMode(bool development, const fs::path &exeDirectory)
++    {
++        if (development)
++            return UserPathsMode::Development;
++        return pathExists(exeDirectory / "portable.txt") ? UserPathsMode::Portable : UserPathsMode::Installed;
++    }
++
++    UserPaths resolveUserPaths(UserPathsMode mode, const fs::path &exeDirectory, const fs::path &documentsDirectory,
++                               const fs::path &localAppDataDirectory)
++    {
++        UserPaths paths;
++        if (mode == UserPathsMode::Installed && (documentsDirectory.empty() || localAppDataDirectory.empty()))
++            mode = UserPathsMode::Portable;
++        paths.mode = mode;
++        switch (mode)
++        {
++        case UserPathsMode::Development:
++            paths.configDirectory = exeDirectory;
++            paths.logsDirectory = exeDirectory;
++            break;
++        case UserPathsMode::Portable:
++            paths.configDirectory = exeDirectory / "config";
++            paths.savesDirectory = exeDirectory / "partidas";
++            paths.logsDirectory = exeDirectory / "registros";
++            paths.modsDirectory = exeDirectory / "mods";
++            break;
++        case UserPathsMode::Installed:
++        {
++            // "My Games" is the physical folder name ("Mis juegos" is only how Explorer shows it in Spanish).
++            const fs::path root = documentsDirectory / "My Games" / kGameFolder;
++            paths.configDirectory = root / "config";
++            paths.savesDirectory = root / "partidas";
++            paths.modsDirectory = root / "mods";
++            paths.logsDirectory = localAppDataDirectory / kGameFolder / "registros";
++            break;
++        }
++        }
++        return paths;
++    }
++
++    std::vector<MigrationStep> planUserDataMigration(const fs::path &exeDirectory, const std::string &exeStem,
++                                                     const UserPaths &paths)
++    {
++        std::vector<MigrationStep> plan;
++        if (paths.mode == UserPathsMode::Development)
++            return plan;
++        const MigrationAction action =
++            paths.mode == UserPathsMode::Portable ? MigrationAction::Move : MigrationAction::Copy;
++        const auto add = [&](MigrationItem item, const fs::path &source, const fs::path &target)
++        {
++            if (pathExists(source) && !pathExists(target))
++                plan.push_back({item, action, source, target});
++        };
++        add(MigrationItem::Cards, exeDirectory / "mc0", paths.savesDirectory / "mc0");
++        add(MigrationItem::Cards, exeDirectory / "mc1", paths.savesDirectory / "mc1");
++        add(MigrationItem::Controls, exeDirectory / "controles.ini", paths.configDirectory / "controles.ini");
++        for (const std::string name : {exeStem + ".log", exeStem + ".anterior.log"})
++            add(MigrationItem::Log, exeDirectory / name, paths.logsDirectory / name);
++        return plan;
++    }
++
++    std::vector<std::string> runUserDataMigration(const std::vector<MigrationStep> &steps)
++    {
++        std::vector<std::string> lines;
++        for (const MigrationStep &step : steps)
++        {
++            if (pathExists(step.target))
++            {
++                lines.push_back("[rutas] no se migra " + pathForLog(step.source) + ": ya existe " +
++                                pathForLog(step.target));
++                continue;
++            }
++            std::error_code error;
++            const bool move = step.action == MigrationAction::Move;
++            if (moveOrCopy(step.source, step.target, move, error))
++            {
++                const bool moved = move && !pathExists(step.source);
++                lines.push_back("[rutas] migrado " + pathForLog(step.source) + " -> " + pathForLog(step.target) +
++                                (moved ? " (movido)" : " (copiado)"));
++            }
++            else
++            {
++                lines.push_back("[rutas] no se pudo migrar " + pathForLog(step.source) + " -> " +
++                                pathForLog(step.target) + ": " + error.message());
++            }
++        }
++        return lines;
++    }
++
++    void createUserDirectories(const UserPaths &paths)
++    {
++        std::error_code error;
++        for (const fs::path &folder : {paths.configDirectory, paths.logsDirectory, paths.modsDirectory})
++            if (!folder.empty())
++                fs::create_directories(folder, error);
++        if (!paths.savesDirectory.empty())
++        {
++            fs::create_directories(paths.savesDirectory / "mc0", error);
++            fs::create_directories(paths.savesDirectory / "mc1", error);
++        }
++    }
++
++    std::string describeUserPaths(const UserPaths &paths)
++    {
++        const char *mode = paths.mode == UserPathsMode::Portable    ? "portable"
++                           : paths.mode == UserPathsMode::Installed ? "instalado"
++                                                                    : "desarrollo";
++        const std::string saves = paths.savesDirectory.empty() ? "(junto al ELF)" : pathForLog(paths.savesDirectory);
++        const std::string mods = paths.modsDirectory.empty() ? "(ninguna)" : pathForLog(paths.modsDirectory);
++        return std::string("[rutas] modo ") + mode + ": config=" + pathForLog(paths.configDirectory) +
++               " partidas=" + saves + " registros=" + pathForLog(paths.logsDirectory) + " mods=" + mods;
++    }
++
++    std::string pathForLog(const fs::path &path)
++    {
++        try
++        {
++            return path.string();
++        }
++        catch (const std::exception &)
++        {
++            const std::u8string text = path.u8string();
++            return std::string(text.begin(), text.end());
++        }
++    }
++
++    fs::path knownDocumentsDirectory()
++    {
++#if defined(_WIN32)
++        return knownFolder(FOLDERID_Documents);
++#else
++        return {};
++#endif
++    }
++
++    fs::path knownLocalAppDataDirectory()
++    {
++#if defined(_WIN32)
++        return knownFolder(FOLDERID_LocalAppData);
++#else
++        return {};
++#endif
++    }
++
++    void setUserConfigDirectory(const fs::path &directory)
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        g_configDirectory = directory;
++    }
++
++    fs::path userConfigDirectory()
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        return g_configDirectory;
++    }
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 85d0f5b..9b9d0ac 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -1,5 +1,7 @@
+ #include "ps2_runtime.h"
+ #include "games_database.h"
++#include "ps2_options.h"
++#include "ps2_user_paths.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -18,6 +20,7 @@
+ #include <cstdint>
+ #include <fstream>
+ #include <iterator>
++#include <sstream>
+ #include <vector>
+ #include <ctime>
+ #if defined(_WIN32)
+@@ -153,9 +156,10 @@ namespace
+     std::filesystem::path getExecutablePath();
+ 
+     // A player starts the .exe by hand, so its output goes to a console window nobody keeps: write it to
+-    // <exe dir>\<exe name>.log instead (the previous run is kept as <exe name>.anterior.log). Runs whose output is
+-    // already redirected (the test scripts) are left alone; PS2X_LOG=0 keeps the console.
+-    void redirectConsoleToLogFile(const std::filesystem::path &executable)
++    // <directory>\<exe name>.log instead (the previous run is kept as <exe name>.anterior.log). Runs whose output is
++    // already redirected (the test scripts) are left alone; PS2X_LOG=0 (registro = 0 in opciones.ini) keeps the
++    // console.
++    void redirectConsoleToLogFile(const std::filesystem::path &executable, const std::filesystem::path &directory)
+     {
+ #if defined(_WIN32)
+         if (_isatty(_fileno(stdout)) == 0)
+@@ -164,11 +168,11 @@ namespace
+         if (setting != nullptr && setting[0] == '0')
+             return;
+         std::error_code error;
+-        const std::filesystem::path directory = executable.parent_path();
++        std::filesystem::create_directories(directory, error);
+         const std::filesystem::path log = directory / (executable.stem().string() + ".log");
+         if (std::filesystem::exists(log, error))
+             std::filesystem::rename(log, directory / (executable.stem().string() + ".anterior.log"), error);
+-        std::cout << "[registro] " << log.string() << std::endl;
++        std::cout << "[registro] " << ps2x::pathForLog(log) << std::endl;
+         FILE *out = nullptr;
+         if (_wfreopen_s(&out, log.c_str(), L"w", stdout) != 0 || out == nullptr)
+             return;
+@@ -176,12 +180,53 @@ namespace
+         const std::time_t now = std::time(nullptr);
+         char stamp[32] = {};
+         std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+-        std::cout << "[registro] " << stamp << " " << executable.string() << std::endl;
++        std::cout << "[registro] " << stamp << " " << ps2x::pathForLog(executable) << std::endl;
+ #else
+         (void)executable;
++        (void)directory;
+ #endif
+     }
+ 
++    // Phase 1: where the player's files live (ps2_user_paths.h). Moves or copies the old layout next to the .exe,
++    // creates the folders, reads opciones.ini into the PS2X_* variables that are not set and returns the lines for
++    // the log, which only opens afterwards (its folder and PS2X_LOG come from here).
++    ps2x::UserPaths prepareUserPaths(const std::filesystem::path &executable, bool development,
++                                     std::vector<std::string> &messages)
++    {
++        std::error_code error;
++        const std::filesystem::path exeDirectory =
++            executable.empty() ? std::filesystem::current_path(error) : executable.parent_path();
++        const ps2x::UserPathsMode mode = ps2x::chooseUserPathsMode(development, exeDirectory);
++        const bool installed = mode == ps2x::UserPathsMode::Installed;
++        const ps2x::UserPaths paths =
++            ps2x::resolveUserPaths(mode, exeDirectory, installed ? ps2x::knownDocumentsDirectory() : std::filesystem::path{},
++                                   installed ? ps2x::knownLocalAppDataDirectory() : std::filesystem::path{});
++        messages.push_back(ps2x::describeUserPaths(paths));
++
++        // PS2X_TARJETAS and PS2X_CONTROLES (tests) point elsewhere, so the player's cards and controls stay put.
++        const char *cards = std::getenv("PS2X_TARJETAS");
++        const char *controls = std::getenv("PS2X_CONTROLES");
++        std::vector<ps2x::MigrationStep> plan;
++        for (const ps2x::MigrationStep &step :
++             ps2x::planUserDataMigration(exeDirectory, executable.stem().string(), paths))
++        {
++            if ((step.item == ps2x::MigrationItem::Cards && cards && *cards) ||
++                (step.item == ps2x::MigrationItem::Controls && controls && *controls))
++                continue;
++            plan.push_back(step);
++        }
++        for (std::string &line : ps2x::runUserDataMigration(plan))
++            messages.push_back(std::move(line));
++        ps2x::createUserDirectories(paths);
++        ps2x::setUserConfigDirectory(paths.configDirectory);
++        ps2x::applyOptionsFile(paths.configDirectory / "opciones.ini", messages);
++        if (cards && *cards)
++            messages.push_back(std::string("[rutas] PS2X_TARJETAS manda: ") + cards);
++        if (controls && *controls)
++            messages.push_back(std::string("[rutas] PS2X_CONTROLES manda: ") + controls);
++        return paths;
++    }
++
+     // The running .exe (to find an ISO appended to it or next to it).
+     std::filesystem::path runningExecutable(const char *argv0)
+     {
+@@ -209,7 +254,8 @@ namespace
+     }
+ 
+     // Where the game comes from: an ELF file (folder mode) or an ISO image (image mode). A non-empty
+-    // cardDirectory (the datos folder next to the .exe) keeps the memory cards there instead of next to the ELF.
++    // cardDirectory (the folder of the .exe, set when booting its datos folder) marks a packaged game, whose cards
++    // go to the player's partidas folder instead of next to the ELF.
+     struct BootSource
+     {
+         std::filesystem::path elfPath;
+@@ -220,23 +266,23 @@ namespace
+ 
+     // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, a datos folder next to the .exe,
+     // an ISO appended to the .exe, exactly one .iso next to the .exe, PS2X_DEFAULT_BOOT_ELF.
+-    BootSource chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable)
++    BootSource chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable, std::ostream &out)
+     {
+         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+         {
+             const std::filesystem::path argument(argv[1]);
+             if (hasIsoExtension(argument))
+             {
+-                std::cout << "[arranque] ISO del argumento: " << argument.string() << std::endl;
++                out << "[arranque] ISO del argumento: " << argument.string() << std::endl;
+                 return {{}, argument, 0u};
+             }
+-            std::cout << "Using argv boot path" << std::endl;
+-            std::cout << "[arranque] ELF del argumento: " << argument.string() << std::endl;
++            out << "Using argv boot path" << std::endl;
++            out << "[arranque] ELF del argumento: " << argument.string() << std::endl;
+             return {argument};
+         }
+         if (const char *iso = std::getenv("PS2X_ISO"); iso && *iso)
+         {
+-            std::cout << "[arranque] ISO de PS2X_ISO: " << iso << std::endl;
++            out << "[arranque] ISO de PS2X_ISO: " << iso << std::endl;
+             return {{}, std::filesystem::path(iso), 0u};
+         }
+         if (!executable.empty())
+@@ -244,14 +290,14 @@ namespace
+             if (const std::optional<ps2x::iop::DataFolderBoot> data =
+                     ps2x::iop::findDataFolderBoot(executable.parent_path()))
+             {
+-                std::cout << "[arranque] carpeta datos junto al .exe: " << data->dataDirectory.string() << " (ELF "
++                out << "[arranque] carpeta datos junto al .exe: " << data->dataDirectory.string() << " (ELF "
+                           << data->elfPath.filename().string() << ")" << std::endl;
+                 return {data->elfPath, {}, 0u, executable.parent_path()};
+             }
+ 
+             if (const std::optional<ps2x::iop::AppendedIso> appended = ps2x::iop::findAppendedIso(executable))
+             {
+-                std::cout << "[arranque] ISO pegada al .exe (desplazamiento=" << appended->offset << ")" << std::endl;
++                out << "[arranque] ISO pegada al .exe (desplazamiento=" << appended->offset << ")" << std::endl;
+                 return {{}, executable, appended->offset};
+             }
+ 
+@@ -266,23 +312,23 @@ namespace
+             }
+             if (isos.size() == 1u)
+             {
+-                std::cout << "[arranque] ISO junto al .exe: " << isos.front().string() << std::endl;
++                out << "[arranque] ISO junto al .exe: " << isos.front().string() << std::endl;
+                 return {{}, isos.front(), 0u};
+             }
+             if (isos.size() > 1u)
+             {
+-                std::cout << "[arranque] " << isos.size()
++                out << "[arranque] " << isos.size()
+                           << " ISO junto al .exe: no se elige ninguna (pasa una como argumento)" << std::endl;
+             }
+         }
+         return {getExecutablePath()};
+     }
+ 
+-    // Image mode: the disc is the image, the ELF is BOOT2 of its SYSTEM.CNF, the cards live next to the .exe.
++    // Image mode: the disc is the image, the ELF is BOOT2 of its SYSTEM.CNF, the cards live in cardDirectory.
+     std::vector<uint8_t> prepareImageBoot(const BootSource &boot, const std::filesystem::path &baseDirectory,
+-                                          std::string &elfName)
++                                          const std::filesystem::path &cardDirectory, std::string &elfName)
+     {
+-        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, {});
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, {}, cardDirectory);
+         const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage();
+         if (!image)
+         {
+@@ -306,7 +352,7 @@ namespace
+         }
+ 
+         elfName = ps2x::iop::bootElfName(*boot2);
+-        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, elfName);
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, elfName, cardDirectory);
+         std::cout << "[arranque] ELF del disco: " << *boot2 << " (" << bytes.size() << " bytes), carpeta base: "
+                   << baseDirectory.string() << std::endl;
+         return bytes;
+@@ -341,8 +387,16 @@ int main(int argc, char *argv[])
+     try
+     {
+         const std::filesystem::path executable = runningExecutable(argc >= 1 ? argv[0] : nullptr);
+-        redirectConsoleToLogFile(executable);
+-        const BootSource boot = chooseBootSource(argc, argv, executable);
++        std::ostringstream bootLines;
++        const BootSource boot = chooseBootSource(argc, argv, executable, bootLines);
++        // Development: an ELF given by path (argument or PS2X_DEFAULT_BOOT_ELF) keeps the old layout.
++        const bool development = boot.imagePath.empty() && boot.cardDirectory.empty();
++        std::vector<std::string> pathLines;
++        const ps2x::UserPaths userPaths = prepareUserPaths(executable, development, pathLines);
++        redirectConsoleToLogFile(executable, userPaths.logsDirectory);
++        std::cout << bootLines.str();
++        for (const std::string &line : pathLines)
++            std::cout << line << std::endl;
+ 
+         std::string filePathStr = boot.elfPath.string();
+         std::string elfName = boot.elfPath.filename().string();
+@@ -352,12 +406,12 @@ int main(int argc, char *argv[])
+             std::error_code error;
+             const std::filesystem::path baseDirectory =
+                 executable.empty() ? std::filesystem::current_path(error) : executable.parent_path();
+-            elfBytes = prepareImageBoot(boot, baseDirectory, elfName);
++            elfBytes = prepareImageBoot(boot, baseDirectory, userPaths.savesDirectory, elfName);
+             filePathStr = elfName;
+         }
+         else if (!boot.cardDirectory.empty())
+         {
+-            PS2Runtime::configureIoPathsFromElf(filePathStr, boot.cardDirectory);
++            PS2Runtime::configureIoPathsFromElf(filePathStr, userPaths.savesDirectory);
+             std::ifstream file(boot.elfPath, std::ios::binary);
+             if (file)
+             {
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 4f1ba58..ac9558e 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -38,6 +38,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_sif_dma_tests.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
++    src/ps2_user_paths_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index c20a8c0..6a23afb 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -19,6 +19,7 @@ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
++void register_ps2_user_paths_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -42,6 +43,7 @@ int main()
+     register_ps2_sif_dma_tests();
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
++    register_ps2_user_paths_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+new file mode 100644
+index 0000000..f3c15a3
+--- /dev/null
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -0,0 +1,426 @@
++#include "MiniTest.h"
++#include "ps2_options.h"
++#include "ps2_runtime.h"
++#include "ps2_user_paths.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace
++{
++    namespace fs = std::filesystem;
++    using ps2x::MigrationAction;
++    using ps2x::MigrationItem;
++    using ps2x::MigrationStep;
++    using ps2x::UserPaths;
++    using ps2x::UserPathsMode;
++
++    struct TempDir
++    {
++        fs::path path;
++
++        TempDir()
++        {
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            path = fs::temp_directory_path() / ("ps2x-user-paths-" + std::to_string(stamp));
++            fs::create_directories(path);
++        }
++
++        ~TempDir()
++        {
++            std::error_code error;
++            fs::remove_all(path, error);
++        }
++    };
++
++    struct IoPathsGuard
++    {
++        PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
++        ~IoPathsGuard() { PS2Runtime::setIoPaths(saved); }
++    };
++
++    // Sets (or clears, with nullptr) environment variables and restores them at the end of the test.
++    struct EnvironmentGuard
++    {
++        std::map<std::string, std::string> saved;
++        std::vector<std::string> unset;
++
++        void set(const char *name, const char *value)
++        {
++            if (saved.count(name) == 0u && std::find(unset.begin(), unset.end(), name) == unset.end())
++            {
++                if (const char *old = std::getenv(name))
++                    saved[name] = old;
++                else
++                    unset.emplace_back(name);
++            }
++            _putenv_s(name, value ? value : "");
++        }
++
++        ~EnvironmentGuard()
++        {
++            for (const auto &[name, value] : saved)
++                _putenv_s(name.c_str(), value.c_str());
++            for (const std::string &name : unset)
++                _putenv_s(name.c_str(), "");
++        }
++    };
++
++    void writeText(const fs::path &path, const std::string &text)
++    {
++        fs::create_directories(path.parent_path());
++        std::ofstream out(path, std::ios::binary);
++        out << text;
++    }
++
++    std::string readText(const fs::path &path)
++    {
++        std::ifstream in(path, std::ios::binary);
++        std::stringstream text;
++        text << in.rdbuf();
++        return text.str();
++    }
++
++    std::string normal(const fs::path &path)
++    {
++        return path.lexically_normal().string();
++    }
++
++    // The old layout of a packaged game next to its .exe.
++    void writeOldLayout(const fs::path &exe)
++    {
++        writeText(exe / "mc0" / "BESCES-53950" / "save.bin", "card0");
++        writeText(exe / "mc1" / "keep.bin", "card1");
++        writeText(exe / "controles.ini", "cruz = tecla:X\n");
++        writeText(exe / "F1-06.log", "old log\n");
++        writeText(exe / "F1-06.anterior.log", "older log\n");
++    }
++
++    std::map<std::string, std::string> environmentMap(const std::vector<ps2x::EnvironmentSetting> &settings)
++    {
++        std::map<std::string, std::string> result;
++        for (const ps2x::EnvironmentSetting &setting : settings)
++            result[setting.variable] = setting.value;
++        return result;
++    }
++}
++
++void register_ps2_user_paths_tests()
++{
++    MiniTest::Case("UserPaths", [](TestCase &tc)
++    {
++        tc.Run("portable mode keeps config, partidas, registros and mods next to the .exe", [](TestCase &t)
++        {
++            const fs::path exe = "C:/Games/F1-06";
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Portable, exe, "C:/Users/p/Documents",
++                                                           "C:/Users/p/AppData/Local");
++            t.IsTrue(paths.mode == UserPathsMode::Portable, "the mode is portable");
++            t.Equals(normal(paths.configDirectory), normal(exe / "config"), "config next to the .exe");
++            t.Equals(normal(paths.savesDirectory), normal(exe / "partidas"), "partidas next to the .exe");
++            t.Equals(normal(paths.logsDirectory), normal(exe / "registros"), "registros next to the .exe");
++            t.Equals(normal(paths.modsDirectory), normal(exe / "mods"), "mods next to the .exe");
++        });
++
++        tc.Run("installed mode uses Documents\\My Games\\F1-06 and LocalAppData\\F1-06\\registros", [](TestCase &t)
++        {
++            const fs::path documents = "C:/Users/p/Documents";
++            const fs::path local = "C:/Users/p/AppData/Local";
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Installed, "C:/Games/F1-06", documents, local);
++            const fs::path root = documents / "My Games" / "F1-06";
++            t.IsTrue(paths.mode == UserPathsMode::Installed, "the mode is installed");
++            t.Equals(normal(paths.configDirectory), normal(root / "config"), "config in My Games");
++            t.Equals(normal(paths.savesDirectory), normal(root / "partidas"), "partidas in My Games");
++            t.Equals(normal(paths.modsDirectory), normal(root / "mods"), "mods in My Games");
++            t.Equals(normal(paths.logsDirectory), normal(local / "F1-06" / "registros"), "registros in LocalAppData");
++        });
++
++        tc.Run("installed mode without Documents falls back to the portable layout", [](TestCase &t)
++        {
++            const fs::path exe = "C:/Games/F1-06";
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Installed, exe, {}, {});
++            t.IsTrue(paths.mode == UserPathsMode::Portable, "the mode becomes portable");
++            t.Equals(normal(paths.configDirectory), normal(exe / "config"), "config next to the .exe");
++            t.Equals(normal(paths.logsDirectory), normal(exe / "registros"), "registros next to the .exe");
++        });
++
++        tc.Run("development mode keeps the old layout", [](TestCase &t)
++        {
++            const fs::path exe = "C:/build/runner";
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Development, exe, "C:/Users/p/Documents",
++                                                           "C:/Users/p/AppData/Local");
++            t.IsTrue(paths.mode == UserPathsMode::Development, "the mode is development");
++            t.Equals(normal(paths.configDirectory), normal(exe), "controles.ini stays next to the .exe");
++            t.IsTrue(paths.savesDirectory.empty(), "the cards stay next to the ELF");
++            t.Equals(normal(paths.logsDirectory), normal(exe), "the log stays next to the .exe");
++            t.IsTrue(paths.modsDirectory.empty(), "no mods folder");
++        });
++
++        tc.Run("the mode: development wins, portable.txt picks portable, otherwise installed", [](TestCase &t)
++        {
++            TempDir dir;
++            t.IsTrue(ps2x::chooseUserPathsMode(false, dir.path) == UserPathsMode::Installed, "no portable.txt");
++            writeText(dir.path / "portable.txt", "");
++            t.IsTrue(ps2x::chooseUserPathsMode(false, dir.path) == UserPathsMode::Portable, "with portable.txt");
++            t.IsTrue(ps2x::chooseUserPathsMode(true, dir.path) == UserPathsMode::Development,
++                     "an ELF argument is development even with portable.txt");
++        });
++
++        tc.Run("portable migration moves the old layout and never overwrites", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path exe = dir.path / "exe";
++            writeOldLayout(exe);
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Portable, exe, {}, {});
++            writeText(paths.savesDirectory / "mc1" / "newer.bin", "new card1");
++
++            const std::vector<MigrationStep> plan = ps2x::planUserDataMigration(exe, "F1-06", paths);
++            t.Equals(plan.size(), size_t{4}, "mc0, controles.ini and both logs (mc1 already exists)");
++            for (const MigrationStep &step : plan)
++                t.IsTrue(step.action == MigrationAction::Move, "portable mode moves");
++
++            const std::vector<std::string> lines = ps2x::runUserDataMigration(plan);
++            t.Equals(lines.size(), size_t{4}, "one line per item");
++            for (const std::string &line : lines)
++                t.IsTrue(line.rfind("[rutas] migrado ", 0) == 0, "line starts with [rutas] migrado: " + line);
++
++            t.Equals(readText(paths.savesDirectory / "mc0" / "BESCES-53950" / "save.bin"), std::string("card0"),
++                     "mc0 moved into partidas");
++            t.IsFalse(fs::exists(exe / "mc0"), "mc0 is gone from next to the .exe");
++            t.Equals(readText(paths.configDirectory / "controles.ini"), std::string("cruz = tecla:X\n"),
++                     "controles.ini moved into config");
++            t.Equals(readText(paths.logsDirectory / "F1-06.log"), std::string("old log\n"), "the log moved");
++            t.Equals(readText(paths.logsDirectory / "F1-06.anterior.log"), std::string("older log\n"),
++                     "the previous log moved");
++            t.Equals(readText(exe / "mc1" / "keep.bin"), std::string("card1"), "the old mc1 is left alone");
++            t.Equals(readText(paths.savesDirectory / "mc1" / "newer.bin"), std::string("new card1"),
++                     "the existing mc1 is not overwritten");
++            t.IsFalse(fs::exists(paths.savesDirectory / "mc1" / "keep.bin"), "nothing is merged into mc1");
++
++            t.IsTrue(ps2x::planUserDataMigration(exe, "F1-06", paths).empty(), "a second run has nothing to do");
++        });
++
++        tc.Run("installed migration copies and leaves the old layout in place", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path exe = dir.path / "exe";
++            writeOldLayout(exe);
++            const UserPaths paths =
++                ps2x::resolveUserPaths(UserPathsMode::Installed, exe, dir.path / "docs", dir.path / "local");
++            writeText(paths.configDirectory / "controles.ini", "already here\n");
++
++            const std::vector<MigrationStep> plan = ps2x::planUserDataMigration(exe, "F1-06", paths);
++            t.Equals(plan.size(), size_t{4}, "mc0, mc1 and both logs (controles.ini already exists)");
++            for (const MigrationStep &step : plan)
++                t.IsTrue(step.action == MigrationAction::Copy, "installed mode copies");
++            t.Equals(ps2x::runUserDataMigration(plan).size(), size_t{4}, "one line per item");
++
++            t.Equals(readText(paths.savesDirectory / "mc0" / "BESCES-53950" / "save.bin"), std::string("card0"),
++                     "mc0 copied");
++            t.Equals(readText(paths.savesDirectory / "mc1" / "keep.bin"), std::string("card1"), "mc1 copied");
++            t.Equals(readText(paths.logsDirectory / "F1-06.log"), std::string("old log\n"), "the log copied");
++            t.Equals(readText(exe / "mc0" / "BESCES-53950" / "save.bin"), std::string("card0"), "the old mc0 stays");
++            t.Equals(readText(exe / "controles.ini"), std::string("cruz = tecla:X\n"), "the old controles.ini stays");
++            t.Equals(readText(paths.configDirectory / "controles.ini"), std::string("already here\n"),
++                     "the existing controles.ini is not overwritten");
++        });
++
++        tc.Run("a target created after planning is not overwritten", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path exe = dir.path / "exe";
++            writeOldLayout(exe);
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Portable, exe, {}, {});
++            const std::vector<MigrationStep> plan = ps2x::planUserDataMigration(exe, "F1-06", paths);
++            writeText(paths.configDirectory / "controles.ini", "late\n");
++            const std::vector<std::string> lines = ps2x::runUserDataMigration(plan);
++            t.Equals(readText(paths.configDirectory / "controles.ini"), std::string("late\n"), "kept");
++            t.Equals(readText(exe / "controles.ini"), std::string("cruz = tecla:X\n"), "the source is left alone");
++            t.Equals(static_cast<size_t>(std::count_if(lines.begin(), lines.end(), [](const std::string &line)
++                                                       { return line.rfind("[rutas] migrado ", 0) == 0; })),
++                     plan.size() - 1u, "every other item migrated");
++        });
++
++        tc.Run("development mode migrates nothing", [](TestCase &t)
++        {
++            TempDir dir;
++            writeOldLayout(dir.path);
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Development, dir.path, {}, {});
++            t.IsTrue(ps2x::planUserDataMigration(dir.path, "F1-06", paths).empty(), "no plan");
++        });
++
++        tc.Run("the folders of the mode are created and described in one line", [](TestCase &t)
++        {
++            TempDir dir;
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Portable, dir.path, {}, {});
++            ps2x::createUserDirectories(paths);
++            for (const fs::path &folder : {paths.configDirectory, paths.savesDirectory / "mc0",
++                                           paths.savesDirectory / "mc1", paths.logsDirectory, paths.modsDirectory})
++                t.IsTrue(fs::is_directory(folder), "created: " + folder.string());
++            t.Equals(ps2x::describeUserPaths(paths),
++                     "[rutas] modo portable: config=" + paths.configDirectory.string() +
++                         " partidas=" + paths.savesDirectory.string() + " registros=" + paths.logsDirectory.string() +
++                         " mods=" + paths.modsDirectory.string(),
++                     "the [rutas] line");
++            const UserPaths installed =
++                ps2x::resolveUserPaths(UserPathsMode::Installed, dir.path, dir.path / "d", dir.path / "l");
++            t.IsTrue(ps2x::describeUserPaths(installed).rfind("[rutas] modo instalado: config=", 0) == 0,
++                     "installed line");
++        });
++
++        tc.Run("ELF argument mode still puts the cards next to the ELF", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            EnvironmentGuard environment;
++            environment.set("PS2X_TARJETAS", nullptr);
++            environment.set("PS2X_ISO", nullptr);
++            TempDir dir;
++            const fs::path elf = dir.path / "juego" / "SCES_539.50";
++            const UserPaths paths = ps2x::resolveUserPaths(UserPathsMode::Development, dir.path / "runner", {}, {});
++            PS2Runtime::configureIoPathsFromElf(elf.string(), paths.savesDirectory);
++            t.Equals(normal(PS2Runtime::getIoPaths().mcRoot), normal(fs::absolute(elf).parent_path() / "mc0"),
++                     "mc0 next to the ELF");
++        });
++
++        tc.Run("image mode puts the cards in the partidas folder", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            EnvironmentGuard environment;
++            environment.set("PS2X_TARJETAS", nullptr);
++            TempDir dir;
++            const fs::path saves = dir.path / "partidas";
++            PS2Runtime::configureIoPathsForImage(dir.path / "missing.iso", 0u, dir.path, "SCES_539.50", saves);
++            t.Equals(normal(PS2Runtime::getIoPaths().mcRoot), normal(fs::absolute(saves) / "mc0"), "partidas\\mc0");
++            t.Equals(normal(PS2Runtime::getIoPaths().hostRoot), normal(fs::absolute(dir.path)),
++                     "host: stays the base folder");
++            environment.set("PS2X_TARJETAS", (dir.path / "cards").string().c_str());
++            PS2Runtime::configureIoPathsForImage(dir.path / "missing.iso", 0u, dir.path, "SCES_539.50", saves);
++            t.Equals(normal(PS2Runtime::getIoPaths().mcRoot), normal(fs::absolute(dir.path / "cards") / "mc0"),
++                     "PS2X_TARJETAS still wins");
++        });
++    });
++
++    MiniTest::Case("Options", [](TestCase &tc)
++    {
++        tc.Run("the default opciones.ini lists every option with its default and a comment", [](TestCase &t)
++        {
++            const std::string text = ps2x::defaultOptionsText();
++            for (const char *line : {"pantalla_completa = 0\n", "aspecto = auto\n", "filtro = bilineal\n",
++                                     "volumen = 100\n", "registro = 1\n"})
++                t.IsTrue(text.find(line) != std::string::npos, std::string("has ") + line);
++            const ps2x::OptionsFile parsed = ps2x::parseOptions(text);
++            t.IsTrue(parsed.warnings.empty(), "the default file parses without warnings");
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++            {
++                t.Equals(parsed.values.at(spec.key), std::string(spec.defaultValue), std::string("default of ") + spec.key);
++                t.IsTrue(text.find(std::string("\n") + spec.key + " = ") != std::string::npos,
++                         std::string("key line of ") + spec.key);
++                t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
++            }
++            t.Equals(ps2x::optionSpecs().size(), size_t{5}, "five options");
++        });
++
++        tc.Run("parseOptions accepts spaces, comments, CRLF, a BOM and any case", [](TestCase &t)
++        {
++            const ps2x::OptionsFile parsed = ps2x::parseOptions(
++                "\xEF\xBB\xBF# comentario\r\n"
++                "  Pantalla_Completa=1   \r\n"
++                "\taspecto   =  16:9  # al final\r\n"
++                "\r\n"
++                "filtro = CERCANO\r\n"
++                "volumen = 35\r\n"
++                "registro = 0");
++            t.IsTrue(parsed.warnings.empty(), "no warnings");
++            t.Equals(parsed.values.at("pantalla_completa"), std::string("1"), "pantalla_completa");
++            t.Equals(parsed.values.at("aspecto"), std::string("16:9"), "aspecto");
++            t.Equals(parsed.values.at("filtro"), std::string("cercano"), "filtro");
++            t.Equals(parsed.values.at("volumen"), std::string("35"), "volumen");
++            t.Equals(parsed.values.at("registro"), std::string("0"), "registro");
++        });
++
++        tc.Run("a bad value keeps the default with one warning; an unknown key is warned and ignored", [](TestCase &t)
++        {
++            const ps2x::OptionsFile parsed = ps2x::parseOptions("volumen = 150\n"
++                                                                "aspecto = 5:4\n"
++                                                                "filtro = bilineal\n"
++                                                                "brillo = 3\n"
++                                                                "volumen = mucho\n"
++                                                                "sin igual\n");
++            t.Equals(parsed.values.at("volumen"), std::string("100"), "volumen falls back to the default");
++            t.Equals(parsed.values.at("aspecto"), std::string("auto"), "aspecto falls back to the default");
++            t.Equals(parsed.values.at("filtro"), std::string("bilineal"), "a good value is kept");
++            t.Equals(parsed.warnings.size(), size_t{5}, "one warning per bad line");
++            const std::string all = [&]
++            {
++                std::string joined;
++                for (const std::string &w : parsed.warnings)
++                    joined += w + "\n";
++                return joined;
++            }();
++            t.IsTrue(all.find("[opciones] opciones.ini:1: valor no valido '150' para volumen; se usa 100") !=
++                         std::string::npos,
++                     "bad volume warning: " + all);
++            t.IsTrue(all.find("[opciones] opciones.ini:4: opcion desconocida 'brillo'; se ignora") != std::string::npos,
++                     "unknown key warning");
++            t.IsTrue(all.find("opciones.ini:6:") != std::string::npos, "a line without '=' is warned");
++        });
++
++        tc.Run("environment variables win over the file, the file over the default", [](TestCase &t)
++        {
++            const ps2x::OptionsFile parsed = ps2x::parseOptions("volumen = 40\nfiltro = cercano\naspecto = 4:3\n");
++            const std::map<std::string, std::string> fake = {{"PS2X_VOLUMEN", "80"}};
++            const auto getEnvironment = [&](const char *name) -> const char *
++            {
++                const auto found = fake.find(name);
++                return found == fake.end() ? nullptr : found->second.c_str();
++            };
++            const std::map<std::string, std::string> set =
++                environmentMap(ps2x::optionsEnvironment(parsed, getEnvironment));
++            t.IsTrue(set.count("PS2X_VOLUMEN") == 0u, "a variable already set is not touched");
++            t.Equals(set.at("PS2X_FILTRO"), std::string("0"), "cercano -> PS2X_FILTRO=0");
++            t.Equals(set.at("PS2X_ASPECTO"), std::string("4:3"), "aspecto -> PS2X_ASPECTO");
++            t.Equals(set.at("PS2X_PANTALLA_COMPLETA"), std::string("0"), "default pantalla_completa");
++            t.Equals(set.at("PS2X_LOG"), std::string("1"), "default registro");
++
++            const std::map<std::string, std::string> defaults =
++                environmentMap(ps2x::optionsEnvironment(ps2x::parseOptions(""), getEnvironment));
++            t.IsTrue(defaults.count("PS2X_ASPECTO") == 0u, "aspecto = auto leaves the game's own option");
++            t.Equals(defaults.at("PS2X_FILTRO"), std::string("1"), "bilineal -> PS2X_FILTRO=1");
++        });
++
++        tc.Run("applyOptionsFile creates the defaults the first time and applies an edited file", [](TestCase &t)
++        {
++            EnvironmentGuard environment;
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                environment.set(spec.environment, nullptr);
++            TempDir dir;
++            const fs::path file = dir.path / "config" / "opciones.ini";
++            std::vector<std::string> messages;
++            ps2x::applyOptionsFile(file, messages);
++            t.Equals(readText(file), ps2x::defaultOptionsText(), "created with the defaults");
++            t.IsTrue(std::getenv("PS2X_ASPECTO") == nullptr, "auto leaves PS2X_ASPECTO unset");
++            t.IsTrue(!messages.empty() && messages.front().find("creado") != std::string::npos, "creation is logged");
++
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                environment.set(spec.environment, nullptr);
++            environment.set("PS2X_FILTRO", "1");
++            writeText(file, "volumen = 25\nfiltro = cercano\nvolumen2 = 1\n");
++            messages.clear();
++            ps2x::applyOptionsFile(file, messages);
++            t.Equals(std::string(std::getenv("PS2X_VOLUMEN") ? std::getenv("PS2X_VOLUMEN") : ""), std::string("25"),
++                     "the file sets PS2X_VOLUMEN");
++            t.Equals(std::string(std::getenv("PS2X_FILTRO")), std::string("1"), "the variable wins over the file");
++            t.Equals(readText(file), std::string("volumen = 25\nfiltro = cercano\nvolumen2 = 1\n"),
++                     "an existing file is never rewritten");
++            t.IsTrue(std::any_of(messages.begin(), messages.end(), [](const std::string &m)
++                                 { return m.find("opcion desconocida 'volumen2'") != std::string::npos; }),
++                     "the unknown key reaches the log");
++        });
++    });
++}

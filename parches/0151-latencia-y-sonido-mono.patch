@@ -1,0 +1,303 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h b/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
+index de30071..4bcf48f 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
++++ b/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
+@@ -2,10 +2,26 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <string_view>
+ 
+ namespace ps2x::iop
+ {
+     // SPU2 output (patch 0111): 48 kHz stereo, interleaved int16. The host audio device pulls it from its own thread.
+     // Returns the frames written; the caller fills the rest with silence.
+     std::size_t readSpu2Audio(int16_t *interleavedStereo, std::size_t frames) noexcept;
++
++    // Fase 5 (T5, T6; opciones.ini latencia_audio and audio_mono). The output latency: Auto adapts from 43 to 128 ms
++    // (patch 0147), Low keeps 43 ms and rises to 64 ms at most, High holds 128 ms (slow PCs). Mono mixes both channels
++    // into each. Any thread; the device applies them from its next request. The Spu2 starts them from
++    // PS2X_LATENCIA_AUDIO (auto, baja, alta) and PS2X_AUDIO_MONO (1 = mono).
++    enum class Spu2OutputLatency : int
++    {
++        Auto,
++        Low,
++        High,
++    };
++    // auto, baja, alta (case-insensitive); false (latency unchanged) for anything else.
++    bool parseSpu2OutputLatency(std::string_view text, Spu2OutputLatency &latency);
++    void setSpu2OutputLatency(Spu2OutputLatency latency) noexcept;
++    void setSpu2OutputMono(bool mono) noexcept;
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 2c91056..2ddca99 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -5,11 +5,13 @@
+ #include "ps2x/iop/iop_spu2_audio.h"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cstdarg>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
+ 
+ // SPU2 (patch 0111). Register map (byte offsets from 0x1F900000; core 1 = core 0 + 0x400):
+ //   voice v: +v*0x10: VOLL, VOLR, PITCH, ADSR1, ADSR2, ENVX, VOLXL, VOLXR
+@@ -280,6 +282,9 @@ namespace ps2x::iop::detail
+         OutputRing g_output;
+         Spu2OutputConsumer g_consumer; // audio device thread only
+         std::atomic<int32_t> g_outputGain{256}; // PS2X_VOLUMEN (0-100 %), 256 = 100 %
++        // Fase 5 (T5, T6): latencia_audio waiting for the device's next request (-1: none) and audio_mono.
++        std::atomic<int> g_latencyRequest{-1};
++        std::atomic<bool> g_outputMono{false};
+     }
+ 
+     struct Spu2::Synth
+@@ -1000,6 +1005,14 @@ namespace ps2x::iop::detail
+         m_threadEnabled = enabled == nullptr || enabled[0] != '0';
+         if (const char *gain = std::getenv("PS2X_VOLUMEN"))
+             g_outputGain.store(std::clamp(std::atoi(gain), 0, 100) * 256 / 100);
++        if (const char *value = std::getenv("PS2X_LATENCIA_AUDIO"))
++        {
++            Spu2OutputLatency latency = Spu2OutputLatency::Auto;
++            if (parseSpu2OutputLatency(value, latency))
++                setSpu2OutputLatency(latency);
++        }
++        if (const char *value = std::getenv("PS2X_AUDIO_MONO"))
++            setSpu2OutputMono(value[0] == '1');
+         reset();
+     }
+ 
+@@ -1562,6 +1575,13 @@ namespace ps2x::iop::detail
+     std::size_t readSpu2AudioImpl(int16_t *out, std::size_t frames) noexcept
+     {
+         // A dry ring fades out, rebuffers in silence and fades back in (patch 0147; see Spu2OutputConsumer).
++        if (const int latency = g_latencyRequest.exchange(-1, std::memory_order_relaxed); latency >= 0)
++        {
++            const Spu2LatencyBounds bounds = spu2LatencyBounds(static_cast<Spu2OutputLatency>(latency));
++            g_consumer.setBounds(bounds);
++            g_output.target.store(bounds.start, std::memory_order_relaxed);
++            std::fprintf(stderr, "[spu2] latencia de salida %.0f-%.0f ms\n", bounds.minimum / 48.0, bounds.maximum / 48.0);
++        }
+         const size_t r = g_output.read.load(std::memory_order_relaxed);
+         const size_t available = g_output.write.load(std::memory_order_acquire) - r;
+         const Spu2OutputConsumer::Result result = g_consumer.read(out, frames, available, g_output.target, [r](size_t i)
+@@ -1579,6 +1599,8 @@ namespace ps2x::iop::detail
+             g_output.requestMin.store(requested, std::memory_order_relaxed);
+         if (requested > g_output.requestMax.load(std::memory_order_relaxed))
+             g_output.requestMax.store(requested, std::memory_order_relaxed);
++        if (g_outputMono.load(std::memory_order_relaxed))
++            downmixToMono(out, result.written);
+         return result.written;
+     }
+ }
+@@ -1589,4 +1611,30 @@ namespace ps2x::iop
+     {
+         return detail::readSpu2AudioImpl(interleavedStereo, frames);
+     }
++
++    bool parseSpu2OutputLatency(std::string_view text, Spu2OutputLatency &latency)
++    {
++        std::string lowered(text);
++        for (char &c : lowered)
++            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        if (lowered == "auto")
++            latency = Spu2OutputLatency::Auto;
++        else if (lowered == "baja")
++            latency = Spu2OutputLatency::Low;
++        else if (lowered == "alta")
++            latency = Spu2OutputLatency::High;
++        else
++            return false;
++        return true;
++    }
++
++    void setSpu2OutputLatency(Spu2OutputLatency latency) noexcept
++    {
++        detail::g_latencyRequest.store(static_cast<int>(latency), std::memory_order_relaxed);
++    }
++
++    void setSpu2OutputMono(bool mono) noexcept
++    {
++        detail::g_outputMono.store(mono, std::memory_order_relaxed);
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2_output.h b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+index 0f28be2..254dbd1 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2_output.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+@@ -5,14 +5,52 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
++#include "ps2x/iop/iop_spu2_audio.h"
++
+ namespace ps2x::iop::detail
+ {
++    // Fase 5 (T5): the range the latency target moves in (frames at 48 kHz) and where it starts, per opciones.ini
++    // latencia_audio. The device pulls 1024 frames at a time, so 2048 (43 ms) is the least that plays smoothly.
++    struct Spu2LatencyBounds
++    {
++        uint32_t minimum = 2048u;
++        uint32_t maximum = 6144u;
++        uint32_t start = 2048u;
++    };
++
++    [[nodiscard]] constexpr Spu2LatencyBounds spu2LatencyBounds(Spu2OutputLatency latency) noexcept
++    {
++        switch (latency)
++        {
++        case Spu2OutputLatency::Low:
++            return {2048u, 3072u, 2048u}; // 43 ms, at most 64 ms after underruns
++        case Spu2OutputLatency::High:
++            return {6144u, 6144u, 6144u}; // 128 ms held
++        case Spu2OutputLatency::Auto:
++            break;
++        }
++        return {2048u, 6144u, 2048u}; // patch 0147: 43 to 128 ms
++    }
++
++    // Fase 5 (T6): opciones.ini audio_mono, (left + right) / 2 on both channels of `frames` interleaved stereo frames.
++    inline void downmixToMono(int16_t *interleavedStereo, size_t frames) noexcept
++    {
++        for (size_t i = 0; i < frames; ++i)
++        {
++            const int32_t sum = static_cast<int32_t>(interleavedStereo[i * 2u]) + interleavedStereo[i * 2u + 1u];
++            const int16_t mono = static_cast<int16_t>(sum / 2);
++            interleavedStereo[i * 2u] = mono;
++            interleavedStereo[i * 2u + 1u] = mono;
++        }
++    }
++
+     // Device side of the host output ring (patch 0147). When the EE thread stalls longer than the ring holds, the
+     // device runs dry; it used to get whatever was left and zeros after it, a hard cut from full level to silence (the
+     // crackle heard from boot to the menu). Now the last frame played is held and faded out after the real frames (so
+     // a ring that runs dry exactly at a request boundary fades too), the device gets silence until the ring is back at
+     // the latency target, and playback resumes with a fade-in, so a stall is a short dip instead of a click. The target itself adapts: each underrun raises it (up to 128 ms) and 20 s of output without one lowers it
+-    // slowly (never below the 43 ms of patch 0146); the producer's resampler steers the ring toward it.
++    // slowly (never below the 43 ms of patch 0146); the producer's resampler steers the ring toward it. Fase 5 (T5): the
++    // range is setBounds' (opciones.ini latencia_audio); MinTarget and MaxTarget are the automatic one.
+     // Single consumer: only the device thread touches this object; the target is written here and read by the producer.
+     class Spu2OutputConsumer
+     {
+@@ -34,10 +72,16 @@ namespace ps2x::iop::detail
+ 
+         // One device request of `frames` (interleaved stereo into `out`) with `available` frames in the ring;
+         // fetch(i) returns the packed frame i past the read position (left | right << 16).
++        // The range of the target (latencia_audio); read() brings the target into it.
++        void setBounds(const Spu2LatencyBounds &bounds) noexcept { m_bounds = bounds; }
++
+         template <typename Fetch>
+         Result read(int16_t *out, size_t frames, size_t available, std::atomic<uint32_t> &target, Fetch &&fetch)
+         {
+             Result result;
++            const uint32_t held = target.load(std::memory_order_relaxed);
++            if (held < m_bounds.minimum || held > m_bounds.maximum)
++                target.store(std::clamp(held, m_bounds.minimum, m_bounds.maximum), std::memory_order_relaxed);
+             if (m_state == State::Rebuffering)
+             {
+                 if (available < target.load(std::memory_order_relaxed))
+@@ -74,7 +118,7 @@ namespace ps2x::iop::detail
+                 m_played = 0;
+                 m_tail = FadeOutFrames;
+                 result.written += writeTail(out + count * 2u, frames - count);
+-                target.store(std::min(target.load(std::memory_order_relaxed) + TargetRaise, MaxTarget),
++                target.store(std::min(target.load(std::memory_order_relaxed) + TargetRaise, m_bounds.maximum),
+                              std::memory_order_relaxed);
+                 return result;
+             }
+@@ -83,7 +127,7 @@ namespace ps2x::iop::detail
+             {
+                 m_played = 0;
+                 const uint32_t current = target.load(std::memory_order_relaxed);
+-                target.store(current > MinTarget + TargetLower ? current - TargetLower : MinTarget,
++                target.store(current > m_bounds.minimum + TargetLower ? current - TargetLower : m_bounds.minimum,
+                              std::memory_order_relaxed);
+             }
+             return result;
+@@ -115,6 +159,7 @@ namespace ps2x::iop::detail
+             return count;
+         }
+ 
++        Spu2LatencyBounds m_bounds; // latencia_audio; auto by default
+         State m_state = State::Rebuffering;
+         uint32_t m_fade = 0;
+         uint32_t m_tail = 0;           // fade-out frames still to write
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index 680c805..a44eef4 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -560,5 +560,69 @@ void register_ps2_iop_tests()
+             t.Equals(run.underruns, uint64_t{0}, "no underrun");
+         });
+ 
++        // Fase 5 (T5): opciones.ini latencia_audio = auto / baja / alta.
++        tc.Run("SPU2 output latency option: auto adapts 43-128 ms, baja stays low, alta holds 128 ms", [](TestCase &t)
++        {
++            using ps2x::iop::Spu2OutputLatency;
++            using ps2x::iop::detail::Spu2LatencyBounds;
++            using ps2x::iop::detail::spu2LatencyBounds;
++            const Spu2LatencyBounds automatic = spu2LatencyBounds(Spu2OutputLatency::Auto);
++            t.IsTrue(automatic.minimum == 2048u && automatic.maximum == 6144u && automatic.start == 2048u,
++                     "auto: from 43 ms, adapting up to 128 ms (patch 0147)");
++            const Spu2LatencyBounds low = spu2LatencyBounds(Spu2OutputLatency::Low);
++            t.IsTrue(low.minimum == 2048u && low.maximum == 3072u && low.start == 2048u, "baja: 43 ms, at most 64 ms");
++            const Spu2LatencyBounds high = spu2LatencyBounds(Spu2OutputLatency::High);
++            t.IsTrue(high.minimum == 6144u && high.maximum == 6144u && high.start == 6144u, "alta: 128 ms");
++
++            Spu2OutputLatency latency = Spu2OutputLatency::Auto;
++            t.IsTrue(ps2x::iop::parseSpu2OutputLatency("baja", latency) && latency == Spu2OutputLatency::Low, "baja");
++            t.IsTrue(ps2x::iop::parseSpu2OutputLatency("ALTA", latency) && latency == Spu2OutputLatency::High, "alta");
++            t.IsTrue(ps2x::iop::parseSpu2OutputLatency("auto", latency) && latency == Spu2OutputLatency::Auto, "auto");
++            t.IsFalse(ps2x::iop::parseSpu2OutputLatency("media", latency), "an unknown value");
++            t.IsTrue(latency == Spu2OutputLatency::Auto, "leaves the value alone");
++
++            ConsumerRun run; // baja: the underruns raise the target up to 64 ms only
++            run.consumer.setBounds(low);
++            for (int event = 0; event < 6; ++event)
++            {
++                run.queued = run.target.load() + 100u;
++                while (run.pull(1024u) == 1024u)
++                {
++                }
++            }
++            t.Equals(run.underruns, uint64_t{6}, "six underruns");
++            t.Equals(run.target.load(), 3072u, "baja is capped at 64 ms");
++
++            ConsumerRun steady; // alta: never falls below 128 ms
++            steady.consumer.setBounds(high);
++            steady.target.store(high.start);
++            steady.queued = UINT64_MAX / 2u;
++            for (int i = 0; i < 3000; ++i)
++                steady.pull(1024u);
++            t.Equals(steady.target.load(), 6144u, "alta holds 128 ms after a minute without underruns");
++            t.Equals(steady.left[2000u], ConsumerRun::kLevel, "and plays once the ring holds 128 ms");
++
++            ConsumerRun clamped; // a target outside new bounds is brought into them
++            clamped.target.store(6144u);
++            clamped.consumer.setBounds(low);
++            clamped.queued = UINT64_MAX / 2u;
++            clamped.pull(1024u);
++            t.Equals(clamped.target.load(), 3072u, "switching to baja lowers a raised target to 64 ms");
++        });
++
++        tc.Run("SPU2 output mono downmix mixes both channels into each", [](TestCase &t)
++        {
++            int16_t frames[] = {1000, -1000, 32767, 32767, -32768, -32768, 3, 4, 8000, 0};
++            ps2x::iop::detail::downmixToMono(frames, 5u);
++            const int16_t expected[] = {0, 0, 32767, 32767, -32768, -32768, 3, 3, 4000, 4000};
++            bool same = true;
++            for (size_t i = 0; i < 10u; ++i)
++                same = same && frames[i] == expected[i];
++            t.IsTrue(same, "(left + right) / 2 on both channels, without overflow");
++            int16_t untouched[] = {5, 7};
++            ps2x::iop::detail::downmixToMono(untouched, 0u);
++            t.IsTrue(untouched[0] == 5 && untouched[1] == 7, "zero frames change nothing");
++        });
++
+     });
+ }

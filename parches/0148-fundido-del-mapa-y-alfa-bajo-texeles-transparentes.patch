@@ -1,0 +1,596 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6a51c4f..dcf611a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -965,7 +965,9 @@ namespace
+             << " tbw=" << int(ctx.tex0.tbw) << " tpsm=" << int(ctx.tex0.psm) << " tw=" << int(ctx.tex0.tw)
+             << " th=" << int(ctx.tex0.th) << " tcc=" << int(ctx.tex0.tcc) << " tfx=" << int(ctx.tex0.tfx)
+             << " cbp=" << ctx.tex0.cbp << " cpsm=" << int(ctx.tex0.cpsm) << " csa=" << int(ctx.tex0.csa)
+-            << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << " clamp=0x" << ctx.clamp << std::dec;
++            << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << " clamp=0x" << ctx.clamp << std::dec
++            << " scissor=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-(" << ctx.scissor.x1 << ","
++            << ctx.scissor.y1 << ")"; // patch 0148
+         const int vertices = (type == GS_PRIM_SPRITE || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP) ? 2
+                              : (type == GS_PRIM_POINT) ? 1 : 3;
+         const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+@@ -1099,6 +1101,45 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     if (s_omitTbp >= 0 && state.prim.tme && static_cast<int64_t>(ctx.tex0.tbp0) == s_omitTbp &&
+         state.prim.type >= GS_PRIM_TRIANGLE && state.prim.type <= GS_PRIM_TRIFAN)
+         return;
++    // Debug (patch 0148): F1_GS_VOLCAR_TEXTURA=<tbp>,<u0>,<v0>,<w>,<h> prints once, at the first textured draw with
++    // that texture base, the RGBA (after the CLUT) of the texels [u0,u0+w) x [v0,v0+h), rows wrapped to the texture.
++    static int s_dumpTexture[5] = {-1, 0, 0, 0, 0};
++    static const bool s_dumpTextureInit = []
++    {
++        if (const char *value = std::getenv("F1_GS_VOLCAR_TEXTURA"))
++            std::sscanf(value, "%d,%d,%d,%d,%d", &s_dumpTexture[0], &s_dumpTexture[1], &s_dumpTexture[2],
++                        &s_dumpTexture[3], &s_dumpTexture[4]);
++        return true;
++    }();
++    (void)s_dumpTextureInit;
++    if (s_dumpTexture[0] >= 0 && state.prim.tme && static_cast<int>(ctx.tex0.tbp0) == s_dumpTexture[0])
++    {
++        s_dumpTexture[0] = -1;
++        QuiesceBands(kWaitDirect);
++        std::ostringstream text;
++        text << "[gs:textura] tbp=" << ctx.tex0.tbp0 << " psm=" << int(ctx.tex0.psm) << " " << state.textureWidth << "x"
++             << state.textureHeight << " cbp=" << ctx.tex0.cbp << " csa=" << int(ctx.tex0.csa) << "\n";
++        for (int dv = 0; dv < s_dumpTexture[4]; ++dv)
++        {
++            const int v = ((s_dumpTexture[2] + dv) % state.textureHeight + state.textureHeight) % state.textureHeight;
++            text << "[gs:textura] v=" << v << ":";
++            for (int du = 0; du < s_dumpTexture[3]; ++du)
++            {
++                const uint32_t raw = ReadTextureVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
++                                                             static_cast<uint32_t>(s_dumpTexture[1] + du),
++                                                             static_cast<uint32_t>(v));
++                const uint32_t rgba = (ctx.tex0.psm == GS_PSM_T4 || ctx.tex0.psm == GS_PSM_T8)
++                                          ? LookupCLUT(state, static_cast<uint8_t>(raw), ctx.tex0.cpsm, ctx.tex0.csm,
++                                                       ctx.tex0.csa, ctx.tex0.psm)
++                                          : raw;
++                char cell[16];
++                std::snprintf(cell, sizeof(cell), " %08x", rgba);
++                text << cell;
++            }
++            text << "\n";
++        }
++        std::cerr << text.str() << std::flush;
++    }
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5525d5f..e1bd311 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -126,6 +126,206 @@ namespace
+                                     { return true; });
+     }
+ 
++    // Debug (patch 0148): F1_GS_VOLCAR_TIJERA=<64-bit value in hex> prints, once, the first GIF packet holding that
++    // value (at any 8-byte position; e.g. a SCISSOR or a packed XYZ2), the F1_GS_VOLCAR_TIJERA_ANTES (default 0)
++    // packets before it and the F1_GS_VOLCAR_TIJERA_N (default 40) after it, one quadword per line ("[gs:tijera]").
++    // F1_GS_VOLCAR_TIJERA_MASCARA=<hex>: only those bits of each word are compared.
++    // Called under the GS state mutex.
++    void printDumpedPacket(const uint8_t *data, uint32_t sizeBytes, const char *label)
++    {
++        std::ostringstream text;
++        text << "[gs:tijera] paquete" << label << " de " << sizeBytes << " bytes\n";
++        for (uint32_t at = 0; at + 16u <= sizeBytes; at += 16u)
++        {
++            char line[64];
++            std::snprintf(line, sizeof(line), "[gs:tijera] %5u %016llx %016llx\n", at / 16u,
++                          static_cast<unsigned long long>(loadLE64(data + at + 8u)),
++                          static_cast<unsigned long long>(loadLE64(data + at)));
++            text << line;
++        }
++        std::cerr << text.str() << std::flush;
++    }
++
++    void dumpScissorPacket(const uint8_t *data, uint32_t sizeBytes)
++    {
++        static const uint64_t s_value = []
++        {
++            const char *value = std::getenv("F1_GS_VOLCAR_TIJERA");
++            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
++        }();
++        static const int s_after = []
++        {
++            const char *value = std::getenv("F1_GS_VOLCAR_TIJERA_N");
++            return value != nullptr ? std::atoi(value) : 40;
++        }();
++        static const size_t s_before = []
++        {
++            const char *value = std::getenv("F1_GS_VOLCAR_TIJERA_ANTES");
++            return value != nullptr ? static_cast<size_t>(std::max(0, std::atoi(value))) : size_t{0};
++        }();
++        static const uint64_t s_mask = []
++        {
++            const char *value = std::getenv("F1_GS_VOLCAR_TIJERA_MASCARA"); // bits compared (default all)
++            return value != nullptr ? std::strtoull(value, nullptr, 16) : ~0ull;
++        }();
++        static std::vector<std::vector<uint8_t>> s_previous; // the last s_before packets, oldest first
++        static int s_left = -1; // packets still to print after the first one (-1: not found yet)
++        if (s_value == 0u || s_left == 0)
++            return;
++        if (s_left < 0)
++        {
++            bool found = false;
++            for (uint32_t at = 0; at + 8u <= sizeBytes && !found; at += 8u)
++                found = (loadLE64(data + at) & s_mask) == s_value;
++            if (!found)
++            {
++                if (s_before != 0u)
++                {
++                    if (s_previous.size() == s_before)
++                        s_previous.erase(s_previous.begin());
++                    s_previous.emplace_back(data, data + sizeBytes);
++                }
++                return;
++            }
++            for (const std::vector<uint8_t> &previous : s_previous)
++                printDumpedPacket(previous.data(), static_cast<uint32_t>(previous.size()), " (antes)");
++            s_previous.clear();
++            s_left = s_after + 1;
++            printDumpedPacket(data, sizeBytes, " (el buscado)");
++            --s_left;
++            return;
++        }
++        --s_left;
++        printDumpedPacket(data, sizeBytes, "");
++    }
++
++    // Patch 0148: ps2GsSetScissorFeather and ps2GsSetKeepFrameAlpha.
++    constexpr uint64_t kScissorFieldMask = 0x07FF07FF07FF07FFull;
++    std::atomic<uint64_t> s_featherScissor{0u};
++    std::atomic<uint32_t> s_featherWidth{0u};
++    std::atomic<uint64_t> s_keepAlphaFbps[8] = {}; // one bit per FBP (0-511)
++    std::atomic<bool> s_keepAlphaOn{false};
++    thread_local bool t_rewriteBusy = false; // processing a rewritten packet
++
++    uint64_t encodeScissor(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++    {
++        return static_cast<uint64_t>(x0) | (static_cast<uint64_t>(x1) << 16) | (static_cast<uint64_t>(y0) << 32) |
++               (static_cast<uint64_t>(y1) << 48);
++    }
++
++    // A draw packet rewritten by the rules of patch 0148, or false when no rule applies. Only a packet that is one
++    // PACKED tag with PRE (a triangle or sprite primitive) and vertex data is considered.
++    bool buildDrawRewrite(const uint8_t *data, uint32_t sizeBytes, const GSContext ctx[2], bool prmodecont,
++                          const GSPrimReg &prmode, bool pabe, std::vector<uint8_t> &out)
++    {
++        const uint32_t width = s_featherWidth.load(std::memory_order_acquire);
++        const uint64_t window = s_featherScissor.load(std::memory_order_relaxed);
++        const bool keepAlphaOn = s_keepAlphaOn.load(std::memory_order_acquire);
++        if (((width == 0u || window == 0u) && !keepAlphaOn) || t_rewriteBusy || sizeBytes < 32u)
++            return false;
++        const uint64_t tagLo = loadLE64(data);
++        const uint64_t tagHi = loadLE64(data + 8u);
++        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++        if (nreg == 0u)
++            nreg = 16u;
++        const uint32_t prim = static_cast<uint32_t>((tagLo >> 47) & 0x7FFu);
++        const uint32_t type = prim & 7u;
++        if (((tagLo >> 58) & 3u) != GIF_FMT_PACKED || ((tagLo >> 46) & 1u) == 0u || type < GS_PRIM_TRIANGLE ||
++            type > GS_PRIM_SPRITE || 16ull + 16ull * nloop * nreg != sizeBytes)
++            return false;
++        for (uint32_t r = 0; r < nreg; ++r)
++        {
++            const uint32_t reg = static_cast<uint32_t>((tagHi >> (r * 4u)) & 0xFu);
++            if ((reg < GS_REG_RGBAQ || reg > GS_REG_XYZ2) && reg != GS_REG_FOG && reg != 0xFu) // vertex data, NOP
++                return false;
++        }
++        const GSPrimReg attributes = prmodecont ? decodePrimRegister(prim) : prmode;
++        const uint32_t ci = attributes.ctxt ? 1u : 0u;
++        const GSContext &c = ctx[ci];
++
++        // ps2GsSetKeepFrameAlpha: a textured, alpha-blended (Cs-Cd)*As+Cd draw without alpha test into a registered
++        // PSMCT32 buffer. A texel with As 0 leaves the colour as it was but writes alpha 0; with the alpha test
++        // NOTEQUAL 0 and AFAIL ZB_ONLY it writes nothing but the Z it wrote before.
++        const uint32_t fbp = c.frame.fbp & 0x1FFu;
++        const bool keepAlpha =
++            keepAlphaOn && attributes.tme && attributes.abe && !pabe && (c.alpha & 0xFFu) == 0x44u &&
++            (c.test & 1u) == 0u && ((c.test >> 14) & 1u) == 0u && c.frame.psm == GS_PSM_CT32 &&
++            (c.frame.fbmsk & 0xFF000000u) == 0u && (c.fba & 1u) == 0u && c.tex0.tcc != 0u &&
++            ((s_keepAlphaFbps[fbp >> 6].load(std::memory_order_relaxed) >> (fbp & 63u)) & 1u) != 0u;
++        const GSScissorReg &sc = c.scissor;
++        uint32_t k = 0u;
++        if (width != 0u && window != 0u && encodeScissor(sc.x0, sc.y0, sc.x1, sc.y1) == window && sc.x1 >= sc.x0 &&
++            sc.y1 >= sc.y0)
++            k = std::min<uint32_t>({width, (sc.x1 - sc.x0) / 2u, (sc.y1 - sc.y0) / 2u});
++        if (k == 0u && !keepAlpha)
++            return false;
++
++        const uint64_t scissorReg = ci != 0u ? GS_REG_SCISSOR_2 : GS_REG_SCISSOR_1;
++        const uint64_t testReg = ci != 0u ? GS_REG_TEST_2 : GS_REG_TEST_1;
++        out.clear();
++        out.reserve((4u * k + 2u) * (sizeBytes + 32u) + 64u);
++        const auto put = [&out](uint64_t value)
++        {
++            const size_t at = out.size();
++            out.resize(at + 8u);
++            std::memcpy(out.data() + at, &value, 8u);
++        };
++        const auto writeRegister = [&](uint64_t reg, uint64_t value)
++        {
++            put(1ull | (static_cast<uint64_t>(GIF_FMT_PACKED) << 58) | (1ull << 60)); // NLOOP 1, NREG 1, no EOP
++            put(0xEull); // A+D
++            put(value);
++            put(reg);
++        };
++        const auto draw = [&](float factor)
++        {
++            const size_t at = out.size();
++            out.insert(out.end(), data, data + sizeBytes);
++            out[at + 1u] &= 0x7Fu; // EOP off: a register write follows
++            if (factor != 1.0f)
++                for (uint32_t loop = 0; loop < nloop; ++loop)
++                    for (uint32_t r = 0; r < nreg; ++r)
++                        if (((tagHi >> (r * 4u)) & 0xFu) == GS_REG_RGBAQ)
++                        {
++                            uint8_t &alpha = out[at + 16u + (loop * nreg + r) * 16u + 12u];
++                            alpha = static_cast<uint8_t>(std::lround(alpha * factor));
++                        }
++        };
++        const auto drawIn = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, float factor)
++        {
++            if (x1 < x0 || y1 < y0)
++                return;
++            writeRegister(scissorReg, encodeScissor(x0, y0, x1, y1));
++            draw(factor);
++        };
++
++        if (keepAlpha)
++            writeRegister(testReg, (c.test & ~0x3FFFull) | 1u | (7u << 1) | (2u << 12)); // ATE, NOTEQUAL 0, ZB_ONLY
++        if (k == 0u)
++            draw(1.0f);
++        else
++        {
++            // ps2GsSetScissorFeather: rings of one pixel along the edge of the window, faint to full, then the rest.
++            for (uint32_t ring = 0; ring < k; ++ring)
++            {
++                const float t = static_cast<float>(ring + 1u) / static_cast<float>(k + 1u);
++                const float factor = t * t * (3.0f - 2.0f * t); // smoothstep
++                const uint32_t x0 = sc.x0 + ring, x1 = sc.x1 - ring, y0 = sc.y0 + ring, y1 = sc.y1 - ring;
++                drawIn(x0, y0, x1, y0, factor);
++                drawIn(x0, y1, x1, y1, factor);
++                drawIn(x0, y0 + 1u, x0, y1 - 1u, factor);
++                drawIn(x1, y0 + 1u, x1, y1 - 1u, factor);
++            }
++            drawIn(sc.x0 + k, sc.y0 + k, sc.x1 - k, sc.y1 - k, 1.0f);
++            writeRegister(scissorReg, window);
++        }
++        if (keepAlpha)
++            writeRegister(testReg, c.test);
++        out[out.size() - 32u + 1u] |= static_cast<uint8_t>(tagLo >> 8) & 0x80u; // the EOP of the original tag
++        return true;
++    }
++
+     std::atomic<uint32_t> s_debugGifPacketCount{0};
+     std::atomic<uint32_t> s_debugGsRegisterCount{0};
+     std::atomic<uint32_t> s_debugGsPackedVertexCount{0};
+@@ -496,6 +696,37 @@ bool ps2GsGifOnWorker()
+     return t_gifWorker;
+ }
+ 
++// Patch 0148: soft edges for the draws inside one scissor window (F1 06: the race-HUD minimap, a big rotated quad of
++// the whole track clipped by SCISSOR_1 to an 80x125 box, so the track line ends in a hard straight cut). A draw
++// packet (one PACKED tag with PRE) whose context scissor is exactly `scissor` is redrawn as disjoint pieces: rings of
++// one pixel along the edge of the window, each with its own scissor and the vertex alpha scaled from faint (outer
++// ring) to full, and the rest of the window once as it was; the window's scissor is set again after them. The
++// rewrite happens before either rasterizer sees the packet, so both draw the same thing. scissor 0 or width 0: off.
++void ps2GsSetScissorFeather(uint64_t scissor, uint32_t widthPixels)
++{
++    s_featherWidth.store(0u, std::memory_order_relaxed);
++    s_featherScissor.store(scissor & kScissorFieldMask, std::memory_order_relaxed);
++    s_featherWidth.store(widthPixels, std::memory_order_release);
++}
++
++// Patch 0148: textured, alpha-blended draws into these frame buffers (FBP) do not write the frame alpha where the
++// texel alpha is 0. F1 06 shows each picture as circuit 1 blended with the other buffer one line lower (PMODE MMOD 0:
++// by the pixel alpha of circuit 1); the transparent texels of its text and menu sprites wrote alpha 0, so their whole
++// boxes showed the other buffer shifted by a line (the red of a bar one line higher behind its "100%", a dark line
++// above a sprite edge). The colour is the same either way ((Cs-Cd)*0+Cd). count 0: off.
++void ps2GsSetKeepFrameAlpha(const uint32_t *fbps, uint32_t count)
++{
++    s_keepAlphaOn.store(false, std::memory_order_relaxed);
++    for (std::atomic<uint64_t> &word : s_keepAlphaFbps)
++        word.store(0u, std::memory_order_relaxed);
++    for (uint32_t i = 0; i < count; ++i)
++    {
++        const uint32_t fbp = fbps[i] & 0x1FFu;
++        s_keepAlphaFbps[fbp >> 6].fetch_or(1ull << (fbp & 63u), std::memory_order_relaxed);
++    }
++    s_keepAlphaOn.store(count != 0u, std::memory_order_release);
++}
++
+ 
+ 
+ GS::GS()
+@@ -1136,6 +1367,19 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
++    dumpScissorPacket(data, sizeBytes);
++
++    {
++        std::vector<uint8_t> rewritten;
++        if (buildDrawRewrite(data, sizeBytes, m_ctx, m_prmodecont, m_prmodeRegister, m_pabe, rewritten))
++        {
++            t_rewriteBusy = true; // patch 0148
++            processGIFPacket(rewritten.data(), static_cast<uint32_t>(rewritten.size()));
++            t_rewriteBusy = false;
++            return;
++        }
++    }
++
+     if (m_gpu)
+         m_gpu->GifPacket(data, sizeBytes); // paraLLEl-GS draws it; the parse below keeps our state and events
+ 
+@@ -1241,6 +1485,20 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
+ 
++    dumpScissorPacket(data, sizeBytes);
++
++    {
++        std::vector<uint8_t> rewritten;
++        if (buildDrawRewrite(data, sizeBytes, m_ctx, m_prmodecont, m_prmodeRegister, m_pabe, rewritten))
++        {
++            t_rewriteBusy = true; // patch 0148
++            processGIFPacket(rewritten.data(), static_cast<uint32_t>(rewritten.size()));
++            t_rewriteBusy = false;
++            ++m_nativePackedGIFPacketCount;
++            return true;
++        }
++    }
++
+     if (m_gpu)
+         m_gpu->GifPacket(data, sizeBytes);
+ 
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index a8730cb..f2951c9 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -22,6 +22,10 @@
+ 
+ using namespace ps2_syscalls;
+ 
++// gs_frontend.cpp (patch 0148): soft edges for the draws inside one scissor window.
++void ps2GsSetScissorFeather(uint64_t scissor, uint32_t widthPixels);
++void ps2GsSetKeepFrameAlpha(const uint32_t *fbps, uint32_t count);
++
+ namespace
+ {
+     std::atomic<uint32_t> g_gsSyncCallbackHits{0u};
+@@ -411,6 +415,83 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Patch 0148: a 64x64 PSMCT32 frame at FBP 0, alpha blending (Cs-Cd)*As+Cd, SCISSOR_1 kFeatherScissor = (8,8)-(39,39).
++    constexpr uint64_t kFeatherScissor = 8ull | (39ull << 16) | (8ull << 32) | (39ull << 48);
++
++    void setUpFeatherFrame(GS &gs)
++    {
++        gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
++        gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
++        gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++        gs.writeRegister(GS_REG_ALPHA_1, 0x44ull);
++        gs.writeRegister(GS_REG_SCISSOR_1, kFeatherScissor);
++    }
++
++    // One PACKED GIF tag with PRE: an alpha-blended sprite (0,0)-(48,48) of red `red` and alpha 0x80.
++    std::vector<uint8_t> featherSpritePacket(uint8_t red)
++    {
++        const uint64_t prim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6);
++        std::vector<uint8_t> packet;
++        appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 3u, true) | (1ull << 46) | (prim << 47));
++        appendU64(packet, 0x551ull); // RGBAQ, XYZ2, XYZ2
++        appendU64(packet, red);
++        appendU64(packet, 0x80ull << 32);
++        appendU64(packet, 0ull);
++        appendU64(packet, 0ull);
++        appendU64(packet, (48ull << 4) | ((48ull << 4) << 32));
++        appendU64(packet, 0ull);
++        return packet;
++    }
++
++    uint32_t featherRed(const std::vector<uint8_t> &vram, uint32_t x, uint32_t y)
++    {
++        return readReferencePSMCT32Pixel(vram, 0u, 1u, x, y) & 0xFFu;
++    }
++
++    // Patch 0148, frame alpha kept under transparent texels: an 8x8 PSMCT32 texture at block 128 whose left half
++    // (u < 4) is white with alpha 0 and right half white with alpha 0x80, drawn 1:1 at (0,0)-(8,8) with ALPHA 0x44
++    // over a frame (FBW 1) filled with 0x40112233.
++    constexpr uint32_t kKeepAlphaFill = 0x40112233u;
++
++    void setUpKeepAlphaDraw(GS &gs, std::vector<uint8_t> &vram, uint32_t fbp)
++    {
++        for (uint32_t y = 0; y < 8u; ++y)
++            for (uint32_t x = 0; x < 8u; ++x)
++            {
++                gs.WriteVram(GS_PSM_CT32, 128u, 1u, x, y, x < 4u ? 0x00FFFFFFu : 0x80FFFFFFu);
++                writeReferenceFramePSMCT32Pixel(vram, fbp, 1u, x, y, kKeepAlphaFill);
++            }
++        gs.writeRegister(GS_REG_FRAME_1, static_cast<uint64_t>(fbp) | (1ull << 16));
++        gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
++        gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++        gs.writeRegister(GS_REG_ALPHA_1, 0x44ull);
++        gs.writeRegister(GS_REG_SCISSOR_1, 63ull << 16 | 63ull << 48);
++        gs.writeRegister(GS_REG_TEX0_1, 128ull | (1ull << 14) | (3ull << 26) | (3ull << 30) | (1ull << 34));
++    }
++
++    // One PACKED GIF tag with PRE: a textured, alpha-blended sprite with UV (fst), (0,0)-(8,8), vertex colour 0x80.
++    std::vector<uint8_t> keepAlphaSpritePacket()
++    {
++        const uint64_t prim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 6) | (1ull << 8);
++        std::vector<uint8_t> packet;
++        appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 5u, true) | (1ull << 46) | (prim << 47));
++        appendU64(packet, 0x53531ull); // RGBAQ, UV, XYZ2, UV, XYZ2
++        appendU64(packet, 0x80ull | (0x80ull << 32));
++        appendU64(packet, 0x80ull | (0x80ull << 32));
++        appendU64(packet, 0ull);
++        appendU64(packet, 0ull);
++        appendU64(packet, 0ull);
++        appendU64(packet, 0ull);
++        appendU64(packet, (8ull << 4) | ((8ull << 4) << 32));
++        appendU64(packet, 0ull);
++        appendU64(packet, (8ull << 4) | ((8ull << 4) << 32));
++        appendU64(packet, 0ull);
++        return packet;
++    }
++}
++
+ void register_ps2_gs_tests()
+ {
+     MiniTest::Case("PS2GS", [](TestCase &tc)
+@@ -4666,5 +4747,145 @@ void register_ps2_gs_tests()
+             t.IsTrue(pattern2Ok,
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
++
++        tc.Run("scissor feather fades the draws of the registered window toward its edges", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            setUpFeatherFrame(gs);
++            ps2GsSetScissorFeather(kFeatherScissor, 4u);
++            const std::vector<uint8_t> packet = featherSpritePacket(0xFFu);
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++
++            t.Equals(featherRed(vram, 7u, 20u), 0u, "outside the window nothing is drawn");
++            t.Equals(featherRed(vram, 20u, 20u), 255u, "the centre keeps the full colour");
++            t.Equals(featherRed(vram, 12u, 20u), 255u, "the fade is 4 pixels wide");
++            const uint32_t edge = featherRed(vram, 8u, 20u);
++            t.IsTrue(edge > 0u && edge < featherRed(vram, 9u, 20u), "the outermost ring is the faintest, but drawn");
++            t.IsTrue(featherRed(vram, 9u, 20u) < featherRed(vram, 10u, 20u) &&
++                         featherRed(vram, 10u, 20u) < featherRed(vram, 11u, 20u) &&
++                         featherRed(vram, 11u, 20u) < 255u,
++                     "the rings grow towards the centre");
++            t.Equals(featherRed(vram, 39u, 20u), edge, "the right edge fades like the left one");
++            t.Equals(featherRed(vram, 20u, 8u), edge, "the top edge fades like the left one");
++            t.Equals(featherRed(vram, 20u, 39u), edge, "the bottom edge fades like the left one");
++            t.Equals(featherRed(vram, 8u, 8u), edge, "a corner belongs to the outermost ring");
++            t.Equals(featherRed(vram, 40u, 20u), 0u, "nothing is drawn right of the window");
++
++            // The window's scissor is back afterwards: an ordinary draw (feather off) fills it up to its edge.
++            ps2GsSetScissorFeather(0u, 0u);
++            const std::vector<uint8_t> plain = featherSpritePacket(0x40u);
++            gs.processGIFPacket(plain.data(), static_cast<uint32_t>(plain.size()));
++            waitForGs(gs);
++            t.Equals(featherRed(vram, 8u, 20u), 0x40u, "the scissor of the window is restored after the rings");
++            t.Equals(featherRed(vram, 7u, 20u), 0u, "the restored scissor still clips outside the window");
++        });
++
++        tc.Run("scissor feather leaves draws in other windows, or with it off, as they were", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            setUpFeatherFrame(gs);
++            const std::vector<uint8_t> packet = featherSpritePacket(0xFFu);
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            t.Equals(featherRed(vram, 8u, 20u), 255u, "with no window registered the edge gets the full colour");
++            t.Equals(featherRed(vram, 7u, 20u), 0u, "with no window registered the scissor still clips");
++
++            std::fill(vram.begin(), vram.end(), 0u);
++            ps2GsSetScissorFeather(kFeatherScissor + 1u, 4u); // another window: (9,8)-(39,39)
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            ps2GsSetScissorFeather(0u, 0u);
++            t.Equals(featherRed(vram, 8u, 20u), 255u, "a draw in another window gets the full colour at its edge");
++            t.Equals(featherRed(vram, 20u, 20u), 255u, "a draw in another window gets the full colour at its centre");
++        });
++
++        tc.Run("keep frame alpha: transparent texels leave the frame alpha of a registered buffer", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            setUpKeepAlphaDraw(gs, vram, 0u);
++            const uint32_t fbps[] = {0u, 128u};
++            ps2GsSetKeepFrameAlpha(fbps, 2u);
++            const std::vector<uint8_t> packet = keepAlphaSpritePacket();
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kKeepAlphaFill,
++                     "a fully transparent texel leaves colour and alpha of the frame");
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 6u, 1u), 0x80FFFFFFu,
++                     "an opaque texel is drawn as before");
++
++            // The TEST of the draw is back afterwards: an untextured sprite of alpha 0 still writes alpha 0.
++            const uint64_t prim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6);
++            std::vector<uint8_t> plain;
++            appendU64(plain, makeGifTag(1u, GIF_FMT_PACKED, 3u, true) | (1ull << 46) | (prim << 47));
++            appendU64(plain, 0x551ull);
++            appendU64(plain, 0x33ull);
++            appendU64(plain, 0ull);
++            appendU64(plain, 0ull);
++            appendU64(plain, 0ull);
++            appendU64(plain, (8ull << 4) | ((8ull << 4) << 32));
++            appendU64(plain, 0ull);
++            gs.processGIFPacket(plain.data(), static_cast<uint32_t>(plain.size()));
++            waitForGs(gs);
++            ps2GsSetKeepFrameAlpha(nullptr, 0u);
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 1u, 1u) >> 24, 0u,
++                     "the TEST of the context is restored after the draw");
++        });
++
++        tc.Run("keep frame alpha: other buffers, or with it off, still get alpha 0 from transparent texels", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            setUpKeepAlphaDraw(gs, vram, 0u);
++            const std::vector<uint8_t> packet = keepAlphaSpritePacket();
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kKeepAlphaFill & 0x00FFFFFFu,
++                     "with no buffer registered a transparent texel writes alpha 0 and keeps the colour");
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 6u, 1u), 0x80FFFFFFu,
++                     "with no buffer registered an opaque texel is drawn");
++
++            setUpKeepAlphaDraw(gs, vram, 0u);
++            const uint32_t fbps[] = {128u};
++            ps2GsSetKeepFrameAlpha(fbps, 1u);
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            ps2GsSetKeepFrameAlpha(nullptr, 0u);
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kKeepAlphaFill & 0x00FFFFFFu,
++                     "a buffer that is not registered still gets alpha 0");
++        });
++
++        tc.Run("keep frame alpha and scissor feather work together on one draw", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            setUpKeepAlphaDraw(gs, vram, 0u);
++            constexpr uint64_t kWindow = 0ull | (7ull << 16) | (0ull << 32) | (7ull << 48);
++            gs.writeRegister(GS_REG_SCISSOR_1, kWindow);
++            const uint32_t fbps[] = {0u};
++            ps2GsSetKeepFrameAlpha(fbps, 1u);
++            ps2GsSetScissorFeather(kWindow, 2u);
++            const std::vector<uint8_t> packet = keepAlphaSpritePacket();
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            ps2GsSetScissorFeather(0u, 0u);
++            ps2GsSetKeepFrameAlpha(nullptr, 0u);
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 0u, 3u), kKeepAlphaFill,
++                     "a transparent texel in the outer ring leaves the frame as it was");
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 2u, 3u), kKeepAlphaFill,
++                     "a transparent texel in the centre leaves the frame as it was");
++            const uint32_t edge = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 7u, 3u) & 0xFFu;
++            t.IsTrue(edge > 0x33u && edge < 0xFFu, "an opaque texel in the outer ring is faded");
++            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 5u, 3u) & 0xFFu, 0xFFu,
++                     "an opaque texel in the centre is drawn in full");
++        });
+     });
+ }

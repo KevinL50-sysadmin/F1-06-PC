@@ -1,0 +1,73 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index b4c6a0c..35492b9 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -76,7 +76,8 @@
+ // IRQ in the sound data input areas (0x2000-0x27FF), as before patch 0112, 107 (patch 0113) the IOP interpreter loop of
+ // before patch 0113 (step() and IopCpuCore::executeInstruction for every instruction, without iop_cpu_fast.h), 108
+ // (patch 0115) the SPU2 voices interpolated with Catmull-Rom instead of the hardware gaussian table, as before, 109
+-// (patch 0119) GS triangles sampled at the pixel centre instead of its integer coordinate, as before.
++// (patch 0119) GS triangles sampled at the pixel centre instead of its integer coordinate, as before, 110 (patch 0120)
++// the interpolated FST UV of GS triangles truncated instead of rounded to the nearest 1/16 texel, as before.
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f4ca778..d983994 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2386,6 +2386,11 @@ namespace
+         float winding, invAbsDenom, k, slope0, slope1, slope2, e0, e1;
+         float r0, r1, r2, g0, g1, g2, b0, b1, b2, a0, a1, a2;
+         float fog0, fog1, fog2, u0, u1, u2, t0, t1, t2;
++        // Patch 0120: added to the interpolated UV (FST, 12.4) before it is truncated. The weights add up to 1 only
++        // within float rounding, so a UV that is the same at the three vertices (608 = texel 38) came out as 607.99 and
++        // truncated to texel 37 on some pixels: the neighbouring atlas column (red dots in the grid name boxes). The GS
++        // DDA keeps a constant UV exact. 0.5: the nearest 1/16 texel; A/B mode 110: 0, truncated as before.
++        float fstRound;
+         float s0, s1, s2, tq0, tq1, tq2, q0, q1, q2;
+         double z0, z1, z2;
+         uint32_t flatRgba;
+@@ -2509,6 +2514,7 @@ namespace
+         t.a0 = v0.a, t.a1 = v1.a, t.a2 = v2.a;
+         t.fog0 = v0.fog, t.fog1 = v1.fog, t.fog2 = v2.fog;
+         t.u0 = v0.u, t.u1 = v1.u, t.u2 = v2.u;
++        t.fstRound = g_ps2AbMode.load(std::memory_order_relaxed) == 110 ? 0.0f : 0.5f;
+         t.t0 = v0.v, t.t1 = v1.v, t.t2 = v2.v;
+         t.s0 = v0.s, t.s1 = v1.s, t.s2 = v2.s;
+         t.tq0 = v0.t, t.tq1 = v1.t, t.tq2 = v2.t;
+@@ -2708,8 +2714,8 @@ namespace
+                     if (t.fst)
+                     {
+                         // The same conversions as the scalar loop, from the same float values.
+-                        const uint16_t iu = static_cast<uint16_t>(sL[i]);
+-                        const uint16_t iv = static_cast<uint16_t>(tL[i]);
++                        const uint16_t iu = static_cast<uint16_t>(sL[i] + t.fstRound);
++                        const uint16_t iv = static_cast<uint16_t>(tL[i] + t.fstRound);
+                         if constexpr (S != nullptr)
+                             texel = S(job.sampler, 0.0f, 0.0f, 1.0f, iu, iv);
+                         else
+@@ -3525,8 +3531,8 @@ namespace
+                     uint16_t iu, iv;
+                     if (t.fst)
+                     {
+-                        iu = static_cast<uint16_t>(t.u0 * w0 + t.u1 * w1 + t.u2 * w2);
+-                        iv = static_cast<uint16_t>(t.t0 * w0 + t.t1 * w1 + t.t2 * w2);
++                        iu = static_cast<uint16_t>(t.u0 * w0 + t.u1 * w1 + t.u2 * w2 + t.fstRound);
++                        iv = static_cast<uint16_t>(t.t0 * w0 + t.t1 * w1 + t.t2 * w2 + t.fstRound);
+                         is = 0.0f;
+                         it = 0.0f;
+                         iq = 1.0f;
+@@ -5875,8 +5881,10 @@ void GSCpuBackend::DrawTriangleReference(const GSPrimitiveBatch &batch)
+                 uint16_t iu, iv;
+                 if (state.prim.fst)
+                 {
+-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
++                    // Patch 0120: rounded to the nearest 1/16 texel, as TriangleSetup::fstRound (A/B mode 110: truncated).
++                    const float fstRound = g_ps2AbMode.load(std::memory_order_relaxed) == 110 ? 0.0f : 0.5f;
++                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2 + fstRound);
++                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2 + fstRound);
+                     is = 0.0f;
+                     it = 0.0f;
+                     iq = 1.0f;

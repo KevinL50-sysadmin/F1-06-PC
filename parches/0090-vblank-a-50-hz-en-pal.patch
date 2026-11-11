@@ -1,0 +1,109 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 4beabfb..ef67b8d 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -256,6 +256,9 @@ struct EeThreadCreateParams
+     uint32_t option = 0;
+ };
+ 
++// Patch 0090: the VBLANK period for the video mode the game sets (sceGsResetGraph; omode 3 = PAL: 50 Hz, else 60 Hz).
++void ps2SetVideoModePal(bool pal);
++
+ class EeScheduler
+ {
+ public:
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 4bb3454..96fe167 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -96,7 +96,6 @@ namespace
+     constexpr uint32_t WEF_OR = 0x01u;
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+@@ -115,7 +114,34 @@ namespace
+         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+     }
+ 
+-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
++    // Patch 0090: the VBLANK period follows the video mode the game sets with sceGsResetGraph (ps2SetVideoModePal: PAL
++    // 50 Hz, otherwise 60 Hz, as before). F1 06 is PAL: its logic advances 1/50 s per frame and it draws at most one
++    // frame per VBLANK, so at 60 Hz the light scenes ran at up to 120 % of real time. PS2X_VBLANK_HZ=50/60 forces it.
++    std::atomic<uint32_t> g_vblankPeriodUs{16667u};
++
++    uint32_t forcedVBlankPeriodUs()
++    {
++        static const uint32_t forced = []() -> uint32_t
++        {
++            const char *value = std::getenv("PS2X_VBLANK_HZ");
++            const unsigned long hz = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
++            return hz >= 10ul && hz <= 240ul ? static_cast<uint32_t>((1000000ul + hz / 2u) / hz) : 0u;
++        }();
++        return forced;
++    }
++
++    std::chrono::microseconds vblankPeriod()
++    {
++        const uint32_t forced = forcedVBlankPeriodUs();
++        if (forced == 0u && g_ps2AbMode.load(std::memory_order_relaxed) == 83)
++            return std::chrono::microseconds(16667); // A/B mode 83: 60 Hz, as before patch 0090
++        return std::chrono::microseconds(forced != 0u ? forced : g_vblankPeriodUs.load(std::memory_order_relaxed));
++    }
++
++    uint64_t vblankPeriodCycles()
++    {
++        return microsecondsToEeCycles(static_cast<uint64_t>(vblankPeriod().count()));
++    }
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
+@@ -216,8 +242,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+-                  std::chrono::steady_clock::now() + kVBlankPeriod,
++    scheduleEvent(m_eeCycle + vblankPeriodCycles(),
++                  std::chrono::steady_clock::now() + vblankPeriod(),
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -2169,8 +2195,8 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
++                              scheduled.hostDeadline + vblankPeriod(),
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+@@ -2466,3 +2492,12 @@ void EeScheduler::publishIdleDebugContext()
+         publishDebugContext(selected->activeContext());
+     }
+ }
++
++// Patch 0090: called by sceGsResetGraph with the video mode the game asks for (omode 3 = PAL).
++void ps2SetVideoModePal(bool pal)
++{
++    const uint32_t period = pal ? 20000u : 16667u;
++    if (g_vblankPeriodUs.exchange(period, std::memory_order_relaxed) != period)
++        std::fprintf(stderr, "[ee:vblank] %s: %u us%s\n", pal ? "PAL" : "NTSC", period,
++                     forcedVBlankPeriodUs() != 0u ? " (PS2X_VBLANK_HZ manda)" : "");
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 9c54919..a2ec806 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -800,6 +800,7 @@ namespace ps2_stubs
+ 
+             g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
+             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
++            ps2SetVideoModePal((omode & 0xFF) == 3u); // patch 0090: the VBLANK at 50 Hz for PAL
+             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
+             writeGsGParamToScratch(runtime);
+             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);

@@ -1,0 +1,252 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index b880235..d557324 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -14,44 +14,18 @@
+ 
+ class PS2Runtime;
+ 
+-// Phase 3 (T3, F1 06): the in-game options menu (ImGui, in Spanish). F2, or L3+R3 held for half a second on the pad,
+-// opens and closes it; Esc, circle or triangle close it. While it is open the game keeps running but its pad reads
++// Phase 3 (T3, F1 06): the options menu (ImGui, in Spanish). Nativizacion T17: no key opens it for the player any more
++// (F2, Esc and L3+R3 held did): every option lives in the game's OPTIONS > PC pages. It is the model behind those
++// pages (gameOptionNumber...); the window only opens through PS2X_MENU_GUION or PS2X_MENU_PETICION (abrir), for tests
++// and development; Esc, circle or triangle close it. While it is open the game keeps running but its pad reads
+ // neutral (keyboard, pad and wheel), until every button is released after closing. Its values come from opciones.ini
+ // (ps2_options.h, OptionsMenuModel) and apply at once where the runtime can change them live; Guardar rewrites the file.
+ namespace ps2x
+ {
+-    constexpr double kMenuComboSeconds = 0.5;
+     constexpr uint16_t kPadL3 = 1u << 1, kPadR3 = 1u << 2; // pressed-button bits, in the PS2's order
+ 
+-    // Fires once when held has been true for holdSeconds without a break; then it needs a release to fire again.
+-    class HoldComboDetector
+-    {
+-    public:
+-        explicit HoldComboDetector(double holdSeconds = kMenuComboSeconds) : m_holdSeconds(holdSeconds) {}
+-
+-        bool update(bool held, double now)
+-        {
+-            if (!held)
+-            {
+-                m_since = -1.0;
+-                m_fired = false;
+-                return false;
+-            }
+-            if (m_since < 0.0)
+-                m_since = now;
+-            if (m_fired || now - m_since + 1e-9 < m_holdSeconds) // 1e-9: 4.1 - 3.6 is a hair under 0.5
+-                return false;
+-            m_fired = true;
+-            return true;
+-        }
+-
+-    private:
+-        double m_holdSeconds;
+-        double m_since = -1.0;
+-        bool m_fired = false;
+-    };
+-
+-    // pressed: pressed-button bits (1 = pressed). L3 and R3 held together are the menu's combo: the game sees neither.
++    // pressed: pressed-button bits (1 = pressed). L3 and R3 held together: the game sees neither (they opened the menu
++    // until Nativizacion T17; ps2_pad.cpp still hides them).
+     inline uint16_t maskMenuCombo(uint16_t pressed)
+     {
+         constexpr uint16_t combo = kPadL3 | kPadR3;
+@@ -59,8 +33,8 @@ namespace ps2x
+     }
+ 
+     // Foto y repeticion T3: L3 or R3 pressed alone (the photo mode's buttons, ps2_photo_mode.h). It acts when let go, and
+-    // only if the other one was not held at any moment of the press: L3+R3 is the menu's combo, which neither must
+-    // trigger. cancel: forget the press in progress (the options menu opened).
++    // only if the other one was not held at any moment of the press: L3+R3 held together triggers neither. cancel:
++    // forget the press in progress (the options menu opened).
+     // Camaras y pilotos T4: a press that starts within kChatterSeconds of the last let go is that press going on (the
+     // pad's chatter: a frame without the button while it is held, or a bounce when let go), never a second click: the
+     // player's DualSense turned the photo mode on and, when R3 was let go a second later, off again (logs/usuario/
+@@ -127,11 +101,11 @@ namespace ps2x
+         return mode == UserPathsMode::Development;
+     }
+ 
+-    // Esc in the player's modes opens and closes the menu, like a PC game, and never quits (one press too many would
+-    // lose a race); the window's close button still quits. Development keeps raylib's Esc = quit.
+-    inline bool escapeOpensMenu(UserPathsMode mode)
++    // Esc in the player's modes never quits (one press too many would lose a race); the window's close button still
++    // quits. Development keeps raylib's Esc = quit. Nativizacion T17: Esc no longer opens the menu.
++    inline bool escapeQuits(UserPathsMode mode)
+     {
+-        return mode != UserPathsMode::Development;
++        return mode == UserPathsMode::Development;
+     }
+ 
+     // Nativizacion T14: a text of the host for the game's OPTIONS > PC NETPLAY page (the reason a start failed, the
+@@ -151,7 +125,7 @@ namespace ps2x
+     // Nativizacion T16: the host's password typed on the game's own keyboard (OPTIONS > PC NETPLAY, PASSWORD). The
+     // page's Lua sends it one character code at a time (begin, add each code, finish), so no piece of it is left in
+     // the game's Lua heap as a key string. It is taken whole or not at all: printable ASCII, and empty (a new random
+-    // one when the host starts, as in the F2 menu) or kGamePasswordMinSize to kGamePasswordMaxSize characters.
++    // one when the host starts) or kGamePasswordMinSize to kGamePasswordMaxSize characters.
+     // finish (and begin) wipe the characters received.
+     constexpr size_t kGamePasswordMinSize = 8;  // ps2x::netplay::kMinHostPasswordSize
+     constexpr size_t kGamePasswordMaxSize = 32; // the keyboard's charLimit
+@@ -267,7 +241,7 @@ public:
+     void initialize();
+     void shutdown();
+ 
+-    // F2, the pad combo, Esc / circle / triangle and PS2X_MENU_GUION; every frame, before drawing.
++    // PS2X_MENU_GUION, PS2X_MENU_PETICION and, while open, Esc / circle / triangle (close); every frame, before drawing.
+     void update(PS2Runtime &runtime);
+     bool isVisible() const;
+     // F1 was pressed in development mode (debugPanelAllowed): the debug panel shows or hides. Player modes: never.
+@@ -308,10 +282,10 @@ public:
+         std::string guest;
+     };
+     static GameNetplayState gameNetplayState(int waitMs);
+-    // Nativizacion T16 (PC NETPLAY, PASSWORD): the host's password typed on the game's keyboard goes to the buffer the
+-    // F2 menu types in (empty: a new random one when the host starts). Refused while the host runs or is asked to start
+-    // (F2 only lets it change then) and when ps2x::gamePasswordValid refuses it. Never saved. gameNetplayPassword: the
+-    // one to tell the guest, as F2 shows it: the host's while it runs, else the one typed (empty: random).
++    // Nativizacion T16 (PC NETPLAY, PASSWORD): the host's password typed on the game's keyboard goes to the menu's
++    // password buffer (empty: a new random one when the host starts). Refused while the host runs or is asked to start
++    // and when ps2x::gamePasswordValid refuses it. Never saved. gameNetplayPassword: the one to tell the guest: the
++    // host's while it runs, else the one typed (empty: random).
+     static bool setGameNetplayPassword(const std::string &password);
+     static std::string gameNetplayPassword();
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index 9c09ccf..450bbdd 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -261,7 +261,7 @@ namespace ps2x::netplay
+             }
+             text("Tab o flechas: cambiar de campo  ·  Intro: conectar  ·  Ctrl+V: pegar  ·  F4: ver la contraseña", 24,
+                  static_cast<float>(screenHeight) - 92, 18, LIGHTGRAY);
+-            text("El anfitrión ve su dirección en OPCIONES > OPCIONES PC > JUEGO EN RED PC y la contraseña en F2 > Juego en red.", 24,
++            text("El anfitrión ve su dirección y la contraseña en OPCIONES > OPCIONES PC > JUEGO EN RED PC.", 24,
+                  static_cast<float>(screenHeight) - 66, 18, LIGHTGRAY);
+             text("Cierra la ventana para salir.", 24, static_cast<float>(screenHeight) - 36, 16, GRAY);
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index bd6bac1..063255d 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -269,7 +269,6 @@ struct PS2OptionsMenu::State
+     const char *hint = nullptr;
+     std::string hintNote;
+ 
+-    ps2x::HoldComboDetector combo;
+     uint16_t padPressed = 0u;
+     bool padDirection[4] = {}; // up, down, left, right
+     bool padActivate = false;
+@@ -633,7 +632,7 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+             s.focusFirstRow = true;
+             s.status.clear();
+             ImGui::GetIO().ClearInputKeys();
+-            // Held buttons (the combo) must not act in the menu.
++            // Held buttons must not act in the menu.
+             const ps2x::MenuPadState pad = ps2x::readMenuPad();
+             s.padPressed = pad.pressed;
+         }
+@@ -754,11 +753,8 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     const ps2x::MenuPadState pad = ps2x::readMenuPad();
+     const uint16_t pressedNow = static_cast<uint16_t>(pad.pressed & ~s.padPressed);
+     s.padPressed = pad.pressed;
+-    const bool comboFired = s.combo.update((pad.pressed & (ps2x::kPadL3 | ps2x::kPadR3)) == (ps2x::kPadL3 | ps2x::kPadR3), now);
+-    const bool escapeToggles = ps2x::escapeOpensMenu(s.mode) && IsKeyPressed(KEY_ESCAPE);
+-    if (IsKeyPressed(KEY_F2) || comboFired || escapeToggles)
+-        setOpen(!s.open);
+-    else if (s.open && (IsKeyPressed(KEY_ESCAPE) || (pressedNow & ((1u << 12) | (1u << 13))) != 0u)) // triangle, circle
++    // Nativizacion T17: no key opens the menu (F2, Esc and L3+R3 held did); the game's OPTIONS > PC pages hold it all.
++    if (s.open && (IsKeyPressed(KEY_ESCAPE) || (pressedNow & ((1u << 12) | (1u << 13))) != 0u)) // triangle, circle
+         setOpen(false);
+ 
+     if (s.open)
+@@ -796,8 +792,8 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+         s.padActivate = false;
+     }
+ 
+-    // Esc closes the menu, not the game, while it is open; in the player's modes Esc never quits (escapeOpensMenu).
+-    const bool clearExitKey = s.open || ps2x::escapeOpensMenu(s.mode);
++    // Esc closes the menu, not the game, while it is open; in the player's modes Esc never quits (escapeQuits).
++    const bool clearExitKey = s.open || !ps2x::escapeQuits(s.mode);
+     if (clearExitKey != s.exitKeyCleared)
+     {
+         SetExitKey(clearExitKey ? KEY_NULL : KEY_ESCAPE);
+@@ -1100,7 +1096,7 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Hay cambios sin guardar (ya se ven en el juego).");
+         else
+             ImGui::TextUnformatted(" ");
+-        ImGui::TextDisabled("F2 o L3+R3 (mantener): abrir y cerrar. Esc, círculo o triángulo: cerrar. L1/R1: sección.");
++        ImGui::TextDisabled("Esc, círculo o triángulo: cerrar. L1/R1: sección.");
+         if (!model.forced.empty())
+             ImGui::TextDisabled("Las variables de entorno PS2X_* mandan sobre opciones.ini al arrancar.");
+         ImGui::TextDisabled("%s", ps2x::pathForLog(s.file).c_str());
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d9a1ff2..4579b72 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -963,8 +963,8 @@ namespace ps2x
+ 
+ // Foto y repeticion T3 (main thread, once per frame): the pad's R3 alone turns the photo mode on and off as
+ // tecla_modo_foto, where it can (photoModeReady: elsewhere R3 is the game's, ps2_pad.cpp), and L3 alone shows or hides
+-// the help bar of the photo mode and of the replay. Both act when let go, never together (L3+R3 held opens the options
+-// menu) nor with the options menu open.
++// the help bar of the photo mode and of the replay. Both act when let go, never together (L3+R3 held does neither) nor
++// with the options menu open.
+ static void UpdateStickButtons(bool optionsMenuOpen)
+ {
+     static ps2x::StickButtonClick s_l3, s_r3;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 85a8e24..98f0677 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1791,7 +1791,7 @@ void register_ps2_options_menu_tests()
+             t.Equals(bar.alpha(600.5), 0.0f, "its mode ended: gone");
+         });
+ 
+-        tc.Run("a stick button alone acts when let go; with the other one it is the menu's L3+R3", [](TestCase &t)
++        tc.Run("a stick button alone acts when let go; with the other one held it does nothing", [](TestCase &t)
+         {
+             ps2x::StickButtonClick r3;
+             double now = 0.0;
+@@ -2055,22 +2055,6 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(ps2x::nextHudMode(ps2x::HudMode::Hidden) == ps2x::HudMode::Full, "oculto -> completo");
+         });
+ 
+-        tc.Run("the pad combo fires once after being held for its time", [](TestCase &t)
+-        {
+-            ps2x::HoldComboDetector combo(0.5);
+-            t.IsFalse(combo.update(false, 0.0), "not held");
+-            t.IsFalse(combo.update(true, 1.0), "held: starts");
+-            t.IsFalse(combo.update(true, 1.49), "not yet at 0.49 s");
+-            t.IsTrue(combo.update(true, 1.5), "fires at 0.5 s");
+-            t.IsFalse(combo.update(true, 3.0), "only once while held");
+-            t.IsFalse(combo.update(false, 3.1), "released");
+-            t.IsFalse(combo.update(true, 3.2), "held again: starts over");
+-            t.IsFalse(combo.update(false, 3.5), "released before the time");
+-            t.IsFalse(combo.update(true, 3.6), "held again");
+-            t.IsFalse(combo.update(true, 4.0), "0.4 s");
+-            t.IsTrue(combo.update(true, 4.1), "fires at 0.5 s from the new press");
+-        });
+-
+         tc.Run("maskMenuCombo hides L3 and R3 from the game only while both are held", [](TestCase &t)
+         {
+             constexpr uint16_t l3 = 1u << 1, r3 = 1u << 2, cross = 1u << 14;
+@@ -2099,11 +2083,13 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(ps2x::debugPanelAllowed(ps2x::UserPathsMode::Installed), "installed: no");
+         });
+ 
+-        tc.Run("Esc opens the menu for the player and never quits; development keeps Esc = quit", [](TestCase &t)
++        // Nativizacion T17: no key opens the options overlay any more (F2, Esc and L3+R3 did); Esc still never quits
++        // in the player's modes.
++        tc.Run("Esc never quits for the player; development keeps Esc = quit", [](TestCase &t)
+         {
+-            t.IsTrue(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Portable), "portable: Esc opens the menu");
+-            t.IsTrue(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Installed), "installed: Esc opens the menu");
+-            t.IsFalse(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Development), "development: Esc quits as before");
++            t.IsFalse(ps2x::escapeQuits(ps2x::UserPathsMode::Portable), "portable: Esc does not quit");
++            t.IsFalse(ps2x::escapeQuits(ps2x::UserPathsMode::Installed), "installed: Esc does not quit");
++            t.IsTrue(ps2x::escapeQuits(ps2x::UserPathsMode::Development), "development: Esc quits as before");
+         });
+ 
+         tc.Run("parseMenuScript reads the steps of PS2X_MENU_GUION", [](TestCase &t)

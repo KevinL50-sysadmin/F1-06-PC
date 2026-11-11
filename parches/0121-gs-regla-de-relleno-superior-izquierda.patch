@@ -1,0 +1,145 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 35492b9..c9a8f9e 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -77,7 +77,8 @@
+ // before patch 0113 (step() and IopCpuCore::executeInstruction for every instruction, without iop_cpu_fast.h), 108
+ // (patch 0115) the SPU2 voices interpolated with Catmull-Rom instead of the hardware gaussian table, as before, 109
+ // (patch 0119) GS triangles sampled at the pixel centre instead of its integer coordinate, as before, 110 (patch 0120)
+-// the interpolated FST UV of GS triangles truncated instead of rounded to the nearest 1/16 texel, as before.
++// the interpolated FST UV of GS triangles truncated instead of rounded to the nearest 1/16 texel, as before, 111
++// (patch 0121) every edge of a GS triangle inclusive instead of the top-left fill rule, as before.
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index d983994..6a51c4f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2377,6 +2377,25 @@ namespace
+         }
+     }
+ 
++    // Patch 0121: the lowest barycentric weight that still covers a pixel, for the edge (a, b) opposite vertex c. The GS
++    // fills with the top-left rule (PCSX2 GSRasterizer: columns [ceil(x left), ceil(x right)), rows [ceil(y top),
++    // ceil(y bottom))): a pixel exactly on a left or top edge is drawn, on a right or bottom edge it is not, so a pixel
++    // on an edge two triangles share is drawn once. All edges were inclusive (w >= -epsilon): translucent quads split
++    // in two blended their diagonal twice (a lighter line across the full-screen fades of the loading screens). The
++    // epsilon still absorbs the float error of w on either side. A/B mode 111: every edge inclusive, as before.
++    inline float edgeCoverageMin(float ax, float ay, float bx, float by, float cx, float cy)
++    {
++        constexpr float kEpsilon = 1.0e-4f;
++        if (g_ps2AbMode.load(std::memory_order_relaxed) == 111)
++            return -kEpsilon;
++        bool topLeft;
++        if (ay != by)
++            topLeft = cx > ax + (cy - ay) * (bx - ax) / (by - ay); // the inside is to the right: a left edge
++        else
++            topLeft = cy > ay; // horizontal with the inside below: a top edge
++        return topLeft ? -kEpsilon : kEpsilon;
++    }
++
+     // What DrawTriangle's pixel loop reads, worked out once per primitive with the same expressions as
+     // DrawTriangleReference (F1_GS_VERIFICAR checks them pixel for pixel).
+     struct TriangleSetup
+@@ -2391,6 +2410,7 @@ namespace
+         // truncated to texel 37 on some pixels: the neighbouring atlas column (red dots in the grid name boxes). The GS
+         // DDA keeps a constant UV exact. 0.5: the nearest 1/16 texel; A/B mode 110: 0, truncated as before.
+         float fstRound;
++        float edgeMin0, edgeMin1, edgeMin2; // patch 0121: edgeCoverageMin of the edges opposite v0, v1, v2
+         float s0, s1, s2, tq0, tq1, tq2, q0, q1, q2;
+         double z0, z1, z2;
+         uint32_t flatRgba;
+@@ -2488,6 +2508,9 @@ namespace
+             t.fx2 += 0.5f;
+             t.fy2 += 0.5f;
+         }
++        t.edgeMin0 = edgeCoverageMin(t.fx1, t.fy1, t.fx2, t.fy2, t.fx0, t.fy0);
++        t.edgeMin1 = edgeCoverageMin(t.fx2, t.fy2, t.fx0, t.fy0, t.fx1, t.fy1);
++        t.edgeMin2 = edgeCoverageMin(t.fx0, t.fy0, t.fx1, t.fy1, t.fx2, t.fy2);
+ 
+         t.minX = clampInt(static_cast<int>(std::floor(std::min({t.fx0, t.fx1, t.fx2}))), ctx.scissor.x0, ctx.scissor.x1);
+         t.maxX = clampInt(static_cast<int>(std::ceil(std::max({t.fx0, t.fx1, t.fx2}))), ctx.scissor.x0, ctx.scissor.x1);
+@@ -2626,7 +2649,7 @@ namespace
+                                            float row0, float row1)
+     {
+         const PixelPipeline &pp = job.pp;
+-        const __m128 eps = _mm_set1_ps(-1.0e-4f);
++        const __m128 eps0 = _mm_set1_ps(t.edgeMin0), eps1 = _mm_set1_ps(t.edgeMin1), eps2 = _mm_set1_ps(t.edgeMin2);
+         const __m128 one = _mm_set1_ps(1.0f);
+         const __m128 fx2 = _mm_set1_ps(t.fx2);
+         const __m128 e0 = _mm_set1_ps(t.e0), e1 = _mm_set1_ps(t.e1);
+@@ -2655,7 +2678,7 @@ namespace
+             const __m128 w0 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e0, dx), r0v), winding), inv);
+             const __m128 w1 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e1, dx), r1v), winding), inv);
+             const __m128 w2 = _mm_sub_ps(_mm_sub_ps(one, w0), w1);
+-            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps), _mm_cmplt_ps(w1, eps)), _mm_cmplt_ps(w2, eps));
++            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps0), _mm_cmplt_ps(w1, eps1)), _mm_cmplt_ps(w2, eps2));
+             const int count = std::min(4, spanX1 - x + 1);
+             unsigned live = ~static_cast<unsigned>(_mm_movemask_ps(out)) & ((1u << count) - 1u);
+             if (live == 0u)
+@@ -3119,7 +3142,7 @@ namespace
+         const TextureSampler &ts = job.sampler;
+         uint8_t *const vram = pp.vram;
+         const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3 (the caller leaves 0 to rasterTriangleSpan4)
+-        const __m128 eps = _mm_set1_ps(-1.0e-4f);
++        const __m128 eps0 = _mm_set1_ps(t.edgeMin0), eps1 = _mm_set1_ps(t.edgeMin1), eps2 = _mm_set1_ps(t.edgeMin2);
+         const __m128 one = _mm_set1_ps(1.0f);
+         const __m128 half = _mm_set1_ps(0.5f);
+         const __m128 fx2 = _mm_set1_ps(t.fx2);
+@@ -3166,7 +3189,7 @@ namespace
+             const __m128 w0 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e0, dx), r0v), winding), inv);
+             const __m128 w1 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e1, dx), r1v), winding), inv);
+             const __m128 w2 = _mm_sub_ps(_mm_sub_ps(one, w0), w1);
+-            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps), _mm_cmplt_ps(w1, eps)), _mm_cmplt_ps(w2, eps));
++            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps0), _mm_cmplt_ps(w1, eps1)), _mm_cmplt_ps(w2, eps2));
+             const int count = std::min(4, spanX1 - x + 1);
+             unsigned live = ~static_cast<unsigned>(_mm_movemask_ps(out)) & ((1u << count) - 1u);
+             if (live == 0u)
+@@ -3313,7 +3336,7 @@ namespace
+         const PixelPipeline &pp = job.pp;
+         uint8_t *const vram = pp.vram;
+         const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3
+-        const __m128 eps = _mm_set1_ps(-1.0e-4f);
++        const __m128 eps0 = _mm_set1_ps(t.edgeMin0), eps1 = _mm_set1_ps(t.edgeMin1), eps2 = _mm_set1_ps(t.edgeMin2);
+         const __m128 one = _mm_set1_ps(1.0f);
+         const __m128 half = _mm_set1_ps(0.5f);
+         const __m128 fx2 = _mm_set1_ps(t.fx2);
+@@ -3346,7 +3369,7 @@ namespace
+             const __m128 w0 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e0, dx), r0v), winding), inv);
+             const __m128 w1 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e1, dx), r1v), winding), inv);
+             const __m128 w2 = _mm_sub_ps(_mm_sub_ps(one, w0), w1);
+-            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps), _mm_cmplt_ps(w1, eps)), _mm_cmplt_ps(w2, eps));
++            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps0), _mm_cmplt_ps(w1, eps1)), _mm_cmplt_ps(w2, eps2));
+             const int count = std::min(4, spanX1 - x + 1);
+             unsigned live = ~static_cast<unsigned>(_mm_movemask_ps(out)) & ((1u << count) - 1u);
+             if (live == 0u)
+@@ -3511,7 +3534,7 @@ namespace
+                 float w1 = ((t.e1 * (px - t.fx2) + row1) * t.winding) * t.invAbsDenom;
+                 float w2 = 1.0f - w0 - w1;
+ 
+-                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++                if (w0 < t.edgeMin0 || w1 < t.edgeMin1 || w2 < t.edgeMin2)
+                     continue;
+ 
+                 double z = t.z0 * w0 + t.z1 * w1 + t.z2 * w2;
+@@ -5801,6 +5824,10 @@ void GSCpuBackend::DrawTriangleReference(const GSPrimitiveBatch &batch)
+     minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
+     maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+ 
++    // Patch 0121: the top-left fill rule, as prepareTriangle.
++    const float edgeMin0 = edgeCoverageMin(fx1, fy1, fx2, fy2, fx0, fy0);
++    const float edgeMin1 = edgeCoverageMin(fx2, fy2, fx0, fy0, fx1, fy1);
++    const float edgeMin2 = edgeCoverageMin(fx0, fy0, fx1, fy1, fx2, fy2);
+     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+     if (std::fabs(denom) < 0.001f)
+         return;
+@@ -5854,7 +5881,7 @@ void GSCpuBackend::DrawTriangleReference(const GSPrimitiveBatch &batch)
+             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+             float w2 = 1.0f - w0 - w1;
+ 
+-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++            if (w0 < edgeMin0 || w1 < edgeMin1 || w2 < edgeMin2)
+                 continue;
+ 
+             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;

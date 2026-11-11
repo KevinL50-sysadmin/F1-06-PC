@@ -1,0 +1,82 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 042812c..834158e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -60,6 +60,7 @@ namespace
+         std::array<std::vector<Source>, kTargetCount> map;
+         std::string wheel = "auto";
+         int gamepad = 0;
++        bool noDevices = false; // PS2X_SIN_MANDOS=1
+         float deadzone = 0.15f;
+         float wheelDeadzone = 0.02f;
+         float wheelSensitivity = 1.0f;
+@@ -338,6 +339,20 @@ namespace
+                 out << kDefaultConfig;
+                 std::fprintf(stderr, "[pad] controles: %s creado con los valores por defecto\n", path.c_str());
+             }
++            // PS2X_SIN_MANDOS=1 (pruebas automaticas): no abre ni lee ningun mando fisico (DualSense por HID, XInput,
++            // raylib, volante por DirectInput) y no les manda vibracion, para no molestar a quien este usando el
++            // mando o el volante en otro programa. El piloto automatico y los guiones de pulsaciones siguen.
++            const char *noDevices = std::getenv("PS2X_SIN_MANDOS");
++            if (noDevices && noDevices[0] != '\0' && noDevices[0] != '0')
++            {
++                c.gamepad = -1;
++                c.wheel = "ninguno";
++                c.rumble = false;
++                c.noDevices = true;
++                ps2_pad_win::setRumbleEnabled(false, true);
++                std::fprintf(stderr, "[pad] PS2X_SIN_MANDOS: sin mandos fisicos\n");
++                return c;
++            }
+             ps2_pad_win::setRumbleEnabled(c.rumble);
+             return c;
+         }();
+@@ -477,6 +492,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     const Config &cfg = config();
+     std::call_once(g_wheelOnce, [&cfg]()
+                    {
++        if (cfg.noDevices)
++            return; // PS2X_SIN_MANDOS: ni siquiera enumerar DirectInput
+         for (const std::string &name : ps2_pad_win::listGameControllers())
+             std::fprintf(stderr, "[pad] DirectInput: %s\n", name.c_str());
+         if (ps2_pad_win::openWheel(cfg.wheel))
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+index b05d9a8..db218cf 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -574,10 +574,10 @@ namespace ps2_pad_win
+         return g_wheelName;
+     }
+ 
+-    void setRumbleEnabled(bool enabled)
++    void setRumbleEnabled(bool enabled, bool silent)
+     {
+         g_rumbleEnabled.store(enabled, std::memory_order_relaxed);
+-        if (!enabled)
++        if (!enabled && !silent)
+         {
+             if (XInputSetStateFn fn = loadXInputSetState())
+             {
+@@ -620,7 +620,7 @@ namespace ps2_pad_win
+     bool openWheel(const std::string &) { return false; }
+     bool readWheel(JoystickState &out) { out = JoystickState{}; return false; }
+     std::string wheelName() { return {}; }
+-    void setRumbleEnabled(bool) {}
++    void setRumbleEnabled(bool, bool) {}
+     void setRumble(float, float) {}
+     bool readDualSenseBluetooth(DualSenseInput &) { return false; }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.h b/ps2xRuntime/src/lib/ps2_pad_win.h
+index 38f48af..1b836e2 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.h
++++ b/ps2xRuntime/src/lib/ps2_pad_win.h
+@@ -27,7 +27,8 @@ namespace ps2_pad_win
+     std::string wheelName();
+ 
+     // Vibracion del mando XInput 0 (motor pequeno y grande, de 0 a 1).
+-    void setRumbleEnabled(bool enabled);
++    // silent: solo cambia el estado, sin mandar "motores parados" a ningun mando (PS2X_SIN_MANDOS).
++    void setRumbleEnabled(bool enabled, bool silent = false);
+     void setRumble(float smallMotor, float largeMotor);
+ 
+     // DualSense por Bluetooth leido por HID (parche 0117). Al mandarle la vibracion (informe 0x31) pasa a enviar sus

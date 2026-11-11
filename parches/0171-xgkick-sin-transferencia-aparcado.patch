@@ -1,0 +1,202 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 7f02530..adea195 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2965,6 +2965,12 @@ namespace
+     };
+ }
+ 
++namespace
++{
++    // Patch 0171: BlockState::xgkickThrough with no XGKICK transfer in flight (above every cycle: nothing to catch up).
++    constexpr uint64_t kXgkickIdle = ~0ull;
++}
++
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+@@ -3525,6 +3531,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         uint64_t codeGeneration;
+         BuildContext context;
+         BlockState &blockState;
++        // Patch 0171: with no transfer in flight xgkickThrough parks at kXgkickIdle, so the inline checks before every
++        // store and at every block end (ps2_vu1_jit.h) skip the call that only moved it up to the cycle. Every XGKICK
++        // sets it to its issue cycle, as before. A/B mode 173: moved up on every call, as before.
++        bool parkIdle = g_ps2AbMode.load(std::memory_order_relaxed) != 173;
+ 
+         VU1State &state() { return vu.m_state; }
+         uint8_t *data() const { return vuData; }
+@@ -3632,7 +3642,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 return;
+             if (!vu.m_xgkick.active)
+             {
+-                blockState.xgkickThrough = cycle;
++                blockState.xgkickThrough = parkIdle ? kXgkickIdle : cycle;
+                 return;
+             }
+             catchUpXgkickTransfer(cycle);
+@@ -3644,7 +3654,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             {
+                 // Patch 0081: the cycles at once (A/B modes 72 and 73: cycle by cycle, as before).
+                 progressXgkickCycles(cycle - blockState.xgkickThrough);
+-                blockState.xgkickThrough = cycle;
++                blockState.xgkickThrough = parkIdle && !vu.m_xgkick.active ? kXgkickIdle : cycle;
+                 return;
+             }
+             while (blockState.xgkickThrough < cycle)
+@@ -3671,6 +3681,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const uint8_t *code() const { return codeBytes; }
+         const BuildContext &buildContext() const { return context; }
+     };
++    // Patch 0171: where the blocks start the XGKICK catch-up (BlockHost::parkIdle).
++    const auto xgkickThroughAtEntry = [&]() -> uint64_t
++    {
++        return m_xgkick.active || g_ps2AbMode.load(std::memory_order_relaxed) == 173 ? m_cycle : kXgkickIdle;
++    };
+     // The interpreter's pending results as a block timing state (false when they do not fit one), and back. Both at
+     // a pair boundary, after the completions of the current cycle.
+     const auto toBlocks = [&](BlockEngine &engine) -> bool
+@@ -3687,7 +3702,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             // always belongs to a pending write, so there are none.
+             st.cycle = m_cycle;
+             st.sig = 0u;
+-            st.xgkickThrough = m_cycle;
++            st.xgkickThrough = xgkickThroughAtEntry();
+             for (uint64_t occupied = index.occupied; occupied != 0u; occupied &= occupied - 1u)
+                 index.wheel[std::countr_zero(occupied)] = 0u;
+             index.occupied = 0u;
+@@ -3789,7 +3804,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         sig.delaySlot = m_state.branchPending ? 1u : 0u;
+         st.cycle = m_cycle;
+         st.sig = engine.sigs.intern(sig);
+-        st.xgkickThrough = m_cycle;
++        st.xgkickThrough = xgkickThroughAtEntry();
+         // The pending results live in the block state now.
+         m_fdiv = {};
+         m_efu = {};
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 60667db..391c639 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_vu1.h"
++#include "runtime/ps2_ab.h"
+ #include "gs_test_sync.h"
+ 
+ #include <cmath>
+@@ -1315,6 +1316,113 @@ void register_ps2_vu1_tests()
+                      "XGKICK resource stalls should consume VU cycles");
+         });
+ 
++        tc.Run("XGKICK packets and cycles stay the same across repeated block runs with stores around the transfers",
++               [](TestCase &t)
++        {
++            // Stores with no transfer in flight, during one and after it ends, a transfer that ends mid-loop and one
++            // still in flight at the end of the program; repeated runs reuse the compiled schedules. A/B mode 173
++            // keeps the XGKICK catch-up bookkeeping as before patch 0171: everything must match.
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            std::vector<std::vector<uint8_t>> captured;
++            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t sizeBytes)
++            {
++                captured.emplace_back(packet, packet + sizeBytes);
++            });
++
++            const uint64_t firstTag = makeGifTag(6u, GIF_FMT_IMAGE, 0u, true);
++            const uint64_t secondTag = makeGifTag(2u, GIF_FMT_IMAGE, 0u, true);
++            const auto resetData = [&]()
++            {
++                std::memset(fx.data, 0, PS2_VU1_DATA_SIZE);
++                std::memcpy(fx.data, &firstTag, sizeof(firstTag));
++                std::memcpy(fx.data + 16u * 16u, &secondTag, sizeof(secondTag));
++                for (uint32_t qw = 1; qw <= 6u; ++qw)
++                    std::memset(fx.data + qw * 16u, static_cast<int>(0x10u + qw), 16u);
++                for (uint32_t qw = 17; qw <= 18u; ++qw)
++                    std::memset(fx.data + qw * 16u, static_cast<int>(0x10u + qw), 16u);
++            };
++            const uint32_t program[][2] = {
++                {makeVuIaddiu(3u, 0u, 0), kVuUpperNop},                     // 0
++                {makeVuIaddiu(5u, 0u, 6), kVuUpperNop},                     // 8
++                {makeVuSq(0xFu, 4u, 4u, 0), kVuUpperNop},                   // 16: loop A, no transfer
++                {makeVuIaddiu(3u, 3u, 1), kVuUpperNop},                     // 24
++                {0u, kVuUpperNop},                                          // 32
++                {makeVuIbne(3u, 5u, -4), kVuUpperNop},                      // 40 -> 16
++                {0u, kVuUpperNop},                                          // 48
++                {makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop},               // 56: XGKICK qw 0
++                {makeVuSq(0xFu, 6u, 2u, 0), kVuUpperNop},                   // 64: last payload qword
++                {makeVuIaddiu(3u, 0u, 0), kVuUpperNop},                     // 72
++                {makeVuSq(0xFu, 7u, 4u, 0), kVuUpperNop},                   // 80: loop B, transfer ends in it
++                {makeVuIaddiu(3u, 3u, 1), kVuUpperNop},                     // 88
++                {0u, kVuUpperNop},                                          // 96
++                {makeVuIbne(3u, 5u, -4), kVuUpperNop},                      // 104 -> 80
++                {0u, kVuUpperNop},                                          // 112
++                {makeVuLowerSpecial(0x6Cu, 7u), kVuUpperNop},               // 120: XGKICK qw 16
++                {makeVuSq(0xFu, 8u, 8u, 0), kVuUpperNop},                   // 128: its last payload qword
++                {0u, kVuUpperNop | 0x40000000u},                            // 136: E
++                {0u, kVuUpperNop},                                          // 144
++            };
++            for (uint32_t i = 0; i < sizeof(program) / sizeof(program[0]); ++i)
++                writeVuInstructionPair(fx.code, i * 8u, program[i][0], program[i][1]);
++            const float vf4[4] = {1.0f, 2.0f, 3.0f, 4.0f};
++            const float vf6[4] = {5.0f, 6.0f, 7.0f, 8.0f};
++            const float vf7[4] = {9.0f, 10.0f, 11.0f, 12.0f};
++            const float vf8[4] = {13.0f, 14.0f, 15.0f, 16.0f};
++            const auto runOnce = [&](VU1Interpreter &vu1, uint64_t &cycles)
++            {
++                resetData();
++                vu1.state().vi[1] = 0;
++                vu1.state().vi[2] = 6;
++                vu1.state().vi[4] = 200;
++                vu1.state().vi[7] = 16;
++                vu1.state().vi[8] = 18;
++                std::memcpy(vu1.state().vf[4], vf4, sizeof(vf4));
++                std::memcpy(vu1.state().vf[6], vf6, sizeof(vf6));
++                std::memcpy(vu1.state().vf[7], vf7, sizeof(vf7));
++                std::memcpy(vu1.state().vf[8], vf8, sizeof(vf8));
++                const uint64_t before = vu1.state().cycles;
++                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 65536u);
++                cycles = vu1.state().cycles - before;
++            };
++
++            std::vector<uint8_t> expectedFirst(16u * 7u, 0u), expectedSecond(16u * 3u, 0u);
++            std::memcpy(expectedFirst.data(), &firstTag, sizeof(firstTag));
++            for (uint32_t qw = 1; qw <= 5u; ++qw)
++                std::memset(expectedFirst.data() + qw * 16u, static_cast<int>(0x10u + qw), 16u);
++            std::memcpy(expectedFirst.data() + 6u * 16u, vf6, sizeof(vf6));
++            std::memcpy(expectedSecond.data(), &secondTag, sizeof(secondTag));
++            std::memset(expectedSecond.data() + 16u, 0x11 + 16, 16u);
++            std::memcpy(expectedSecond.data() + 2u * 16u, vf8, sizeof(vf8));
++
++            const int modes[] = {0, 173};
++            for (int mode : modes)
++            {
++                g_ps2AbMode.store(mode);
++                VU1Interpreter vu1;
++                for (uint32_t run = 0; run < 3u; ++run)
++                {
++                    captured.clear();
++                    uint64_t cycles = 0u;
++                    runOnce(vu1, cycles);
++                    t.Equals(captured.size(), static_cast<size_t>(2u), "both PATH1 packets should be sent");
++                    if (captured.size() == 2u)
++                    {
++                        t.IsTrue(captured[0] == expectedFirst,
++                                 "the first packet should carry the store to its last qword");
++                        t.IsTrue(captured[1] == expectedSecond,
++                                 "the second packet should carry the store after its XGKICK");
++                    }
++                    t.Equals(cycles, static_cast<uint64_t>(70u), "the program should take the same VU cycles");
++                    t.Equals(vu1.state().vi[3], 6, "loop B should run six times");
++                    float scratch[4];
++                    readVuQword(fx.data, 200u, scratch);
++                    t.IsTrue(std::memcmp(scratch, vf7, sizeof(vf7)) == 0, "the loop B stores should land");
++                }
++            }
++            g_ps2AbMode.store(0);
++        });
++
+         tc.Run("synthetic Code Veronica text packet preserves black-frame PATH1 data", [](TestCase &t)
+         {
+             PS2Memory mem;

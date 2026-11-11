@@ -1,0 +1,33 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 5e1ee15..01dc09f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -302,7 +302,16 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // The interpolated value is never negative, so adding 0.5 and truncating rounds like std::lround without
++        // the library call (four per bilinear texel).
++        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
++    }
++
++    // floor() for texel coordinates without the library call: truncate and step down for negative fractions.
++    inline int fastFloorToInt(float value)
++    {
++        const int truncated = static_cast<int>(value);
++        return (static_cast<float>(truncated) > value) ? truncated - 1 : truncated;
+     }
+ }
+ 
+@@ -1215,8 +1224,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+ 
+     const float sampleU = texUf - 0.5f;
+     const float sampleV = texVf - 0.5f;
+-    const int u0 = static_cast<int>(std::floor(sampleU));
+-    const int v0 = static_cast<int>(std::floor(sampleV));
++    const int u0 = fastFloorToInt(sampleU);
++    const int v0 = fastFloorToInt(sampleV);
+     const int u1 = u0 + 1;
+     const int v1 = v0 + 1;
+     const float fx = sampleU - static_cast<float>(u0);

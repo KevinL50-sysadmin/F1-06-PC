@@ -1,0 +1,110 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index ce43629..65ddd3e 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -46,7 +46,8 @@
+ // waking the sleeping GS thread as before patch 0069 (again on every command while the pending cost it last saw stays
+ // over the bound), 50 and 51 the GS band workers spinning 200 and 1000 pauses instead of 4000 before sleeping on another
+ // worker, 52 the GS coordinator spinning 1000 instead of 4000 (patch 0071: none of the three changed anything), 53 and
+-// 54 GS bands of 16 and 4 rows instead of 8 (16 before patch 0071). Since patch 0069 the modes of
++// 54 GS bands of 16 and 4 rows instead of 8 (16 before patch 0071), 55 the VU0 microprograms run by the
++// interpreter alone, without blocks (before patch 0072). Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index ba7baef..311d583 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2902,14 +2902,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+ 
+     // F1_VU1_VERIFICAR=<n>: the program runs with blocks (its packets kept, not sent), then again from the same state
+     // with this interpreter alone (which sends them), and state, data memory and packets are compared.
+-    static uint32_t s_verifyLeft = []() { const char *v = std::getenv("F1_VU1_VERIFICAR"); return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u; }();
++    // F1_VU0_VERIFICAR=<n>: the same for the VU0 microprograms (patch 0072: VU0 by blocks too).
++    static uint32_t s_verifyLeftUnit[2] = {
++        []() { const char *v = std::getenv("F1_VU0_VERIFICAR"); return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u; }(),
++        []() { const char *v = std::getenv("F1_VU1_VERIFICAR"); return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u; }()};
+     static const double s_verifyFrom = []() { const char *v = std::getenv("F1_VU1_VERIFICAR_DESDE"); return v ? std::atof(v) : 0.0; }();
+     static const auto s_verifyStart = std::chrono::steady_clock::now();
+-    if (s_verifyLeft != 0u && m_unit == Unit::VU1 && !pipelinesPending() &&
++    uint32_t &s_verifyLeft = s_verifyLeftUnit[m_unit == Unit::VU1 ? 1 : 0];
++    if (s_verifyLeft != 0u && !pipelinesPending() &&
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - s_verifyStart).count() >= s_verifyFrom)
+     {
+         --s_verifyLeft;
+-        static uint64_t s_verifySame = 0u, s_verifyDifferent = 0u;
++        static uint64_t s_verifySameUnit[2] = {}, s_verifyDifferentUnit[2] = {};
++        uint64_t &s_verifySame = s_verifySameUnit[m_unit == Unit::VU1 ? 1 : 0];
++        uint64_t &s_verifyDifferent = s_verifyDifferentUnit[m_unit == Unit::VU1 ? 1 : 0];
++        const char *const verifyTag = m_unit == Unit::VU1 ? "vu1" : "vu0";
+         std::vector<uint8_t> stateBefore(sizeof(VU1State));
+         std::memcpy(stateBefore.data(), &m_state, sizeof(VU1State));
+         const std::vector<uint8_t> dataBefore(vuData, vuData + dataSize);
+@@ -2945,8 +2952,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+         {
+             VU1State blocksState{};
+             std::memcpy(&blocksState, stateBlocks.data(), sizeof(VU1State));
+-            std::fprintf(stderr, "[vu1:verificar] DISTINTO: programa en 0x%04x, ciclos %llu (bloques %llu), paquetes %zu (bloques %zu)",
+-                         startPC & microAddressMask(), static_cast<unsigned long long>(m_state.cycles - cycleBefore),
++            std::fprintf(stderr, "[%s:verificar] DISTINTO: programa en 0x%04x, ciclos %llu (bloques %llu), paquetes %zu (bloques %zu)",
++                         verifyTag, startPC & microAddressMask(), static_cast<unsigned long long>(m_state.cycles - cycleBefore),
+                          static_cast<unsigned long long>(blocksState.cycles - cycleBefore), packetsReference.size(),
+                          packetsBlocks.size());
+             for (uint32_t r = 0; r < 32u; ++r)
+@@ -2965,10 +2972,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                 std::fprintf(stderr, " datos");
+             if (packetsBlocks != packetsReference)
+                 std::fprintf(stderr, " paquetes");
+-            std::fprintf(stderr, "\n");
++            std::fprintf(stderr, " pc=0x%04x (bloques 0x%04x)\n", m_state.pc, blocksState.pc);
++            if (m_unit == Unit::VU0 && s_verifyDifferent == 1u)
++            {
++                // The first difference of the VU0: its micro memory, data memory and state before, for vu_dis.py.
++                if (FILE *f = std::fopen("logs/vu0_verificar.bin", "wb"))
++                {
++                    std::fwrite(vuCode, 1, codeSize, f);
++                    std::fwrite(dataBefore.data(), 1, dataBefore.size(), f);
++                    std::fwrite(stateBefore.data(), 1, stateBefore.size(), f);
++                    std::fclose(f);
++                }
++            }
+         }
+         if ((s_verifySame + s_verifyDifferent) % 5000u == 0u || s_verifyLeft == 0u)
+-            std::fprintf(stderr, "[vu1:verificar] %llu iguales, %llu distintos\n",
++            std::fprintf(stderr, "[%s:verificar] %llu iguales, %llu distintos\n", verifyTag,
+                          static_cast<unsigned long long>(s_verifySame), static_cast<unsigned long long>(s_verifyDifferent));
+         return;
+     }
+@@ -3208,11 +3226,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const char *value = std::getenv("PS2X_VU1_BLOQUES");
+         return value == nullptr || value[0] != '0';
+     }();
++    // Patch 0072: the VU0 microprograms (VCALLMS: the visibility test of F1 06) run by blocks too, with their own
++    // engine; PS2X_VU0_BLOQUES=0 or A/B mode 55 runs them here, as before.
++    static const bool s_vu0BlocksEnabled = []()
++    {
++        const char *value = std::getenv("PS2X_VU0_BLOQUES");
++        return value == nullptr || value[0] != '0';
++    }();
+     BlockEngine *blocks = nullptr;
+-    if (s_blocksEnabled && !s_blocksOff && g_ps2AbMode.load(std::memory_order_relaxed) != 3 &&
+-        m_unit == Unit::VU1 && planCache != nullptr && s_pasoN == 0u)
++    const int blocksMode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (s_blocksEnabled && !s_blocksOff && blocksMode != 3 &&
++        (m_unit == Unit::VU1 || (s_vu0BlocksEnabled && blocksMode != 55)) && planCache != nullptr && s_pasoN == 0u)
+     {
+-        blocks = &s_blockEngines[1];
++        blocks = &s_blockEngines[m_unit == Unit::VU1 ? 1 : 0];
+         if (blocks->owner != this)
+         {
+             blocks->clear();
+@@ -3542,7 +3568,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             blocks->fallbackAt[m_state.pc >> 3] == 0u && toBlocks(*blocks))
+         {
+             BlockHost host{*this, vuData, dataSize, gs, memory, vuCode, codeSize, codeGeneration,
+-                           BuildContext{s_pairInfos[1], planCache, decodedCount, codeSize}, blocks->state};
++                           BuildContext{s_pairInfos[m_unit == Unit::VU1 ? 1 : 0], planCache, decodedCount, codeSize}, blocks->state};
+             const uint64_t pairsBefore = blocks->stats.pairs;
+             const BlockRunEnd end = runBlocks(*blocks, host, budgetEnd);
+             toInterpreter(*blocks);

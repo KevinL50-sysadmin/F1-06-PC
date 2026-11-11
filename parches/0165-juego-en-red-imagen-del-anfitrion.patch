@@ -1,0 +1,3581 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index ab86632..b54ce6e 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -265,6 +265,14 @@ elseif(WIN32)
+     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+     set(FFMPEG_PREBUILT_URL
+         "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
++    # Fase 5 (T15, netplay N2): a local copy of that zip instead of the download (no network), e.g. for the tests'
++    # build, which needs FFmpeg for the video loopback tests. One-time reconfigure of the tests' build:
++    #   cmake -S third_party/PS2Recomp -B build/ps2recomp -DPS2X_ENABLE_FFMPEG=ON
++    #     -DPS2X_FFMPEG_ARCHIVE=<repo>/build/runner-dev/ThirdParty/ffmpeg-prefix/src/ffmpeg-n7.1-241205-lgpl-amd64-shared.zip
++    set(PS2X_FFMPEG_ARCHIVE "" CACHE FILEPATH "Local copy of the FFmpeg prebuilt zip (empty: download it)")
++    if(PS2X_FFMPEG_ARCHIVE)
++        set(FFMPEG_PREBUILT_URL "${PS2X_FFMPEG_ARCHIVE}")
++    endif()
+ 
+     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
+     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
+@@ -400,6 +408,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_netplay_crypto.cpp
+     src/lib/ps2_netplay_guest.cpp
+     src/lib/ps2_netplay_protocol.cpp
++    src/lib/ps2_netplay_video.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index 490a199..a3c16f1 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -1,10 +1,14 @@
+ #include "ps2_netplay.h"
++#include "ps2_netplay_video.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstring>
++#include <deque>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -24,6 +28,12 @@
+ // Fase 5 (T15, netplay N1): the host and the guest over TCP (Winsock 2). One thread per side; the game thread only
+ // reads the guest's last pad (readRemotePad). Nothing received is ever executed or loaded: the frames are fixed-size
+ // records (ps2_netplay_protocol.h) checked before they are read.
++// N2: the host's picture. The window's thread copies each new latched frame (offerHostPicture); the host's encoder
++// thread scales and encodes the newest one (older ones are dropped, never waited for) and queues its chunks, which go
++// out after any control frame (SendQueue). An encoded picture is not made while the previous one still waits whole
++// in the queue (the network is behind): that picture is skipped at the source, so the H.264 chain stays whole. The
++// guest checks and reassembles the chunks (VideoAssembler, after the tag) and decodes them in a thread of its own.
++// Encoded bytes reach FFmpeg only after their tag was verified.
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -35,10 +45,17 @@ namespace ps2x::netplay
+         constexpr int kPingIntervalMs = 1000;
+         constexpr int kPadIntervalUs = 16667;     // ~60 Hz
+         constexpr int kAuthFailureDelayMs = 1000; // no new connection is taken for this long after a wrong password
+-        constexpr int kStatsIntervalMs = 10000;
++        constexpr int kStatsIntervalMs = 5000;
+         constexpr int kConnectTimeoutMs = 5000;
+         constexpr int kSendTimeoutMs = 2000;
+         constexpr int kPollMs = 20;
++        // N2.
++        constexpr int kSendBufferBytes = 128 * 1024; // the kernel's share of the queue: the rest stays in SendQueue
++        constexpr uint16_t kVideoFps = 50;            // the game's rate (PAL)
++        constexpr int kKeyRequestIntervalMs = 250;    // between two key pictures asked for
++        constexpr int kAckIntervalMs = 250;
++        constexpr size_t kMaxDecodeQueue = 8;         // pictures waiting for the guest's decoder
++        constexpr int kBusyLingerMs = 2000;           // a refused second guest: time to read its REJECT
+ 
+         void logLine(const char *format, ...)
+         {
+@@ -84,6 +101,40 @@ namespace ps2x::netplay
+             }
+         }
+ 
++        // N2: the newest picture offered, waiting for the encoder of the host that has a guest.
++        struct PictureSlot
++        {
++            std::mutex mutex;
++            std::condition_variable ready;
++            std::vector<uint8_t> rgba; // tightly packed
++            uint32_t width = 0, height = 0;
++            uint32_t captureMs = 0;
++            bool fresh = false;
++            bool stop = false;
++        };
++
++        std::mutex g_pictureMutex;
++        PictureSlot *g_pictureOwner = nullptr;
++        std::atomic<bool> g_pictureWanted{false};
++        std::atomic<float> g_pictureAspect{4.0f / 3.0f};
++
++        void setPictureOwner(PictureSlot *slot)
++        {
++            std::lock_guard<std::mutex> lock(g_pictureMutex);
++            g_pictureOwner = slot;
++            g_pictureWanted = slot != nullptr;
++        }
++
++        void clearPictureOwner(PictureSlot *slot)
++        {
++            std::lock_guard<std::mutex> lock(g_pictureMutex);
++            if (g_pictureOwner == slot)
++            {
++                g_pictureOwner = nullptr;
++                g_pictureWanted = false;
++            }
++        }
++
+         void put32(uint8_t *out, uint32_t value)
+         {
+             for (int i = 0; i < 4; ++i)
+@@ -225,6 +276,44 @@ namespace ps2x::netplay
+ #endif
+     }
+ 
++    bool hostPictureWanted()
++    {
++        return g_pictureWanted.load(std::memory_order_relaxed);
++    }
++
++    void offerHostPicture(const uint8_t *rgba, uint32_t width, uint32_t height, size_t stride)
++    {
++        if (!g_pictureWanted.load(std::memory_order_relaxed) || rgba == nullptr || width == 0 || height == 0 ||
++            width > 4096 || height > 4096 || stride < static_cast<size_t>(width) * 4u)
++            return;
++        const uint32_t now = clockMs();
++        std::lock_guard<std::mutex> owner(g_pictureMutex);
++        PictureSlot *slot = g_pictureOwner;
++        if (slot == nullptr)
++            return;
++        {
++            std::lock_guard<std::mutex> lock(slot->mutex);
++            const size_t row = static_cast<size_t>(width) * 4u;
++            slot->rgba.resize(row * height);
++            if (stride == row)
++                std::memcpy(slot->rgba.data(), rgba, row * height);
++            else
++                for (uint32_t y = 0; y < height; ++y)
++                    std::memcpy(slot->rgba.data() + row * y, rgba + stride * y, row);
++            slot->width = width;
++            slot->height = height;
++            slot->captureMs = now;
++            slot->fresh = true;
++        }
++        slot->ready.notify_one();
++    }
++
++    void setHostPictureAspect(float aspect)
++    {
++        if (aspect > 0.25f && aspect < 8.0f)
++            g_pictureAspect.store(aspect, std::memory_order_relaxed);
++    }
++
+     bool remotePadActive()
+     {
+         std::lock_guard<std::mutex> lock(g_remoteMutex);
+@@ -268,16 +357,48 @@ namespace ps2x::netplay
+         Clock::time_point accepted, lastReceived, lastPing, statsStart, acceptAfter;
+         uint32_t pingToken = 0;
+         uint64_t statsPads = 0;
+-        uint32_t roundTripMs = 0;
++        std::atomic<uint32_t> roundTripMs{0};
++        // Refused second guests, kept open until they read the REJECT (closing with their HELLO unread would reset
++        // the connection before it).
++        struct Lingering
++        {
++            SOCKET socket;
++            Clock::time_point until;
++        };
++        std::vector<Lingering> lingering;
++
++        // What leaves during the session, from this thread and the encoder's (io).
++        std::mutex io;
++        SendQueue queue;
++        std::vector<uint8_t> out; // the frame being written (signed)
++        size_t outSent = 0;
++        bool sendFailed = false;
++        bool sessionOpen = false; // the encoder may queue
++
++        // N2: the encoder thread.
++        PictureSlot slot;
++        std::thread encoderThread;
++        std::atomic<bool> keyRequested{false};
++        std::atomic<uint32_t> latencyMs{0};
++        mutable std::mutex statsMutex;
++        HostVideoStats stats;
++        uint64_t statsPictures = 0, statsSkipped = 0, statsBytes = 0; // since the last stats line
++        double statsEncodeMs = 0.0;
+ 
+         bool listen(std::string &error);
+         void run();
+         void acceptOne();
+         void drop(const std::string &why, bool sendBye, ByeReason reason);
+         bool sendFrame(MessageType type, const uint8_t *payload, size_t size);
++        void flushLocked();
++        bool outputPending();
+         void readClient();
+         void onSessionFrame(const Frame &frame);
+         void timers();
++        void lingerTick();
++        void startVideo();
++        void stopVideo();
++        void encodeLoop();
+     };
+ 
+     bool Host::Impl::listen(std::string &error)
+@@ -357,18 +478,79 @@ namespace ps2x::netplay
+         return ok;
+     }
+ 
++    // Writes what the socket takes now: the rest of the frame being written, then the next ones of the queue (control
++    // first), each signed as it leaves. Stops when the socket is full (the thread goes on when it is writable).
++    void Host::Impl::flushLocked()
++    {
++        while (!sendFailed && client != INVALID_SOCKET)
++        {
++            if (outSent == out.size())
++            {
++                SendQueue::Message m;
++                if (!queue.next(m))
++                    return;
++                out = encodeFrame(m.type, m.payload.data(), m.payload.size(), &auth);
++                outSent = 0;
++                if (out.empty())
++                    continue;
++                if (m.video)
++                {
++                    std::lock_guard<std::mutex> lock(statsMutex);
++                    stats.bytes += out.size();
++                    statsBytes += out.size();
++                }
++            }
++            const int n = send(client, reinterpret_cast<const char *>(out.data() + outSent),
++                               static_cast<int>(out.size() - outSent), 0);
++            if (n > 0)
++            {
++                outSent += static_cast<size_t>(n);
++                continue;
++            }
++            if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
++                return;
++            sendFailed = true;
++        }
++    }
++
++    bool Host::Impl::outputPending()
++    {
++        std::lock_guard<std::mutex> lock(io);
++        return outSent < out.size() || !queue.empty();
++    }
++
+     bool Host::Impl::sendFrame(MessageType type, const uint8_t *payload, size_t size)
+     {
+-        const std::vector<uint8_t> frame = encodeFrame(type, payload, size, phase == Phase::Session ? &auth : nullptr);
+-        return !frame.empty() && sendAll(client, frame);
++        if (phase != Phase::Session)
++        {
++            const std::vector<uint8_t> frame = encodeFrame(type, payload, size, nullptr);
++            return !frame.empty() && sendAll(client, frame);
++        }
++        std::lock_guard<std::mutex> lock(io);
++        queue.pushControl(type, payload, size);
++        flushLocked();
++        return !sendFailed;
+     }
+ 
+     void Host::Impl::drop(const std::string &why, bool sendBye, ByeReason reason)
+     {
+-        if (sendBye && phase == Phase::Session)
++        if (phase == Phase::Session)
+         {
+-            const uint8_t payload[1] = {static_cast<uint8_t>(reason)};
+-            sendFrame(MessageType::Bye, payload, 1);
++            stopVideo();
++            std::lock_guard<std::mutex> lock(io);
++            sessionOpen = false;
++            if (sendBye && !sendFailed)
++            {
++                // The frame half written goes out whole first (the guest reads frames, not bytes).
++                if (outSent < out.size())
++                    sendAll(client, std::vector<uint8_t>(out.begin() + static_cast<std::ptrdiff_t>(outSent), out.end()));
++                const uint8_t payload[1] = {static_cast<uint8_t>(reason)};
++                sendAll(client, encodeFrame(MessageType::Bye, payload, 1, &auth));
++            }
++            queue.clear();
++            out.clear();
++            outSent = 0;
++            sendFailed = false;
+         }
+         if (phase == Phase::Session)
+         {
+@@ -379,13 +561,206 @@ namespace ps2x::netplay
+         }
+         else
+             logLine("conexion de %s cerrada en el saludo (%s)", clientAddress.c_str(), why.c_str());
+-        closeSocket(client);
++        {
++            std::lock_guard<std::mutex> lock(io);
++            closeSocket(client);
++        }
+         phase = Phase::None;
+         handshake.reset();
+         auth.reset();
+         reader.reset();
+     }
+ 
++    void Host::Impl::startVideo()
++    {
++        if (settings.video.codec == "no")
++        {
++            logLine("imagen: desactivada (--imagen-codec no)");
++            return;
++        }
++        if (!videoAvailable())
++        {
++            logLine("imagen: esta compilacion no lleva FFmpeg; el invitado no vera la imagen");
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(slot.mutex);
++            slot.fresh = false;
++            slot.stop = false;
++        }
++        keyRequested = true;
++        latencyMs = 0;
++        {
++            std::lock_guard<std::mutex> lock(statsMutex);
++            stats = HostVideoStats{};
++            statsPictures = statsSkipped = statsBytes = 0;
++            statsEncodeMs = 0.0;
++        }
++        encoderThread = std::thread([this] { encodeLoop(); });
++        setPictureOwner(&slot);
++    }
++
++    void Host::Impl::stopVideo()
++    {
++        clearPictureOwner(&slot);
++        {
++            std::lock_guard<std::mutex> lock(slot.mutex);
++            slot.stop = true;
++        }
++        slot.ready.notify_one();
++        if (encoderThread.joinable())
++            encoderThread.join();
++    }
++
++    void Host::Impl::encodeLoop()
++    {
++        // Below the game's threads: with every core busy the encoder waits, not the game (a late picture is skipped).
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++        VideoEncoder encoder;
++        std::vector<std::string> failed; // encoders that opened but could not encode
++        std::vector<uint8_t> rgba;
++        uint32_t width = 0, height = 0, captureMs = 0;
++        uint32_t stream = 0, pictureNumber = 0;
++        bool forceKey = true, gaveUp = false;
++        Clock::time_point lastKey = Clock::now() - std::chrono::seconds(1);
++        for (;;)
++        {
++            {
++                std::unique_lock<std::mutex> lock(slot.mutex);
++                slot.ready.wait(lock, [&] { return slot.fresh || slot.stop; });
++                if (slot.stop)
++                    break;
++                rgba.swap(slot.rgba);
++                width = slot.width;
++                height = slot.height;
++                captureMs = slot.captureMs;
++                slot.fresh = false;
++            }
++            if (gaveUp)
++                continue;
++            {
++                std::lock_guard<std::mutex> lock(io);
++                if (!sessionOpen)
++                    continue;
++                if (queue.waitingPictures() > 0) // the network is behind: skip this one at the source
++                {
++                    std::lock_guard<std::mutex> statsLock(statsMutex);
++                    ++stats.skipped;
++                    ++statsSkipped;
++                    continue;
++                }
++            }
++            uint16_t w = 0, h = 0;
++            videoOutputSize(height, g_pictureAspect.load(std::memory_order_relaxed), settings.video.height, w, h);
++            if (!encoder.isOpen() || encoder.settings().width != w || encoder.settings().height != h)
++            {
++                VideoEncoderSettings es;
++                es.width = w;
++                es.height = h;
++                es.fps = kVideoFps;
++                es.kbps = settings.video.kbps;
++                es.keyIntervalPictures = kVideoFps * 5;
++                std::string error, tried;
++                bool opened = false;
++                for (const std::string &name : videoEncoderCandidates(settings.video.codec))
++                {
++                    if (std::find(failed.begin(), failed.end(), name) != failed.end())
++                        continue;
++                    es.preference = name;
++                    std::vector<std::string> attempts;
++                    if (encoder.open(es, error, &attempts))
++                    {
++                        opened = true;
++                        break;
++                    }
++                    for (const std::string &a : attempts)
++                        tried += (tried.empty() ? "" : "; ") + a;
++                }
++                if (!opened)
++                {
++                    logLine("imagen: ningun codificador abre (%s); el invitado no vera la imagen", tried.c_str());
++                    gaveUp = true;
++                    clearPictureOwner(&slot);
++                    continue;
++                }
++                if (!tried.empty())
++                    logLine("imagen: probados antes: %s", tried.c_str());
++                VideoConfig config;
++                config.codec = static_cast<uint8_t>(encoder.codec());
++                config.width = w;
++                config.height = h;
++                config.fps = kVideoFps;
++                config.kbps = settings.video.kbps;
++                config.stream = ++stream;
++                logLine("imagen: codificador %s, %ux%u, %u kbit/s, %u imagenes/s (origen %ux%u, aspecto %.3f)",
++                        encoder.encoderName().c_str(), static_cast<unsigned>(w), static_cast<unsigned>(h),
++                        static_cast<unsigned>(settings.video.kbps), static_cast<unsigned>(kVideoFps),
++                        static_cast<unsigned>(width), static_cast<unsigned>(height),
++                        static_cast<double>(g_pictureAspect.load(std::memory_order_relaxed)));
++                {
++                    std::lock_guard<std::mutex> lock(statsMutex);
++                    stats.encoder = encoder.encoderName();
++                    stats.width = w;
++                    stats.height = h;
++                }
++                std::lock_guard<std::mutex> lock(io);
++                queue.dropWaitingPictures();
++                queue.pushVideoConfig(config);
++                forceKey = true;
++            }
++            const Clock::time_point now = Clock::now();
++            if (keyRequested.load() && elapsedMs(lastKey, now) >= kKeyRequestIntervalMs)
++            {
++                keyRequested = false;
++                forceKey = true;
++            }
++            std::vector<VideoEncoder::Packet> packets;
++            std::string error;
++            const Clock::time_point started = Clock::now();
++            if (!encoder.encode(rgba.data(), width, height, static_cast<size_t>(width) * 4u, forceKey, packets, error))
++            {
++                logLine("imagen: %s; se prueba el siguiente codificador", error.c_str());
++                failed.push_back(encoder.encoderName());
++                encoder.close();
++                continue;
++            }
++            const double encodeMs =
++                std::chrono::duration<double, std::milli>(Clock::now() - started).count();
++            if (forceKey)
++                lastKey = now;
++            forceKey = false;
++            for (const VideoEncoder::Packet &packet : packets)
++            {
++                VideoPicture picture;
++                picture.picture = ++pictureNumber;
++                picture.key = packet.key;
++                picture.captureMs = captureMs;
++                picture.encodeMs = static_cast<uint16_t>(std::min(encodeMs, 65535.0));
++                picture.latencyMs = static_cast<uint16_t>(std::min<uint32_t>(latencyMs.load(), 65535u));
++                picture.data = packet.data;
++                std::vector<std::vector<uint8_t>> chunks = chunkVideoPicture(picture, stream);
++                if (chunks.empty())
++                {
++                    logLine("imagen: una imagen de %u bytes no cabe en el protocolo; se descarta",
++                            static_cast<unsigned>(packet.data.size()));
++                    forceKey = true;
++                    continue;
++                }
++                std::lock_guard<std::mutex> lock(io);
++                if (!sessionOpen)
++                    break;
++                if (packet.key)
++                    queue.dropWaitingPictures(); // a key picture needs none of them
++                queue.pushPicture(std::move(chunks), picture.picture);
++                flushLocked();
++                std::lock_guard<std::mutex> statsLock(statsMutex);
++                ++stats.pictures;
++                ++statsPictures;
++                statsEncodeMs += encodeMs;
++            }
++        }
++    }
++
+     void Host::Impl::acceptOne()
+     {
+         sockaddr_storage from{};
+@@ -401,10 +776,14 @@ namespace ps2x::netplay
+             uint8_t payload[3] = {static_cast<uint8_t>(RejectReason::Busy), static_cast<uint8_t>(kProtocolVersion & 0xFF),
+                                   static_cast<uint8_t>(kProtocolVersion >> 8)};
+             sendAll(s, encodeFrame(MessageType::Reject, payload, sizeof(payload), nullptr));
+-            closesocket(s);
++            shutdown(s, SD_SEND);
++            lingering.push_back({s, Clock::now() + std::chrono::milliseconds(kBusyLingerMs)});
+             logLine("conexion de %s rechazada: ya hay un invitado", address.c_str());
+             return;
+         }
++        // A small kernel send buffer: what waits stays in the queue, where control frames pass the video.
++        const int sendBuffer = kSendBufferBytes;
++        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&sendBuffer), sizeof(sendBuffer));
+         client = s;
+         clientAddress = address;
+         phase = Phase::Handshake;
+@@ -441,6 +820,23 @@ namespace ps2x::netplay
+         case MessageType::Bye:
+             drop(std::string("el invitado se fue: ") + byeReasonText(frame.payload[0]), false, ByeReason::Quit);
+             return;
++        case MessageType::VideoKeyRequest:
++            keyRequested = true;
++            return;
++        case MessageType::VideoAck:
++        {
++            // Capture -> the guest's screen: now - capture, less the time the guest held the ack and the way back.
++            const uint32_t captured = get32(frame.payload.data() + 4);
++            const uint32_t held = get32(frame.payload.data() + 8);
++            const int64_t total = static_cast<int64_t>(clockMs() - captured) - held - roundTripMs.load() / 2;
++            if (total >= 0 && total < 60000)
++            {
++                latencyMs = static_cast<uint32_t>(total);
++                std::lock_guard<std::mutex> lock(statsMutex);
++                stats.latencyMs = static_cast<uint32_t>(total);
++            }
++            return;
++        }
+         default:
+             drop("mensaje fuera de lugar en la sesion", true, ByeReason::Protocol);
+             return;
+@@ -497,6 +893,15 @@ namespace ps2x::netplay
+                 setRemote(this, PadWire{});
+                 logLine("invitado conectado desde %s: es el jugador 2 (puerto 2 conectado al mando remoto)",
+                         clientAddress.c_str());
++                {
++                    std::lock_guard<std::mutex> lock(io);
++                    queue.clear();
++                    out.clear();
++                    outSent = 0;
++                    sendFailed = false;
++                    sessionOpen = true;
++                }
++                startVideo();
+             }
+             else if (step == HostHandshake::Result::Rejected)
+             {
+@@ -547,41 +952,109 @@ namespace ps2x::netplay
+                 return;
+             }
+         }
++        {
++            bool failed = false;
++            {
++                std::lock_guard<std::mutex> lock(io);
++                failed = sendFailed;
++            }
++            if (failed)
++            {
++                drop("no se puede enviar", false, ByeReason::Quit);
++                return;
++            }
++        }
+         const int statsMs = elapsedMs(statsStart, now);
+         if (statsMs >= kStatsIntervalMs)
+         {
+             logLine("mando del invitado: %.1f mensajes/s, ida y vuelta %u ms",
+-                    static_cast<double>(statsPads) * 1000.0 / statsMs, static_cast<unsigned>(roundTripMs));
++                    static_cast<double>(statsPads) * 1000.0 / statsMs, static_cast<unsigned>(roundTripMs.load()));
++            HostVideoStats s;
++            uint64_t pictures = 0, skipped = 0, bytes = 0;
++            double encodeMs = 0.0;
++            {
++                std::lock_guard<std::mutex> lock(statsMutex);
++                s = stats;
++                pictures = statsPictures;
++                skipped = statsSkipped;
++                bytes = statsBytes;
++                encodeMs = statsEncodeMs;
++                statsPictures = statsSkipped = statsBytes = 0;
++                statsEncodeMs = 0.0;
++            }
++            if (!s.encoder.empty())
++                logLine("imagen: %s %ux%u, %.1f imagenes/s, %.2f Mbit/s, %llu omitidas por la red, codificar %.1f ms, "
++                        "latencia ~%u ms, ida y vuelta %u ms",
++                        s.encoder.c_str(), static_cast<unsigned>(s.width), static_cast<unsigned>(s.height),
++                        static_cast<double>(pictures) * 1000.0 / statsMs,
++                        static_cast<double>(bytes) * 8.0 / 1000.0 / statsMs, static_cast<unsigned long long>(skipped),
++                        pictures > 0 ? encodeMs / static_cast<double>(pictures) : 0.0,
++                        static_cast<unsigned>(s.latencyMs), static_cast<unsigned>(roundTripMs.load()));
+             statsStart = now;
+             statsPads = 0;
+         }
+     }
+ 
++    void Host::Impl::lingerTick()
++    {
++        const Clock::time_point now = Clock::now();
++        for (size_t i = 0; i < lingering.size();)
++        {
++            uint8_t scratch[256];
++            int n = 0;
++            while ((n = recv(lingering[i].socket, reinterpret_cast<char *>(scratch), sizeof(scratch), 0)) > 0)
++            {
++            }
++            const bool closed = n == 0 || (n == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK);
++            if (closed || now >= lingering[i].until)
++            {
++                closesocket(lingering[i].socket);
++                lingering.erase(lingering.begin() + static_cast<std::ptrdiff_t>(i));
++            }
++            else
++                ++i;
++        }
++    }
++
+     void Host::Impl::run()
+     {
+         while (running)
+         {
+-            fd_set readable;
++            fd_set readable, writable;
+             FD_ZERO(&readable);
++            FD_ZERO(&writable);
+             const bool canAccept = Clock::now() >= acceptAfter;
+             if (canAccept)
+                 FD_SET(listener, &readable);
+             if (client != INVALID_SOCKET)
++            {
+                 FD_SET(client, &readable);
++                if (phase == Phase::Session && outputPending())
++                    FD_SET(client, &writable);
++            }
+             timeval wait{0, kPollMs * 1000};
+             if (readable.fd_count == 0)
+                 std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+-            else if (select(0, &readable, nullptr, nullptr, &wait) > 0)
++            else if (select(0, &readable, writable.fd_count > 0 ? &writable : nullptr, nullptr, &wait) > 0)
+             {
++                if (client != INVALID_SOCKET && FD_ISSET(client, &writable))
++                {
++                    std::lock_guard<std::mutex> lock(io);
++                    flushLocked();
++                }
+                 if (client != INVALID_SOCKET && FD_ISSET(client, &readable))
+                     readClient();
+                 if (canAccept && FD_ISSET(listener, &readable))
+                     acceptOne();
+             }
+             timers();
++            lingerTick();
+         }
+         if (client != INVALID_SOCKET)
+             drop("el anfitrion se cierra", true, ByeReason::Shutdown);
++        for (Lingering &l : lingering)
++            closesocket(l.socket);
++        lingering.clear();
+         closeSocket(listener);
+     }
+ 
+@@ -640,6 +1113,12 @@ namespace ps2x::netplay
+         return m_impl->rejected;
+     }
+ 
++    HostVideoStats Host::videoStats() const
++    {
++        std::lock_guard<std::mutex> lock(m_impl->statsMutex);
++        return m_impl->stats;
++    }
++
+     struct Guest::Impl
+     {
+         GuestSettings settings;
+@@ -649,6 +1128,37 @@ namespace ps2x::netplay
+         GuestStatus status;
+         PadWire pad;
+ 
++        // N2: the decoder thread and the last picture.
++        struct DecodeItem
++        {
++            bool config = false;
++            VideoConfig videoConfig;
++            VideoPicture picture;
++            bool gap = false;
++        };
++        std::mutex decodeMutex;
++        std::condition_variable decodeReady;
++        std::deque<DecodeItem> decodeQueue;
++        bool decodeStop = false;
++        std::thread decoderThread;
++        std::atomic<bool> keyWanted{false};
++        std::atomic<uint64_t> decoded{0};
++        std::atomic<uint64_t> lostInDecoder{0};
++
++        struct Shown
++        {
++            uint32_t picture = 0;
++            uint32_t captureMs = 0;
++            Clock::time_point at;
++            bool fresh = false;
++        };
++        std::mutex pictureMutex;
++        std::vector<uint8_t> picture;
++        uint16_t pictureWidth = 0, pictureHeight = 0;
++        uint32_t pictureNumber = 0, pictureCaptureMs = 0;
++        uint64_t pictureSerial = 0, takenSerial = 0;
++        Shown shown;
++
+         void setStatus(GuestState state, const std::string &text)
+         {
+             std::lock_guard<std::mutex> lock(mutex);
+@@ -658,8 +1168,106 @@ namespace ps2x::netplay
+ 
+         SOCKET connectToHost();
+         void run();
++        void decodeLoop();
++        void queueForDecoder(DecodeItem item);
++        void stopDecoder();
+     };
+ 
++    void Guest::Impl::queueForDecoder(DecodeItem item)
++    {
++        {
++            std::lock_guard<std::mutex> lock(decodeMutex);
++            if (!item.config && decodeQueue.size() >= kMaxDecodeQueue)
++            {
++                // The decoder is behind: what waits is old. Keep the configurations, wait for a key picture.
++                std::deque<DecodeItem> kept;
++                for (DecodeItem &waiting : decodeQueue)
++                    if (waiting.config)
++                        kept.push_back(std::move(waiting));
++                    else
++                        ++lostInDecoder;
++                decodeQueue = std::move(kept);
++                item.gap = true;
++            }
++            decodeQueue.push_back(std::move(item));
++        }
++        decodeReady.notify_one();
++    }
++
++    void Guest::Impl::stopDecoder()
++    {
++        {
++            std::lock_guard<std::mutex> lock(decodeMutex);
++            decodeStop = true;
++        }
++        decodeReady.notify_one();
++        if (decoderThread.joinable())
++            decoderThread.join();
++    }
++
++    void Guest::Impl::decodeLoop()
++    {
++        VideoDecoder decoder;
++        VideoConfig current;
++        bool waitingKey = true;
++        std::vector<uint8_t> work;
++        int errorsLogged = 0;
++        for (;;)
++        {
++            DecodeItem item;
++            {
++                std::unique_lock<std::mutex> lock(decodeMutex);
++                decodeReady.wait(lock, [&] { return decodeStop || !decodeQueue.empty(); });
++                if (decodeStop)
++                    break;
++                item = std::move(decodeQueue.front());
++                decodeQueue.pop_front();
++            }
++            if (item.config)
++            {
++                std::string error;
++                if (!decoder.open(item.videoConfig, error))
++                    logLine("imagen: no se puede abrir el decodificador %s: %s", videoCodecName(item.videoConfig.codec),
++                            error.c_str());
++                current = item.videoConfig;
++                waitingKey = true;
++                continue;
++            }
++            if (!decoder.isOpen())
++                continue;
++            if (item.gap)
++                waitingKey = true;
++            if (waitingKey && !item.picture.key)
++            {
++                keyWanted = true; // a picture after a lost one would decode wrong: wait for a key picture
++                ++lostInDecoder;
++                continue;
++            }
++            bool got = false;
++            std::string error;
++            if (!decoder.decode(item.picture.data.data(), item.picture.data.size(), work, got, error))
++            {
++                if (errorsLogged < 20 && ++errorsLogged)
++                    logLine("imagen %u no decodificada: %s", static_cast<unsigned>(item.picture.picture), error.c_str());
++                waitingKey = true;
++                keyWanted = true;
++                ++lostInDecoder;
++                continue;
++            }
++            if (!got)
++                continue;
++            waitingKey = false;
++            ++decoded;
++            std::lock_guard<std::mutex> lock(pictureMutex);
++            picture.swap(work);
++            pictureWidth = current.width;
++            pictureHeight = current.height;
++            pictureNumber = item.picture.picture;
++            pictureCaptureMs = item.picture.captureMs;
++            ++pictureSerial;
++        }
++    }
++
+     SOCKET Guest::Impl::connectToHost()
+     {
+         const std::string target = (settings.host.find(':') != std::string::npos ? "[" + settings.host + "]"
+@@ -754,6 +1362,19 @@ namespace ps2x::netplay
+         Clock::time_point lastReceived = started, lastPing = started, statsStart = started;
+         Clock::time_point nextPad = started;
+         uint32_t padCounter = 0, pingToken = 0, sentPads = 0;
++        // N2.
++        std::vector<uint8_t> buffer(kMaxFrame);
++        VideoAssembler assembler;
++        Clock::time_point lastKeyRequest = started - std::chrono::seconds(1), lastAck = started,
++                          rateStart = started;
++        uint64_t videoBytes = 0, rateBytes = 0, rateDecoded = 0, statsDecoded = 0, statsVideoBytes = 0;
++        uint16_t lastLatency = 0;
++        {
++            std::lock_guard<std::mutex> lock(decodeMutex);
++            decodeQueue.clear();
++            decodeStop = false;
++        }
++        decoderThread = std::thread([this] { decodeLoop(); });
+ 
+         auto end = [&](GuestState state, const std::string &text, bool bye, ByeReason reason)
+         {
+@@ -782,8 +1403,7 @@ namespace ps2x::netplay
+             timeval wait{0, 5 * 1000};
+             if (select(0, &readable, nullptr, nullptr, &wait) > 0)
+             {
+-                uint8_t buffer[512];
+-                const int n = receiveSome(s, buffer, sizeof(buffer));
++                const int n = receiveSome(s, buffer.data(), static_cast<int>(buffer.size()));
+                 if (n == 0 || n == -2)
+                 {
+                     end(session ? GuestState::Disconnected : GuestState::Failed,
+@@ -794,7 +1414,7 @@ namespace ps2x::netplay
+                 if (n > 0)
+                 {
+                     lastReceived = Clock::now();
+-                    if (!reader.feed(buffer, static_cast<size_t>(n)))
++                    if (!reader.feed(buffer.data(), static_cast<size_t>(n)))
+                     {
+                         end(GuestState::Failed, std::string("Mensaje no valido del anfitrion: ") +
+                                                     frameErrorText(reader.error()),
+@@ -850,6 +1470,49 @@ namespace ps2x::netplay
+                                 std::string("El anfitrion cerro la sesion: ") + byeReasonText(frame.payload[0]), false,
+                                 ByeReason::Quit);
+                             break;
++                        case MessageType::VideoConfig:
++                        {
++                            if (!assembler.configure(frame.payload.data(), frame.size))
++                            {
++                                end(GuestState::Failed, "Imagen no valida del anfitrion: " + assembler.why(), true,
++                                    ByeReason::Protocol);
++                                break;
++                            }
++                            const VideoConfig &c = assembler.config();
++                            logLine("imagen: %s %ux%u, %u kbit/s (secuencia %u)", videoCodecName(c.codec),
++                                    static_cast<unsigned>(c.width), static_cast<unsigned>(c.height),
++                                    static_cast<unsigned>(c.kbps), static_cast<unsigned>(c.stream));
++                            {
++                                std::lock_guard<std::mutex> lock(mutex);
++                                status.codec = videoCodecName(c.codec);
++                                status.width = c.width;
++                                status.height = c.height;
++                            }
++                            DecodeItem item;
++                            item.config = true;
++                            item.videoConfig = c;
++                            queueForDecoder(std::move(item));
++                            break;
++                        }
++                        case MessageType::VideoChunk:
++                        {
++                            videoBytes += frame.size;
++                            DecodeItem item;
++                            const VideoAssembler::Result r = assembler.add(frame.payload.data(), frame.size, item.picture);
++                            if (r == VideoAssembler::Result::Error)
++                            {
++                                end(GuestState::Failed, "Imagen no valida del anfitrion: " + assembler.why(), true,
++                                    ByeReason::Protocol);
++                                break;
++                            }
++                            if (r == VideoAssembler::Result::Picture)
++                            {
++                                item.gap = assembler.gapBeforeLast();
++                                lastLatency = item.picture.latencyMs;
++                                queueForDecoder(std::move(item));
++                            }
++                            break;
++                        }
+                         default:
+                             end(GuestState::Failed, "Mensaje fuera de lugar del anfitrion", true, ByeReason::Protocol);
+                             break;
+@@ -897,20 +1560,73 @@ namespace ps2x::netplay
+                 put32(payload + 4, clockMs());
+                 sendAll(s, encodeFrame(MessageType::Ping, payload, sizeof(payload), &auth));
+             }
++            // N2: a key picture when the decoder lost the chain; what is on screen, for the latency.
++            if (keyWanted.load() && elapsedMs(lastKeyRequest, now) >= kKeyRequestIntervalMs)
++            {
++                keyWanted = false;
++                lastKeyRequest = now;
++                uint8_t payload[4];
++                put32(payload, assembler.configured() ? assembler.config().stream : 0u);
++                sendAll(s, encodeFrame(MessageType::VideoKeyRequest, payload, sizeof(payload), &auth));
++            }
++            if (elapsedMs(lastAck, now) >= kAckIntervalMs)
++            {
++                Shown shownNow;
++                {
++                    std::lock_guard<std::mutex> lock(pictureMutex);
++                    shownNow = shown;
++                    shown.fresh = false;
++                }
++                if (shownNow.fresh)
++                {
++                    lastAck = now;
++                    uint8_t payload[12];
++                    put32(payload, shownNow.picture);
++                    put32(payload + 4, shownNow.captureMs);
++                    put32(payload + 8, static_cast<uint32_t>(std::max(0, elapsedMs(shownNow.at, now))));
++                    sendAll(s, encodeFrame(MessageType::VideoAck, payload, sizeof(payload), &auth));
++                }
++            }
++            const int rateMs = elapsedMs(rateStart, now);
++            if (rateMs >= 1000)
++            {
++                const uint64_t decodedNow = decoded.load();
++                std::lock_guard<std::mutex> lock(mutex);
++                status.fps = static_cast<float>((decodedNow - rateDecoded) * 1000.0 / rateMs);
++                status.mbps = static_cast<float>((videoBytes - rateBytes) * 8.0 / 1000.0 / rateMs);
++                status.latencyMs = lastLatency;
++                status.pictures = decodedNow;
++                status.lost = assembler.lostPictures() + lostInDecoder.load();
++                rateDecoded = decodedNow;
++                rateBytes = videoBytes;
++                rateStart = now;
++            }
+             const int statsMs = elapsedMs(statsStart, now);
+             if (statsMs >= kStatsIntervalMs)
+             {
+-                uint32_t rtt;
++                GuestStatus st;
+                 {
+                     std::lock_guard<std::mutex> lock(mutex);
+-                    rtt = status.roundTripMs;
++                    st = status;
+                 }
+                 logLine("mando enviado: %.1f mensajes/s, ida y vuelta %u ms",
+-                        static_cast<double>(sentPads) * 1000.0 / statsMs, static_cast<unsigned>(rtt));
++                        static_cast<double>(sentPads) * 1000.0 / statsMs, static_cast<unsigned>(st.roundTripMs));
++                const uint64_t decodedNow = decoded.load();
++                if (!st.codec.empty())
++                    logLine("imagen recibida: %s %ux%u, %.1f imagenes/s, %.2f Mbit/s, ida y vuelta %u ms, latencia ~%u ms, "
++                            "perdidas %llu",
++                            st.codec.c_str(), static_cast<unsigned>(st.width), static_cast<unsigned>(st.height),
++                            static_cast<double>(decodedNow - statsDecoded) * 1000.0 / statsMs,
++                            static_cast<double>(videoBytes - statsVideoBytes) * 8.0 / 1000.0 / statsMs,
++                            static_cast<unsigned>(st.roundTripMs), static_cast<unsigned>(st.latencyMs),
++                            static_cast<unsigned long long>(st.lost));
++                statsDecoded = decodedNow;
++                statsVideoBytes = videoBytes;
+                 statsStart = now;
+                 sentPads = 0;
+             }
+         }
++        stopDecoder();
+         closesocket(s);
+     }
+ 
+@@ -939,7 +1655,26 @@ namespace ps2x::netplay
+     GuestStatus Guest::status() const
+     {
+         std::lock_guard<std::mutex> lock(m_impl->mutex);
+-        return m_impl->status;
++        GuestStatus s = m_impl->status;
++        s.pictures = m_impl->decoded.load();
++        return s;
++    }
++
++    bool Guest::takePicture(std::vector<uint8_t> &rgba, uint16_t &width, uint16_t &height)
++    {
++        Impl &m = *m_impl;
++        std::lock_guard<std::mutex> lock(m.pictureMutex);
++        if (m.pictureSerial == m.takenSerial || m.picture.empty())
++            return false;
++        rgba.swap(m.picture);
++        width = m.pictureWidth;
++        height = m.pictureHeight;
++        m.takenSerial = m.pictureSerial;
++        m.shown.picture = m.pictureNumber;
++        m.shown.captureMs = m.pictureCaptureMs;
++        m.shown.at = Clock::now();
++        m.shown.fresh = true;
++        return true;
+     }
+ 
+     void Guest::stop()
+@@ -964,6 +1699,7 @@ namespace ps2x::netplay
+     bool Host::guestConnected() const { return false; }
+     uint64_t Host::padMessages() const { return 0; }
+     uint64_t Host::rejectedLogins() const { return 0; }
++    HostVideoStats Host::videoStats() const { return {}; }
+     struct Guest::Impl
+     {
+         GuestStatus status;
+@@ -976,6 +1712,7 @@ namespace ps2x::netplay
+     }
+     void Guest::setPad(const PadWire &) {}
+     GuestStatus Guest::status() const { return m_impl->status; }
++    bool Guest::takePicture(std::vector<uint8_t> &, uint16_t &, uint16_t &) { return false; }
+     void Guest::stop() {}
+ #endif
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.h b/ps2xRuntime/src/lib/ps2_netplay.h
+index 6f076db..5b07405 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.h
++++ b/ps2xRuntime/src/lib/ps2_netplay.h
+@@ -8,15 +8,34 @@
+ 
+ // Fase 5 (T15, netplay N1): own netplay inside F1-06.exe, by IP (LAN or a VPN like Tailscale/ZeroTier, no router
+ // ports). The host runs the game and listens on one TCP port for one guest; the guest (no game, a small window) sends
+-// its pad, which the host's game reads on the second PS2 port. N2/N3 add the host's picture and sound.
++// its pad, which the host's game reads on the second PS2 port. N2: the host sends its picture (encoded in a thread of
++// its own, never holding up the game) and the guest shows it. N3 adds the sound.
+ // Logs: "[red] ...".
+ namespace ps2x::netplay
+ {
++    struct HostVideoSettings
++    {
++        uint16_t height = 540; // the picture's lines at most (the width follows the aspect on the host's window)
++        uint32_t kbps = 8000;
++        std::string codec = "auto"; // videoEncoderCandidates; "no" = no picture
++    };
++
+     struct HostSettings
+     {
+         std::string listenAddress; // empty: every interface (IPv6 and IPv4)
+         uint16_t port = kDefaultPort; // 0: any free port (tests)
+         std::string password;
++        HostVideoSettings video;
++    };
++
++    struct HostVideoStats
++    {
++        std::string encoder;   // empty: no encoder open
++        uint16_t width = 0, height = 0;
++        uint64_t pictures = 0; // encoded and queued
++        uint64_t skipped = 0;  // offered while the network was still busy with the previous one
++        uint64_t bytes = 0;    // video bytes sent
++        uint32_t latencyMs = 0;
+     };
+ 
+     class Host
+@@ -34,12 +53,21 @@ namespace ps2x::netplay
+         bool guestConnected() const;
+         uint64_t padMessages() const;
+         uint64_t rejectedLogins() const;
++        HostVideoStats videoStats() const;
+ 
+     private:
+         struct Impl;
+         std::unique_ptr<Impl> m_impl;
+     };
+ 
++    // The host's picture (N2), from the window's thread: whether a guest wants it now (cheap) and the latched frame
++    // (RGBA). The copy is the only work done in the caller's thread; a picture offered while the encoder is busy
++    // replaces the one waiting.
++    bool hostPictureWanted();
++    void offerHostPicture(const uint8_t *rgba, uint32_t width, uint32_t height, size_t stride);
++    // The aspect the host's window shows the picture at (width / height): 4:3, 16:9 or the frame's own.
++    void setHostPictureAspect(float aspect);
++
+     enum class GuestState
+     {
+         Idle,
+@@ -56,6 +84,14 @@ namespace ps2x::netplay
+         GuestState state = GuestState::Idle;
+         std::string text; // for the window and the log
+         uint32_t roundTripMs = 0;
++        // N2: the host's picture.
++        std::string codec;    // empty: no picture yet
++        uint16_t width = 0, height = 0;
++        float fps = 0.0f;     // pictures decoded per second (last seconds)
++        float mbps = 0.0f;    // video megabits per second received
++        uint32_t latencyMs = 0; // the host's estimate: capture -> this screen
++        uint64_t pictures = 0;  // decoded
++        uint64_t lost = 0;      // pictures lost or dropped
+     };
+ 
+     struct GuestSettings
+@@ -78,6 +114,9 @@ namespace ps2x::netplay
+         // The pad sent from now on (~60 times per second).
+         void setPad(const PadWire &pad);
+         GuestStatus status() const;
++        // The last decoded picture of the host (RGBA) if it is newer than the one taken before; taking it counts as
++        // showing it (the latency is measured up to here).
++        bool takePicture(std::vector<uint8_t> &rgba, uint16_t &width, uint16_t &height);
+         // Says goodbye to the host and closes.
+         void stop();
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index 043878d..e163fa9 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -2,9 +2,13 @@
+ #include "ps2_host_backend.h"
+ #include "runtime/ps2_pad.h"
+ 
++#include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
++#include <filesystem>
++#include <fstream>
+ #include <string>
++#include <vector>
+ 
+ #if defined(_WIN32)
+ // Declared by hand: <windows.h> clashes with raylib names (as in ps2_runtime.cpp).
+@@ -13,8 +17,9 @@ extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hW
+ #endif
+ 
+ // Fase 5 (T15, netplay N1): the guest's window. It does not run the game: it shows the connection and sends the local
+-// pad (player 1 of this PC's controles.ini: keys, gamepad, wheel) to the host ~60 times per second. N2 draws the
+-// host's picture here.
++// pad (player 1 of this PC's controles.ini: keys, gamepad, wheel) to the host ~60 times per second. N2: the host's
++// picture fills the window (its aspect kept, black bars), with a line of figures (size, pictures per second, bit rate,
++// round trip, latency; F3 hides it).
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -45,6 +50,64 @@ namespace ps2x::netplay
+                     out += (out.empty() ? "" : " ") + std::string(kNames[b]);
+             return out.empty() ? "-" : out;
+         }
++
++        // The connection screen (before the first picture, or when the session ends).
++        void drawStatus(const GuestStatus &status, const PadWire &wire, int screenHeight)
++        {
++            ClearBackground(Color{18, 22, 30, 255});
++            DrawText("FORMULA ONE 06 - JUEGO EN RED", 24, 20, 24, RAYWHITE);
++            DrawText("Invitado: tu mando es el del jugador 2 del anfitrion", 24, 56, 18, LIGHTGRAY);
++            const Color stateColor = status.state == GuestState::Connected ? GREEN
++                                     : status.state == GuestState::Connecting ||
++                                             status.state == GuestState::Authenticating
++                                         ? YELLOW
++                                         : RED;
++            DrawText(stateName(status.state), 24, 100, 32, stateColor);
++            DrawText(status.text.c_str(), 24, 142, 18, RAYWHITE);
++            if (status.state == GuestState::Connected)
++            {
++                DrawText(TextFormat("Ida y vuelta: %u ms", static_cast<unsigned>(status.roundTripMs)), 24, 176, 18,
++                         LIGHTGRAY);
++                DrawText(TextFormat("Botones: %s", pressedNames(wire).c_str()), 24, 206, 18, LIGHTGRAY);
++                DrawText(TextFormat("Stick izq: %3u %3u   Stick der: %3u %3u", wire.lx, wire.ly, wire.rx, wire.ry), 24,
++                         236, 18, LIGHTGRAY);
++                DrawText("Esperando la imagen del anfitrion...", 24, 270, 18, YELLOW);
++            }
++            DrawText("Cierra la ventana para salir.", 24, screenHeight - 30, 14, GRAY);
++        }
++
++        // PS2X_CAPTURA_PETICION=<file>, as in the game's window (ps2_runtime.cpp): when the file exists, the window as
++        // drawn is saved as a PNG at the path written in it, and the file is deleted.
++        void saveRequestedCapture(const RenderTexture2D &canvas)
++        {
++            static const char *const s_request = std::getenv("PS2X_CAPTURA_PETICION");
++            static int s_skip = 0;
++            if (s_request == nullptr || s_request[0] == '\0' || s_skip-- > 0)
++                return;
++            s_skip = 10; // the file is looked for about every 10 frames
++            std::ifstream in(s_request, std::ios::binary);
++            if (!in)
++                return;
++            std::string path;
++            std::getline(in, path);
++            in.close();
++            if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEFu &&
++                static_cast<unsigned char>(path[1]) == 0xBBu && static_cast<unsigned char>(path[2]) == 0xBFu)
++                path.erase(0, 3); // UTF-8 BOM
++            while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' '))
++                path.pop_back();
++            if (!path.empty())
++            {
++                Image image = LoadImageFromTexture(canvas.texture);
++                ImageFlipVertical(&image);
++                const bool saved = ExportImage(image, path.c_str());
++                UnloadImage(image);
++                std::fprintf(stderr, "[red] captura del invitado %s: %s\n", saved ? "guardada" : "fallida", path.c_str());
++                std::fflush(stderr);
++            }
++            std::error_code error;
++            std::filesystem::remove(s_request, error);
++        }
+     }
+ 
+     int runGuestWindow(const GuestSettings &settings)
+@@ -57,20 +120,24 @@ namespace ps2x::netplay
+             flags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED | FLAG_WINDOW_ALWAYS_RUN;
+         SetConfigFlags(flags);
+         SetTraceLogLevel(LOG_WARNING);
+-        InitWindow(640, 360, "Formula One 06 - invitado (jugador 2)");
++        InitWindow(960, 540, "Formula One 06 - invitado (jugador 2)");
+ #if defined(_WIN32)
+         if (backgroundWindow)
+             SetWindowPos(GetWindowHandle(), reinterpret_cast<void *>(1) /* HWND_BOTTOM */, -4000, 0, 0, 0,
+                          0x0001u /* SWP_NOSIZE */ | 0x0010u /* SWP_NOACTIVATE */ | 0x0040u /* SWP_SHOWWINDOW */);
+ #endif
+         SetExitKey(KEY_NULL); // ESC may be one of the player's controls
+-        SetTargetFPS(60);
++        SetTargetFPS(120);    // a new picture shows at most ~8 ms after it was decoded
+ 
+         Guest guest;
+         guest.start(settings);
+         PSPadBackend pad;
+         uint8_t report[32] = {};
+         GuestState lastState = GuestState::Idle;
++        Texture2D picture{};
++        RenderTexture2D canvas{};
++        std::vector<uint8_t> rgba;
++        bool showFigures = true;
+         while (!WindowShouldClose())
+         {
+             pad.readState(0, 0, report, sizeof(report));
+@@ -84,29 +151,72 @@ namespace ps2x::netplay
+                 std::fflush(stderr);
+             }
+ 
+-            BeginDrawing();
+-            ClearBackground(Color{18, 22, 30, 255});
+-            DrawText("FORMULA ONE 06 - JUEGO EN RED", 24, 20, 24, RAYWHITE);
+-            DrawText("Invitado: tu mando es el del jugador 2 del anfitrion", 24, 56, 18, LIGHTGRAY);
+-            const Color stateColor = status.state == GuestState::Connected ? GREEN
+-                                     : status.state == GuestState::Connecting ||
+-                                             status.state == GuestState::Authenticating
+-                                         ? YELLOW
+-                                         : RED;
+-            DrawText(stateName(status.state), 24, 100, 32, stateColor);
+-            DrawText(status.text.c_str(), 24, 142, 18, RAYWHITE);
+-            if (status.state == GuestState::Connected)
++            uint16_t width = 0, height = 0;
++            if (guest.takePicture(rgba, width, height) && width > 0 && height > 0 &&
++                rgba.size() == static_cast<size_t>(width) * height * 4u)
+             {
+-                DrawText(TextFormat("Ida y vuelta: %u ms", static_cast<unsigned>(status.roundTripMs)), 24, 176, 18,
+-                         LIGHTGRAY);
+-                DrawText(TextFormat("Botones: %s", pressedNames(wire).c_str()), 24, 206, 18, LIGHTGRAY);
+-                DrawText(TextFormat("Stick izq: %3u %3u   Stick der: %3u %3u", wire.lx, wire.ly, wire.rx, wire.ry), 24,
+-                         236, 18, LIGHTGRAY);
++                if (picture.id == 0 || picture.width != width || picture.height != height)
++                {
++                    if (picture.id != 0)
++                        UnloadTexture(picture);
++                    Image image{rgba.data(), width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                    picture = LoadTextureFromImage(image);
++                    SetTextureFilter(picture, TEXTURE_FILTER_BILINEAR);
++                }
++                else
++                    UpdateTexture(picture, rgba.data());
+             }
+-            DrawText("La imagen del anfitrion llegara en una version proxima. Cierra la ventana para salir.", 24, 320,
+-                     14, GRAY);
++            if (IsKeyPressed(KEY_F3))
++                showFigures = !showFigures;
++
++            // Drawn into a texture first: the capture asked for by PS2X_CAPTURA_PETICION reads it back even with the
++            // window hidden (automated runs).
++            const int screenWidth = std::max(1, GetScreenWidth()), screenHeight = std::max(1, GetScreenHeight());
++            if (canvas.id == 0 || canvas.texture.width != screenWidth || canvas.texture.height != screenHeight)
++            {
++                if (canvas.id != 0)
++                    UnloadRenderTexture(canvas);
++                canvas = LoadRenderTexture(screenWidth, screenHeight);
++            }
++            BeginTextureMode(canvas);
++            if (status.state == GuestState::Connected && picture.id != 0)
++            {
++                // The picture already has the host's aspect (square pixels): the largest rectangle that fits.
++                ClearBackground(BLACK);
++                const float sw = static_cast<float>(screenWidth), sh = static_cast<float>(screenHeight);
++                const float scale = std::min(sw / picture.width, sh / picture.height);
++                const float dw = picture.width * scale, dh = picture.height * scale;
++                DrawTexturePro(picture,
++                               Rectangle{0, 0, static_cast<float>(picture.width), static_cast<float>(picture.height)},
++                               Rectangle{(sw - dw) * 0.5f, (sh - dh) * 0.5f, dw, dh}, Vector2{0, 0}, 0.0f, WHITE);
++                if (showFigures)
++                {
++                    const char *line = TextFormat("%ux%u %s  %.0f img/s  %.1f Mbit/s  ida y vuelta %u ms  latencia ~%u ms"
++                                                  "  perdidas %llu  (F3)",
++                                                  static_cast<unsigned>(status.width), static_cast<unsigned>(status.height),
++                                                  status.codec.c_str(), static_cast<double>(status.fps),
++                                                  static_cast<double>(status.mbps), static_cast<unsigned>(status.roundTripMs),
++                                                  static_cast<unsigned>(status.latencyMs),
++                                                  static_cast<unsigned long long>(status.lost));
++                    DrawRectangle(0, 0, MeasureText(line, 16) + 16, 24, Color{0, 0, 0, 160});
++                    DrawText(line, 8, 4, 16, RAYWHITE);
++                }
++            }
++            else
++                drawStatus(status, wire, screenHeight);
++            EndTextureMode();
++            saveRequestedCapture(canvas);
++            BeginDrawing();
++            ClearBackground(BLACK);
++            DrawTextureRec(canvas.texture,
++                           Rectangle{0, 0, static_cast<float>(screenWidth), -static_cast<float>(screenHeight)},
++                           Vector2{0, 0}, WHITE);
+             EndDrawing();
+         }
++        if (canvas.id != 0)
++            UnloadRenderTexture(canvas);
++        if (picture.id != 0)
++            UnloadTexture(picture);
+         guest.stop();
+         const GuestStatus last = guest.status();
+         std::fprintf(stderr, "[red] invitado cerrado: %s - %s\n", stateName(last.state), last.text.c_str());
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+index d75d36f..11e2e7e 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+@@ -4,7 +4,7 @@
+ #include <cctype>
+ #include <cstring>
+ 
+-// Fase 5 (T15, netplay N1): see ps2_netplay_protocol.h.
++// Fase 5 (T15, netplay N1, N2): see ps2_netplay_protocol.h.
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -77,13 +77,32 @@ namespace ps2x::netplay
+         case MessageType::Ping: return 8;
+         case MessageType::Pong: return 8;
+         case MessageType::Bye: return 1;
++        case MessageType::VideoConfig: return static_cast<int>(kVideoConfigPayloadSize);
++        case MessageType::VideoChunk: return -1;
++        case MessageType::VideoKeyRequest: return 4;
++        case MessageType::VideoAck: return 12;
+         }
+         return -1;
+     }
+ 
++    bool payloadRange(uint8_t type, size_t &minSize, size_t &maxSize)
++    {
++        if (type == static_cast<uint8_t>(MessageType::VideoChunk))
++        {
++            minSize = kVideoChunkHeaderSize + 1;
++            maxSize = kVideoChunkHeaderSize + kMaxVideoChunkData;
++            return true;
++        }
++        const int exact = payloadSizeOf(type);
++        if (exact < 0)
++            return false;
++        minSize = maxSize = static_cast<size_t>(exact);
++        return true;
++    }
++
+     bool isReservedType(uint8_t type)
+     {
+-        return type >= 0x20 && type <= 0x3F;
++        return type >= 0x24 && type <= 0x3F;
+     }
+ 
+     const char *rejectReasonText(uint8_t reason)
+@@ -212,8 +231,9 @@ namespace ps2x::netplay
+ 
+     std::vector<uint8_t> encodeFrame(MessageType type, const uint8_t *payload, size_t size, MessageAuth *auth)
+     {
+-        const int expected = payloadSizeOf(static_cast<uint8_t>(type));
+-        if (expected < 0 || size != static_cast<size_t>(expected) || (size > 0 && payload == nullptr))
++        size_t minSize = 0, maxSize = 0;
++        if (!payloadRange(static_cast<uint8_t>(type), minSize, maxSize) || size < minSize || size > maxSize ||
++            (size > 0 && payload == nullptr))
+             return {};
+         const bool tagged = auth != nullptr && auth->active();
+         std::vector<uint8_t> out(kHeaderSize + size + (tagged ? kTagSize : 0));
+@@ -265,12 +285,12 @@ namespace ps2x::netplay
+         const uint8_t *h = m_pending.data();
+         const uint8_t type = h[0];
+         const uint16_t length = get16(h + 2);
+-        const int expected = payloadSizeOf(type);
+-        if (expected < 0)
++        size_t minSize = 0, maxSize = 0;
++        if (!payloadRange(type, minSize, maxSize))
+             m_error = isReservedType(type) ? FrameError::ReservedType : FrameError::UnknownType;
+         else if (h[1] != 0)
+             m_error = FrameError::BadFlags;
+-        else if (length != static_cast<uint16_t>(expected))
++        else if (length < minSize || length > maxSize)
+             m_error = FrameError::BadLength;
+         if (m_error != FrameError::None)
+             return Result::Error;
+@@ -284,9 +304,9 @@ namespace ps2x::netplay
+             return Result::Error;
+         }
+         out.type = type;
+-        out.size = static_cast<uint8_t>(length);
+-        out.payload.fill(0);
++        out.size = length;
+         std::memcpy(out.payload.data(), h + kHeaderSize, length);
++        std::memset(out.payload.data() + length, 0, out.payload.size() - length);
+         m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(total));
+         return Result::Frame;
+     }
+@@ -441,6 +461,316 @@ namespace ps2x::netplay
+         return Result::Failed;
+     }
+ 
++    const char *videoCodecName(uint8_t codec)
++    {
++        switch (static_cast<VideoCodec>(codec))
++        {
++        case VideoCodec::H264: return "h264";
++        case VideoCodec::Mjpeg: return "mjpeg";
++        }
++        return "?";
++    }
++
++    std::array<uint8_t, kVideoConfigPayloadSize> encodeVideoConfig(const VideoConfig &config)
++    {
++        std::array<uint8_t, kVideoConfigPayloadSize> out{};
++        out[0] = config.codec;
++        put16(out.data() + 2, config.width);
++        put16(out.data() + 4, config.height);
++        put16(out.data() + 6, config.fps);
++        put32(out.data() + 8, config.kbps);
++        put32(out.data() + 12, config.stream);
++        return out;
++    }
++
++    bool decodeVideoConfig(const uint8_t *payload, size_t size, VideoConfig &config, std::string &why)
++    {
++        if (payload == nullptr || size != kVideoConfigPayloadSize)
++        {
++            why = "configuracion de imagen de tamano no valido";
++            return false;
++        }
++        VideoConfig c;
++        c.codec = payload[0];
++        c.width = get16(payload + 2);
++        c.height = get16(payload + 4);
++        c.fps = get16(payload + 6);
++        c.kbps = get32(payload + 8);
++        c.stream = get32(payload + 12);
++        if (c.codec != static_cast<uint8_t>(VideoCodec::H264) && c.codec != static_cast<uint8_t>(VideoCodec::Mjpeg))
++            why = "codec de imagen desconocido (" + std::to_string(c.codec) + ")";
++        else if (payload[1] != 0)
++            why = "byte reservado de la configuracion de imagen";
++        else if (c.width < kMinVideoSide || c.width > kMaxVideoWidth || c.height < kMinVideoSide ||
++                 c.height > kMaxVideoHeight || (c.width & 1u) != 0 || (c.height & 1u) != 0)
++            why = "tamano de imagen no valido: " + std::to_string(c.width) + "x" + std::to_string(c.height);
++        else if (c.fps < 1 || c.fps > 120)
++            why = "imagenes por segundo no validas: " + std::to_string(c.fps);
++        else if (c.kbps < 100 || c.kbps > 100000)
++            why = "tasa de bits no valida: " + std::to_string(c.kbps);
++        else if (c.stream == 0)
++            why = "numero de secuencia de imagen 0";
++        else
++        {
++            config = c;
++            return true;
++        }
++        return false;
++    }
++
++    namespace
++    {
++        std::vector<uint8_t> encodeChunkHeader(const VideoChunkHeader &h)
++        {
++            std::vector<uint8_t> out(kVideoChunkHeaderSize, 0);
++            put16(out.data(), h.stream);
++            put16(out.data() + 2, h.index);
++            put16(out.data() + 4, h.count);
++            out[6] = h.flags;
++            put32(out.data() + 8, h.picture);
++            put32(out.data() + 12, h.pictureSize);
++            put32(out.data() + 16, h.captureMs);
++            put16(out.data() + 20, h.encodeMs);
++            put16(out.data() + 22, h.latencyMs);
++            return out;
++        }
++
++        VideoChunkHeader decodeChunkHeader(const uint8_t *in)
++        {
++            VideoChunkHeader h;
++            h.stream = get16(in);
++            h.index = get16(in + 2);
++            h.count = get16(in + 4);
++            h.flags = in[6];
++            h.picture = get32(in + 8);
++            h.pictureSize = get32(in + 12);
++            h.captureMs = get32(in + 16);
++            h.encodeMs = get16(in + 20);
++            h.latencyMs = get16(in + 22);
++            return h;
++        }
++
++        size_t chunksFor(size_t pictureSize)
++        {
++            return (pictureSize + kMaxVideoChunkData - 1) / kMaxVideoChunkData;
++        }
++    }
++
++    std::vector<std::vector<uint8_t>> chunkVideoPicture(const VideoPicture &picture, uint32_t stream)
++    {
++        const size_t size = picture.data.size();
++        if (size == 0 || size > kMaxVideoPictureBytes)
++            return {};
++        VideoChunkHeader h;
++        h.stream = static_cast<uint16_t>(stream & 0xFFFFu);
++        h.count = static_cast<uint16_t>(chunksFor(size));
++        h.flags = picture.key ? kVideoKeyPicture : 0;
++        h.picture = picture.picture;
++        h.pictureSize = static_cast<uint32_t>(size);
++        h.captureMs = picture.captureMs;
++        h.encodeMs = picture.encodeMs;
++        h.latencyMs = picture.latencyMs;
++        std::vector<std::vector<uint8_t>> chunks;
++        chunks.reserve(h.count);
++        for (uint16_t i = 0; i < h.count; ++i)
++        {
++            h.index = i;
++            std::vector<uint8_t> chunk = encodeChunkHeader(h);
++            const size_t at = static_cast<size_t>(i) * kMaxVideoChunkData;
++            const size_t n = std::min(kMaxVideoChunkData, size - at);
++            chunk.insert(chunk.end(), picture.data.begin() + static_cast<std::ptrdiff_t>(at),
++                         picture.data.begin() + static_cast<std::ptrdiff_t>(at + n));
++            chunks.push_back(std::move(chunk));
++        }
++        return chunks;
++    }
++
++    VideoAssembler::Result VideoAssembler::fail(const std::string &why)
++    {
++        m_why = why;
++        m_inPicture = false;
++        m_data.clear();
++        return Result::Error;
++    }
++
++    bool VideoAssembler::configure(const uint8_t *payload, size_t size)
++    {
++        VideoConfig config;
++        if (!decodeVideoConfig(payload, size, config, m_why))
++            return false;
++        if (config.stream <= m_config.stream)
++        {
++            m_why = "la secuencia de imagen no avanza (" + std::to_string(config.stream) + ")";
++            return false;
++        }
++        if (m_inPicture)
++        {
++            ++m_lost; // the host gave up on it
++            m_inPicture = false;
++            m_data.clear();
++        }
++        m_config = config;
++        return true;
++    }
++
++    VideoAssembler::Result VideoAssembler::add(const uint8_t *payload, size_t size, VideoPicture &out)
++    {
++        if (m_config.stream == 0)
++            return fail("trozo de imagen antes de su configuracion");
++        if (payload == nullptr || size <= kVideoChunkHeaderSize || size > kVideoChunkHeaderSize + kMaxVideoChunkData)
++            return fail("trozo de imagen de tamano no valido");
++        const VideoChunkHeader h = decodeChunkHeader(payload);
++        const size_t dataSize = size - kVideoChunkHeaderSize;
++        if (h.stream != static_cast<uint16_t>(m_config.stream & 0xFFFFu))
++            return fail("trozo de otra secuencia de imagen");
++        if ((h.flags & ~kVideoKeyPicture) != 0 || payload[7] != 0)
++            return fail("banderas del trozo de imagen no validas");
++        if (h.pictureSize == 0 || h.pictureSize > kMaxVideoPictureBytes)
++            return fail("imagen de tamano no valido: " + std::to_string(h.pictureSize));
++        if (h.count == 0 || h.count > kMaxVideoChunks || h.count != chunksFor(h.pictureSize) || h.index >= h.count)
++            return fail("numero de trozos no valido");
++        const size_t expectedData =
++            h.index + 1u < h.count ? kMaxVideoChunkData
++                                   : h.pictureSize - static_cast<size_t>(h.count - 1u) * kMaxVideoChunkData;
++        if (dataSize != expectedData)
++            return fail("trozo de imagen de longitud no valida");
++        if (h.index == 0)
++        {
++            if (m_anyPicture && h.picture <= m_lastPicture)
++                return fail("numero de imagen que no avanza");
++            if (m_inPicture)
++                ++m_lost; // the host dropped the rest of the previous one
++            m_inPicture = true;
++            m_current = h;
++            m_data.clear();
++            m_data.reserve(h.pictureSize);
++            m_anyPicture = true;
++            m_lastPicture = h.picture;
++        }
++        else
++        {
++            if (!m_inPicture || h.picture != m_current.picture || h.index != m_current.index + 1u ||
++                h.count != m_current.count || h.pictureSize != m_current.pictureSize || h.flags != m_current.flags ||
++                h.captureMs != m_current.captureMs)
++                return fail("trozo de imagen fuera de orden");
++            m_current.index = h.index;
++        }
++        m_data.insert(m_data.end(), payload + kVideoChunkHeaderSize, payload + size);
++        if (h.index + 1u < h.count)
++            return Result::NeedMore;
++
++        // Gap: a picture lost since the last whole one (dropped unfinished, or numbers skipped by the host).
++        const uint64_t skipped = m_anyWhole ? static_cast<uint64_t>(h.picture - m_lastWhole - 1u) : 0u;
++        const uint64_t lostBefore = m_lost;
++        m_lost += skipped;
++        m_gap = skipped > 0 || lostBefore != m_lostAtWhole;
++        m_lostAtWhole = m_lost;
++        m_anyWhole = true;
++        m_lastWhole = h.picture;
++        m_inPicture = false;
++        out.picture = h.picture;
++        out.key = (h.flags & kVideoKeyPicture) != 0;
++        out.captureMs = h.captureMs;
++        out.encodeMs = h.encodeMs;
++        out.latencyMs = h.latencyMs;
++        out.data = std::move(m_data);
++        m_data.clear();
++        return Result::Picture;
++    }
++
++    void SendQueue::pushControl(MessageType type, const uint8_t *payload, size_t size)
++    {
++        Message m;
++        m.type = type;
++        m.payload.assign(payload, payload + size);
++        m_control.push_back(std::move(m));
++    }
++
++    void SendQueue::pushVideoConfig(const VideoConfig &config)
++    {
++        const auto bytes = encodeVideoConfig(config);
++        VideoItem item;
++        item.config = true;
++        Message m;
++        m.type = MessageType::VideoConfig;
++        m.payload.assign(bytes.begin(), bytes.end());
++        m.video = true;
++        item.messages.push_back(std::move(m));
++        m_video.push_back(std::move(item));
++    }
++
++    void SendQueue::pushPicture(std::vector<std::vector<uint8_t>> chunks, uint32_t picture)
++    {
++        if (chunks.empty())
++            return;
++        VideoItem item;
++        item.picture = picture;
++        item.messages.reserve(chunks.size());
++        for (std::vector<uint8_t> &chunk : chunks)
++        {
++            Message m;
++            m.type = MessageType::VideoChunk;
++            m.payload = std::move(chunk);
++            m.video = true;
++            item.messages.push_back(std::move(m));
++        }
++        m_video.push_back(std::move(item));
++    }
++
++    bool SendQueue::next(Message &out)
++    {
++        if (!m_control.empty())
++        {
++            out = std::move(m_control.front());
++            m_control.erase(m_control.begin());
++            return true;
++        }
++        if (m_video.empty())
++            return false;
++        VideoItem &item = m_video.front();
++        out = std::move(item.messages[item.sent++]);
++        m_inProgress = item.sent < item.messages.size();
++        if (!m_inProgress)
++            m_video.erase(m_video.begin());
++        return true;
++    }
++
++    bool SendQueue::empty() const
++    {
++        return m_control.empty() && m_video.empty();
++    }
++
++    size_t SendQueue::waitingPictures() const
++    {
++        size_t n = 0;
++        for (size_t i = 0; i < m_video.size(); ++i)
++            if (!m_video[i].config && !(i == 0 && m_inProgress))
++                ++n;
++        return n;
++    }
++
++    size_t SendQueue::dropWaitingPictures()
++    {
++        size_t dropped = 0;
++        std::vector<VideoItem> kept;
++        for (size_t i = 0; i < m_video.size(); ++i)
++        {
++            if (m_video[i].config || (i == 0 && m_inProgress))
++                kept.push_back(std::move(m_video[i]));
++            else
++                ++dropped;
++        }
++        m_video = std::move(kept);
++        return dropped;
++    }
++
++    void SendQueue::clear()
++    {
++        m_control.clear();
++        m_video.clear();
++        m_inProgress = false;
++    }
++
+     bool splitHostPort(const std::string &text, std::string &host, uint16_t &port, bool &hasPort, std::string &error)
+     {
+         hasPort = false;
+@@ -511,7 +841,8 @@ namespace ps2x::netplay
+     {
+         std::vector<std::string> rest;
+         bool host = false, guest = false, portGiven = false, listenGiven = false, passwordGiven = false;
+-        std::string guestAddress, portText;
++        bool videoGiven = false;
++        std::string guestAddress, portText, heightText, kbpsText, codecText;
+         for (size_t i = 0; i < args.size(); ++i)
+         {
+             const std::string &a = args[i];
+@@ -551,14 +882,20 @@ namespace ps2x::netplay
+                 if (!value(options.password))
+                     return false;
+             }
++            else if (a == "--imagen-alto" || a == "--imagen-kbps" || a == "--imagen-codec")
++            {
++                videoGiven = true;
++                if (!value(a == "--imagen-alto" ? heightText : a == "--imagen-kbps" ? kbpsText : codecText))
++                    return false;
++            }
+             else
+                 rest.push_back(a);
+         }
+         if (!host && !guest)
+         {
+-            if (portGiven || listenGiven || passwordGiven)
++            if (portGiven || listenGiven || passwordGiven || videoGiven)
+             {
+-                error = "--puerto, --escuchar y --clave van con --anfitrion o --invitado";
++                error = "--puerto, --escuchar, --clave y --imagen-* van con --anfitrion o --invitado";
+                 return false;
+             }
+             options.mode = NetplayMode::Off;
+@@ -574,6 +911,60 @@ namespace ps2x::netplay
+             error = "--escuchar es solo para el anfitrion";
+             return false;
+         }
++        if (guest && videoGiven)
++        {
++            error = "--imagen-alto, --imagen-kbps y --imagen-codec son solo para el anfitrion";
++            return false;
++        }
++        // A whole decimal number within [low, high].
++        auto number = [&](const std::string &text, const char *name, unsigned long low, unsigned long high,
++                          unsigned long &out) -> bool
++        {
++            bool ok = !text.empty() && text.size() <= 6;
++            for (char c : text)
++                ok = ok && c >= '0' && c <= '9';
++            out = ok ? std::stoul(text) : 0;
++            if (!ok || out < low || out > high)
++            {
++                error = std::string(name) + " debe ser un numero entre " + std::to_string(low) + " y " +
++                        std::to_string(high) + ": " + text;
++                return false;
++            }
++            return true;
++        };
++        if (!heightText.empty())
++        {
++            unsigned long value = 0;
++            if (!number(heightText, "--imagen-alto", 144, 1080, value))
++                return false;
++            if (value % 2 != 0)
++            {
++                error = "--imagen-alto debe ser par: " + heightText;
++                return false;
++            }
++            options.videoHeight = static_cast<uint16_t>(value);
++        }
++        if (!kbpsText.empty())
++        {
++            unsigned long value = 0;
++            if (!number(kbpsText, "--imagen-kbps", 500, 50000, value))
++                return false;
++            options.videoKbps = static_cast<uint32_t>(value);
++        }
++        if (!codecText.empty())
++        {
++            static const char *const kCodecs[] = {"auto", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "mjpeg", "no"};
++            bool known = false;
++            for (const char *c : kCodecs)
++                known = known || codecText == c;
++            if (!known)
++            {
++                error = "--imagen-codec no valido: " + codecText +
++                        " (auto, h264_nvenc, h264_amf, h264_qsv, h264_mf, mjpeg o no)";
++                return false;
++            }
++            options.videoCodec = codecText;
++        }
+         if (portGiven)
+         {
+             std::string ignored;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.h b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+index 9beb576..cef95e8 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+@@ -13,8 +13,8 @@
+ //
+ // Frame: type (1 byte), flags (1, always 0), payload length (2, little endian), payload, and once the session is
+ // authenticated a 16-byte tag: HMAC-SHA256(session key, direction 'G'/'H' || frame counter (8, LE) || header ||
+-// payload), cut to 16 bytes. Every type has one exact payload size; anything else (unknown or reserved type, flags,
+-// another length, a wrong tag) closes the connection before the payload is read.
++// payload), cut to 16 bytes. Every type has one exact payload size or (VIDEO_CHUNK) a bounded range; anything else
++// (unknown or reserved type, flags, another length, a wrong tag) closes the connection before the payload is read.
+ //
+ // Handshake: guest HELLO (magic "F1-06NP\0", version) -> host CHALLENGE (version, 32-byte host nonce) -> guest AUTH
+ // (32-byte guest nonce, proof) -> host WELCOME (proof, port) or REJECT (reason, host version). Both sides derive
+@@ -22,17 +22,32 @@
+ // HMAC(key, "guest" || nonces), the host proof HMAC(key, "host" || nonces), the session key HMAC(key, "session" ||
+ // nonces). The password never travels; a guest without it gets REJECT, a host without it is refused by the guest.
+ //
+-// After WELCOME: PAD (guest -> host, ~60 Hz), PING/PONG (keepalive and round trip), BYE. Reserved for later
+-// milestones: 0x20-0x2F video (N2), 0x30-0x3F audio (N3); this version rejects them.
++// After WELCOME: PAD (guest -> host, ~60 Hz), PING/PONG (keepalive and round trip), BYE.
++//
++// Version 2 (N2, the host's picture): VIDEO_CONFIG (host: codec and size of the stream that follows), VIDEO_CHUNK
++// (host: a piece of one encoded picture, at most kMaxVideoChunkData bytes; a picture has at most kMaxVideoChunks
++// pieces and kMaxVideoPictureBytes bytes, sent in order), VIDEO_KEY_REQUEST (guest: a picture was lost, send a key
++// picture) and VIDEO_ACK (guest: the picture on screen, for the latency). A version 1 peer is refused with REJECT
++// (version). Still reserved: 0x24-0x2F (video) and 0x30-0x3F (audio, N3).
+ namespace ps2x::netplay
+ {
+-    constexpr uint16_t kProtocolVersion = 1;
++    constexpr uint16_t kProtocolVersion = 2;
+     constexpr uint16_t kDefaultPort = 50650;
+     constexpr size_t kHeaderSize = 4;
+     constexpr size_t kTagSize = 16;
+     constexpr size_t kNonceSize = 32;
+-    constexpr size_t kMaxPayload = 64; // the largest payload of this version (AUTH)
++    constexpr size_t kMaxControlPayload = 64; // the largest payload of the fixed-size types (AUTH)
++    // VIDEO_CHUNK: a 24-byte header and up to kMaxVideoChunkData bytes of the encoded picture.
++    constexpr size_t kVideoChunkHeaderSize = 24;
++    constexpr size_t kMaxVideoChunkData = 16384;
++    constexpr size_t kMaxPayload = kVideoChunkHeaderSize + kMaxVideoChunkData;
+     constexpr size_t kMaxFrame = kHeaderSize + kMaxPayload + kTagSize;
++    constexpr size_t kMaxVideoPictureBytes = 1u << 20;
++    constexpr uint16_t kMaxVideoChunks = static_cast<uint16_t>(kMaxVideoPictureBytes / kMaxVideoChunkData);
++    // The largest picture a guest decodes (VIDEO_CONFIG is refused above it).
++    constexpr uint16_t kMinVideoSide = 64;
++    constexpr uint16_t kMaxVideoWidth = 1920;
++    constexpr uint16_t kMaxVideoHeight = 1080;
+     constexpr uint32_t kKeyIterations = 20000;
+     constexpr size_t kMinPasswordSize = 4;
+     constexpr size_t kMaxPasswordSize = 256;
+@@ -49,6 +64,10 @@ namespace ps2x::netplay
+         Ping = 0x11,      // either: token (4), sender time in ms (4)
+         Pong = 0x12,      // either: the ping's payload
+         Bye = 0x13,       // either: reason (1)
++        VideoConfig = 0x20,     // host: codec (1), reserved (1), width (2), height (2), fps (2), kbit/s (4), stream (4)
++        VideoChunk = 0x21,      // host: chunk header (kVideoChunkHeaderSize) and 1..kMaxVideoChunkData bytes
++        VideoKeyRequest = 0x22, // guest: the stream it decodes (4; informative)
++        VideoAck = 0x23,        // guest: picture number (4), its capture time (4), ms since it was shown (4)
+     };
+ 
+     enum class RejectReason : uint8_t
+@@ -67,9 +86,12 @@ namespace ps2x::netplay
+         Shutdown = 4,
+     };
+ 
+-    // The payload size of a type of this version; -1 for unknown and reserved types.
++    // The payload size of a fixed-size type of this version; -1 for VIDEO_CHUNK (a range) and unknown and reserved
++    // types.
+     int payloadSizeOf(uint8_t type);
+-    // 0x20-0x3F: video (N2) and audio (N3).
++    // The payload sizes a type allows (min == max for the fixed ones); false for unknown and reserved types.
++    bool payloadRange(uint8_t type, size_t &minSize, size_t &maxSize);
++    // 0x24-0x2F: video types of later versions; 0x30-0x3F: audio (N3).
+     bool isReservedType(uint8_t type);
+     const char *rejectReasonText(uint8_t reason);
+     const char *byeReasonText(uint8_t reason);
+@@ -114,7 +136,7 @@ namespace ps2x::netplay
+         uint64_t m_received = 0;
+     };
+ 
+-    // One frame, tagged when auth is active. The payload must have its type's exact size (otherwise: empty result).
++    // One frame, tagged when auth is active. The payload must have a size its type allows (otherwise: empty result).
+     std::vector<uint8_t> encodeFrame(MessageType type, const uint8_t *payload, size_t size, MessageAuth *auth);
+ 
+     enum class FrameError
+@@ -133,7 +155,7 @@ namespace ps2x::netplay
+     struct Frame
+     {
+         uint8_t type = 0;
+-        uint8_t size = 0;
++        uint16_t size = 0;
+         std::array<uint8_t, kMaxPayload> payload{};
+     };
+ 
+@@ -159,7 +181,8 @@ namespace ps2x::netplay
+         FrameError error() const { return m_error; }
+         void reset();
+ 
+-        static constexpr size_t kPendingLimit = 4096;
++        // Two whole frames: the reader is drained after every read of at most kMaxFrame bytes.
++        static constexpr size_t kPendingLimit = 2 * kMaxFrame;
+ 
+     private:
+         MessageAuth &m_auth;
+@@ -167,6 +190,139 @@ namespace ps2x::netplay
+         FrameError m_error = FrameError::None;
+     };
+ 
++    // N2: the host's picture.
++    enum class VideoCodec : uint8_t
++    {
++        H264 = 1,
++        Mjpeg = 2,
++    };
++    const char *videoCodecName(uint8_t codec);
++
++    // VIDEO_CONFIG: what the guest's decoder opens. stream grows with every new configuration; the chunks carry it.
++    struct VideoConfig
++    {
++        uint8_t codec = 0;
++        uint16_t width = 0, height = 0; // even, kMinVideoSide..kMaxVideoWidth x kMinVideoSide..kMaxVideoHeight
++        uint16_t fps = 0;               // 1..120 (nominal, for the rate control)
++        uint32_t kbps = 0;              // 100..100000
++        uint32_t stream = 0;            // >= 1
++        bool operator==(const VideoConfig &other) const = default;
++    };
++    constexpr size_t kVideoConfigPayloadSize = 16;
++    std::array<uint8_t, kVideoConfigPayloadSize> encodeVideoConfig(const VideoConfig &config);
++    // False (and why) for a payload of another size, an unknown codec, a reserved byte, odd or out-of-range sizes.
++    bool decodeVideoConfig(const uint8_t *payload, size_t size, VideoConfig &config, std::string &why);
++
++    // The header of a VIDEO_CHUNK. Every chunk of a picture but the last carries kMaxVideoChunkData bytes.
++    struct VideoChunkHeader
++    {
++        uint16_t stream = 0;      // low 16 bits of VideoConfig::stream
++        uint16_t index = 0;       // 0..count-1, in order
++        uint16_t count = 0;       // 1..kMaxVideoChunks, = ceil(pictureSize / kMaxVideoChunkData)
++        uint8_t flags = 0;        // kVideoKeyPicture; no other bit
++        uint32_t picture = 0;     // picture number: grows by one per encoded picture (a gap = pictures lost)
++        uint32_t pictureSize = 0; // 1..kMaxVideoPictureBytes
++        uint32_t captureMs = 0;   // host clock when the picture was taken
++        uint16_t encodeMs = 0;    // the host's encoding time
++        uint16_t latencyMs = 0;   // the host's last estimate of capture -> guest's screen (0 = none yet)
++    };
++    constexpr uint8_t kVideoKeyPicture = 1;
++
++    // One encoded picture.
++    struct VideoPicture
++    {
++        uint32_t picture = 0;
++        bool key = false;
++        uint32_t captureMs = 0;
++        uint16_t encodeMs = 0;
++        uint16_t latencyMs = 0;
++        std::vector<uint8_t> data;
++    };
++
++    // The VIDEO_CHUNK payloads of a picture (empty if it is empty or larger than kMaxVideoPictureBytes).
++    std::vector<std::vector<uint8_t>> chunkVideoPicture(const VideoPicture &picture, uint32_t stream);
++
++    // Puts the pictures back together on the guest, checking every chunk against the configuration and the chunks
++    // before it. TCP keeps the order, so a chunk out of order, of another size or another picture's is a protocol
++    // error (the guest closes). A chunk 0 of a later picture drops an unfinished one (the host gave up on it).
++    class VideoAssembler
++    {
++    public:
++        enum class Result
++        {
++            NeedMore,
++            Picture, // a whole picture in out
++            Error,   // why()
++        };
++
++        // A new VIDEO_CONFIG: false (why()) if it is not valid or its stream does not grow.
++        bool configure(const uint8_t *payload, size_t size);
++        Result add(const uint8_t *payload, size_t size, VideoPicture &out);
++        const VideoConfig &config() const { return m_config; }
++        bool configured() const { return m_config.stream != 0; }
++        const std::string &why() const { return m_why; }
++        // Pictures dropped unfinished or skipped by the host (gaps in the numbers) since the start.
++        uint64_t lostPictures() const { return m_lost; }
++        // A gap before the last whole picture: the decoder must wait for a key picture.
++        bool gapBeforeLast() const { return m_gap; }
++
++    private:
++        Result fail(const std::string &why);
++
++        VideoConfig m_config;
++        bool m_inPicture = false;
++        VideoChunkHeader m_current;
++        std::vector<uint8_t> m_data;
++        bool m_anyPicture = false;
++        uint32_t m_lastPicture = 0; // the last picture started
++        uint32_t m_lastWhole = 0;   // the last picture completed
++        bool m_anyWhole = false;
++        bool m_gap = false;
++        uint64_t m_lost = 0;
++        uint64_t m_lostAtWhole = 0; // m_lost when the last whole picture came
++        std::string m_why;
++    };
++
++    // What the host sends once the session started: control frames (PING, PONG, BYE...) always before the video, which
++    // goes picture by picture and chunk by chunk, so a control frame waits at most one chunk. Frames are signed when
++    // they leave the queue (the tags count frames in the order they are sent).
++    class SendQueue
++    {
++    public:
++        struct Message
++        {
++            MessageType type = MessageType::Ping;
++            std::vector<uint8_t> payload;
++            bool video = false;
++        };
++
++        void pushControl(MessageType type, const uint8_t *payload, size_t size);
++        // A configuration (never dropped) or one picture's chunks (a VIDEO_CONFIG first if given).
++        void pushVideoConfig(const VideoConfig &config);
++        void pushPicture(std::vector<std::vector<uint8_t>> chunks, uint32_t picture);
++        bool next(Message &out);
++        bool empty() const;
++        // Pictures waiting whose first chunk has not left yet.
++        size_t waitingPictures() const;
++        bool pictureInProgress() const { return m_inProgress; }
++        // Drops the pictures that have not started (keeps the configurations); how many.
++        size_t dropWaitingPictures();
++        void clear();
++
++    private:
++        struct VideoItem
++        {
++            bool config = false;
++            uint32_t picture = 0;
++            std::vector<Message> messages;
++            size_t sent = 0;
++        };
++
++        std::vector<Message> m_control; // FIFO
++        std::vector<VideoItem> m_video; // FIFO
++        bool m_inProgress = false;      // m_video.front() has sent some of its chunks
++    };
++
+     using RandomSource = std::function<bool(void *, size_t)>;
+ 
+     // The handshake of each side, frame by frame. On success both MessageAuth objects are started with the same key.
+@@ -245,6 +401,9 @@ namespace ps2x::netplay
+     // Command line of the netplay (the game's other arguments stay in args, in order):
+     //   --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
+     //   --invitado <address>[:port] [--puerto N] --clave <password>
++    // The host's picture (N2): [--imagen-alto N] (144..1080, even; default 540) [--imagen-kbps N] (500..50000; default
++    // 8000) [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no] (default auto: the first that opens,
++    // in that order; no = no picture).
+     // Without --clave the password comes from environmentPassword (PS2X_RED_CLAVE), if any. Returns false with
+     // error set when a netplay argument is wrong.
+     enum class NetplayMode
+@@ -261,6 +420,9 @@ namespace ps2x::netplay
+         std::string hostAddress;   // guest
+         uint16_t port = kDefaultPort;
+         std::string password;
++        uint16_t videoHeight = 540;
++        uint32_t videoKbps = 8000;
++        std::string videoCodec = "auto";
+     };
+ 
+     bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_video.cpp b/ps2xRuntime/src/lib/ps2_netplay_video.cpp
+new file mode 100644
+index 0000000..25eb90f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_video.cpp
+@@ -0,0 +1,565 @@
++#include "ps2_netplay_video.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++#if !defined(PS2X_HAS_FFMPEG)
++#define PS2X_HAS_FFMPEG 1
++#endif
++
++#if PS2X_HAS_FFMPEG
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++#include <libavutil/error.h>
++#include <libavutil/frame.h>
++#include <libavutil/opt.h>
++#include <libswscale/swscale.h>
++}
++#endif
++
++// Fase 5 (T15, netplay N2): see ps2_netplay_video.h.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        constexpr const char *kEncoderOrder[] = {"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "mjpeg"};
++        constexpr uint32_t kMaxSourceSide = 4096; // the latched frame is at most twice 640x512; anything above is wrong
++    }
++
++    std::vector<std::string> videoEncoderCandidates(const std::string &preference)
++    {
++        if (preference == "auto")
++            return std::vector<std::string>(std::begin(kEncoderOrder), std::end(kEncoderOrder));
++        if (isVideoEncoderName(preference))
++            return {preference};
++        return {};
++    }
++
++    bool isVideoEncoderName(const std::string &name)
++    {
++        for (const char *known : kEncoderOrder)
++            if (name == known)
++                return true;
++        return false;
++    }
++
++    void videoOutputSize(uint32_t sourceHeight, float aspect, uint32_t maxHeight, uint16_t &width, uint16_t &height)
++    {
++        if (!(aspect > 0.25f && aspect < 8.0f))
++            aspect = 4.0f / 3.0f;
++        uint32_t h = std::min<uint32_t>(maxHeight, sourceHeight != 0 ? sourceHeight : maxHeight);
++        h = std::clamp<uint32_t>(h, kMinVideoSide, kMaxVideoHeight) & ~1u;
++        uint32_t w = static_cast<uint32_t>(std::lround(h * static_cast<double>(aspect) / 2.0)) * 2u;
++        if (w > kMaxVideoWidth)
++        {
++            w = kMaxVideoWidth;
++            h = static_cast<uint32_t>(std::lround(w / static_cast<double>(aspect) / 2.0)) * 2u;
++            h = std::clamp<uint32_t>(h, kMinVideoSide, kMaxVideoHeight) & ~1u;
++        }
++        w = std::max<uint32_t>(w, kMinVideoSide);
++        width = static_cast<uint16_t>(w);
++        height = static_cast<uint16_t>(h);
++    }
++
++#if PS2X_HAS_FFMPEG
++    namespace
++    {
++        std::string avError(int code)
++        {
++            char text[AV_ERROR_MAX_STRING_SIZE] = {};
++            av_strerror(code, text, sizeof(text));
++            return text;
++        }
++
++        // The encoder's input format: what it takes among the ones the scaler writes well.
++        AVPixelFormat inputFormat(const AVCodec *codec, AVCodecContext *ctx)
++        {
++            if (codec->id == AV_CODEC_ID_MJPEG)
++                return AV_PIX_FMT_YUVJ420P;
++            const void *list = nullptr;
++            int count = 0;
++            if (avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &list, &count) < 0 ||
++                list == nullptr)
++                return AV_PIX_FMT_YUV420P;
++            const AVPixelFormat *formats = static_cast<const AVPixelFormat *>(list);
++            for (AVPixelFormat wanted : {AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P})
++                for (int i = 0; i < count; ++i)
++                    if (formats[i] == wanted)
++                        return wanted;
++            return AV_PIX_FMT_NONE;
++        }
++
++        // An H.264 access unit with a sequence parameter set (NAL type 7) near its start.
++        bool hasSequenceHeader(const uint8_t *data, size_t size)
++        {
++            const size_t limit = std::min<size_t>(size, 512);
++            for (size_t i = 0; i + 3 < limit; ++i)
++                if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1Fu) == 7u)
++                    return true;
++            return false;
++        }
++
++        void setOption(AVCodecContext *ctx, const char *name, const char *value)
++        {
++            av_opt_set(ctx->priv_data, name, value, 0); // an option a version does not have is not an error
++        }
++    }
++
++    bool videoAvailable()
++    {
++        return true;
++    }
++
++    struct VideoEncoder::Impl
++    {
++        VideoEncoderSettings settings;
++        std::string name;
++        VideoCodec codec = VideoCodec::H264;
++        AVCodecContext *ctx = nullptr;
++        AVFrame *frame = nullptr;
++        AVPacket *packet = nullptr;
++        SwsContext *sws = nullptr;
++        int64_t pts = 0;
++
++        void release()
++        {
++            sws_freeContext(sws);
++            sws = nullptr;
++            av_packet_free(&packet);
++            av_frame_free(&frame);
++            avcodec_free_context(&ctx);
++            name.clear();
++            pts = 0;
++        }
++
++        bool tryOpen(const AVCodec *c, const std::string &encoder, std::string &why)
++        {
++            ctx = avcodec_alloc_context3(c);
++            if (ctx == nullptr)
++            {
++                why = "sin memoria";
++                return false;
++            }
++            const bool mjpeg = c->id == AV_CODEC_ID_MJPEG;
++            const int fps = std::max<int>(1, settings.fps);
++            ctx->width = settings.width;
++            ctx->height = settings.height;
++            ctx->time_base = AVRational{1, fps};
++            ctx->framerate = AVRational{fps, 1};
++            ctx->pix_fmt = inputFormat(c, ctx);
++            if (ctx->pix_fmt == AV_PIX_FMT_NONE)
++            {
++                why = "sin formato de entrada compatible";
++                release();
++                return false;
++            }
++            ctx->bit_rate = static_cast<int64_t>(settings.kbps) * 1000;
++            if (!mjpeg)
++            {
++                // Constant rate with a buffer of about two pictures: no picture waits for the ones after it.
++                ctx->rc_max_rate = ctx->bit_rate;
++                ctx->rc_buffer_size = static_cast<int>(ctx->bit_rate * 2 / fps);
++            }
++            ctx->gop_size = std::max(1, settings.keyIntervalPictures);
++            ctx->max_b_frames = 0;
++            ctx->thread_count = 1;
++            ctx->color_range = mjpeg ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++            ctx->colorspace = AVCOL_SPC_SMPTE170M;
++            if (encoder == "h264_nvenc")
++            {
++                setOption(ctx, "preset", "p2");
++                setOption(ctx, "tune", "ull");
++                setOption(ctx, "rc", "cbr");
++                setOption(ctx, "zerolatency", "1");
++                setOption(ctx, "delay", "0");
++                setOption(ctx, "rc-lookahead", "0");
++                setOption(ctx, "forced-idr", "1");
++            }
++            else if (encoder == "h264_amf")
++            {
++                setOption(ctx, "usage", "ultralowlatency");
++                setOption(ctx, "rc", "cbr");
++                setOption(ctx, "forced_idr", "1");
++            }
++            else if (encoder == "h264_qsv")
++            {
++                setOption(ctx, "preset", "veryfast");
++                setOption(ctx, "async_depth", "1");
++                setOption(ctx, "low_delay_brc", "1");
++                setOption(ctx, "forced_idr", "1");
++            }
++            else if (encoder == "h264_mf")
++            {
++                setOption(ctx, "scenario", "display_remoting");
++                setOption(ctx, "rate_control", "cbr");
++            }
++            const int opened = avcodec_open2(ctx, c, nullptr);
++            if (opened < 0)
++            {
++                why = avError(opened);
++                release();
++                return false;
++            }
++            frame = av_frame_alloc();
++            packet = av_packet_alloc();
++            if (frame == nullptr || packet == nullptr)
++            {
++                why = "sin memoria";
++                release();
++                return false;
++            }
++            frame->format = ctx->pix_fmt;
++            frame->width = ctx->width;
++            frame->height = ctx->height;
++            frame->color_range = ctx->color_range;
++            frame->colorspace = ctx->colorspace;
++            const int buffer = av_frame_get_buffer(frame, 0);
++            if (buffer < 0)
++            {
++                why = avError(buffer);
++                release();
++                return false;
++            }
++            name = encoder;
++            codec = mjpeg ? VideoCodec::Mjpeg : VideoCodec::H264;
++            return true;
++        }
++    };
++
++    VideoEncoder::VideoEncoder() : m_impl(std::make_unique<Impl>()) {}
++
++    VideoEncoder::~VideoEncoder()
++    {
++        close();
++    }
++
++    bool VideoEncoder::open(const VideoEncoderSettings &settings, std::string &error, std::vector<std::string> *tried)
++    {
++        close();
++        if (settings.width < kMinVideoSide || settings.width > kMaxVideoWidth || settings.height < kMinVideoSide ||
++            settings.height > kMaxVideoHeight || (settings.width & 1u) != 0 || (settings.height & 1u) != 0)
++        {
++            error = "tamano de imagen no valido: " + std::to_string(settings.width) + "x" +
++                    std::to_string(settings.height);
++            return false;
++        }
++        m_impl->settings = settings;
++        const std::vector<std::string> candidates = videoEncoderCandidates(settings.preference);
++        if (candidates.empty())
++        {
++            error = "codificador desconocido: " + settings.preference;
++            return false;
++        }
++        std::string all;
++        for (const std::string &name : candidates)
++        {
++            std::string why;
++            const AVCodec *c = avcodec_find_encoder_by_name(name.c_str());
++            if (c == nullptr)
++                why = "no esta en esta version de FFmpeg";
++            else if (m_impl->tryOpen(c, name, why))
++                return true;
++            if (tried != nullptr)
++                tried->push_back(name + ": " + why);
++            all += (all.empty() ? "" : "; ") + name + ": " + why;
++        }
++        error = "ningun codificador abre (" + all + ")";
++        return false;
++    }
++
++    void VideoEncoder::close()
++    {
++        m_impl->release();
++    }
++
++    bool VideoEncoder::isOpen() const
++    {
++        return m_impl->ctx != nullptr;
++    }
++
++    const std::string &VideoEncoder::encoderName() const
++    {
++        return m_impl->name;
++    }
++
++    VideoCodec VideoEncoder::codec() const
++    {
++        return m_impl->codec;
++    }
++
++    const VideoEncoderSettings &VideoEncoder::settings() const
++    {
++        return m_impl->settings;
++    }
++
++    bool VideoEncoder::encode(const uint8_t *rgba, uint32_t width, uint32_t height, size_t stride, bool forceKey,
++                              std::vector<Packet> &packets, std::string &error)
++    {
++        Impl &m = *m_impl;
++        if (m.ctx == nullptr)
++        {
++            error = "codificador cerrado";
++            return false;
++        }
++        if (rgba == nullptr || width == 0 || height == 0 || width > kMaxSourceSide || height > kMaxSourceSide ||
++            stride < static_cast<size_t>(width) * 4u || stride > static_cast<size_t>(INT32_MAX))
++        {
++            error = "imagen de origen no valida";
++            return false;
++        }
++        m.sws = sws_getCachedContext(m.sws, static_cast<int>(width), static_cast<int>(height), AV_PIX_FMT_RGBA,
++                                     m.ctx->width, m.ctx->height, m.ctx->pix_fmt, SWS_BILINEAR, nullptr, nullptr,
++                                     nullptr);
++        if (m.sws == nullptr)
++        {
++            error = "no se puede escalar la imagen";
++            return false;
++        }
++        const int *coefficients = sws_getCoefficients(SWS_CS_ITU601);
++        sws_setColorspaceDetails(m.sws, coefficients, 1, coefficients, m.ctx->color_range == AVCOL_RANGE_JPEG ? 1 : 0,
++                                 0, 1 << 16, 1 << 16);
++        const int writable = av_frame_make_writable(m.frame);
++        if (writable < 0)
++        {
++            error = avError(writable);
++            return false;
++        }
++        const uint8_t *src[4] = {rgba, nullptr, nullptr, nullptr};
++        const int srcStride[4] = {static_cast<int>(stride), 0, 0, 0};
++        sws_scale(m.sws, src, srcStride, 0, static_cast<int>(height), m.frame->data, m.frame->linesize);
++        m.frame->pts = m.pts++;
++        m.frame->pict_type = forceKey ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
++        if (forceKey)
++            m.frame->flags |= AV_FRAME_FLAG_KEY;
++        else
++            m.frame->flags &= ~AV_FRAME_FLAG_KEY;
++        const int sent = avcodec_send_frame(m.ctx, m.frame);
++        if (sent < 0)
++        {
++            error = "el codificador " + m.name + " falla: " + avError(sent);
++            return false;
++        }
++        for (;;)
++        {
++            const int got = avcodec_receive_packet(m.ctx, m.packet);
++            if (got == AVERROR(EAGAIN) || got == AVERROR_EOF)
++                break;
++            if (got < 0)
++            {
++                error = "el codificador " + m.name + " falla: " + avError(got);
++                return false;
++            }
++            Packet p;
++            p.key = (m.packet->flags & AV_PKT_FLAG_KEY) != 0;
++            // A key picture must open the decoder on its own: its parameter sets in front if the encoder keeps them
++            // apart (extradata).
++            if (p.key && m.codec == VideoCodec::H264 && m.ctx->extradata_size > 0 &&
++                !hasSequenceHeader(m.packet->data, static_cast<size_t>(m.packet->size)))
++                p.data.assign(m.ctx->extradata, m.ctx->extradata + m.ctx->extradata_size);
++            p.data.insert(p.data.end(), m.packet->data, m.packet->data + m.packet->size);
++            packets.push_back(std::move(p));
++            av_packet_unref(m.packet);
++        }
++        return true;
++    }
++
++    struct VideoDecoder::Impl
++    {
++        VideoConfig config;
++        AVCodecContext *ctx = nullptr;
++        AVFrame *frame = nullptr;
++        AVPacket *packet = nullptr;
++        SwsContext *sws = nullptr;
++
++        void release()
++        {
++            sws_freeContext(sws);
++            sws = nullptr;
++            av_packet_free(&packet);
++            av_frame_free(&frame);
++            avcodec_free_context(&ctx);
++        }
++    };
++
++    VideoDecoder::VideoDecoder() : m_impl(std::make_unique<Impl>()) {}
++
++    VideoDecoder::~VideoDecoder()
++    {
++        close();
++    }
++
++    bool VideoDecoder::open(const VideoConfig &config, std::string &error)
++    {
++        close();
++        // The same checks as on the wire, whoever builds the config.
++        const auto bytes = encodeVideoConfig(config);
++        VideoConfig checked;
++        if (!decodeVideoConfig(bytes.data(), bytes.size(), checked, error))
++            return false;
++        const AVCodec *c = avcodec_find_decoder(config.codec == static_cast<uint8_t>(VideoCodec::Mjpeg)
++                                                    ? AV_CODEC_ID_MJPEG
++                                                    : AV_CODEC_ID_H264);
++        if (c == nullptr)
++        {
++            error = std::string("no hay decodificador ") + videoCodecName(config.codec);
++            return false;
++        }
++        Impl &m = *m_impl;
++        m.ctx = avcodec_alloc_context3(c);
++        m.frame = av_frame_alloc();
++        m.packet = av_packet_alloc();
++        if (m.ctx == nullptr || m.frame == nullptr || m.packet == nullptr)
++        {
++            error = "sin memoria";
++            m.release();
++            return false;
++        }
++        // One picture in, one out (no frame threads, which hold pictures back), and no picture larger than the
++        // configuration allows, whatever the bitstream says.
++        m.ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
++        m.ctx->thread_count = 1;
++        m.ctx->max_pixels = static_cast<int64_t>(kMaxVideoWidth) * kMaxVideoHeight;
++        m.ctx->width = config.width;
++        m.ctx->height = config.height;
++        const int opened = avcodec_open2(m.ctx, c, nullptr);
++        if (opened < 0)
++        {
++            error = avError(opened);
++            m.release();
++            return false;
++        }
++        m.config = config;
++        return true;
++    }
++
++    void VideoDecoder::close()
++    {
++        m_impl->release();
++    }
++
++    bool VideoDecoder::isOpen() const
++    {
++        return m_impl->ctx != nullptr;
++    }
++
++    bool VideoDecoder::decode(const uint8_t *data, size_t size, std::vector<uint8_t> &rgba, bool &got,
++                              std::string &error)
++    {
++        Impl &m = *m_impl;
++        got = false;
++        if (m.ctx == nullptr)
++        {
++            error = "decodificador cerrado";
++            return false;
++        }
++        if (data == nullptr || size == 0 || size > kMaxVideoPictureBytes)
++        {
++            error = "imagen codificada de tamano no valido";
++            return false;
++        }
++        const int made = av_new_packet(m.packet, static_cast<int>(size)); // zeroed padding after the data
++        if (made < 0)
++        {
++            error = avError(made);
++            return false;
++        }
++        std::memcpy(m.packet->data, data, size);
++        const int sent = avcodec_send_packet(m.ctx, m.packet);
++        av_packet_unref(m.packet);
++        if (sent < 0)
++        {
++            error = "imagen que no se puede decodificar: " + avError(sent);
++            return false;
++        }
++        for (;;)
++        {
++            const int received = avcodec_receive_frame(m.ctx, m.frame);
++            if (received == AVERROR(EAGAIN) || received == AVERROR_EOF)
++                break;
++            if (received < 0)
++            {
++                error = "imagen que no se puede decodificar: " + avError(received);
++                return false;
++            }
++            const int w = m.frame->width, h = m.frame->height;
++            if (w != m.config.width || h != m.config.height)
++            {
++                error = "imagen de " + std::to_string(w) + "x" + std::to_string(h) + " en una secuencia de " +
++                        std::to_string(m.config.width) + "x" + std::to_string(m.config.height);
++                av_frame_unref(m.frame);
++                return false;
++            }
++            m.sws = sws_getCachedContext(m.sws, w, h, static_cast<AVPixelFormat>(m.frame->format), w, h,
++                                         AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
++            if (m.sws == nullptr)
++            {
++                error = "formato de imagen decodificada no valido";
++                av_frame_unref(m.frame);
++                return false;
++            }
++            const bool fullRange = m.frame->color_range == AVCOL_RANGE_JPEG ||
++                                   m.frame->format == AV_PIX_FMT_YUVJ420P;
++            const int *coefficients = sws_getCoefficients(SWS_CS_ITU601);
++            sws_setColorspaceDetails(m.sws, coefficients, fullRange ? 1 : 0, coefficients, 1, 0, 1 << 16, 1 << 16);
++            rgba.resize(static_cast<size_t>(w) * h * 4u);
++            uint8_t *dst[4] = {rgba.data(), nullptr, nullptr, nullptr};
++            const int dstStride[4] = {w * 4, 0, 0, 0};
++            sws_scale(m.sws, m.frame->data, m.frame->linesize, 0, h, dst, dstStride);
++            av_frame_unref(m.frame);
++            got = true;
++        }
++        return true;
++    }
++#else
++    bool videoAvailable()
++    {
++        return false;
++    }
++
++    struct VideoEncoder::Impl
++    {
++        VideoEncoderSettings settings;
++        std::string name;
++    };
++    VideoEncoder::VideoEncoder() : m_impl(std::make_unique<Impl>()) {}
++    VideoEncoder::~VideoEncoder() = default;
++    bool VideoEncoder::open(const VideoEncoderSettings &settings, std::string &error, std::vector<std::string> *)
++    {
++        m_impl->settings = settings;
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++    }
++    void VideoEncoder::close() {}
++    bool VideoEncoder::isOpen() const { return false; }
++    const std::string &VideoEncoder::encoderName() const { return m_impl->name; }
++    VideoCodec VideoEncoder::codec() const { return VideoCodec::H264; }
++    const VideoEncoderSettings &VideoEncoder::settings() const { return m_impl->settings; }
++    bool VideoEncoder::encode(const uint8_t *, uint32_t, uint32_t, size_t, bool, std::vector<Packet> &,
++                              std::string &error)
++    {
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++    }
++
++    struct VideoDecoder::Impl
++    {
++    };
++    VideoDecoder::VideoDecoder() : m_impl(std::make_unique<Impl>()) {}
++    VideoDecoder::~VideoDecoder() = default;
++    bool VideoDecoder::open(const VideoConfig &, std::string &error)
++    {
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++    }
++    void VideoDecoder::close() {}
++    bool VideoDecoder::isOpen() const { return false; }
++    bool VideoDecoder::decode(const uint8_t *, size_t, std::vector<uint8_t> &, bool &got, std::string &error)
++    {
++        got = false;
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++    }
++#endif
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_video.h b/ps2xRuntime/src/lib/ps2_netplay_video.h
+new file mode 100644
+index 0000000..67659a7
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_video.h
+@@ -0,0 +1,91 @@
++#pragma once
++
++#include "ps2_netplay_protocol.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// Fase 5 (T15, netplay N2): the host's picture, encoded with the FFmpeg the game already carries (LGPL DLLs, also used
++// by the .pss videos). No FFmpeg type leaves ps2_netplay_video.cpp. Without FFmpeg (PS2X_ENABLE_FFMPEG=OFF) nothing
++// opens and the netplay goes on without a picture.
++namespace ps2x::netplay
++{
++    // Whether this build carries FFmpeg.
++    bool videoAvailable();
++
++    // The encoders tried for a preference, in order: "auto" = h264_nvenc, h264_amf, h264_qsv (hardware), h264_mf
++    // (Media Foundation: the GPU's or Windows' own), mjpeg (always there). A single name = only that one.
++    std::vector<std::string> videoEncoderCandidates(const std::string &preference);
++    bool isVideoEncoderName(const std::string &name);
++
++    // The picture size for a source of sourceHeight lines shown at aspect (width / height): maxHeight lines at most
++    // (never more than the source has), the width from the aspect; both even and within the protocol's limits.
++    void videoOutputSize(uint32_t sourceHeight, float aspect, uint32_t maxHeight, uint16_t &width, uint16_t &height);
++
++    struct VideoEncoderSettings
++    {
++        uint16_t width = 960, height = 540;
++        uint16_t fps = 50;
++        uint32_t kbps = 8000;
++        std::string preference = "auto";
++        int keyIntervalPictures = 250; // a key picture at least this often (and whenever asked)
++    };
++
++    // Low-latency settings: no B pictures, no look-ahead, one picture in -> one packet out, constant bit rate with a
++    // small buffer (about two pictures).
++    class VideoEncoder
++    {
++    public:
++        VideoEncoder();
++        ~VideoEncoder();
++        VideoEncoder(const VideoEncoder &) = delete;
++        VideoEncoder &operator=(const VideoEncoder &) = delete;
++
++        // Opens the first candidate that works; tried lists every attempt ("h264_nvenc: <why>").
++        bool open(const VideoEncoderSettings &settings, std::string &error, std::vector<std::string> *tried = nullptr);
++        void close();
++        bool isOpen() const;
++        const std::string &encoderName() const;
++        VideoCodec codec() const;
++        const VideoEncoderSettings &settings() const;
++
++        // Scales an RGBA picture (any size) to the encoder's and encodes it. packets gets what the encoder gives back
++        // (normally one packet); key tells whether each is a key picture. False if the encoder failed.
++        struct Packet
++        {
++            std::vector<uint8_t> data;
++            bool key = false;
++        };
++        bool encode(const uint8_t *rgba, uint32_t width, uint32_t height, size_t stride, bool forceKey,
++                    std::vector<Packet> &packets, std::string &error);
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++
++    // The guest's decoder. Only pictures of the configured size come out (capped at kMaxVideoWidth x kMaxVideoHeight
++    // by the configuration itself and by the decoder's own pixel limit).
++    class VideoDecoder
++    {
++    public:
++        VideoDecoder();
++        ~VideoDecoder();
++        VideoDecoder(const VideoDecoder &) = delete;
++        VideoDecoder &operator=(const VideoDecoder &) = delete;
++
++        bool open(const VideoConfig &config, std::string &error);
++        void close();
++        bool isOpen() const;
++        // One whole picture -> RGBA (width * height * 4). False with error if it does not decode or has another size;
++        // true with got = false if the decoder gave nothing back for it.
++        bool decode(const uint8_t *data, size_t size, std::vector<uint8_t> &rgba, bool &got, std::string &error);
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9db428a..11339f5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -23,6 +23,7 @@
+ #include "ps2_photo.h"
+ #include "ps2_photo_mode.h"
+ #include "ps2_replay_scrub.h"
++#include "ps2_netplay.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -1298,6 +1299,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_lastPreferred = usedPreferredDisplaySource;
+     s_lastWidth = width;
+     s_lastHeight = height;
++    // Fase 5 (T15, netplay N2): each new picture to the guest (a copy; the host's encoder thread does the rest).
++    if (ps2x::netplay::hostPictureWanted() && width != 0u && height != 0u &&
++        s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
++        ps2x::netplay::offerHostPicture(s_scratch.data(), width, height, static_cast<size_t>(width) * 4u);
+ 
+     // The texture as large as the frame (at most twice 640x512 on each axis), and the upload buffer as the texture.
+     EnsureFrameTexture(tex, std::min<uint32_t>(width, FB_WIDTH * 2u), std::min<uint32_t>(height, FB_HEIGHT * 2u));
+@@ -3593,6 +3598,7 @@ void PS2Runtime::run()
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+                                     : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
+                                                                                : srcWidth / srcHeight;
++        ps2x::netplay::setHostPictureAspect(pictureAspect); // T15 (N2): the guest sees it with this aspect
+         const float dstWidth = std::min(screenWidth, screenHeight * pictureAspect);
+         const float dstHeight = dstWidth / pictureAspect;
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 6d2eac7..1a7d7b8 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -445,6 +445,8 @@ int main(int argc, char *argv[])
+         {
+             std::cerr << "[red] argumentos no validos: " << netplayError << std::endl
+                       << "[red] uso: --anfitrion [--escuchar <direccion>] [--puerto N] --clave <contrasena>" << std::endl
++                      << "[red]      [--imagen-alto 144-1080] [--imagen-kbps 500-50000]" << std::endl
++                      << "[red]      [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no]" << std::endl
+                       << "[red]      --invitado <direccion>[:puerto] [--puerto N] --clave <contrasena>" << std::endl;
+             std::cout.flush();
+             std::cerr.flush();
+@@ -572,7 +574,9 @@ int main(int argc, char *argv[])
+         if (netplay.mode == ps2x::netplay::NetplayMode::Host)
+         {
+             std::string error;
+-            if (!s_netplayHost.start({netplay.listenAddress, netplay.port, netplay.password}, error))
++            ps2x::netplay::HostSettings hostSettings{netplay.listenAddress, netplay.port, netplay.password};
++            hostSettings.video = {netplay.videoHeight, netplay.videoKbps, netplay.videoCodec};
++            if (!s_netplayHost.start(hostSettings, error))
+                 std::cerr << "[red] no se puede escuchar en el puerto " << netplay.port << ": " << error
+                           << " (el juego sigue sin red)" << std::endl;
+         }
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 1a57270..3225a3b 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -6,7 +6,9 @@
+ #include "ps2_netplay.h"
+ #include "ps2_netplay_crypto.h"
+ #include "ps2_netplay_protocol.h"
++#include "ps2_netplay_video.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+@@ -20,7 +22,8 @@
+ #include <vector>
+ 
+ // Fase 5 (T15, netplay N1): hashes (published vectors), frames, handshake, pad state, command line and a host and a
+-// guest talking over 127.0.0.1 in this process.
++// guest talking over 127.0.0.1 in this process. N2: protocol version 2 (video frames, pictures in chunks, the send
++// queue), the codec (MJPEG, always in the FFmpeg build) and the host's picture reaching the guest.
+ namespace
+ {
+     using namespace ps2x::netplay;
+@@ -126,6 +129,81 @@ namespace
+         return static_cast<uint32_t>(getRegU32(&ctx, 2));
+     }
+ 
++    VideoConfig validConfig(uint32_t stream = 1)
++    {
++        VideoConfig c;
++        c.codec = static_cast<uint8_t>(VideoCodec::Mjpeg);
++        c.width = 640;
++        c.height = 480;
++        c.fps = 50;
++        c.kbps = 8000;
++        c.stream = stream;
++        return c;
++    }
++
++    VideoPicture pictureOf(uint32_t number, size_t size, bool key = false)
++    {
++        VideoPicture p;
++        p.picture = number;
++        p.key = key;
++        p.captureMs = 1000u + number;
++        p.encodeMs = 3;
++        p.data.resize(size);
++        for (size_t i = 0; i < size; ++i)
++            p.data[i] = static_cast<uint8_t>(i * 7u + number);
++        return p;
++    }
++
++    // A chunk header with the given fields over the data of a valid chunk (to break one field at a time).
++    std::vector<uint8_t> chunkWith(const std::vector<uint8_t> &chunk, size_t offset, std::vector<uint8_t> bytes)
++    {
++        std::vector<uint8_t> out = chunk;
++        for (size_t i = 0; i < bytes.size(); ++i)
++            out[offset + i] = bytes[i];
++        return out;
++    }
++
++    // A synthetic RGBA picture: smooth gradients and a few solid blocks (what JPEG keeps well).
++    std::vector<uint8_t> syntheticPicture(uint32_t width, uint32_t height, uint32_t seed)
++    {
++        std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4u);
++        for (uint32_t y = 0; y < height; ++y)
++            for (uint32_t x = 0; x < width; ++x)
++            {
++                uint8_t *p = &rgba[(static_cast<size_t>(y) * width + x) * 4u];
++                const bool block = ((x / 64u) + (y / 64u) + seed) % 5u == 0u;
++                p[0] = block ? 230 : static_cast<uint8_t>(x * 255u / width);
++                p[1] = block ? 40 : static_cast<uint8_t>(y * 255u / height);
++                p[2] = block ? 60 : static_cast<uint8_t>((x + y + seed * 16u) & 0xFFu);
++                p[3] = 0x80;
++            }
++        return rgba;
++    }
++
++    // Mean absolute difference of the colour channels of two RGBA pictures of one size.
++    double meanDifference(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b)
++    {
++        if (a.size() != b.size() || a.empty())
++            return 255.0;
++        uint64_t total = 0;
++        for (size_t i = 0; i < a.size(); i += 4)
++            for (size_t c = 0; c < 3; ++c)
++                total += static_cast<uint64_t>(std::abs(static_cast<int>(a[i + c]) - static_cast<int>(b[i + c])));
++        return static_cast<double>(total) / static_cast<double>(a.size() / 4u * 3u);
++    }
++
++    // Scales an RGBA picture (nearest) to compare it with what the guest got at another size.
++    std::vector<uint8_t> scaledNearest(const std::vector<uint8_t> &src, uint32_t sw, uint32_t sh, uint32_t dw,
++                                       uint32_t dh)
++    {
++        std::vector<uint8_t> out(static_cast<size_t>(dw) * dh * 4u);
++        for (uint32_t y = 0; y < dh; ++y)
++            for (uint32_t x = 0; x < dw; ++x)
++                std::memcpy(&out[(static_cast<size_t>(y) * dw + x) * 4u],
++                            &src[(static_cast<size_t>(y * sh / dh) * sw + x * sw / dw) * 4u], 4);
++        return out;
++    }
++
+     // The game's pad on a test: no physical pads, and a controles.ini that does not exist (no [jugador2]: port 2
+     // is empty without a guest, as in patch 0123).
+     void isolatePads()
+@@ -224,7 +302,7 @@ void register_ps2_netplay_tests()
+ 
+     MiniTest::Case("NetplayProtocol", [](TestCase &tc)
+                    {
+-        tc.Run("every type has one exact size; video and audio are reserved", [](TestCase &t)
++        tc.Run("every type has one exact size or a bounded range; later video and audio are reserved", [](TestCase &t)
+         {
+             t.Equals(payloadSizeOf(0x01), 12, "HELLO");
+             t.Equals(payloadSizeOf(0x02), 36, "CHALLENGE");
+@@ -236,10 +314,21 @@ void register_ps2_netplay_tests()
+             t.Equals(payloadSizeOf(0x12), 8, "PONG");
+             t.Equals(payloadSizeOf(0x13), 1, "BYE");
+             t.Equals(payloadSizeOf(0x00), -1, "0 is no type");
+-            t.Equals(payloadSizeOf(0x20), -1, "video is not in this version");
+-            t.IsTrue(isReservedType(0x20) && isReservedType(0x2F) && isReservedType(0x30) && isReservedType(0x3F),
+-                     "0x20-0x3F reserved");
++            t.Equals(payloadSizeOf(0x20), 16, "VIDEO_CONFIG");
++            t.Equals(payloadSizeOf(0x22), 4, "VIDEO_KEY_REQUEST");
++            t.Equals(payloadSizeOf(0x23), 12, "VIDEO_ACK");
++            t.Equals(payloadSizeOf(0x21), -1, "VIDEO_CHUNK has no single size");
++            size_t lo = 0, hi = 0;
++            t.IsTrue(payloadRange(0x21, lo, hi), "VIDEO_CHUNK range");
++            t.Equals(lo, kVideoChunkHeaderSize + 1, "at least one byte of picture");
++            t.Equals(hi, kVideoChunkHeaderSize + kMaxVideoChunkData, "at most one chunk");
++            t.IsTrue(payloadRange(0x10, lo, hi) && lo == 22u && hi == 22u, "PAD: exact");
++            t.IsFalse(payloadRange(0x24, lo, hi) || payloadRange(0x7E, lo, hi), "reserved and unknown: none");
++            t.IsFalse(isReservedType(0x20) || isReservedType(0x23), "0x20-0x23 are video now");
++            t.IsTrue(isReservedType(0x24) && isReservedType(0x2F) && isReservedType(0x30) && isReservedType(0x3F),
++                     "0x24-0x3F reserved");
+             t.IsFalse(isReservedType(0x40) || isReservedType(0x1F), "outside the reserved range");
++            t.Equals(kProtocolVersion, static_cast<uint16_t>(2), "version 2");
+         });
+ 
+         tc.Run("a frame is header + payload and reads back whole", [](TestCase &t)
+@@ -253,7 +342,7 @@ void register_ps2_netplay_tests()
+             Frame got;
+             t.Equals(readOne(reader, frame, got), FrameReader::Result::Frame, "read");
+             t.Equals(got.type, static_cast<uint8_t>(0x13), "type");
+-            t.Equals(got.size, static_cast<uint8_t>(1), "size");
++            t.Equals(got.size, static_cast<uint16_t>(1), "size");
+             t.Equals(got.payload[0], static_cast<uint8_t>(1), "payload");
+             t.Equals(reader.next(got), FrameReader::Result::NeedMore, "nothing else");
+         });
+@@ -269,8 +358,15 @@ void register_ps2_netplay_tests()
+             const Bad cases[] = {
+                 {header(0x7E, 0, 1), FrameError::UnknownType, "unknown type"},
+                 {header(0x00, 0, 0), FrameError::UnknownType, "type 0"},
+-                {header(0x20, 0, 1000), FrameError::ReservedType, "video (N2) in N1"},
+-                {header(0x30, 0, 8), FrameError::ReservedType, "audio (N3) in N1"},
++                {header(0x24, 0, 1000), FrameError::ReservedType, "a later video type"},
++                {header(0x30, 0, 8), FrameError::ReservedType, "audio (N3) in N2"},
++                {header(0x20, 0, 15), FrameError::BadLength, "VIDEO_CONFIG one byte short"},
++                {header(0x21, 0, static_cast<uint16_t>(kVideoChunkHeaderSize)), FrameError::BadLength,
++                 "VIDEO_CHUNK without picture bytes"},
++                {header(0x21, 0, static_cast<uint16_t>(kVideoChunkHeaderSize + kMaxVideoChunkData + 1)),
++                 FrameError::BadLength, "VIDEO_CHUNK one byte over"},
++                {header(0x21, 0, 0xFFFF), FrameError::BadLength, "VIDEO_CHUNK of 64 KB"},
++                {header(0x22, 0, 5), FrameError::BadLength, "VIDEO_KEY_REQUEST one byte long"},
+                 {header(0x13, 1, 1), FrameError::BadFlags, "flags"},
+                 {header(0x13, 0, 0xFFFF), FrameError::BadLength, "oversized length"},
+                 {header(0x01, 0, 11), FrameError::BadLength, "HELLO one byte short"},
+@@ -455,11 +551,11 @@ void register_ps2_netplay_tests()
+             {
+                 Pipe p;
+                 HostHandshake host("clave", p.hostAuth, counting(0));
+-                uint8_t hello[12] = {'F', '1', '-', '0', '6', 'N', 'P', 0, 2, 0, 0, 0}; // version 2
++                uint8_t hello[12] = {'F', '1', '-', '0', '6', 'N', 'P', 0, 1, 0, 0, 0}; // version 1 (N1)
+                 Frame f;
+                 deliver(p.toHost, encodeFrame(MessageType::Hello, hello, 12, nullptr), f);
+                 std::vector<std::vector<uint8_t>> out;
+-                t.Equals(host.onFrame(f, out), HostHandshake::Result::Rejected, "newer guest");
++                t.Equals(host.onFrame(f, out), HostHandshake::Result::Rejected, "a version 1 guest");
+                 t.Equals(host.rejectReason(), RejectReason::Version, "version reason");
+                 t.IsTrue(deliver(p.toGuest, out.at(0), f), "REJECT");
+                 t.Equals(f.payload[0], static_cast<uint8_t>(RejectReason::Version), "reason byte");
+@@ -468,7 +564,7 @@ void register_ps2_netplay_tests()
+             {
+                 Pipe p;
+                 HostHandshake host("clave", p.hostAuth, counting(0));
+-                uint8_t hello[12] = {'X', '1', '-', '0', '6', 'N', 'P', 0, 1, 0, 0, 0};
++                uint8_t hello[12] = {'X', '1', '-', '0', '6', 'N', 'P', 0, 2, 0, 0, 0};
+                 Frame f;
+                 deliver(p.toHost, encodeFrame(MessageType::Hello, hello, 12, nullptr), f);
+                 std::vector<std::vector<uint8_t>> out;
+@@ -487,11 +583,25 @@ void register_ps2_netplay_tests()
+             }
+         });
+ 
++        tc.Run("handshake: the guest refuses a version 1 host", [](TestCase &t)
++        {
++            Pipe p;
++            GuestHandshake guest("clave", p.guestAuth, counting(100));
++            uint8_t challenge[36] = {1, 0, 0, 0}; // version 1
++            Frame f;
++            deliver(p.toGuest, encodeFrame(MessageType::Challenge, challenge, 36, nullptr), f);
++            std::vector<std::vector<uint8_t>> out;
++            t.Equals(guest.onFrame(f, out), GuestHandshake::Result::Failed, "old host");
++            t.IsTrue(out.empty(), "no AUTH for it");
++            t.IsTrue(guest.reason().find("version 1") != std::string::npos, "says which: " + guest.reason());
++            t.IsFalse(p.guestAuth.active(), "no session");
++        });
++
+         tc.Run("handshake: the guest refuses a host that does not know the password", [](TestCase &t)
+         {
+             Pipe p;
+             GuestHandshake guest("clave", p.guestAuth, counting(100));
+-            uint8_t challenge[36] = {1, 0, 0, 0};
++            uint8_t challenge[36] = {2, 0, 0, 0};
+             Frame f;
+             deliver(p.toGuest, encodeFrame(MessageType::Challenge, challenge, 36, nullptr), f);
+             std::vector<std::vector<uint8_t>> out;
+@@ -535,6 +645,21 @@ void register_ps2_netplay_tests()
+             o = {};
+             t.IsTrue(parseNetplayArguments(args, "x", o, error), "no netplay");
+             t.Equals(o.mode, NetplayMode::Off, "off");
++            t.Equals(o.videoHeight, static_cast<uint16_t>(540), "default picture height");
++            t.Equals(o.videoKbps, 8000u, "default bit rate");
++            t.Equals(o.videoCodec, std::string("auto"), "default encoder");
++
++            args = {"--anfitrion", "--clave", "secreto", "--imagen-alto", "720", "--imagen-kbps", "12000",
++                    "--imagen-codec", "h264_mf"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "picture options: " + error);
++            t.Equals(o.videoHeight, static_cast<uint16_t>(720), "--imagen-alto");
++            t.Equals(o.videoKbps, 12000u, "--imagen-kbps");
++            t.Equals(o.videoCodec, std::string("h264_mf"), "--imagen-codec");
++            args = {"--anfitrion", "--clave", "secreto", "--imagen-codec", "no"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "no picture");
++            t.Equals(o.videoCodec, std::string("no"), "--imagen-codec no");
+ 
+             const std::vector<std::vector<std::string>> bad = {
+                 {"--anfitrion"},                                           // no password
+@@ -548,6 +673,16 @@ void register_ps2_netplay_tests()
+                 {"--anfitrion", "--clave"},                                // missing value
+                 {"--invitado", "1.2.3.4", "--escuchar", "0.0.0.0", "--clave", "abcd"},
+                 {"--anfitrion", "--clave", std::string(300, 'k')},
++                {"--anfitrion", "--clave", "abcd", "--imagen-alto", "143"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-alto", "1081"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-alto", "541"}, // odd
++                {"--anfitrion", "--clave", "abcd", "--imagen-alto", "5x0"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-kbps", "499"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-kbps", "50001"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-codec", "libx264"},
++                {"--anfitrion", "--clave", "abcd", "--imagen-codec"},
++                {"--invitado", "1.2.3.4", "--clave", "abcd", "--imagen-alto", "720"}, // host only
++                {"--imagen-kbps", "8000"},                                             // without netplay
+             };
+             for (const auto &b : bad)
+             {
+@@ -562,6 +697,405 @@ void register_ps2_netplay_tests()
+             }
+         }); });
+ 
++    MiniTest::Case("NetplayVideoProtocol", [](TestCase &tc)
++                   {
++        tc.Run("video config: bytes, limits and refusals", [](TestCase &t)
++        {
++            const VideoConfig c = validConfig(7);
++            const auto bytes = encodeVideoConfig(c);
++            const std::vector<uint8_t> expected = {2, 0, 0x80, 0x02, 0xE0, 0x01, 50, 0, 0x40, 0x1F, 0, 0, 7, 0, 0, 0};
++            t.Equals(std::vector<uint8_t>(bytes.begin(), bytes.end()), expected, "VIDEO_CONFIG payload");
++            VideoConfig back;
++            std::string why;
++            t.IsTrue(decodeVideoConfig(bytes.data(), bytes.size(), back, why), "decodes: " + why);
++            t.IsTrue(back == c, "same config");
++
++            struct Bad
++            {
++                size_t offset;
++                std::vector<uint8_t> bytes;
++                const char *name;
++            };
++            const Bad cases[] = {
++                {0, {0}, "codec 0"},
++                {0, {3}, "unknown codec"},
++                {1, {1}, "reserved byte"},
++                {2, {0x81, 0x02}, "odd width"},
++                {2, {0x3E, 0x00}, "width 62"},
++                {2, {0x82, 0x07}, "width 1922"},
++                {4, {0x3A, 0x04}, "height 1082"},
++                {6, {0, 0}, "0 fps"},
++                {6, {121, 0}, "121 fps"},
++                {8, {99, 0, 0, 0}, "99 kbit/s"},
++                {8, {0xA1, 0x86, 0x01, 0}, "100001 kbit/s"},
++                {12, {0, 0, 0, 0}, "stream 0"},
++            };
++            for (const Bad &bad : cases)
++            {
++                std::vector<uint8_t> broken(bytes.begin(), bytes.end());
++                for (size_t i = 0; i < bad.bytes.size(); ++i)
++                    broken[bad.offset + i] = bad.bytes[i];
++                VideoConfig out;
++                std::string reason;
++                t.IsFalse(decodeVideoConfig(broken.data(), broken.size(), out, reason), bad.name);
++                t.IsFalse(reason.empty(), std::string("reason for ") + bad.name);
++            }
++            VideoConfig out;
++            t.IsFalse(decodeVideoConfig(bytes.data(), bytes.size() - 1, out, why), "short payload");
++        });
++
++        tc.Run("a picture is cut into chunks and put back together", [](TestCase &t)
++        {
++            const VideoPicture picture = pictureOf(1, 40000, true);
++            const auto chunks = chunkVideoPicture(picture, 3);
++            t.Equals(chunks.size(), static_cast<size_t>(3), "three chunks");
++            t.Equals(chunks[0].size(), kVideoChunkHeaderSize + kMaxVideoChunkData, "full chunk");
++            t.Equals(chunks[2].size(), kVideoChunkHeaderSize + (40000 - 2 * kMaxVideoChunkData), "the rest");
++            const std::vector<uint8_t> head(chunks[1].begin(), chunks[1].begin() + kVideoChunkHeaderSize);
++            // stream 3, index 1, count 3, key, picture 1, 40000 bytes, capture 1001, encode 3 ms, latency 0
++            const std::vector<uint8_t> expectedHead = {3, 0, 1, 0, 3, 0, 1, 0, 1, 0, 0, 0, 0x40, 0x9C, 0, 0,
++                                                       0xE9, 0x03, 0, 0, 3, 0, 0, 0};
++            t.Equals(head, expectedHead, "chunk header bytes");
++
++            VideoAssembler assembler;
++            const auto config = encodeVideoConfig(validConfig(3));
++            t.IsTrue(assembler.configure(config.data(), config.size()), "configured: " + assembler.why());
++            VideoPicture out;
++            t.Equals(assembler.add(chunks[0].data(), chunks[0].size(), out), VideoAssembler::Result::NeedMore, "1/3");
++            t.Equals(assembler.add(chunks[1].data(), chunks[1].size(), out), VideoAssembler::Result::NeedMore, "2/3");
++            t.Equals(assembler.add(chunks[2].data(), chunks[2].size(), out), VideoAssembler::Result::Picture, "3/3");
++            t.IsTrue(out.data == picture.data, "same bytes");
++            t.IsTrue(out.key && out.picture == 1u && out.captureMs == 1001u && out.encodeMs == 3u, "same header");
++
++            const auto one = chunkVideoPicture(pictureOf(2, 1), 3);
++            t.Equals(one.size(), static_cast<size_t>(1), "a one-byte picture is one chunk");
++            t.Equals(assembler.add(one[0].data(), one[0].size(), out), VideoAssembler::Result::Picture, "whole");
++            t.IsFalse(out.key, "not a key picture");
++            t.IsFalse(assembler.gapBeforeLast(), "no gap");
++
++            const auto largest = chunkVideoPicture(pictureOf(3, kMaxVideoPictureBytes), 3);
++            t.Equals(largest.size(), static_cast<size_t>(kMaxVideoChunks), "the largest picture: 64 chunks");
++            VideoAssembler::Result r = VideoAssembler::Result::NeedMore;
++            for (const auto &chunk : largest)
++                r = assembler.add(chunk.data(), chunk.size(), out);
++            t.Equals(r, VideoAssembler::Result::Picture, "the largest picture is accepted");
++            t.IsTrue(chunkVideoPicture(pictureOf(4, kMaxVideoPictureBytes + 1), 3).empty(), "one byte more: refused");
++            t.IsTrue(chunkVideoPicture(pictureOf(4, 0), 3).empty(), "an empty picture: refused");
++        });
++
++        tc.Run("reassembly refuses chunks out of order, of another size or another stream", [](TestCase &t)
++        {
++            const auto config = encodeVideoConfig(validConfig(3));
++            const auto chunks = chunkVideoPicture(pictureOf(5, 40000, true), 3);
++            struct Bad
++            {
++                std::vector<std::vector<uint8_t>> sequence;
++                const char *name;
++            };
++            const Bad cases[] = {
++                {{chunks[1]}, "index 1 first"},
++                {{chunks[0], chunks[2]}, "index 2 after 0"},
++                {{chunks[0], chunks[0]}, "index 0 twice (the same picture number)"},
++                {{chunkWith(chunks[0], 0, {4, 0})}, "another stream"},
++                {{chunkWith(chunks[0], 6, {3})}, "unknown flag"},
++                {{chunkWith(chunks[0], 7, {1})}, "reserved byte"},
++                {{chunkWith(chunks[0], 4, {0, 0})}, "count 0"},
++                {{chunkWith(chunks[0], 2, {3, 0})}, "index past the count"},
++                {{chunkWith(chunks[0], 4, {4, 0})}, "count does not match the size"},
++                {{chunkWith(chunks[0], 4, {65, 0})}, "count over 64"},
++                {{chunkWith(chunks[0], 12, {1, 0, 0x10, 0})}, "picture over 1 MB"},
++                {{chunkWith(chunks[0], 12, {0, 0, 0, 0})}, "picture of 0 bytes"},
++                {{chunks[0], chunkWith(chunks[1], 12, {0x41, 0x9C})}, "size changes inside the picture"},
++                {{chunks[0], chunkWith(chunks[1], 6, {0})}, "flags change inside the picture"},
++                {{std::vector<uint8_t>(chunks[0].begin(), chunks[0].end() - 1)}, "a full chunk one byte short"},
++                {{chunks[0], chunks[1], std::vector<uint8_t>(chunks[2].begin(), chunks[2].end() - 1)},
++                 "the last chunk one byte short"},
++                {{std::vector<uint8_t>(chunks[0].begin(), chunks[0].begin() + 10)}, "shorter than the header"},
++            };
++            for (const Bad &bad : cases)
++            {
++                VideoAssembler assembler;
++                assembler.configure(config.data(), config.size());
++                VideoPicture out;
++                VideoAssembler::Result r = VideoAssembler::Result::NeedMore;
++                for (const auto &chunk : bad.sequence)
++                    r = assembler.add(chunk.data(), chunk.size(), out);
++                t.Equals(r, VideoAssembler::Result::Error, bad.name);
++                t.IsFalse(assembler.why().empty(), std::string("reason for ") + bad.name);
++            }
++
++            VideoAssembler unconfigured;
++            VideoPicture out;
++            t.Equals(unconfigured.add(chunks[0].data(), chunks[0].size(), out), VideoAssembler::Result::Error,
++                     "a chunk before any VIDEO_CONFIG");
++
++            VideoAssembler older;
++            older.configure(config.data(), config.size());
++            const auto same = encodeVideoConfig(validConfig(3));
++            t.IsFalse(older.configure(same.data(), same.size()), "a config whose stream does not grow");
++            const auto later = chunkVideoPicture(pictureOf(9, 10), 3);
++            const auto earlier = chunkVideoPicture(pictureOf(8, 10), 3);
++            t.Equals(older.add(later[0].data(), later[0].size(), out), VideoAssembler::Result::Picture, "picture 9");
++            t.Equals(older.add(earlier[0].data(), earlier[0].size(), out), VideoAssembler::Result::Error,
++                     "picture 8 after 9");
++        });
++
++        tc.Run("an unfinished picture is dropped by the next one and gaps are counted", [](TestCase &t)
++        {
++            const auto config = encodeVideoConfig(validConfig(1));
++            VideoAssembler assembler;
++            assembler.configure(config.data(), config.size());
++            VideoPicture out;
++            const auto first = chunkVideoPicture(pictureOf(1, 20000, true), 1);
++            t.Equals(assembler.add(first[0].data(), first[0].size(), out), VideoAssembler::Result::NeedMore, "half");
++            const auto second = chunkVideoPicture(pictureOf(2, 100), 1);
++            t.Equals(assembler.add(second[0].data(), second[0].size(), out), VideoAssembler::Result::Picture,
++                     "the next picture starts and ends");
++            t.Equals(out.picture, 2u, "picture 2");
++            t.Equals(assembler.lostPictures(), static_cast<uint64_t>(1), "picture 1 lost");
++            t.IsTrue(assembler.gapBeforeLast(), "the decoder must wait for a key picture");
++            const auto fifth = chunkVideoPicture(pictureOf(5, 100), 1);
++            assembler.add(fifth[0].data(), fifth[0].size(), out);
++            t.Equals(assembler.lostPictures(), static_cast<uint64_t>(3), "3 and 4 skipped by the host");
++            const auto sixth = chunkVideoPicture(pictureOf(6, 100), 1);
++            assembler.add(sixth[0].data(), sixth[0].size(), out);
++            t.IsFalse(assembler.gapBeforeLast(), "6 follows 5");
++            const auto config2 = encodeVideoConfig(validConfig(2));
++            t.IsTrue(assembler.configure(config2.data(), config2.size()), "a new stream");
++            const auto again = chunkVideoPicture(pictureOf(7, 100, true), 2);
++            t.Equals(assembler.add(again[0].data(), again[0].size(), out), VideoAssembler::Result::Picture,
++                     "chunks of the new stream");
++            t.Equals(assembler.add(sixth[0].data(), sixth[0].size(), out), VideoAssembler::Result::Error,
++                     "chunks of the old stream after the new config");
++        });
++
++        tc.Run("video frames go through the reader signed, and a changed byte is caught", [](TestCase &t)
++        {
++            Digest key{};
++            key[3] = 9;
++            MessageAuth host, guest;
++            host.start(key, true);
++            guest.start(key, false);
++            const auto chunks = chunkVideoPicture(pictureOf(1, 40000, true), 1);
++            const std::vector<uint8_t> frame =
++                encodeFrame(MessageType::VideoChunk, chunks[0].data(), chunks[0].size(), &host);
++            t.Equals(frame.size(), kHeaderSize + chunks[0].size() + kTagSize, "header + chunk + tag");
++            t.IsTrue(encodeFrame(MessageType::VideoChunk, chunks[0].data(), kVideoChunkHeaderSize, &host).empty(),
++                     "a chunk without data is not encoded");
++            FrameReader reader(guest);
++            Frame got;
++            t.IsTrue(reader.feed(frame.data(), frame.size()), "fits the reader");
++            t.Equals(reader.next(got), FrameReader::Result::Frame, "a whole chunk");
++            t.Equals(got.size, static_cast<uint16_t>(chunks[0].size()), "its size");
++            t.Equals(std::memcmp(got.payload.data(), chunks[0].data(), chunks[0].size()), 0, "its bytes");
++
++            const std::vector<uint8_t> second =
++                encodeFrame(MessageType::VideoChunk, chunks[1].data(), chunks[1].size(), &host);
++            std::vector<uint8_t> tampered = second;
++            tampered[kHeaderSize + kVideoChunkHeaderSize + 5000] ^= 0x20u;
++            t.IsTrue(reader.feed(tampered.data(), tampered.size()), "fed");
++            t.Equals(reader.next(got), FrameReader::Result::Error, "changed picture byte");
++            t.Equals(reader.error(), FrameError::BadTag, "caught by the tag");
++
++            MessageAuth guest2;
++            guest2.start(key, false);
++            FrameReader two(guest2);
++            const std::vector<uint8_t> a =
++                encodeFrame(MessageType::VideoChunk, chunks[0].data(), chunks[0].size(), nullptr);
++            std::vector<uint8_t> both = frame;
++            both.insert(both.end(), second.begin(), second.end());
++            t.IsTrue(two.feed(both.data(), both.size()), "two whole chunks fit the reader at once");
++            t.Equals(two.next(got), FrameReader::Result::Frame, "first");
++            t.Equals(two.next(got), FrameReader::Result::Frame, "second");
++            (void)a;
++        });
++
++        tc.Run("the send queue puts control frames before video and drops waiting pictures", [](TestCase &t)
++        {
++            SendQueue q;
++            const VideoPicture first = pictureOf(1, 40000, true);
++            q.pushVideoConfig(validConfig(1));
++            q.pushPicture(chunkVideoPicture(first, 1), 1);
++            const uint8_t ping[8] = {1};
++            q.pushControl(MessageType::Ping, ping, 8);
++            SendQueue::Message m;
++            t.IsTrue(q.next(m) && m.type == MessageType::Ping, "the PING queued after the video goes first");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoConfig, "then the config");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoChunk, "then chunk 0");
++            t.IsTrue(q.pictureInProgress(), "picture 1 started");
++            const uint8_t pong[8] = {2};
++            q.pushControl(MessageType::Pong, pong, 8);
++            const uint8_t bye[1] = {1};
++            q.pushControl(MessageType::Bye, bye, 1);
++            t.IsTrue(q.next(m) && m.type == MessageType::Pong, "a PONG goes between two chunks");
++            t.IsTrue(q.next(m) && m.type == MessageType::Bye, "control frames keep their order");
++            q.pushPicture(chunkVideoPicture(pictureOf(2, 100), 1), 2);
++            q.pushPicture(chunkVideoPicture(pictureOf(3, 100), 1), 3);
++            t.Equals(q.waitingPictures(), static_cast<size_t>(2), "two waiting");
++            t.Equals(q.dropWaitingPictures(), static_cast<size_t>(2), "stale pictures dropped");
++            q.pushVideoConfig(validConfig(2));
++            q.pushPicture(chunkVideoPicture(pictureOf(4, 100, true), 2), 4);
++            t.Equals(q.dropWaitingPictures(), static_cast<size_t>(1), "configs are never dropped");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoChunk, "picture 1 goes on: chunk 1");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoChunk, "chunk 2");
++            t.IsFalse(q.pictureInProgress(), "picture 1 done");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoConfig, "the second config");
++            t.IsFalse(q.next(m), "nothing else");
++            t.IsTrue(q.empty(), "empty");
++        });
++
++        tc.Run("picture size: the host's aspect, never above the source, even", [](TestCase &t)
++        {
++            uint16_t w = 0, h = 0;
++            videoOutputSize(1024, 16.0f / 9.0f, 540, w, h);
++            t.IsTrue(w == 960 && h == 540, "16:9 at 540: " + std::to_string(w) + "x" + std::to_string(h));
++            videoOutputSize(1024, 4.0f / 3.0f, 540, w, h);
++            t.IsTrue(w == 720 && h == 540, "4:3 at 540");
++            videoOutputSize(512, 4.0f / 3.0f, 540, w, h);
++            t.IsTrue(w == 682 && h == 512, "a 512-line source stays 512: " + std::to_string(w));
++            videoOutputSize(448, 1.25f, 1080, w, h);
++            t.IsTrue(w == 560 && h == 448, "pixel aspect");
++            videoOutputSize(2048, 32.0f / 9.0f, 1080, w, h);
++            t.IsTrue(w <= kMaxVideoWidth && h <= kMaxVideoHeight && w % 2 == 0 && h % 2 == 0, "very wide: capped");
++            videoOutputSize(0, 4.0f / 3.0f, 540, w, h);
++            t.IsTrue(w >= kMinVideoSide && h >= kMinVideoSide, "never below the minimum");
++            t.Equals(videoEncoderCandidates("auto"),
++                     std::vector<std::string>{"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "mjpeg"}, "auto order");
++            t.Equals(videoEncoderCandidates("mjpeg"), std::vector<std::string>{"mjpeg"}, "one encoder");
++            t.IsTrue(isVideoEncoderName("h264_mf") && !isVideoEncoderName("libx264") && !isVideoEncoderName("no"),
++                     "encoder names");
++        }); });
++
++    MiniTest::Case("NetplayVideoCodec", [](TestCase &tc)
++                   {
++        tc.Run("a synthetic picture: MJPEG encode, chunks, signed frames, reassembly, decode", [](TestCase &t)
++        {
++            t.IsTrue(videoAvailable(), "this build carries FFmpeg");
++            VideoEncoderSettings settings;
++            settings.width = 320;
++            settings.height = 240;
++            settings.kbps = 20000;
++            settings.preference = "mjpeg";
++            VideoEncoder encoder;
++            std::string error;
++            std::vector<std::string> tried;
++            t.IsTrue(encoder.open(settings, error, &tried), "MJPEG opens: " + error);
++            t.Equals(encoder.encoderName(), std::string("mjpeg"), "encoder");
++            t.Equals(encoder.codec(), VideoCodec::Mjpeg, "codec");
++
++            const std::vector<uint8_t> source = syntheticPicture(640, 480, 1); // scaled down to 320x240
++            std::vector<VideoEncoder::Packet> packets;
++            t.IsTrue(encoder.encode(source.data(), 640, 480, 640 * 4, true, packets, error), "encodes: " + error);
++            t.Equals(packets.size(), static_cast<size_t>(1), "one packet, no delay");
++            if (packets.empty())
++                return;
++            t.IsTrue(packets[0].key, "MJPEG pictures are all key pictures");
++
++            VideoConfig config;
++            config.codec = static_cast<uint8_t>(encoder.codec());
++            config.width = 320;
++            config.height = 240;
++            config.fps = 50;
++            config.kbps = 20000;
++            config.stream = 1;
++            VideoPicture picture;
++            picture.picture = 1;
++            picture.key = packets[0].key;
++            picture.data = packets[0].data;
++
++            Digest key{};
++            key[0] = 1;
++            MessageAuth host, guest;
++            host.start(key, true);
++            guest.start(key, false);
++            SendQueue queue;
++            queue.pushVideoConfig(config);
++            queue.pushPicture(chunkVideoPicture(picture, config.stream), 1);
++            std::vector<uint8_t> wire;
++            SendQueue::Message m;
++            while (queue.next(m))
++            {
++                const auto frame = encodeFrame(m.type, m.payload.data(), m.payload.size(), &host);
++                wire.insert(wire.end(), frame.begin(), frame.end());
++            }
++            FrameReader reader(guest);
++            VideoAssembler assembler;
++            VideoPicture whole;
++            bool gotPicture = false;
++            for (size_t at = 0; at < wire.size();)
++            {
++                const size_t n = std::min<size_t>(1500, wire.size() - at); // a few TCP segments at a time
++                t.IsTrue(reader.feed(wire.data() + at, n), "fed");
++                at += n;
++                Frame f;
++                while (reader.next(f) == FrameReader::Result::Frame)
++                {
++                    if (f.type == static_cast<uint8_t>(MessageType::VideoConfig))
++                        t.IsTrue(assembler.configure(f.payload.data(), f.size), "config: " + assembler.why());
++                    else if (assembler.add(f.payload.data(), f.size, whole) == VideoAssembler::Result::Picture)
++                        gotPicture = true;
++                }
++            }
++            t.IsTrue(gotPicture, "the picture arrived whole");
++            t.IsTrue(whole.data == picture.data, "the bytes the encoder gave");
++
++            VideoDecoder decoder;
++            t.IsTrue(decoder.open(assembler.config(), error), "decoder opens: " + error);
++            std::vector<uint8_t> rgba;
++            bool got = false;
++            t.IsTrue(decoder.decode(whole.data.data(), whole.data.size(), rgba, got, error), "decodes: " + error);
++            t.IsTrue(got, "a picture out");
++            t.Equals(rgba.size(), static_cast<size_t>(320 * 240 * 4), "320x240 RGBA");
++            const double diff = meanDifference(rgba, scaledNearest(source, 640, 480, 320, 240));
++            t.IsTrue(diff < 12.0, "close to the source: mean difference " + std::to_string(diff));
++        });
++
++        tc.Run("the decoder refuses garbage and pictures of another size", [](TestCase &t)
++        {
++            VideoConfig config = validConfig(1);
++            config.width = 320;
++            config.height = 240;
++            VideoDecoder decoder;
++            std::string error;
++            t.IsTrue(decoder.open(config, error), "opens: " + error);
++            std::vector<uint8_t> garbage(5000);
++            for (size_t i = 0; i < garbage.size(); ++i)
++                garbage[i] = static_cast<uint8_t>((i * 2654435761u) >> 13);
++            std::vector<uint8_t> rgba;
++            bool got = true;
++            const bool ok = decoder.decode(garbage.data(), garbage.size(), rgba, got, error);
++            t.IsTrue(!ok || !got, "random bytes give no picture");
++
++            VideoEncoderSettings settings;
++            settings.width = 640;
++            settings.height = 480;
++            settings.preference = "mjpeg";
++            VideoEncoder encoder;
++            t.IsTrue(encoder.open(settings, error), "encoder: " + error);
++            const std::vector<uint8_t> source = syntheticPicture(640, 480, 2);
++            std::vector<VideoEncoder::Packet> packets;
++            encoder.encode(source.data(), 640, 480, 640 * 4, true, packets, error);
++            t.IsFalse(packets.empty(), "a 640x480 picture");
++            if (packets.empty())
++                return;
++            got = false;
++            t.IsFalse(decoder.decode(packets[0].data.data(), packets[0].data.size(), rgba, got, error),
++                      "640x480 refused by a 320x240 stream");
++            t.IsFalse(error.empty(), "with a reason");
++
++            VideoConfig big = validConfig(1);
++            big.width = 1922;
++            VideoDecoder bigger;
++            t.IsFalse(bigger.open(big, error), "a config over 1920x1080 does not open");
++
++            VideoEncoderSettings missing;
++            missing.preference = "h264_qsv_no_existe";
++            VideoEncoder none;
++            std::vector<std::string> tried;
++            t.IsFalse(none.open(missing, error, &tried), "an unknown encoder does not open");
++            t.IsFalse(error.empty(), "with a reason");
++        }); });
++
+     MiniTest::Case("NetplayLoopback", [](TestCase &tc)
+                    {
+         tc.Run("a guest's press reaches port 2 and its disconnect empties port 2", [](TestCase &t)
+@@ -633,5 +1167,86 @@ void register_ps2_netplay_tests()
+             good.stop();
+             host.stop();
+             t.IsFalse(remotePadActive(), "nothing left after stop");
++        });
++
++        tc.Run("the host's picture reaches the guest while the pad keeps working", [](TestCase &t)
++        {
++            isolatePads();
++            t.IsFalse(hostPictureWanted(), "nobody wants a picture without a guest");
++            Host host;
++            HostSettings settings{"127.0.0.1", 0, "clave-de-prueba"};
++            settings.video.codec = "mjpeg";
++            settings.video.height = 540;
++            settings.video.kbps = 20000;
++            std::string error;
++            t.IsTrue(host.start(settings, error), "host listens: " + error);
++            setHostPictureAspect(4.0f / 3.0f);
++            Guest guest;
++            guest.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++            t.IsTrue(waitFor([&] { return guest.status().state == GuestState::Connected; }), "guest connected");
++            t.IsTrue(waitFor([&] { return hostPictureWanted(); }), "the host wants pictures now");
++
++            const std::vector<uint8_t> source = syntheticPicture(640, 512, 3);
++            std::vector<uint8_t> rgba;
++            uint16_t w = 0, h = 0;
++            guest.setPad(crossPressed());
++            const bool arrived = waitFor(
++                [&]
++                {
++                    offerHostPicture(source.data(), 640, 512, 640 * 4);
++                    return guest.takePicture(rgba, w, h);
++                },
++                6000);
++            t.IsTrue(arrived, "a picture reached the guest");
++            t.IsTrue(w == 682 && h == 512, "4:3, no taller than the source: " + std::to_string(w) + "x" +
++                                               std::to_string(h));
++            if (arrived && w == 682 && h == 512)
++            {
++                const double diff = meanDifference(rgba, scaledNearest(source, 640, 512, 682, 512));
++                t.IsTrue(diff < 16.0, "the picture sent: mean difference " + std::to_string(diff));
++            }
++            for (int i = 0; i < 20; ++i)
++            {
++                offerHostPicture(source.data(), 640, 512, 640 * 4);
++                std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            }
++            t.IsTrue(waitFor([&] { return guest.status().pictures >= 5u; }), "more pictures decoded");
++            const GuestStatus status = guest.status();
++            t.Equals(status.codec, std::string("mjpeg"), "codec on the guest");
++            t.IsTrue(status.width == 682 && status.height == 512, "size on the guest");
++            const HostVideoStats stats = host.videoStats();
++            t.Equals(stats.encoder, std::string("mjpeg"), "encoder on the host");
++            t.IsTrue(stats.pictures >= 5u && stats.bytes > 0u, "pictures and bytes counted");
++            uint8_t report[32] = {};
++            PSPadBackend backend;
++            t.IsTrue(waitFor([&]
++                             {
++                                 backend.readState(1, 0, report, sizeof(report));
++                                 return report[3] == 0xBF;
++                             }),
++                     "the guest's pad still reaches port 2");
++            guest.stop();
++            t.IsTrue(waitFor([&] { return !host.guestConnected(); }), "guest gone");
++            t.IsTrue(waitFor([&] { return !hostPictureWanted(); }), "no picture wanted after the guest left");
++            host.stop();
++        });
++
++        tc.Run("a host without picture (--imagen-codec no) still serves the pad", [](TestCase &t)
++        {
++            isolatePads();
++            Host host;
++            HostSettings settings{"127.0.0.1", 0, "clave-de-prueba"};
++            settings.video.codec = "no";
++            std::string error;
++            t.IsTrue(host.start(settings, error), "host listens: " + error);
++            Guest guest;
++            guest.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++            t.IsTrue(waitFor([&] { return guest.status().state == GuestState::Connected; }), "guest connected");
++            t.IsTrue(waitFor([&] { return remotePadActive(); }), "remote pad");
++            t.IsFalse(hostPictureWanted(), "no picture wanted");
++            std::this_thread::sleep_for(std::chrono::milliseconds(200));
++            t.Equals(guest.status().pictures, static_cast<uint64_t>(0), "no pictures");
++            guest.stop();
++            host.stop();
+         }); });
+ }

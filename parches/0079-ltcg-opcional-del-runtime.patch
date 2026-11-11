@@ -1,0 +1,28 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 862f2c5..47bb544 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -402,6 +402,13 @@ if(MSVC)
+     # out-of-class helpers. Builds that pass /Ob1 globally (to keep the translated functions quick to compile) never
+     # inline them, so the runtime library asks for normal inlining. /Z7 keeps symbols and line numbers for profiling.
+     target_compile_options(ps2_runtime PRIVATE /Ob2 /Z7)
++    # Patch 0079: whole-program optimization of the runtime library alone (the translated functions keep their quick
++    # build; LTCG only regenerates the code of the /GL objects at the link).
++    option(PS2X_LTCG_RUNTIME "Build the runtime library with /GL and link the runner with /LTCG" OFF)
++    if(PS2X_LTCG_RUNTIME)
++        target_compile_options(ps2_runtime PRIVATE /GL)
++        set_target_properties(ps2_runtime PROPERTIES STATIC_LIBRARY_OPTIONS "/LTCG")
++    endif()
+ endif()
+ 
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+@@ -507,6 +514,9 @@ endif()
+ 
+ if(MSVC)
+     target_compile_options(ps2EntryRunner PRIVATE /FS)
++    if(PS2X_LTCG_RUNTIME)
++        target_link_options(ps2EntryRunner PRIVATE /LTCG)
++    endif()
+ endif()
+ 
+ target_include_directories(ps2_runtime PUBLIC

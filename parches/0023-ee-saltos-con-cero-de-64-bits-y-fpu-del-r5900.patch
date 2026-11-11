@@ -1,0 +1,95 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..db311d5 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -404,12 +404,15 @@ namespace ps2recomp
+         case OPCODE_BNE:
+         case OPCODE_BNEL:
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
++        // BLEZ/BGTZ/BLTZ/BGEZ (and their likely/AL forms) test the whole 64-bit register on the R5900. They
++        // used to test only the low 32 bits: F1 06 classifies its visibility boxes with bgtz/blez on qmfc2
++        // values (x in the low word, the tested y in the high word) and culled visible objects.
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -417,12 +420,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 944cee7..11b5ea1 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -53,12 +53,22 @@ namespace ps2recomp
+             case COP1_S_MUL:
+                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_DIV:
+-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+-                                   ft, fd, fs, fd, fs, ft);
++                // PS2 semantics (as PCSX2 DIV_S/checkDivideByZero): a zero or denormal divisor gives +-MAX with the XOR
++                // of the signs; a denormal dividend counts as zero and an overflow saturates to +-MAX. No infinity.
++                return fmt::format("{{ uint32_t fs_bits, ft_bits, r; std::memcpy(&fs_bits, &ctx->f[{0}], 4); std::memcpy(&ft_bits, &ctx->f[{1}], 4); "
++                                   "if ((ft_bits & 0x7F800000u) == 0u) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ r = ((fs_bits ^ ft_bits) & 0x80000000u) | 0x7F7FFFFFu; }} "
++                                   "else if ((fs_bits & 0x7F800000u) == 0u) r = (fs_bits ^ ft_bits) & 0x80000000u; "
++                                   "else {{ const float q = ctx->f[{0}] / ctx->f[{1}]; std::memcpy(&r, &q, 4); "
++                                   "if ((r & 0x7F800000u) == 0x7F800000u) r = (r & 0x80000000u) | 0x7F7FFFFFu; }} "
++                                   "std::memcpy(&ctx->f[{2}], &r, 4); }}",
++                                   fs, ft, fd);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // R5900 SQRT.S fd, ft takes its operand from ft (not fs); a negative operand uses |ft| and a zero or
++                // denormal one keeps only its sign (as PCSX2 SQRT_S).
++                return fmt::format("{{ uint32_t ft_bits; std::memcpy(&ft_bits, &ctx->f[{0}], 4); "
++                                   "if ((ft_bits & 0x7F800000u) == 0u) {{ const uint32_t r = ft_bits & 0x80000000u; std::memcpy(&ctx->f[{1}], &r, 4); }} "
++                                   "else ctx->f[{1}] = sqrtf(fabsf(ctx->f[{0}])); }}",
++                                   ft, fd);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -74,9 +84,23 @@ namespace ps2recomp
+             case COP1_S_FLOOR_W:
+                 return fmt::format("{{ int32_t tmp = FPU_FLOOR_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_CVT_W:
+-                return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
++                // The R5900 FPU always rounds toward zero (FPU_CVT_W_S rounded to nearest: 2.7 gave 3) and saturates
++                // when the exponent reaches 2^31 (as PCSX2 CVT_W).
++                return fmt::format("{{ uint32_t bits; std::memcpy(&bits, &ctx->f[{0}], 4); int32_t tmp; "
++                                   "if ((bits & 0x7F800000u) <= 0x4E800000u) tmp = static_cast<int32_t>(ctx->f[{0}]); "
++                                   "else tmp = (bits & 0x80000000u) ? INT32_MIN : INT32_MAX; "
++                                   "std::memcpy(&ctx->f[{1}], &tmp, sizeof(tmp)); }}",
++                                   fs, fd);
+             case COP1_S_RSQRT:
+-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
++                // R5900 RSQRT.S fd, fs, ft = fs / sqrt(ft) (it used to compute 1/sqrt(fs)); a zero or denormal ft gives
++                // +-MAX with the XOR of the signs and a negative ft uses |ft| (as PCSX2 RSQRT_S).
++                return fmt::format("{{ uint32_t fs_bits, ft_bits, r; std::memcpy(&fs_bits, &ctx->f[{0}], 4); std::memcpy(&ft_bits, &ctx->f[{1}], 4); "
++                                   "if ((ft_bits & 0x7F800000u) == 0u) r = ((fs_bits ^ ft_bits) & 0x80000000u) | 0x7F7FFFFFu; "
++                                   "else if ((fs_bits & 0x7F800000u) == 0u) r = fs_bits & 0x80000000u; "
++                                   "else {{ const float q = ctx->f[{0}] / sqrtf(fabsf(ctx->f[{1}])); std::memcpy(&r, &q, 4); "
++                                   "if ((r & 0x7F800000u) == 0x7F800000u) r = (r & 0x80000000u) | 0x7F7FFFFFu; }} "
++                                   "std::memcpy(&ctx->f[{2}], &r, 4); }}",
++                                   fs, ft, fd);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:

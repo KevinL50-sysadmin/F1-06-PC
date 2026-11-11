@@ -1,0 +1,63 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 4d0ff7c..e1bb281 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -15,12 +15,20 @@
+ 
+ namespace
+ {
+-    inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
++    // See advanceEeTimers (patch 0051).
++    uint32_t *s_gifStatWord = nullptr;
++    const void *s_gifStatMap = nullptr;
++
++    // The throw out of line (patch 0051), so that inRange is inlined: it was a call of its own on every access.
++    [[noreturn]] __declspec(noinline) void throwOutOfRange(const char *op, uint32_t address)
++    {
++        throw std::runtime_error(std::string(op) + " out-of-bounds at address: 0x" + std::to_string(address));
++    }
++
++    __forceinline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+     {
+         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
+-        {
+-            throw std::runtime_error(std::string(op) + " out-of-bounds at address: 0x" + std::to_string(address));
+-        }
++            throwOutOfRange(op, address);
+     }
+ 
+     template <typename T>
+@@ -380,6 +388,7 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        s_gifStatWord = nullptr;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -443,9 +452,22 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ 
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    // GIF_STAT's entry looked up once (patch 0051; the hash lookup on every checkpoint was ~0.5 % of the EE thread):
++    // a reference into an unordered_map stays valid until its entry is erased, and the map is only cleared in
++    // initialize, which forgets it.
++    if (s_gifStatMap != &m_ioRegisters)
++        s_gifStatWord = nullptr;
++    if (s_gifStatWord == nullptr)
++    {
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
++        {
++            s_gifStatWord = &gifStatIt->second;
++            s_gifStatMap = &m_ioRegisters;
++        }
++    }
++    if (s_gifStatWord != nullptr)
++        *s_gifStatWord &= ~kGifFqcMask;
+ 
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)

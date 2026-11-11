@@ -1,0 +1,319 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+index e46c5b9..6ac517b 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -7,15 +7,24 @@
+ #include <windows.h>
+ #include <dinput.h>
+ #include <xinput.h>
++#include <setupapi.h>
++#include <hidsdi.h>
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <cstring>
++#include <vector>
+ #include <cctype>
+ #include <cstdio>
++#include <condition_variable>
+ #include <mutex>
++#include <thread>
+ 
+ #pragma comment(lib, "dinput8.lib")
+ #pragma comment(lib, "dxguid.lib")
++#pragma comment(lib, "hid.lib")
++#pragma comment(lib, "setupapi.lib")
+ 
+ namespace
+ {
+@@ -23,6 +32,12 @@ namespace
+     IDirectInputDevice8W *g_wheel = nullptr;
+     std::string g_wheelName;
+     std::atomic<bool> g_rumbleEnabled{true};
++    // Fuerza de respuesta del volante (parche 0107): el juego solo mueve los motores del DualShock 2, asi que en un
++    // volante con fuerza de respuesta se reproducen como una vibracion (efecto senoidal de DirectInput) cuya fuerza
++    // sigue al motor grande (y a la mitad del pequeno). Se aplica desde el hilo que lee el volante (readWheel).
++    IDirectInputEffect *g_wheelEffect = nullptr;
++    std::atomic<int> g_wheelRumble{0}; // 0..10000 (DI_FFNOMINALMAX)
++    int g_wheelRumbleApplied = -1;
+ 
+     std::string narrow(const wchar_t *text)
+     {
+@@ -99,6 +114,174 @@ namespace
+         return std::clamp(static_cast<float>(value) / 32767.0f, -1.0f, 1.0f);
+     }
+ 
++    // Vibracion del DualSense por HID (parche 0107): el DualSense no tiene XInput. Un hilo propio manda los motores
++    // solo cuando cambian (WriteFile puede tardar ~1 ms y la llamada viene del hilo del EE). USB: informe 0x02 de 48
++    // bytes; Bluetooth: informe 0x31 de 78 bytes con CRC32 (semilla 0xA2), como SDL (hidapi_ps5). Bits de efectos:
++    // 0x01 vibracion compatible, 0x02 sin hapticos de audio; motor derecho = agudo (pequeno), izquierdo = grave.
++    class DualSenseRumble
++    {
++    public:
++        void set(uint8_t agudo, uint8_t grave)
++        {
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                if (!m_started)
++                {
++                    m_started = true;
++                    std::thread([this] { loop(); }).detach();
++                }
++                m_small = agudo;
++                m_large = grave;
++                m_pending = true;
++            }
++            m_cv.notify_one();
++        }
++
++    private:
++        static uint32_t crc32(uint32_t crc, const uint8_t *data, size_t size)
++        {
++            crc = ~crc;
++            for (size_t i = 0; i < size; ++i)
++            {
++                crc ^= data[i];
++                for (int k = 0; k < 8; ++k)
++                    crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++            }
++            return ~crc;
++        }
++
++        bool open()
++        {
++            GUID hidGuid;
++            HidD_GetHidGuid(&hidGuid);
++            HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++            if (set == INVALID_HANDLE_VALUE)
++                return false;
++            SP_DEVICE_INTERFACE_DATA iface{};
++            iface.cbSize = sizeof(iface);
++            for (DWORD index = 0;
++                 m_handle == INVALID_HANDLE_VALUE && SetupDiEnumDeviceInterfaces(set, nullptr, &hidGuid, index, &iface);
++                 ++index)
++            {
++                DWORD size = 0;
++                SetupDiGetDeviceInterfaceDetailW(set, &iface, nullptr, 0, &size, nullptr);
++                if (size == 0u)
++                    continue;
++                std::vector<uint8_t> buffer(size);
++                auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
++                detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
++                if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, size, nullptr, nullptr))
++                    continue;
++                HANDLE handle = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
++                                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
++                if (handle == INVALID_HANDLE_VALUE)
++                    continue;
++                HIDD_ATTRIBUTES attributes{};
++                attributes.Size = sizeof(attributes);
++                PHIDP_PREPARSED_DATA preparsed = nullptr;
++                HIDP_CAPS caps{};
++                const bool dualSense = HidD_GetAttributes(handle, &attributes) && attributes.VendorID == 0x054C &&
++                                       (attributes.ProductID == 0x0CE6 || attributes.ProductID == 0x0DF2);
++                if (dualSense && HidD_GetPreparsedData(handle, &preparsed))
++                {
++                    HidP_GetCaps(preparsed, &caps);
++                    HidD_FreePreparsedData(preparsed);
++                }
++                if (dualSense && caps.OutputReportByteLength >= 48u)
++                {
++                    m_handle = handle;
++                    m_bluetooth = caps.OutputReportByteLength != 48u;
++                    std::fprintf(stderr, "[pad] DualSense por %s (HID %04x:%04x): vibracion por HID\n",
++                                 m_bluetooth ? "Bluetooth" : "USB", attributes.VendorID, attributes.ProductID);
++                }
++                else
++                    CloseHandle(handle);
++            }
++            SetupDiDestroyDeviceInfoList(set);
++            return m_handle != INVALID_HANDLE_VALUE;
++        }
++
++        bool send(uint8_t agudo, uint8_t grave)
++        {
++            uint8_t report[78] = {};
++            DWORD length = 48u;
++            uint8_t *effects = report + 1;
++            if (m_bluetooth)
++            {
++                report[0] = 0x31;
++                report[1] = 0x02;
++                effects = report + 2;
++                length = 78u;
++            }
++            else
++                report[0] = 0x02;
++            effects[0] = 0x01 | 0x02;
++            effects[2] = agudo;
++            effects[3] = grave;
++            if (m_bluetooth)
++            {
++                const uint8_t seed = 0xA2;
++                const uint32_t crc = crc32(crc32(0u, &seed, 1u), report, 74u);
++                std::memcpy(report + 74, &crc, sizeof(crc));
++            }
++            DWORD written = 0;
++            return WriteFile(m_handle, report, length, &written, nullptr) != FALSE;
++        }
++
++        void loop()
++        {
++            auto lastTry = std::chrono::steady_clock::now() - std::chrono::seconds(10);
++            for (;;)
++            {
++                uint8_t agudo = 0, grave = 0;
++                {
++                    std::unique_lock<std::mutex> lock(m_mutex);
++                    m_cv.wait(lock, [this] { return m_pending; });
++                    m_pending = false;
++                    agudo = m_small;
++                    grave = m_large;
++                }
++                if (m_handle == INVALID_HANDLE_VALUE)
++                {
++                    // Se busca como mucho cada 5 s (se puede conectar con el juego en marcha).
++                    const auto now = std::chrono::steady_clock::now();
++                    if (now - lastTry < std::chrono::seconds(5))
++                        continue;
++                    lastTry = now;
++                    if (!open())
++                        continue;
++                    m_sentAgudo = m_sentGrave = 0xFFFFu;
++                }
++                if (agudo == m_sentAgudo && grave == m_sentGrave)
++                    continue;
++                if (send(agudo, grave))
++                {
++                    m_sentAgudo = agudo;
++                    m_sentGrave = grave;
++                }
++                else
++                {
++                    CloseHandle(m_handle); // desconectado
++                    m_handle = INVALID_HANDLE_VALUE;
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(8)); // como mucho ~125 envios por segundo
++            }
++        }
++
++        std::mutex m_mutex;
++        std::condition_variable m_cv;
++        bool m_started = false, m_pending = false, m_bluetooth = false;
++        uint8_t m_small = 0, m_large = 0;
++        uint32_t m_sentAgudo = 0xFFFFu, m_sentGrave = 0xFFFFu;
++        HANDLE m_handle = INVALID_HANDLE_VALUE;
++    };
++
++    DualSenseRumble &dualSense()
++    {
++        static DualSenseRumble *s_instance = new DualSenseRumble(); // nunca se destruye: su hilo vive hasta el final
++        return *s_instance;
++    }
++
+     using XInputSetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
+     XInputSetStateFn loadXInputSetState()
+     {
+@@ -157,8 +340,19 @@ namespace ps2_pad_win
+             return false;
+         HWND window = nullptr;
+         EnumWindows(findWindow, reinterpret_cast<LPARAM>(&window));
+-        if (FAILED(device->SetDataFormat(&c_dfDIJoystick2)) ||
+-            (window && FAILED(device->SetCooperativeLevel(window, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))))
++        DIDEVCAPS caps{};
++        caps.dwSize = sizeof(caps);
++        const bool forceFeedback = SUCCEEDED(device->GetCapabilities(&caps)) && (caps.dwFlags & DIDC_FORCEFEEDBACK) != 0u;
++        if (FAILED(device->SetDataFormat(&c_dfDIJoystick2)))
++        {
++            device->Release();
++            return false;
++        }
++        // La fuerza de respuesta necesita el modo exclusivo (en segundo plano, para que funcione sin foco).
++        bool exclusive = false;
++        if (window && forceFeedback)
++            exclusive = SUCCEEDED(device->SetCooperativeLevel(window, DISCL_BACKGROUND | DISCL_EXCLUSIVE));
++        if (window && !exclusive && FAILED(device->SetCooperativeLevel(window, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE)))
+         {
+             device->Release();
+             return false;
+@@ -177,6 +371,29 @@ namespace ps2_pad_win
+         deadzone.dwData = 0;
+         device->SetProperty(DIPROP_DEADZONE, &deadzone.diph);
+         device->Acquire();
++        if (exclusive)
++        {
++            DWORD axes[1] = {DIJOFS_X};
++            LONG directions[1] = {0};
++            DIPERIODIC periodic{};
++            periodic.dwMagnitude = 0;
++            periodic.dwPeriod = 40000; // 25 Hz
++            DIEFFECT effect{};
++            effect.dwSize = sizeof(effect);
++            effect.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTOFFSETS;
++            effect.dwDuration = INFINITE;
++            effect.dwGain = DI_FFNOMINALMAX;
++            effect.dwTriggerButton = DIEB_NOTRIGGER;
++            effect.cAxes = 1;
++            effect.rgdwAxes = axes;
++            effect.rglDirection = directions;
++            effect.cbTypeSpecificParams = sizeof(periodic);
++            effect.lpvTypeSpecificParams = &periodic;
++            if (FAILED(device->CreateEffect(GUID_Sine, &effect, &g_wheelEffect, nullptr)))
++                g_wheelEffect = nullptr;
++        }
++        std::fprintf(stderr, "[pad] volante: fuerza de respuesta %s\n",
++                     g_wheelEffect ? "si (vibracion)" : forceFeedback ? "no (no se pudo crear el efecto)" : "no (no la tiene)");
+         g_wheel = device;
+         g_wheelName = chosen->name;
+         return true;
+@@ -187,6 +404,23 @@ namespace ps2_pad_win
+         out = JoystickState{};
+         if (!g_wheel)
+             return false;
++        if (g_wheelEffect)
++        {
++            const int rumble = g_rumbleEnabled.load(std::memory_order_relaxed) ? g_wheelRumble.load(std::memory_order_relaxed) : 0;
++            if (rumble != g_wheelRumbleApplied)
++            {
++                DIPERIODIC periodic{};
++                periodic.dwMagnitude = static_cast<DWORD>(rumble);
++                periodic.dwPeriod = 40000;
++                DIEFFECT effect{};
++                effect.dwSize = sizeof(effect);
++                effect.cbTypeSpecificParams = sizeof(periodic);
++                effect.lpvTypeSpecificParams = &periodic;
++                const DWORD flags = DIEP_TYPESPECIFICPARAMS | (g_wheelRumbleApplied <= 0 && rumble > 0 ? DIEP_START : 0u);
++                if (SUCCEEDED(g_wheelEffect->SetParameters(&effect, flags)))
++                    g_wheelRumbleApplied = rumble;
++            }
++        }
+         DIJOYSTATE2 js{};
+         HRESULT hr = g_wheel->Poll();
+         hr = g_wheel->GetDeviceState(sizeof(js), &js);
+@@ -221,11 +455,14 @@ namespace ps2_pad_win
+     {
+         g_rumbleEnabled.store(enabled, std::memory_order_relaxed);
+         if (!enabled)
++        {
+             if (XInputSetStateFn fn = loadXInputSetState())
+             {
+                 XINPUT_VIBRATION off{};
+                 fn(0, &off);
+             }
++            dualSense().set(0, 0);
++        }
+     }
+ 
+     void setRumble(float smallMotor, float largeMotor)
+@@ -239,6 +476,10 @@ namespace ps2_pad_win
+             v.wLeftMotorSpeed = static_cast<WORD>(std::clamp(largeMotor, 0.0f, 1.0f) * 65535.0f);
+             fn(0, &v);
+         }
++        g_wheelRumble.store(static_cast<int>(std::clamp(std::max(largeMotor, smallMotor * 0.5f), 0.0f, 1.0f) * 10000.0f),
++                            std::memory_order_relaxed);
++        dualSense().set(static_cast<uint8_t>(std::clamp(smallMotor, 0.0f, 1.0f) * 255.0f),
++                        static_cast<uint8_t>(std::clamp(largeMotor, 0.0f, 1.0f) * 255.0f));
+     }
+ }
+ 

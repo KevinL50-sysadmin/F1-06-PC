@@ -1,0 +1,1442 @@
+diff --git a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+index 4870cd0..414d8d7 100644
+--- a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
++++ b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+@@ -107,6 +107,25 @@ namespace ps2x::iop
+                            static_cast<size_t>(count) * kSectorSize);
+         }
+ 
++        // Reads `size` bytes starting `offset` bytes into the extent at `lsn` (any alignment, inside the volume).
++        bool readBytes(uint32_t lsn, uint64_t offset, void *destination, size_t size) const
++        {
++            const uint64_t start = static_cast<uint64_t>(lsn) * kSectorSize + offset;
++            if (!m_open || start + size > static_cast<uint64_t>(m_totalSectors) * kSectorSize)
++                return false;
++            return size == 0u || readRaw(start, destination, size);
++        }
++
++        // Reads a whole file (any lookup() path form) into `bytes`; directories and missing files fail.
++        bool readFile(std::string_view guestPath, std::vector<uint8_t> &bytes) const
++        {
++            const std::optional<IsoEntry> entry = lookup(guestPath);
++            if (!entry || entry->isDirectory)
++                return false;
++            bytes.resize(entry->size);
++            return readBytes(entry->lsn, 0u, bytes.data(), bytes.size());
++        }
++
+     private:
+         static uint16_t readLe16(const uint8_t *bytes)
+         {
+@@ -239,4 +258,94 @@ namespace ps2x::iop
+         bool m_open = false;
+         std::unordered_map<std::string, IsoEntry> m_index;
+     };
++
++    // Appended-ISO format: <original file bytes> <ISO bytes> <32-byte footer>. The footer is the 8-byte magic
++    // "F1PS2ISO", the uint64 ISO offset, the uint64 ISO size, the uint32 version (1) and a uint32 0, little-endian.
++    inline constexpr char kAppendedIsoMagic[8] = {'F', '1', 'P', 'S', '2', 'I', 'S', 'O'};
++    inline constexpr uint32_t kAppendedIsoVersion = 1u;
++    inline constexpr size_t kAppendedIsoFooterSize = 32u;
++
++    struct AppendedIso
++    {
++        uint64_t offset = 0u;
++        uint64_t size = 0u;
++    };
++
++    // Reads only the last 32 bytes of `path` (and the PVD tag): the ISO appended to it, if the footer is valid.
++    inline std::optional<AppendedIso> findAppendedIso(const std::filesystem::path &path)
++    {
++        std::error_code error;
++        const uint64_t fileSize = std::filesystem::file_size(path, error);
++        if (error || fileSize < kAppendedIsoFooterSize)
++            return std::nullopt;
++        std::ifstream stream(path, std::ios::binary);
++        uint8_t footer[kAppendedIsoFooterSize]{};
++        if (!stream.seekg(static_cast<std::streamoff>(fileSize - kAppendedIsoFooterSize), std::ios::beg) ||
++            !stream.read(reinterpret_cast<char *>(footer), sizeof(footer)))
++            return std::nullopt;
++
++        const auto le = [&](size_t at, size_t bytes)
++        {
++            uint64_t value = 0u;
++            for (size_t i = 0u; i < bytes; ++i)
++                value |= static_cast<uint64_t>(footer[at + i]) << (i * 8u);
++            return value;
++        };
++        const AppendedIso found{le(8u, 8u), le(16u, 8u)};
++        if (std::memcmp(footer, kAppendedIsoMagic, sizeof(kAppendedIsoMagic)) != 0 ||
++            le(24u, 4u) != kAppendedIsoVersion || le(28u, 4u) != 0u ||
++            found.offset > fileSize || found.size > fileSize - found.offset ||
++            found.offset + found.size + kAppendedIsoFooterSize != fileSize)
++            return std::nullopt;
++
++        const uint64_t pvd = static_cast<uint64_t>(IsoImage::kPrimaryVolumeDescriptorLsn) * IsoImage::kSectorSize;
++        uint8_t tag[6]{};
++        if (found.size < pvd + sizeof(tag) ||
++            !stream.seekg(static_cast<std::streamoff>(found.offset + pvd), std::ios::beg) ||
++            !stream.read(reinterpret_cast<char *>(tag), sizeof(tag)) || tag[0] != 1u ||
++            std::memcmp(tag + 1u, "CD001", 5u) != 0)
++            return std::nullopt;
++        return found;
++    }
++
++    // The BOOT2 value of a SYSTEM.CNF (e.g. "cdrom0:\SCES_539.50;1"); key case and spaces are ignored.
++    inline std::optional<std::string> parseSystemCnfBoot2(std::string_view text)
++    {
++        const auto trim = [](std::string_view value)
++        {
++            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
++                value.remove_prefix(1u);
++            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
++                value.remove_suffix(1u);
++            return value;
++        };
++        while (!text.empty())
++        {
++            const size_t end = text.find_first_of("\r\n");
++            const std::string_view line = text.substr(0u, end);
++            text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1u);
++            const size_t equals = line.find('=');
++            if (equals == std::string_view::npos)
++                continue;
++            std::string key(trim(line.substr(0u, equals)));
++            std::transform(key.begin(), key.end(), key.begin(),
++                           [](unsigned char ch)
++                           { return static_cast<char>(std::toupper(ch)); });
++            const std::string_view value = trim(line.substr(equals + 1u));
++            if (key == "BOOT2" && !value.empty())
++                return std::string(value);
++        }
++        return std::nullopt;
++    }
++
++    // File name of a BOOT2 path without device, directories or the ";1" version ("SCES_539.50").
++    inline std::string bootElfName(std::string_view boot2)
++    {
++        const size_t separator = boot2.find_last_of(":\\/");
++        std::string_view name = separator == std::string_view::npos ? boot2 : boot2.substr(separator + 1u);
++        const size_t semicolon = name.rfind(';');
++        if (semicolon != std::string_view::npos)
++            name = name.substr(0u, semicolon);
++        return std::string(name);
++    }
+ }
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index a9c121d..936c464 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -38,6 +38,7 @@
+ namespace ps2x::iop
+ {
+     class IopSubsystem;
++    class IsoImage;
+ }
+ 
+ class PS2IopHostAdapter;
+@@ -289,6 +290,8 @@ public:
+     bool initialize(const char *title = "PS2 Game");
+     bool syncCoreSubsystems();
+     bool loadELF(const std::string &elfPath);
++    // Loads an ELF already in memory (e.g. read from the disc image); displayName is its file name.
++    bool loadELF(const std::vector<uint8_t> &elfBytes, const std::string &displayName);
+     void run();
+ 
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+@@ -359,6 +362,13 @@ public:
+     static const IoPaths &getIoPaths();
+     static void setIoPaths(const IoPaths &paths);
+     static void configureIoPathsFromElf(const std::string &elfPath);
++    // Image mode: the disc is the ISO at imageOffset inside imagePath; host:, mc0/mc1 live in baseDirectory.
++    static void configureIoPathsForImage(const std::filesystem::path &imagePath,
++                                         uint64_t imageOffset,
++                                         const std::filesystem::path &baseDirectory,
++                                         const std::string &elfName);
++    // The ISO 9660 image of IoPaths::cdImage (opened by setIoPaths), or null without one or if it is not an ISO.
++    static std::shared_ptr<const ps2x::iop::IsoImage> cdIsoImage();
+ 
+     void SignalException(R5900Context *ctx, PS2Exception exception);
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..7a3e17d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -590,7 +590,7 @@ namespace ps2_stubs
+             if (emptyNormalizedCount < 64u || (emptyNormalizedCount % 512u) == 0u)
+             {
+                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
+-                          << " (normalized path is empty, root: " << getCdRootPath().string() << ")"
++                          << " (normalized path is empty, " << cdSourceDescription() << ")"
+                           << std::endl;
+             }
+             ++emptyNormalizedCount;
+@@ -621,7 +621,7 @@ namespace ps2_stubs
+             if (samePathFailCount <= 16u || (samePathFailCount % 512u) == 0u)
+             {
+                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
+-                          << " (root: " << getCdRootPath().string()
++                          << " (" << cdSourceDescription()
+                           << ", repeat=" << samePathFailCount << ")" << std::endl;
+             }
+             setReturnS32(ctx, 0);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..a26de0e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,6 +1,8 @@
+ #include <algorithm>
+ #include <cctype>
+ 
++#include "ps2x/iop/ps2_iso_image.h"
++
+ namespace
+ {
+     constexpr uint32_t kCdSectorSize = 2048;
+@@ -23,6 +25,7 @@ namespace
+     std::filesystem::path g_cdImageSizePath;
+     uint64_t g_cdImageSizeBytes = 0;
+     bool g_cdImageSizeValid = false;
++    std::string g_cdFilesSource; // disc the cached search results belong to ("" = the CD root folder)
+     int32_t g_lastCdError = 0;
+     uint32_t g_cdMode = 0;
+     uint32_t g_cdStreamingLbn = 0;
+@@ -181,8 +184,39 @@ namespace
+         return PS2Runtime::getIoPaths().cdImage;
+     }
+ 
++    // Where the disc comes from, for logs: the ISO image or the CD root folder.
++    std::string cdSourceDescription()
++    {
++        if (const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage())
++        {
++            return "image: " + image->path().string();
++        }
++        return "root: " + getCdRootPath().string();
++    }
++
++    // Search results are cached per disc: switching between the image and the CD root folder drops them.
++    void syncCdFileCache(const std::shared_ptr<const ps2x::iop::IsoImage> &image)
++    {
++        const std::string source = image ? image->path().string() + "@" + std::to_string(image->baseOffset())
++                                         : std::string();
++        if (source == g_cdFilesSource)
++        {
++            return;
++        }
++        g_cdFilesSource = source;
++        g_cdFilesByKey.clear();
++        g_nextPseudoLbn = kCdPseudoLbnStart;
++    }
++
+     bool tryGetCdImageTotalSectors(uint64_t &totalSectorsOut)
+     {
++        // An ISO 9660 image: its volume size from the PVD.
++        if (const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage())
++        {
++            totalSectorsOut = image->totalSectors();
++            return true;
++        }
++
+         const std::filesystem::path imagePath = getCdImagePath();
+         if (imagePath.empty())
+         {
+@@ -201,7 +235,9 @@ namespace
+             return false;
+         }
+ 
+-        totalSectorsOut = g_cdImageSizeBytes / static_cast<uint64_t>(kCdSectorSize);
++        const uint64_t offset = PS2Runtime::getIoPaths().cdImageOffset;
++        const uint64_t imageBytes = g_cdImageSizeBytes > offset ? g_cdImageSizeBytes - offset : 0u;
++        totalSectorsOut = imageBytes / static_cast<uint64_t>(kCdSectorSize);
+         return true;
+     }
+ 
+@@ -331,6 +367,9 @@ namespace
+             return false;
+         }
+ 
++        const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage();
++        syncCdFileCache(image);
++
+         auto existing = g_cdFilesByKey.find(key);
+         if (existing != g_cdFilesByKey.end())
+         {
+@@ -339,6 +378,26 @@ namespace
+             return true;
+         }
+ 
++        // With an ISO image, files are its directory records: real LSNs, no host folder fallback.
++        if (image)
++        {
++            const std::optional<ps2x::iop::IsoEntry> found = image->lookup(normalizeCdPathNoPrefix(ps2Path));
++            if (!found || found->isDirectory)
++            {
++                g_lastCdError = -1;
++                return false;
++            }
++
++            CdFileEntry entry;
++            entry.sizeBytes = found->size;
++            entry.baseLbn = found->lsn;
++            entry.sectors = sectorsForBytes(found->size);
++            g_cdFilesByKey.emplace(key, entry);
++            entryOut = entry;
++            g_lastCdError = 0;
++            return true;
++        }
++
+         const std::filesystem::path root = getCdRootPath();
+         std::filesystem::path path = cdHostPath(ps2Path);
+         std::error_code ec;
+@@ -432,8 +491,34 @@ namespace
+         return true;
+     }
+ 
++    bool readImageSectors(const ps2x::iop::IsoImage &image, uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
++    {
++        if (!dst || static_cast<uint64_t>(lbn) + sectors > image.totalSectors())
++        {
++            g_lastCdError = -1;
++            return false;
++        }
++        std::memset(dst, 0, byteCount);
++        const size_t count = static_cast<size_t>(
++            std::min<uint64_t>(byteCount, static_cast<uint64_t>(sectors) * kCdSectorSize));
++        if (count != 0 && !image.readBytes(lbn, 0u, dst, count))
++        {
++            g_lastCdError = -1;
++            return false;
++        }
++        g_lastCdError = 0;
++        return true;
++    }
++
+     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+     {
++        // An ISO image is the whole disc: LSNs are real sectors of the image.
++        if (const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage())
++        {
++            syncCdFileCache(image);
++            return readImageSectors(*image, lbn, sectors, dst, byteCount);
++        }
++
+         for (const auto &[key, entry] : g_cdFilesByKey)
+         {
+             const uint32_t endLbn = entry.baseLbn + entry.sectors;
+@@ -462,7 +547,7 @@ namespace
+                 }
+             }
+ 
+-            const uint64_t offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
++            const uint64_t offset = PS2Runtime::getIoPaths().cdImageOffset + static_cast<uint64_t>(lbn) * kCdSectorSize;
+             return readHostRange(cdImage, offset, dst, byteCount);
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 51d9db9..e724656 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -6,6 +6,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
++#include "ps2x/iop/ps2_iso_image.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -308,6 +309,29 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+         return 0u;
+     }
+ 
++    // With a CD image, cdrom0: paths (which have no host path, see translateGuestPath) are files of the image.
++    const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(path);
++    if (parsed && parsed.device == ps2x::iop::Ps2PathDevice::Cdrom)
++    {
++        std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage();
++        if (image)
++        {
++            const std::optional<ps2x::iop::IsoEntry> entry = image->lookup(parsed.path);
++            if (!entry || entry->isDirectory)
++            {
++                return 0u;
++            }
++            std::lock_guard<std::mutex> lock(m_hostFileMutex);
++            uint64_t handle = m_nextHostFileHandle++;
++            if (handle == 0u)
++            {
++                handle = m_nextHostFileHandle++;
++            }
++            m_hostFiles.emplace(handle, HostFile{nullptr, entry->size, std::move(image), entry->lsn});
++            return handle;
++        }
++    }
++
+     const std::filesystem::path hostPath{std::string(path)};
+ #if defined(_WIN32)
+     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
+@@ -342,7 +366,7 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
+     size = 0u;
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     const auto it = m_hostFiles.find(handle);
+-    if (it == m_hostFiles.end() || !it->second.stream)
++    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.image))
+     {
+         return false;
+     }
+@@ -364,11 +388,24 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
+ 
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     const auto it = m_hostFiles.find(handle);
+-    if (it == m_hostFiles.end() || !it->second.stream)
++    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.image))
+     {
+         return false;
+     }
+ 
++    if (it->second.image)
++    {
++        const HostFile &file = it->second;
++        const uint64_t available = offset < file.size ? file.size - offset : 0u;
++        const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
++        if (count != 0u && !file.image->readBytes(file.imageLsn, offset, destination, count))
++        {
++            return false;
++        }
++        bytesRead = count;
++        return true;
++    }
++
+ #if defined(_WIN32)
+     if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+         _fseeki64(it->second.stream, static_cast<int64_t>(offset), SEEK_SET) != 0)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 1c806c8..b5331c2 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -4,12 +4,18 @@
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <memory>
+ #include <mutex>
+ #include <unordered_map>
+ 
+ class PS2Runtime;
+ struct R5900Context;
+ 
++namespace ps2x::iop
++{
++    class IsoImage;
++}
++
+ class PS2IopHostAdapter final : public ps2x::iop::IopHost
+ {
+ public:
+@@ -98,10 +104,13 @@ private:
+     uint8_t *m_activeRdram = nullptr;
+     uint64_t m_activeToken = 0;
+     uint64_t m_nextToken = 1;
++    // A host file, or a file of the disc image (cdrom0: paths when a CD image is configured).
+     struct HostFile
+     {
+         std::FILE *stream = nullptr;
+         uint64_t size = 0u;
++        std::shared_ptr<const ps2x::iop::IsoImage> image;
++        uint32_t imageLsn = 0u;
+     };
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4cce146..621eeb3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -16,6 +16,7 @@
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ #include "ps2x/iop/iop_spu2_audio.h"
++#include "ps2x/iop/ps2_iso_image.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -177,14 +178,8 @@ namespace
+ 
+     thread_local DispatchHistory g_dispatchHistory;
+ 
+-    bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
++    uint32_t computeCrc32(const std::vector<uint8_t> &bytes)
+     {
+-        std::ifstream file(path, std::ios::binary);
+-        if (!file.is_open())
+-        {
+-            return false;
+-        }
+-
+         static const std::array<uint32_t, 256> table = []
+         {
+             std::array<uint32_t, 256> values{};
+@@ -201,22 +196,11 @@ namespace
+         }();
+ 
+         uint32_t crc = 0xFFFFFFFFu;
+-        std::array<uint8_t, 16 * 1024> buffer{};
+-        while (file.good())
++        for (const uint8_t byte : bytes)
+         {
+-            file.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+-            const std::streamsize count = file.gcount();
+-            for (std::streamsize i = 0; i < count; ++i)
+-            {
+-                crc = table[(crc ^ buffer[static_cast<size_t>(i)]) & 0xFFu] ^ (crc >> 8u);
+-            }
++            crc = table[(crc ^ byte) & 0xFFu] ^ (crc >> 8u);
+         }
+-        if (file.bad())
+-        {
+-            return false;
+-        }
+-        crcOut = ~crc;
+-        return true;
++        return ~crc;
+     }
+ 
+     void pushDispatchPc(uint32_t pc)
+@@ -412,6 +396,45 @@ namespace
+         return paths;
+     }
+ 
++    // The ISO 9660 image of IoPaths::cdImage, shared by the EE (sceCd*, PS2Vfs) and the IOP host (IRX loading).
++    // setIoPaths opens it, so it exists before any EE/IOP thread reads; readers take a reference under the mutex.
++    struct SharedCdImage
++    {
++        std::mutex mutex;
++        std::shared_ptr<const ps2x::iop::IsoImage> image;
++        std::filesystem::path path;
++        uint64_t offset = 0u;
++    };
++
++    SharedCdImage &sharedCdImage()
++    {
++        static SharedCdImage shared;
++        return shared;
++    }
++
++    // Opens the image once per (path, offset); no path, a missing file or a non-ISO file leave no image.
++    void syncSharedCdImage(const std::filesystem::path &path, uint64_t offset)
++    {
++        SharedCdImage &shared = sharedCdImage();
++        std::lock_guard<std::mutex> lock(shared.mutex);
++        if (shared.path == path && shared.offset == offset)
++        {
++            return;
++        }
++        shared.path = path;
++        shared.offset = offset;
++        shared.image.reset();
++        if (path.empty())
++        {
++            return;
++        }
++        auto image = std::make_shared<ps2x::iop::IsoImage>();
++        if (image->open(path, offset))
++        {
++            shared.image = std::move(image);
++        }
++    }
++
+     std::string readGuestPrintableString(const uint8_t *rdram, uint32_t addr, size_t maxLen)
+     {
+         std::string out;
+@@ -943,22 +966,27 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         return false;
+     }
+ 
+-    file.seekg(0, std::ios::end);
+-    const std::streamoff fileSize = file.tellg();
+-    if (fileSize < static_cast<std::streamoff>(sizeof(ElfHeader)))
++    const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (file.bad())
+     {
+-        std::cerr << "ELF file is too small: " << elfPath << std::endl;
++        std::cerr << "Failed to read ELF file: " << elfPath << std::endl;
+         return false;
+     }
+-    file.seekg(0, std::ios::beg);
++    return loadELF(bytes, elfPath);
++}
+ 
+-    ElfHeader header{};
+-    if (!file.read(reinterpret_cast<char *>(&header), sizeof(header)))
++bool PS2Runtime::loadELF(const std::vector<uint8_t> &elfBytes, const std::string &displayName)
++{
++    const uint64_t fileSize = elfBytes.size();
++    if (fileSize < sizeof(ElfHeader))
+     {
+-        std::cerr << "Failed to read ELF header from: " << elfPath << std::endl;
++        std::cerr << "ELF file is too small: " << displayName << std::endl;
+         return false;
+     }
+ 
++    ElfHeader header{};
++    std::memcpy(&header, elfBytes.data(), sizeof(header));
++
+     if (header.magic != ELF_MAGIC)
+     {
+         std::cerr << "Invalid ELF magic number" << std::endl;
+@@ -986,7 +1014,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     const uint64_t programHeaderTableEnd =
+         static_cast<uint64_t>(header.phoff) +
+         static_cast<uint64_t>(header.phnum) * static_cast<uint64_t>(header.phentsize);
+-    if (programHeaderTableEnd > static_cast<uint64_t>(fileSize))
++    if (programHeaderTableEnd > fileSize)
+     {
+         std::cerr << "ELF program-header table is out of range." << std::endl;
+         return false;
+@@ -1005,19 +1033,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         const uint64_t phOffset =
+             static_cast<uint64_t>(header.phoff) +
+             static_cast<uint64_t>(i) * static_cast<uint64_t>(header.phentsize);
+-        if (phOffset + sizeof(ProgramHeader) > static_cast<uint64_t>(fileSize))
++        if (phOffset + sizeof(ProgramHeader) > fileSize)
+         {
+             std::cerr << "ELF program header " << i << " is out of range." << std::endl;
+             return false;
+         }
+ 
+         ProgramHeader ph{};
+-        file.seekg(static_cast<std::streamoff>(phOffset), std::ios::beg);
+-        if (!file.read(reinterpret_cast<char *>(&ph), sizeof(ph)))
+-        {
+-            std::cerr << "Failed to read ELF program header " << i << std::endl;
+-            return false;
+-        }
++        std::memcpy(&ph, elfBytes.data() + phOffset, sizeof(ph));
+ 
+         if (ph.type != PT_LOAD || ph.memsz == 0u)
+         {
+@@ -1031,7 +1054,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         }
+ 
+         const uint64_t segmentFileEnd = static_cast<uint64_t>(ph.offset) + static_cast<uint64_t>(ph.filesz);
+-        if (segmentFileEnd > static_cast<uint64_t>(fileSize))
++        if (segmentFileEnd > fileSize)
+         {
+             std::cerr << "ELF segment " << i << " exceeds file bounds." << std::endl;
+             return false;
+@@ -1075,12 +1098,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         uint8_t *dest = destBase + physAddr;
+         if (ph.filesz > 0u)
+         {
+-            file.seekg(static_cast<std::streamoff>(ph.offset), std::ios::beg);
+-            if (!file.read(reinterpret_cast<char *>(dest), ph.filesz))
+-            {
+-                std::cerr << "Failed to read ELF segment " << i << " payload." << std::endl;
+-                return false;
+-            }
++            std::memcpy(dest, elfBytes.data() + ph.offset, ph.filesz);
+         }
+ 
+         if (ph.memsz > ph.filesz)
+@@ -1152,19 +1170,15 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     }
+ 
+     LoadedModule module;
+-    module.name = elfPath.substr(elfPath.find_last_of("/\\") + 1);
++    module.name = displayName.substr(displayName.find_last_of("/\\") + 1);
+     module.baseAddress = (moduleBase == std::numeric_limits<uint32_t>::max()) ? 0x00100000u : moduleBase;
+     module.size = (moduleEnd > module.baseAddress) ? static_cast<size_t>(moduleEnd - module.baseAddress) : 0u;
+     module.active = true;
+ 
+     m_loadedModules.push_back(module);
+ 
+-    uint32_t elfCrc32 = 0u;
+-    const bool elfCrc32Valid = computeFileCrc32(elfPath, elfCrc32);
+-    if (!elfCrc32Valid)
+-    {
+-        std::cerr << "[ps2xIOP] failed to compute ELF CRC32 for '" << elfPath << "'" << std::endl;
+-    }
++    const uint32_t elfCrc32 = computeCrc32(elfBytes);
++    const bool elfCrc32Valid = true;
+     ps2x::iop::GameIdentity identity;
+     identity.elfName = module.name;
+     identity.entryPoint = m_cpuContext.pc;
+@@ -1179,7 +1193,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     m_iopSubsystem->reset();
+ 
+     ps2_game_overrides::applyMatching(*this,
+-                                      elfPath,
++                                      displayName,
+                                       m_cpuContext.pc,
+                                       elfCrc32,
+                                       elfCrc32Valid);
+@@ -1222,6 +1236,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     }
+ 
+     runtimeIoPaths() = normalized;
++    syncSharedCdImage(normalized.cdImage, normalized.cdImageOffset);
+ }
+ 
+ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1256,6 +1271,33 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+     setIoPaths(paths);
+ }
+ 
++void PS2Runtime::configureIoPathsForImage(const std::filesystem::path &imagePath,
++                                          uint64_t imageOffset,
++                                          const std::filesystem::path &baseDirectory,
++                                          const std::string &elfName)
++{
++    IoPaths paths = runtimeIoPaths();
++    paths.elfDirectory = normalizeAbsolutePath(baseDirectory);
++    paths.elfPath = paths.elfDirectory / elfName;
++    paths.hostRoot = paths.elfDirectory;
++    paths.cdRoot = paths.elfDirectory;
++    paths.mcRoot = paths.elfDirectory / "mc0";
++    if (const char *cards = std::getenv("PS2X_TARJETAS"); cards && *cards)
++    {
++        paths.mcRoot = std::filesystem::path(cards) / "mc0";
++    }
++    paths.cdImage = imagePath;
++    paths.cdImageOffset = imageOffset;
++    setIoPaths(paths);
++}
++
++std::shared_ptr<const ps2x::iop::IsoImage> PS2Runtime::cdIsoImage()
++{
++    SharedCdImage &shared = sharedCdImage();
++    std::lock_guard<std::mutex> lock(shared.mutex);
++    return shared.image;
++}
++
+ namespace
+ {
+     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
+diff --git a/ps2xRuntime/src/lib/ps2_vfs.cpp b/ps2xRuntime/src/lib/ps2_vfs.cpp
+index aff25e6..a628a82 100644
+--- a/ps2xRuntime/src/lib/ps2_vfs.cpp
++++ b/ps2xRuntime/src/lib/ps2_vfs.cpp
+@@ -1,5 +1,7 @@
+ #include "runtime/ps2_vfs.h"
+ 
++#include "ps2_runtime.h"
++#include "ps2x/iop/ps2_iso_image.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_rom_device.h"
+ 
+@@ -13,6 +15,24 @@
+ 
+ namespace
+ {
++    // Moves `position` inside [0, size] like lseek; returns the new position or -1.
++    int64_t seekInside(uint64_t &position, uint64_t size, int64_t offset, int whence)
++    {
++        int64_t base = 0;
++        if (whence == SEEK_CUR)
++            base = static_cast<int64_t>(position);
++        else if (whence == SEEK_END)
++            base = static_cast<int64_t>(size);
++        else if (whence != SEEK_SET)
++            return -1;
++
++        const int64_t target = base + offset;
++        if (target < 0 || static_cast<uint64_t>(target) > size)
++            return -1;
++        position = static_cast<uint64_t>(target);
++        return target;
++    }
++
+     class HostOpenFile final : public IPS2OpenFile
+     {
+     public:
+@@ -70,7 +90,7 @@ namespace
+         {
+             if (!destination && size != 0u)
+                 return -1;
+-            const size_t available = m_position < m_bytes.size() ? m_bytes.size() - m_position : 0u;
++            const size_t available = m_position < m_bytes.size() ? static_cast<size_t>(m_bytes.size() - m_position) : 0u;
+             const size_t count = std::min(size, available);
+             if (count != 0u)
+                 std::memcpy(destination, m_bytes.data() + m_position, count);
+@@ -85,26 +105,55 @@ namespace
+ 
+         int64_t seek(int64_t offset, int whence) override
+         {
+-            int64_t base = 0;
+-            if (whence == SEEK_CUR)
+-                base = static_cast<int64_t>(m_position);
+-            else if (whence == SEEK_END)
+-                base = static_cast<int64_t>(m_bytes.size());
+-            else if (whence != SEEK_SET)
+-                return -1;
++            return seekInside(m_position, m_bytes.size(), offset, whence);
++        }
++
++    private:
++        std::vector<uint8_t> m_bytes;
++        uint64_t m_position = 0u;
++    };
+ 
+-            const int64_t position = base + offset;
+-            if (position < 0 || static_cast<uint64_t>(position) > m_bytes.size())
++    // A read-only file of the disc image: reads go to its extent (lsn, size) in the ISO.
++    class ImageOpenFile final : public IPS2OpenFile
++    {
++    public:
++        ImageOpenFile(std::shared_ptr<const ps2x::iop::IsoImage> image, const ps2x::iop::IsoEntry &entry)
++            : m_image(std::move(image)), m_entry(entry) {}
++
++        int64_t read(void *destination, size_t size) override
++        {
++            if (!destination && size != 0u)
+                 return -1;
+-            m_position = static_cast<size_t>(position);
+-            return position;
++            const uint64_t available = m_position < m_entry.size ? m_entry.size - m_position : 0u;
++            const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
++            if (count != 0u && !m_image->readBytes(m_entry.lsn, m_position, destination, count))
++                return -1;
++            m_position += count;
++            return static_cast<int64_t>(count);
++        }
++
++        int64_t write(const void *, size_t) override
++        {
++            return -1;
++        }
++
++        int64_t seek(int64_t offset, int whence) override
++        {
++            return seekInside(m_position, m_entry.size, offset, whence);
+         }
+ 
+     private:
+-        std::vector<uint8_t> m_bytes;
+-        size_t m_position = 0u;
++        std::shared_ptr<const ps2x::iop::IsoImage> m_image;
++        ps2x::iop::IsoEntry m_entry;
++        uint64_t m_position = 0u;
+     };
+ 
++    // With a CD image configured, cdrom0: is that image (no host folder fallback).
++    std::shared_ptr<const ps2x::iop::IsoImage> discImageFor(const ps2x::iop::ParsedPs2Path &parsed)
++    {
++        return parsed.device == ps2x::iop::Ps2PathDevice::Cdrom ? PS2Runtime::cdIsoImage() : nullptr;
++    }
++
+     const char *hostMode(uint32_t flags)
+     {
+         const bool read = (flags & PS2_FIO_O_RDONLY) != 0u || (flags & PS2_FIO_O_RDWR) == PS2_FIO_O_RDWR;
+@@ -161,7 +210,18 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
+         return -1;
+ 
+     std::unique_ptr<IPS2OpenFile> file;
+-    if (parsed.device == ps2x::iop::Ps2PathDevice::Rom0)
++    const std::shared_ptr<const ps2x::iop::IsoImage> image = discImageFor(parsed);
++    if (image)
++    {
++        const uint32_t access = flags & PS2_FIO_O_RDWR;
++        if (access != PS2_FIO_O_RDONLY || (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC)) != 0u)
++            return -1;
++        const std::optional<ps2x::iop::IsoEntry> entry = image->lookup(parsed.path);
++        if (!entry || entry->isDirectory)
++            return -1;
++        file = std::make_unique<ImageOpenFile>(image, *entry);
++    }
++    else if (parsed.device == ps2x::iop::Ps2PathDevice::Rom0)
+     {
+         const uint32_t access = flags & PS2_FIO_O_RDWR;
+         if (access != PS2_FIO_O_RDONLY || (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC)) != 0u)
+@@ -245,6 +305,16 @@ bool PS2Vfs::stat(std::string_view path, const PS2VfsMounts &mounts, const PS2Ro
+         result.readOnly = true;
+         return true;
+     }
++    if (const std::shared_ptr<const ps2x::iop::IsoImage> image = discImageFor(parsed))
++    {
++        const std::optional<ps2x::iop::IsoEntry> entry = image->lookup(parsed.path);
++        if (!entry)
++            return false;
++        result.directory = entry->isDirectory;
++        result.size = entry->isDirectory ? 0u : entry->size;
++        result.readOnly = true;
++        return true;
++    }
+ 
+     std::filesystem::path hostPath;
+     if (!resolveHostPath(path, mounts, hostPath))
+@@ -286,6 +356,8 @@ bool PS2Vfs::resolveHostPath(std::string_view path, const PS2VfsMounts &mounts,
+         base = mounts.hostRoot;
+         break;
+     case ps2x::iop::Ps2PathDevice::Cdrom:
++        if (discImageFor(parsed))
++            return false; // the disc is the image: no host path
+         base = mounts.cdRoot;
+         break;
+     case ps2x::iop::Ps2PathDevice::MemoryCard0:
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..c631d02 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_runtime.h"
+ #include "games_database.h"
++#include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+ #endif
+@@ -14,6 +15,8 @@
+ #include <exception>
+ #include <algorithm>
+ #include <cstdlib>
++#include <cstdint>
++#include <vector>
+ 
+ #if defined(__ANDROID__)
+ #include <android/log.h>
+@@ -140,13 +143,130 @@ namespace
+         return result;
+     }
+ 
+-    std::filesystem::path getExecutablePath(int argc, char *argv[])
++    std::filesystem::path getExecutablePath();
++
++    // The running .exe (to find an ISO appended to it or next to it).
++    std::filesystem::path runningExecutable(const char *argv0)
++    {
++        std::error_code error;
++#if defined(_WIN32)
++        char *program = nullptr;
++        if (_get_pgmptr(&program) == 0 && program && *program)
++        {
++            return std::filesystem::absolute(std::filesystem::path(program), error).lexically_normal();
++        }
++#endif
++        if (!argv0 || !*argv0)
++        {
++            return {};
++        }
++        return std::filesystem::absolute(std::filesystem::path(argv0), error).lexically_normal();
++    }
++
++    bool hasIsoExtension(const std::filesystem::path &path)
++    {
++        std::string extension = path.extension().string();
++        std::ranges::transform(extension, extension.begin(), [](unsigned char character)
++                               { return static_cast<char>(std::tolower(character)); });
++        return extension == ".iso";
++    }
++
++    // Where the game comes from: an ELF file (folder mode) or an ISO image (image mode).
++    struct BootSource
++    {
++        std::filesystem::path elfPath;
++        std::filesystem::path imagePath;
++        uint64_t imageOffset = 0u;
++    };
++
++    // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, an ISO appended to the .exe,
++    // exactly one .iso next to the .exe, PS2X_DEFAULT_BOOT_ELF.
++    BootSource chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable)
+     {
+         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+         {
++            const std::filesystem::path argument(argv[1]);
++            if (hasIsoExtension(argument))
++            {
++                std::cout << "[arranque] ISO del argumento: " << argument.string() << std::endl;
++                return {{}, argument, 0u};
++            }
+             std::cout << "Using argv boot path" << std::endl;
+-            return std::filesystem::path(argv[1]);
++            std::cout << "[arranque] ELF del argumento: " << argument.string() << std::endl;
++            return {argument};
++        }
++        if (const char *iso = std::getenv("PS2X_ISO"); iso && *iso)
++        {
++            std::cout << "[arranque] ISO de PS2X_ISO: " << iso << std::endl;
++            return {{}, std::filesystem::path(iso), 0u};
+         }
++        if (!executable.empty())
++        {
++            if (const std::optional<ps2x::iop::AppendedIso> appended = ps2x::iop::findAppendedIso(executable))
++            {
++                std::cout << "[arranque] ISO pegada al .exe (desplazamiento=" << appended->offset << ")" << std::endl;
++                return {{}, executable, appended->offset};
++            }
++
++            std::vector<std::filesystem::path> isos;
++            std::error_code error;
++            for (const auto &entry : std::filesystem::directory_iterator(executable.parent_path(), error))
++            {
++                if (entry.is_regular_file(error) && hasIsoExtension(entry.path()))
++                {
++                    isos.push_back(entry.path());
++                }
++            }
++            if (isos.size() == 1u)
++            {
++                std::cout << "[arranque] ISO junto al .exe: " << isos.front().string() << std::endl;
++                return {{}, isos.front(), 0u};
++            }
++            if (isos.size() > 1u)
++            {
++                std::cout << "[arranque] " << isos.size()
++                          << " ISO junto al .exe: no se elige ninguna (pasa una como argumento)" << std::endl;
++            }
++        }
++        return {getExecutablePath()};
++    }
++
++    // Image mode: the disc is the image, the ELF is BOOT2 of its SYSTEM.CNF, the cards live next to the .exe.
++    std::vector<uint8_t> prepareImageBoot(const BootSource &boot, const std::filesystem::path &baseDirectory,
++                                          std::string &elfName)
++    {
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, {});
++        const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage();
++        if (!image)
++        {
++            throw std::runtime_error("Not an ISO 9660 image: " + boot.imagePath.string());
++        }
++
++        std::vector<uint8_t> bytes;
++        if (!image->readFile("SYSTEM.CNF", bytes))
++        {
++            throw std::runtime_error("SYSTEM.CNF not found in " + boot.imagePath.string());
++        }
++        const std::optional<std::string> boot2 =
++            ps2x::iop::parseSystemCnfBoot2(std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
++        if (!boot2)
++        {
++            throw std::runtime_error("SYSTEM.CNF has no BOOT2 line");
++        }
++        if (!image->readFile(*boot2, bytes))
++        {
++            throw std::runtime_error("BOOT2 ELF not found in the image: " + *boot2);
++        }
++
++        elfName = ps2x::iop::bootElfName(*boot2);
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, elfName);
++        std::cout << "[arranque] ELF del disco: " << *boot2 << " (" << bytes.size() << " bytes), carpeta base: "
++                  << baseDirectory.string() << std::endl;
++        return bytes;
++    }
++
++    std::filesystem::path getExecutablePath()
++    {
+ #if defined(PS2X_DEFAULT_BOOT_ELF)
+         std::cout << "Using default boot file" << std::endl;
+         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
+@@ -173,10 +293,20 @@ int main(int argc, char *argv[])
+ 
+     try
+     {
+-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
++        const std::filesystem::path executable = runningExecutable(argc >= 1 ? argv[0] : nullptr);
++        const BootSource boot = chooseBootSource(argc, argv, executable);
+ 
+-        std::string filePathStr = pathObj.string();
+-        std::string elfName = pathObj.filename().string();
++        std::string filePathStr = boot.elfPath.string();
++        std::string elfName = boot.elfPath.filename().string();
++        std::vector<uint8_t> elfBytes;
++        if (!boot.imagePath.empty())
++        {
++            std::error_code error;
++            const std::filesystem::path baseDirectory =
++                executable.empty() ? std::filesystem::current_path(error) : executable.parent_path();
++            elfBytes = prepareImageBoot(boot, baseDirectory, elfName);
++            filePathStr = elfName;
++        }
+         std::string normalizedId = normalizeGameId(elfName);
+ 
+         std::string windowTitle = "PS2-Recomp | ";
+@@ -220,7 +350,8 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
+-        if (!runtime.loadELF(filePathStr))
++        const bool loaded = boot.imagePath.empty() ? runtime.loadELF(filePathStr) : runtime.loadELF(elfBytes, elfName);
++        if (!loaded)
+         {
+             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
+             return 1;
+diff --git a/ps2xTest/src/ps2_iso_image_tests.cpp b/ps2xTest/src/ps2_iso_image_tests.cpp
+index fe01ed4..eda85b8 100644
+--- a/ps2xTest/src/ps2_iso_image_tests.cpp
++++ b/ps2xTest/src/ps2_iso_image_tests.cpp
+@@ -1,11 +1,16 @@
+ #include "MiniTest.h"
+ #include "ps2_runtime.h"
++#include "ps2_stubs.h"
++#include "ps2_iop_host.h"
++#include "runtime/ps2_rom_device.h"
++#include "runtime/ps2_vfs.h"
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_cpu.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+ #include "../../ps2xIOP/src/emulator/imports/iop_cdvd.h"
++#include "../../ps2xIOP/src/emulator/services/iop_module_loader.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -143,6 +148,69 @@ namespace
+         return path;
+     }
+ 
++    // Appended-ISO footer built by hand: magic, uint64 LE offset, uint64 LE size, uint32 LE version, uint32 0.
++    std::vector<uint8_t> appendedFooter(const char *magic, uint64_t offset, uint64_t size, uint32_t version = 1u)
++    {
++        std::vector<uint8_t> footer(32u, 0u);
++        std::memcpy(footer.data(), magic, 8u);
++        for (uint32_t i = 0u; i < 8u; ++i)
++        {
++            footer[8u + i] = static_cast<uint8_t>(offset >> (i * 8u));
++            footer[16u + i] = static_cast<uint8_t>(size >> (i * 8u));
++        }
++        for (uint32_t i = 0u; i < 4u; ++i)
++            footer[24u + i] = static_cast<uint8_t>(version >> (i * 8u));
++        return footer;
++    }
++
++    // An "executable" of `exeSize` bytes followed by `payload` and `footer`.
++    std::filesystem::path writeAppended(const TempDir &dir, const char *name, size_t exeSize,
++                                        const std::vector<uint8_t> &payload, const std::vector<uint8_t> &footer)
++    {
++        std::vector<uint8_t> bytes(exeSize, 'M');
++        bytes.insert(bytes.end(), payload.begin(), payload.end());
++        bytes.insert(bytes.end(), footer.begin(), footer.end());
++        const std::filesystem::path path = dir.path / name;
++        writeFile(path, bytes);
++        return path;
++    }
++
++    // Restores the runtime I/O paths (and with them the shared CD image) when a test ends.
++    struct IoPathsGuard
++    {
++        PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
++        ~IoPathsGuard() { PS2Runtime::setIoPaths(saved); }
++    };
++
++    void setCdPaths(const std::filesystem::path &cdRoot, const std::filesystem::path &image, uint64_t offset)
++    {
++        PS2Runtime::IoPaths paths;
++        paths.elfDirectory = cdRoot;
++        paths.hostRoot = cdRoot;
++        paths.cdRoot = cdRoot;
++        paths.mcRoot = cdRoot / "mc0";
++        paths.cdImage = image;
++        paths.cdImageOffset = offset;
++        PS2Runtime::setIoPaths(paths);
++    }
++
++    void setGuestReg(R5900Context &ctx, int reg, uint32_t value)
++    {
++        ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
++    }
++
++    int32_t guestReturn(const R5900Context &ctx)
++    {
++        return static_cast<int32_t>(::getRegU32(&ctx, 2));
++    }
++
++    uint32_t guestU32(const std::vector<uint8_t> &rdram, uint32_t address)
++    {
++        uint32_t value = 0u;
++        std::memcpy(&value, rdram.data() + address, sizeof(value));
++        return value;
++    }
++
+     void checkImage(TestCase &t, const IsoImage &image, const std::string &label)
+     {
+         t.Equals(image.totalSectors(), kVolumeSectors, label + ": total sectors come from the PVD, not the file size");
+@@ -439,5 +507,289 @@ void register_ps2_iso_image_tests()
+ 
+             PS2Runtime::setIoPaths(oldPaths);
+         });
++
++        tc.Run("findAppendedIso accepts only a valid footer over an ISO 9660 payload", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::vector<uint8_t> iso = buildIso();
++            constexpr size_t exeSize = 3000u;
++            const uint64_t size = iso.size();
++
++            const std::filesystem::path good =
++                writeAppended(dir, "good.exe", exeSize, iso, appendedFooter("F1PS2ISO", exeSize, size));
++            const std::optional<ps2x::iop::AppendedIso> found = ps2x::iop::findAppendedIso(good);
++            t.IsTrue(found.has_value(), "a valid footer is found");
++            if (found)
++            {
++                t.Equals(found->offset, uint64_t{exeSize}, "the footer gives the ISO offset");
++                t.Equals(found->size, size, "the footer gives the ISO size");
++                IsoImage image;
++                t.IsTrue(image.open(good, found->offset), "the ISO opens at the footer offset");
++                t.IsTrue(image.lookup("\\DIR\\FILE.BIN;1").has_value(), "the appended ISO is browsable");
++            }
++
++            const auto rejected = [&](const char *name, const std::vector<uint8_t> &payload,
++                                      const std::vector<uint8_t> &footer, const std::string &why)
++            {
++                t.IsFalse(ps2x::iop::findAppendedIso(writeAppended(dir, name, exeSize, payload, footer)).has_value(),
++                          why);
++            };
++            rejected("magic.exe", iso, appendedFooter("F1PS2ISX", exeSize, size), "a wrong magic is rejected");
++            rejected("offset.exe", iso, appendedFooter("F1PS2ISO", exeSize - 1u, size),
++                     "an offset that does not match the file size is rejected");
++            rejected("size.exe", iso, appendedFooter("F1PS2ISO", exeSize, size + 1u),
++                     "a size that does not match the file size is rejected");
++            rejected("version.exe", iso, appendedFooter("F1PS2ISO", exeSize, size, 2u),
++                     "an unknown footer version is rejected");
++            rejected("payload.exe", std::vector<uint8_t>(iso.size(), 'x'), appendedFooter("F1PS2ISO", exeSize, size),
++                     "a consistent footer over a non-ISO payload is rejected");
++
++            t.IsFalse(ps2x::iop::findAppendedIso(writeIso(dir, "plain.iso", 0u)).has_value(),
++                      "a plain ISO without footer has no appended ISO");
++            writeFile(dir.path / "tiny.exe", std::vector<uint8_t>(10u, 'M'));
++            t.IsFalse(ps2x::iop::findAppendedIso(dir.path / "tiny.exe").has_value(),
++                      "a file shorter than the footer has no appended ISO");
++            t.IsFalse(ps2x::iop::findAppendedIso(dir.path / "missing.exe").has_value(),
++                      "a missing file has no appended ISO");
++        });
++
++        tc.Run("SYSTEM.CNF BOOT2 is parsed with spaces, CRLF and the ;1 suffix", [](TestCase &t)
++        {
++            using ps2x::iop::bootElfName;
++            using ps2x::iop::parseSystemCnfBoot2;
++            t.Equals(parseSystemCnfBoot2("BOOT2 = cdrom0:\\SCES_539.50;1\r\nVER = 1.00\r\nVMODE = PAL\r\n").value_or("?"),
++                     std::string("cdrom0:\\SCES_539.50;1"), "BOOT2 with spaces and CRLF");
++            t.Equals(parseSystemCnfBoot2("VER=1.00\nBOOT2=cdrom0:\\SLUS_123.45;1\n").value_or("?"),
++                     std::string("cdrom0:\\SLUS_123.45;1"), "BOOT2 without spaces after another line");
++            t.Equals(parseSystemCnfBoot2("  boot2   =\t cdrom0:\\GAME.ELF  \r\n").value_or("?"),
++                     std::string("cdrom0:\\GAME.ELF"), "lower-case key, tabs and no ;1");
++            t.Equals(parseSystemCnfBoot2("BOOT2 = cdrom0:\\SCES_539.50;1").value_or("?"),
++                     std::string("cdrom0:\\SCES_539.50;1"), "BOOT2 on the last line without newline");
++            t.IsFalse(parseSystemCnfBoot2("BOOT = cdrom:\\SLES_000.01;1\r\n").has_value(),
++                      "a PS1 BOOT line is not BOOT2");
++            t.IsFalse(parseSystemCnfBoot2("VER = 1.00\r\n").has_value(), "no BOOT2 line");
++            t.IsFalse(parseSystemCnfBoot2("BOOT2 = \r\n").has_value(), "an empty BOOT2 value");
++
++            t.Equals(bootElfName("cdrom0:\\SCES_539.50;1"), std::string("SCES_539.50"), "ELF name without ;1");
++            t.Equals(bootElfName("cdrom0:\\DIR\\GAME.ELF"), std::string("GAME.ELF"), "ELF name inside a directory");
++        });
++
++        tc.Run("IsoImage::readFile returns whole files by path", [](TestCase &t)
++        {
++            TempDir dir;
++            IsoImage image;
++            t.IsTrue(image.open(writeIso(dir, "files.iso", 0u)), "the ISO opens");
++            std::vector<uint8_t> bytes;
++            t.IsTrue(image.readFile("cdrom0:\\DIR\\FILE.BIN;1", bytes), "FILE.BIN is read");
++            t.IsTrue(bytes == fileBytes(), "FILE.BIN has its exact bytes");
++            t.IsTrue(image.readFile("readme.txt", bytes), "README.TXT is read case-insensitively");
++            t.Equals(std::string(bytes.begin(), bytes.end()), kReadme, "README.TXT has its exact bytes");
++            t.IsFalse(image.readFile("\\MISSING.BIN", bytes), "a missing file is not read");
++            t.IsFalse(image.readFile("\\DIR", bytes), "a directory is not read as a file");
++        });
++
++        tc.Run("Image mode I/O paths: base folder for cards, shared image opened once", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 2u * kSector + 9u;
++            const std::filesystem::path iso = writeIso(dir, "game.bin", prefix);
++            const std::filesystem::path base = dir.path / "exe";
++
++            _putenv_s("PS2X_TARJETAS", "");
++            PS2Runtime::configureIoPathsForImage(iso, prefix, base, "SCES_539.50");
++            const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
++            const std::string baseText = std::filesystem::absolute(base).lexically_normal().string();
++            t.Equals(paths.cdImage.lexically_normal().string(), std::filesystem::absolute(iso).lexically_normal().string(),
++                     "the image is the CD image");
++            t.Equals(paths.cdImageOffset, prefix, "the image offset is kept");
++            t.Equals(paths.elfDirectory.lexically_normal().string(), baseText, "the ELF directory is the base folder");
++            t.Equals(paths.hostRoot.lexically_normal().string(), baseText, "host: is the base folder");
++            t.Equals(paths.mcRoot.lexically_normal().string(), (std::filesystem::absolute(base) / "mc0").lexically_normal().string(),
++                     "the memory card sits next to the .exe");
++            t.Equals(paths.elfPath.filename().string(), std::string("SCES_539.50"), "the ELF name is kept");
++
++            const std::shared_ptr<const IsoImage> shared = PS2Runtime::cdIsoImage();
++            t.IsTrue(shared && shared->isOpen(), "the shared image is open");
++            t.IsTrue(shared && shared->totalSectors() == kVolumeSectors && shared->baseOffset() == prefix,
++                     "the shared image is the configured one");
++            setCdPaths(dir.path, iso, prefix);
++            t.IsTrue(PS2Runtime::cdIsoImage() == shared, "the same image and offset are not reopened");
++
++            const std::filesystem::path cards = dir.path / "cards";
++            _putenv_s("PS2X_TARJETAS", cards.string().c_str());
++            PS2Runtime::configureIoPathsForImage(iso, prefix, base, "SCES_539.50");
++            _putenv_s("PS2X_TARJETAS", "");
++            t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(cards) / "mc0").lexically_normal().string(),
++                     "PS2X_TARJETAS still moves the cards in image mode");
++
++            setCdPaths(dir.path, {}, 0u);
++            t.IsTrue(PS2Runtime::cdIsoImage() == nullptr, "without a CD image there is no shared image");
++            writeFile(dir.path / "raw.bin", std::vector<uint8_t>(20u * kSector, 'x'));
++            setCdPaths(dir.path, dir.path / "raw.bin", 0u);
++            t.IsTrue(PS2Runtime::cdIsoImage() == nullptr, "a non-ISO CD image gives no shared image");
++        });
++
++        tc.Run("PS2Vfs serves cdrom0: from the image (exact bytes, any case, optional ;1)", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 4u * kSector + 33u;
++            const std::filesystem::path iso = writeIso(dir, "game.bin", prefix);
++            // A decoy folder copy with other bytes: with an image the folder must not be read.
++            std::filesystem::create_directories(dir.path / "DIR");
++            writeFile(dir.path / "DIR" / "FILE.BIN", std::vector<uint8_t>(kFileSize, 'F'));
++            writeFile(dir.path / "ONLYHOST.BIN", std::vector<uint8_t>(16u, 'H'));
++            setCdPaths(dir.path, iso, prefix);
++            const PS2VfsMounts mounts{dir.path, dir.path, dir.path / "mc0"};
++            PS2RomDevice rom;
++            PS2Vfs vfs;
++
++            const std::vector<uint8_t> expected = fileBytes();
++            const int32_t fd = vfs.open("cdrom0:\\DIR\\FILE.BIN;1", PS2_FIO_O_RDONLY, mounts, rom);
++            t.IsTrue(fd >= 3, "cdrom0: opens a file of the image");
++            std::vector<uint8_t> bytes(kFileSize + 100u, 0xAAu);
++            t.Equals(vfs.read(fd, bytes.data(), bytes.size()), int64_t{kFileSize}, "read stops at the file size");
++            t.IsTrue(std::equal(expected.begin(), expected.end(), bytes.begin()), "read returns the image bytes");
++            t.Equals(vfs.read(fd, bytes.data(), 10u), int64_t{0}, "read at the end returns 0");
++            t.Equals(vfs.seek(fd, 0, SEEK_END), int64_t{kFileSize}, "SEEK_END is the file size");
++            t.Equals(vfs.seek(fd, kSector + 5, SEEK_SET), int64_t{kSector + 5}, "SEEK_SET moves inside the file");
++            t.Equals(vfs.read(fd, bytes.data(), 2900u), int64_t{2900}, "a read across sectors succeeds");
++            t.IsTrue(std::equal(expected.begin() + kSector + 5, expected.begin() + kSector + 5 + 2900, bytes.begin()),
++                     "a read across sectors returns the exact bytes");
++            t.Equals(vfs.seek(fd, -5, SEEK_CUR), int64_t{kSector + 2900}, "SEEK_CUR is relative");
++            t.Equals(vfs.seek(fd, -1, SEEK_SET), int64_t{-1}, "a negative position is refused");
++            t.Equals(vfs.write(fd, bytes.data(), 1u), int64_t{-1}, "the disc is read-only");
++            t.Equals(vfs.close(fd), 0, "close succeeds");
++
++            const int32_t lower = vfs.open("cdrom0:/dir/file.bin", PS2_FIO_O_RDONLY, mounts, rom);
++            t.IsTrue(lower >= 3, "lower case without ;1 opens the same file");
++            std::vector<uint8_t> head(4u);
++            t.IsTrue(vfs.read(lower, head.data(), head.size()) == 4 && std::equal(head.begin(), head.end(), expected.begin()),
++                     "lower case path reads the image bytes");
++            (void)vfs.close(lower);
++            const int32_t readme = vfs.open("cdrom:\\README.TXT", PS2_FIO_O_RDONLY, mounts, rom);
++            std::string text(kReadme.size(), '\0');
++            t.IsTrue(readme >= 3 && vfs.read(readme, text.data(), text.size()) == static_cast<int64_t>(text.size()) && text == kReadme,
++                     "cdrom: reads README.TXT from the image");
++            (void)vfs.close(readme);
++
++            t.Equals(vfs.open("cdrom0:\\DIR\\MISSING.BIN;1", PS2_FIO_O_RDONLY, mounts, rom), -1, "a missing file fails with -1");
++            t.Equals(vfs.open("cdrom0:\\ONLYHOST.BIN;1", PS2_FIO_O_RDONLY, mounts, rom), -1,
++                     "files of the host folder are not on the disc");
++            t.Equals(vfs.open("cdrom0:\\DIR\\FILE.BIN;1", PS2_FIO_O_RDWR, mounts, rom), -1, "write access is refused");
++
++            PS2VfsStat status;
++            t.IsTrue(vfs.stat("cdrom0:\\DIR\\FILE.BIN;1", mounts, rom, status), "stat finds the image file");
++            t.IsTrue(status.size == kFileSize && !status.directory && status.readOnly, "stat reports size, file, read-only");
++            t.IsTrue(vfs.stat("cdrom0:\\dir", mounts, rom, status) && status.directory, "stat reports image directories");
++            t.IsFalse(vfs.stat("cdrom0:\\NOPE.BIN", mounts, rom, status), "stat of a missing file fails");
++            std::filesystem::path hostPath;
++            t.IsFalse(vfs.resolveHostPath("cdrom0:\\DIR\\FILE.BIN;1", mounts, hostPath),
++                      "with an image cdrom0: has no host path");
++            t.IsTrue(vfs.resolveHostPath("host:ONLYHOST.BIN", mounts, hostPath), "host: still maps to the host folder");
++        });
++
++        tc.Run("PS2Vfs cdrom0: without an image still reads the CD root folder", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            std::filesystem::create_directories(dir.path / "DIR");
++            const std::vector<uint8_t> expected = fileBytes();
++            writeFile(dir.path / "DIR" / "FILE.BIN", expected);
++            setCdPaths(dir.path, {}, 0u);
++            const PS2VfsMounts mounts{dir.path, dir.path, dir.path / "mc0"};
++            PS2RomDevice rom;
++            PS2Vfs vfs;
++
++            const int32_t fd = vfs.open("cdrom0:\\DIR\\FILE.BIN", PS2_FIO_O_RDONLY, mounts, rom);
++            t.IsTrue(fd >= 3, "cdrom0: opens the folder file");
++            std::vector<uint8_t> bytes(kFileSize);
++            t.Equals(vfs.read(fd, bytes.data(), bytes.size()), int64_t{kFileSize}, "the folder file is read whole");
++            t.IsTrue(bytes == expected, "the folder file has its bytes");
++            (void)vfs.close(fd);
++            std::filesystem::path hostPath;
++            t.IsTrue(vfs.resolveHostPath("cdrom0:\\DIR\\FILE.BIN", mounts, hostPath) &&
++                         hostPath == (dir.path / "DIR" / "FILE.BIN").lexically_normal(),
++                     "cdrom0: maps to the CD root folder");
++        });
++
++        tc.Run("sceCd on the EE with an image: real LSNs, PVD size and the image offset", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 3u * kSector + 77u;
++            // The file holds more sectors than the PVD volume: only the PVD size may be read.
++            std::vector<uint8_t> iso = buildIso();
++            iso.resize(static_cast<size_t>(kVolumeSectors + 8u) * kSector, 0x5Au);
++            std::vector<uint8_t> bytes(static_cast<size_t>(prefix), 0xEEu);
++            bytes.insert(bytes.end(), iso.begin(), iso.end());
++            writeFile(dir.path / "game.bin", bytes);
++            std::filesystem::create_directories(dir.path / "DIR");
++            writeFile(dir.path / "DIR" / "FILE.BIN", std::vector<uint8_t>(kFileSize, 'F'));
++            setCdPaths(dir.path, dir.path / "game.bin", prefix);
++
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            R5900Context ctx{};
++            constexpr uint32_t fileAddr = 0x3000u;
++            constexpr uint32_t pathAddr = 0x3100u;
++            constexpr uint32_t bufAddr = 0x10000u;
++            const auto search = [&](const std::string &path)
++            {
++                std::memcpy(rdram.data() + pathAddr, path.c_str(), path.size() + 1u);
++                std::memset(rdram.data() + fileAddr, 0, 32u);
++                ctx = R5900Context{};
++                setGuestReg(ctx, 4, fileAddr);
++                setGuestReg(ctx, 5, pathAddr);
++                ps2_stubs::sceCdSearchFile(rdram.data(), &ctx, nullptr);
++                return guestReturn(ctx);
++            };
++            const auto read = [&](uint32_t lsn, uint32_t sectors)
++            {
++                std::memset(rdram.data() + bufAddr, 0xAA, 4u * kSector);
++                ctx = R5900Context{};
++                setGuestReg(ctx, 4, lsn);
++                setGuestReg(ctx, 5, sectors);
++                setGuestReg(ctx, 6, bufAddr);
++                ps2_stubs::sceCdRead(rdram.data(), &ctx, nullptr);
++                return guestReturn(ctx);
++            };
++
++            t.Equals(search("\\DIR\\FILE.BIN;1"), 1, "sceCdSearchFile finds the image file");
++            t.Equals(guestU32(rdram, fileAddr), kFileLsn, "sceCdSearchFile returns the real LSN");
++            t.Equals(guestU32(rdram, fileAddr + 4u), kFileSize, "sceCdSearchFile returns the real size");
++            t.Equals(search("cdrom0:\\readme.txt"), 1, "sceCdSearchFile is case-insensitive without ;1");
++            t.Equals(guestU32(rdram, fileAddr), kReadmeLsn, "README.TXT has its real LSN");
++            t.Equals(search("\\DIR\\NOPE.BIN;1"), 0, "a missing file is not found");
++
++            t.Equals(read(kFileLsn, 3u), 1, "sceCdRead of the file sectors succeeds");
++            const std::vector<uint8_t> expected = fileBytes();
++            t.IsTrue(std::memcmp(rdram.data() + bufAddr, expected.data(), expected.size()) == 0,
++                     "sceCdRead returns the image bytes at the image offset");
++            t.Equals(read(16u, 1u), 1, "sceCdRead of the PVD succeeds");
++            t.IsTrue(rdram[bufAddr] == 1u && std::memcmp(rdram.data() + bufAddr + 1u, "CD001", 5u) == 0,
++                     "sector 16 is the image PVD, not bytes before the offset");
++            t.Equals(read(kVolumeSectors - 1u, 1u), 1, "the last PVD sector is readable");
++            t.IsTrue(rdram[bufAddr] == 0x5Au, "the last PVD sector has its bytes");
++            t.Equals(read(kVolumeSectors + 2u, 1u), 0, "a sector past the PVD volume size is refused");
++        });
++
++        tc.Run("IRX loading reads cdrom0: modules from the image through the IOP host", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 6u * kSector + 1u;
++            setCdPaths(dir.path, writeIso(dir, "game.bin", prefix), prefix);
++            PS2Runtime runtime;
++            PS2IopHostAdapter host(runtime);
++
++            std::vector<uint8_t> bytes;
++            t.IsTrue(ps2x::iop::detail::IopModuleLoader::readWholeHostFile(host, "cdrom0:\\DIR\\FILE.BIN;1", bytes),
++                     "a cdrom0: module is read from the image");
++            t.IsTrue(bytes == fileBytes(), "the module has the exact image bytes");
++            t.IsFalse(ps2x::iop::detail::IopModuleLoader::readWholeHostFile(host, "cdrom0:\\DIR\\NOPE.IRX;1", bytes),
++                      "a missing module fails");
++        });
+     });
+ }

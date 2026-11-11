@@ -1,0 +1,46 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..87641e5 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -392,7 +416,39 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
++
++    // Guest cycles only count executed EE instructions, but host work that real hardware does in
++    // parallel (software GS rasterisation, VU1 interpretation, waits) also takes wall time. Without
++    // this the EE timers fall thousands of times behind real time and games whose clock is T0
++    // overflow-driven (F1 06) never finish their time-based fades. Catch the EE clock up to wall time
++    // (it never runs ahead of it: deadlines are already paced by host time). The IOP keeps counting
++    // executed cycles only, so it is not flooded with a large catch-up slice.
++    uint64_t catchUp = 0u;
++    {
++        static std::chrono::steady_clock::time_point s_hostStart{};
++        static uint64_t s_cycleStart = 0u;
++        static uint32_t s_callsSinceCheck = 0u;
++        if (s_hostStart == std::chrono::steady_clock::time_point{})
++        {
++            s_hostStart = std::chrono::steady_clock::now();
++            s_cycleStart = m_eeCycle;
++        }
++        else if (++s_callsSinceCheck >= 64u)
++        {
++            s_callsSinceCheck = 0u;
++            const auto hostElapsed = std::chrono::steady_clock::now() - s_hostStart;
++            const uint64_t hostMicros = static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::microseconds>(hostElapsed).count());
++            const uint64_t hostCycle = s_cycleStart + microsecondsToEeCycles(hostMicros);
++            if (hostCycle > m_eeCycle)
++            {
++                catchUp = hostCycle - m_eeCycle;
++                m_eeCycle = hostCycle;
++            }
++        }
++    }
++
++    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed + catchUp);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+

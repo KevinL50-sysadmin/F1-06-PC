@@ -1,0 +1,183 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 6942aea..62bf4bf 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -6,7 +6,10 @@
+ // current code, 1 the previous one (GS: drawing on the EE thread with the reference rasterizer), 2 the GS without its
+ // band workers (everything rasterized on the GS thread), 3 the VU1 interpreter without blocks (ps2_vu1_blocks.h), 4 the
+ // IOP advanced on every EE checkpoint instead of in batches (EeScheduler::accountCycles), 5 the VU1 blocks with the
+-// upper instruction dispatched as before BlockPair::upperFn. A
++// upper instruction dispatched as before BlockPair::upperFn, 6 the VIF1 DMA chains gathered in a new vector each time
++// and copied again by an 'i' bit stall (before patch 0039), 7 (game hook) the host cores as Windows decides, 8 the GS
++// worker sleeping as soon as its queue is empty (no spinning first), 9 the VU1 pairs decoded and planned again after
++// every microcode upload (no cache by content). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index a01e784..3991ac0 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -113,6 +113,19 @@ namespace
+         uint8_t kind;
+     };
+ 
++    // Field by field: an aggregate assignment ({mac, status, ...}) was built in a temporary with 4-byte stores and
++    // copied with a 16-byte load, which cannot take its data from those stores (a store forwarding stall on every
++    // FMAC pair of a block; off the critical path, so it measured the same).
++    PS2_VU_FORCEINLINE void setFlagSlot(FlagSlot &e, uint32_t mac, uint32_t status, uint32_t sticky, uint32_t clip,
++                                        uint8_t kind)
++    {
++        e.mac = mac;
++        e.status = status;
++        e.sticky = sticky;
++        e.clip = clip;
++        e.kind = kind;
++    }
++
+     inline void applyFlagSlot(const FlagSlot &e, VU1State &s)
+     {
+         if ((e.kind & kFlagMac) != 0u)
+@@ -1282,14 +1295,14 @@ namespace
+             {
+                 p.upperFn(p, vu, up);
+                 if (p.upperFlags != 0u)
+-                    st.flags[(issue + 4u) & 7u][0] = {up.mac, up.status, up.sticky, 0u, p.upperFlags};
++                    setFlagSlot(st.flags[(issue + 4u) & 7u][0], up.mac, up.status, up.sticky, 0u, p.upperFlags);
+             }
+             else if (p.upperPath == UpperClip)
+             {
+                 uint32_t &workingClip = host.workingClip();
+                 workingClip = ((workingClip << 6) | (vuClipFlags(vu.vf[p.simple.fs], vu.vf[p.simple.ft][3]) & 0x3Fu)) &
+                               0xFFFFFFu;
+-                st.flags[(issue + 4u) & 7u][0] = {0u, 0u, 0u, workingClip, kFlagClip};
++                setFlagSlot(st.flags[(issue + 4u) & 7u][0], 0u, 0u, 0u, workingClip, kFlagClip);
+             }
+ 
+             // Lower instruction.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index ff2e0fb..d07aa7b 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1046,6 +1046,56 @@ namespace
+     };
+     DecodeSnapshot s_decodeSnapshots[2];
+ 
++    // Pairs of the VU1 already decoded and planned, by content (patch 0039): the game loads six microprograms in turn
++    // at the same addresses, so after each upload the same pairs came back and were decoded and planned again (~2 %
++    // of the EE thread in race). Each pair index keeps its last kPairVariants versions (a pair decodes from its own 8
++    // bytes alone, and its plan and PairInfo from the decoded pair). A template because the decoded pair is a private
++    // type of VU1Interpreter, named from its member functions. A/B mode 9: decode and plan again, as before.
++    constexpr uint32_t kPairVariants = 4u;
++    template <typename Decoded>
++    struct PairVariantTable
++    {
++        struct Entry
++        {
++            uint64_t code = ~0ull; // lower | upper << 32
++            bool planned = false;
++            Decoded decoded{};
++            PairPlan plan{};
++            PairInfo info{};
++        };
++        Entry entries[0x4000u / 8u][kPairVariants];
++        uint8_t next[0x4000u / 8u] = {};
++
++        Entry *find(uint32_t index, uint64_t code)
++        {
++            for (Entry &e : entries[index])
++                if (e.code == code)
++                    return &e;
++            return nullptr;
++        }
++        Entry &add(uint32_t index, uint64_t code)
++        {
++            Entry &e = entries[index][next[index]++ % kPairVariants];
++            e.code = code;
++            e.planned = false;
++            return e;
++        }
++    };
++    template <typename Decoded>
++    PairVariantTable<Decoded> &pairVariants()
++    {
++        static PairVariantTable<Decoded> *const s_table = new PairVariantTable<Decoded>();
++        return *s_table;
++    }
++    inline uint64_t pairCode(uint32_t lower, uint32_t upper)
++    {
++        return static_cast<uint64_t>(lower) | (static_cast<uint64_t>(upper) << 32);
++    }
++    inline bool pairVariantsOn(bool vu1)
++    {
++        return vu1 && g_ps2AbMode.load(std::memory_order_relaxed) != 9;
++    }
++
+     // F1_VU1_VERIFICAR=<n> (from F1_VU1_VERIFICAR_DESDE=<s> seconds after the first VU1 run): n programs run twice
+     // from the same state, with blocks and with this interpreter alone, and the results are compared ([vu1:verificar]).
+     std::vector<std::vector<uint8_t>> *s_verifyPackets = nullptr; // packets of the run, when verifying
+@@ -2708,12 +2758,23 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+                              s_planTables[m_unit == Unit::VU1 ? 1 : 0].owner == this;
+     if (incremental)
+     {
++        const bool variants = pairVariantsOn(m_unit == Unit::VU1);
+         for (uint32_t i = 0; i < pairCount; ++i)
+         {
+             if (std::memcmp(snapshot.code + i * 8u, vuCode + i * 8u, 8u) == 0)
+                 continue;
+-            m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+             snapshot.changed[i >> 6] |= 1ull << (i & 63u);
++            if (variants)
++            {
++                uint32_t words[2];
++                std::memcpy(words, vuCode + i * 8u, 8u);
++                if (const auto *e = pairVariants<DecodedInstructionPair>().find(i, pairCode(words[0], words[1])))
++                {
++                    m_decodedCodeCache[i] = e->decoded;
++                    continue;
++                }
++            }
++            m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+         }
+     }
+     else
+@@ -3049,11 +3110,36 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const uint32_t unitIndex = m_unit == Unit::VU1 ? 1u : 0u;
+         PlanTable &table = s_planTables[unitIndex];
+         DecodeSnapshot &snapshot = s_decodeSnapshots[unitIndex];
++        const bool variants = pairVariantsOn(unitIndex == 1u);
+         const auto planPair = [&](uint32_t pairIndex)
+         {
+-            buildPairPlan(decodedCache[pairIndex], lowerWaits(decodedCache[pairIndex].lowerUsage),
+-                          table.plans[pairIndex]);
+-            describePair(decodedCache[pairIndex], table.plans[pairIndex], s_pairInfos[unitIndex][pairIndex]);
++            const DecodedInstructionPair &decoded = decodedCache[pairIndex];
++            PairVariantTable<DecodedInstructionPair>::Entry *entry = nullptr;
++            if (variants)
++            {
++                auto &table2 = pairVariants<DecodedInstructionPair>();
++                const uint64_t code = pairCode(decoded.lower, decoded.upper);
++                entry = table2.find(pairIndex, code);
++                if (entry != nullptr && entry->planned)
++                {
++                    table.plans[pairIndex] = entry->plan;
++                    s_pairInfos[unitIndex][pairIndex] = entry->info;
++                    return;
++                }
++                if (entry == nullptr)
++                {
++                    entry = &table2.add(pairIndex, code);
++                    entry->decoded = decoded;
++                }
++            }
++            buildPairPlan(decoded, lowerWaits(decoded.lowerUsage), table.plans[pairIndex]);
++            describePair(decoded, table.plans[pairIndex], s_pairInfos[unitIndex][pairIndex]);
++            if (entry != nullptr)
++            {
++                entry->plan = table.plans[pairIndex];
++                entry->info = s_pairInfos[unitIndex][pairIndex];
++                entry->planned = true;
++            }
+         };
+         if (table.owner != this)
+         {

@@ -1,0 +1,240 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index 1b43a7c..b880235 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -4,6 +4,7 @@
+ #include "ps2_user_paths.h"
+ 
+ #include <array>
++#include <cmath>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -147,6 +148,80 @@ namespace ps2x
+         return out;
+     }
+ 
++    // Nativizacion T16: the host's password typed on the game's own keyboard (OPTIONS > PC NETPLAY, PASSWORD). The
++    // page's Lua sends it one character code at a time (begin, add each code, finish), so no piece of it is left in
++    // the game's Lua heap as a key string. It is taken whole or not at all: printable ASCII, and empty (a new random
++    // one when the host starts, as in the F2 menu) or kGamePasswordMinSize to kGamePasswordMaxSize characters.
++    // finish (and begin) wipe the characters received.
++    constexpr size_t kGamePasswordMinSize = 8;  // ps2x::netplay::kMinHostPasswordSize
++    constexpr size_t kGamePasswordMaxSize = 32; // the keyboard's charLimit
++    inline bool gamePasswordValid(std::string_view password)
++    {
++        if (!password.empty() && (password.size() < kGamePasswordMinSize || password.size() > kGamePasswordMaxSize))
++            return false;
++        for (const char c : password)
++            if (c < 0x20 || c >= 0x7F)
++                return false;
++        return true;
++    }
++
++    class GamePasswordEntry
++    {
++    public:
++        ~GamePasswordEntry()
++        {
++            wipe();
++        }
++        void begin()
++        {
++            wipe();
++            m_open = true;
++        }
++        // code: a character code as the Lua number it came in; false (and the whole password refused) for anything
++        // but printable ASCII, past kGamePasswordMaxSize, or without begin.
++        bool add(float code)
++        {
++            if (!m_open)
++                return false;
++            if (!(code >= 32.0f && code <= 126.0f) || code != std::floor(code) || m_size >= m_chars.size())
++            {
++                m_refused = true;
++                return false;
++            }
++            m_chars[m_size++] = static_cast<char>(code);
++            return true;
++        }
++        // The password received, if it can be taken; false otherwise (password left as it was).
++        bool finish(std::string &password)
++        {
++            const bool taken = m_open && !m_refused && gamePasswordValid(std::string_view(m_chars.data(), m_size));
++            if (taken)
++                password.assign(m_chars.data(), m_size);
++            wipe();
++            return taken;
++        }
++        size_t size() const
++        {
++            return m_size;
++        }
++
++    private:
++        void wipe()
++        {
++            volatile char *chars = m_chars.data(); // volatile: the compiler may not drop it
++            for (size_t i = 0; i < m_chars.size(); ++i)
++                chars[i] = '\0';
++            m_size = 0u;
++            m_open = false;
++            m_refused = false;
++        }
++
++        std::array<char, kGamePasswordMaxSize> m_chars{};
++        size_t m_size = 0u;
++        bool m_open = false;
++        bool m_refused = false;
++    };
++
+     // PS2X_MENU_GUION (tests): "<seconds>:<action>,..." from the first frame of the window. Actions: abrir, cerrar,
+     // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido|juego>, tecla=<arriba|abajo|izquierda|derecha|
+     // aceptar>, foto (a photo, as tecla_foto) or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
+@@ -233,6 +308,12 @@ public:
+         std::string guest;
+     };
+     static GameNetplayState gameNetplayState(int waitMs);
++    // Nativizacion T16 (PC NETPLAY, PASSWORD): the host's password typed on the game's keyboard goes to the buffer the
++    // F2 menu types in (empty: a new random one when the host starts). Refused while the host runs or is asked to start
++    // (F2 only lets it change then) and when ps2x::gamePasswordValid refuses it. Never saved. gameNetplayPassword: the
++    // one to tell the guest, as F2 shows it: the host's while it runs, else the one typed (empty: random).
++    static bool setGameNetplayPassword(const std::string &password);
++    static std::string gameNetplayPassword();
+ 
+ private:
+     struct State;
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index fd5b54b..bd6bac1 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -1259,3 +1259,35 @@ PS2OptionsMenu::GameNetplayState PS2OptionsMenu::gameNetplayState(int waitMs)
+         state.guest = ps2x::netplayPageText(status.guestAddress, ps2x::kNetplayPageTextSize);
+     return state;
+ }
++
++static_assert(ps2x::kGamePasswordMinSize == ps2x::netplay::kMinHostPasswordSize &&
++                  ps2x::kGamePasswordMaxSize <= ps2x::netplay::kMaxPasswordSize,
++              "the game's keyboard password fits the host's limits");
++
++bool PS2OptionsMenu::setGameNetplayPassword(const std::string &password)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr || netplayHostingWanted() || !ps2x::gamePasswordValid(password))
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureNetplayPassword(s);
++    std::snprintf(s.netplayPassword, sizeof(s.netplayPassword), "%s", password.c_str());
++    std::cout << "[red] contrasena desde el juego: "
++              << (password.empty() ? std::string("una al azar al empezar")
++                                   : std::to_string(password.size()) + " caracteres")
++              << std::endl;
++    return true;
++}
++
++std::string PS2OptionsMenu::gameNetplayPassword()
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    const ps2x::netplay::HostSessionStatus status = ps2x::netplay::hostSession().status();
++    if (status.hosting)
++        return status.password;
++    if (g_gameMenu == nullptr)
++        return std::string();
++    State &s = *g_gameMenu->m_state;
++    ensureNetplayPassword(s);
++    return s.netplayPassword;
++}
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index c77d725..85a8e24 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -795,6 +795,66 @@ void register_ps2_options_menu_tests()
+             t.Equals(ps2x::netplayPageText("abcdef", 2), std::string("ab"), "too small for ...: only cut");
+         });
+ 
++        // Nativizacion T16: the host's password from the game's keyboard reaches the host one character code at a time
++        // and is taken whole or not at all: empty (random when the host starts) or 8 to 32 printable characters.
++        tc.Run("the PC NETPLAY password from the game's keyboard is taken whole: empty or 8 to 32 printable characters",
++               [](TestCase &t)
++        {
++            const auto send = [](ps2x::GamePasswordEntry &entry, const std::string &text)
++            {
++                entry.begin();
++                bool all = true;
++                for (const char c : text)
++                    all = entry.add(static_cast<float>(static_cast<unsigned char>(c))) && all;
++                return all;
++            };
++            ps2x::GamePasswordEntry entry;
++            std::string password = "before";
++            t.IsTrue(send(entry, "0Aa.:567"), "8 characters go in");
++            t.IsTrue(entry.finish(password), "8 characters: taken");
++            t.Equals(password, std::string("0Aa.:567"), "as typed, case and symbols kept");
++            t.Equals(entry.size(), size_t{0}, "wiped once finished");
++
++            const std::string longest = "! #$%&'()*+,-./0123456789:;<=>?@";
++            t.Equals(longest.size(), ps2x::kGamePasswordMaxSize, "the longest has 32");
++            t.IsTrue(send(entry, longest) && entry.finish(password) && password == longest,
++                     "32 characters, space and symbols: taken");
++            t.IsTrue(send(entry, "") && entry.finish(password) && password.empty(), "empty: taken (random one)");
++
++            password = "kept-as-it-was";
++            t.IsTrue(send(entry, "1234567"), "7 characters go in");
++            t.IsFalse(entry.finish(password), "7 characters: refused");
++            t.IsTrue(send(entry, "a") && !entry.finish(password), "1 character: refused");
++            t.IsFalse(send(entry, longest + "x"), "the 33rd character is refused");
++            t.IsFalse(entry.finish(password), "33 characters: refused whole");
++            for (const float code : {31.0f, 127.0f, 200.0f, -65.0f, 65.5f, std::nanf(""), INFINITY})
++            {
++                entry.begin();
++                for (const char c : std::string("abcdefgh"))
++                    entry.add(static_cast<float>(c));
++                t.IsFalse(entry.add(code), "refuses the code " + std::to_string(code));
++                t.IsFalse(entry.finish(password), "a bad code refuses the whole password: " + std::to_string(code));
++            }
++            t.Equals(password, std::string("kept-as-it-was"), "a refused password leaves the old one");
++
++            ps2x::GamePasswordEntry idle;
++            t.IsFalse(idle.add(65.0f), "no code without begin");
++            t.IsFalse(idle.finish(password), "no finish without begin");
++            t.IsTrue(send(entry, "abcdefgh") && entry.finish(password), "one taken");
++            t.IsFalse(entry.finish(password), "and not a second time without begin");
++            entry.begin();
++            entry.add(1.0f);
++            t.IsTrue(send(entry, "abcdefghi") && entry.finish(password) && password == "abcdefghi",
++                     "begin forgets an earlier refused one");
++
++            t.IsTrue(ps2x::gamePasswordValid("") && ps2x::gamePasswordValid("abcdefgh") &&
++                         ps2x::gamePasswordValid(longest),
++                     "valid: empty, 8 and 32");
++            t.IsFalse(ps2x::gamePasswordValid("abcdefg") || ps2x::gamePasswordValid(longest + "x") ||
++                          ps2x::gamePasswordValid("abcdefg\n") || ps2x::gamePasswordValid("abcdefg\xC3\xA1"),
++                      "not valid: 7, 33, a control character or past ASCII");
++        });
++
+         // PS2OptionsMenu (ps2_options_menu.cpp) is built into the runner only, so its game setters are checked in the
+         // source: a number that is not finite is refused first (red_anfitrion would reach std::lround), and the netplay
+         // lock is read holding g_modelMutex (the host starts in update() holding it: no change between check and set).
+@@ -828,6 +888,22 @@ void register_ps2_options_menu_tests()
+                      "gameNetplayState: the reason through netplayPageText");
+             t.IsTrue(contains(page, "state.guest = ps2x::netplayPageText(status.guestAddress"),
+                      "gameNetplayState: the guest's address through netplayPageText");
++            // Nativizacion T16: the game's password goes to the buffer the F2 menu types in (the host takes it from
++            // there), checked again, with the host off (read holding g_modelMutex, as F2 only edits it then), and
++            // the log says its size, never the password.
++            const std::string password = body("setGameNetplayPassword");
++            const size_t lock = password.find("std::lock_guard<std::mutex> lock(g_modelMutex);");
++            const size_t hosting = password.find("netplayHostingWanted()");
++            t.IsTrue(lock != std::string::npos && hosting != std::string::npos && lock < hosting,
++                     "setGameNetplayPassword: refused while hosting, read holding g_modelMutex");
++            t.IsTrue(contains(password, "ps2x::gamePasswordValid(password)"), "setGameNetplayPassword: checked again");
++            t.IsTrue(contains(password, "s.netplayPassword"), "setGameNetplayPassword: into F2's buffer");
++            t.IsTrue(contains(password, "password.size()") && !contains(password, "<< password") &&
++                         !contains(password, "<< s.netplayPassword"),
++                     "setGameNetplayPassword: logs the size only");
++            const std::string shown = body("gameNetplayPassword");
++            t.IsTrue(contains(shown, "status.password") && contains(shown, "s.netplayPassword"),
++                     "gameNetplayPassword: the host's while it runs, else the one typed");
+         });
+ 
+         tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)

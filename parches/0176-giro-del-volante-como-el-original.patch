@@ -1,0 +1,420 @@
+diff --git a/ps2xRuntime/src/lib/ps2_lgdev.h b/ps2xRuntime/src/lib/ps2_lgdev.h
+index 7bdfcd1..3833cd4 100644
+--- a/ps2xRuntime/src/lib/ps2_lgdev.h
++++ b/ps2xRuntime/src/lib/ps2_lgdev.h
+@@ -28,6 +28,10 @@ namespace ps2x::lgdev
+     constexpr size_t kDescriptorSize = 0x18u;
+     constexpr size_t kPositionSize = 0x18u;
+ 
++    // T6: grados_volante and giro of [volante] when not set (or not valid).
++    constexpr float kDefaultWheelDegrees = 900.0f;
++    constexpr float kDefaultLockDegrees = 200.0f;
++
+     // The Driving Force Pro buttons, in the order of their bit in pos + 0x14 (bit 16 + value).
+     enum DfpButton : int
+     {
+@@ -69,8 +73,36 @@ namespace ps2x::lgdev
+         WheelSource brake{WheelSource::Kind::Axis, 5, '~'};
+         std::array<std::vector<WheelSource>, kButtonCount> buttons;
+         float pedalDeadzone = 0.02f; // zona_muerta_volante
++        // T6: the steering ratio. wheelDegrees (grados_volante): the range the wheel is set to in its driver (G HUB:
++        // 900); lockDegrees (giro): the degrees lock to lock that are the game's full steering. The real Driving
++        // Force Pro works at 200 degrees unless the game switches it to 900 (properties 4/5, which F1 06 never sets),
++        // so in the original +-32767 was about +-100 degrees of wheel.
++        float wheelDegrees = kDefaultWheelDegrees;
++        float lockDegrees = kDefaultLockDegrees;
+     };
+ 
++    // The game's steering per unit of the wheel's axis (grados_volante / giro, 4.5 by default).
++    inline float steeringGain(const WheelMap &map)
++    {
++        return map.wheelDegrees / map.lockDegrees;
++    }
++
++    // The other way, for the force effects that refer to a steering position (giro / grados_volante).
++    inline double steeringScale(const WheelMap &map)
++    {
++        return static_cast<double>(map.lockDegrees) / map.wheelDegrees;
++    }
++
++    // The effective values for the log.
++    inline std::string describeSteering(const WheelMap &map)
++    {
++        char text[128];
++        std::snprintf(text, sizeof(text), "giro = %g grados de tope a tope sobre grados_volante = %g (x%.2f)",
++                      static_cast<double>(map.lockDegrees), static_cast<double>(map.wheelDegrees),
++                      static_cast<double>(steeringGain(map)));
++        return text;
++    }
++
+     // A Logitech G29 through DirectInput (G HUB): B1 cross, B2 square, B3 circle, B4 triangle, B5 right paddle (R1),
+     // B6 left paddle (L1), B7 R2, B8 L2, B9 share (select), B10 options (start), B11 R3, B12 L3; X steering, Y throttle
+     // and RZ brake (released at +1). The d-pad is the POV.
+@@ -123,15 +155,18 @@ namespace ps2x::lgdev
+         return false;
+     }
+ 
+-    // The wheel state of DirectInput through the map. Steering linear over the wheel's full physical range (the game
+-    // applies its own handling and sensitivity). false (and out at rest) without a wheel.
++    // The wheel state of DirectInput through the map. Steering linear, symmetric and exact at the centre: giro degrees
++    // of the wheel's grados_volante are the full lock, beyond that it stays at the lock (the game applies its own
++    // handling and sensitivity). false (and out at rest) without a wheel.
+     inline bool wheelInputFrom(const ps2_pad_win::JoystickState &s, const WheelMap &map, WheelInput &out)
+     {
+         out = WheelInput{};
+         if (!s.present)
+             return false;
+         if (map.steering.kind == WheelSource::Kind::Axis && map.steering.code >= 0 && map.steering.code < 8)
+-            out.steering = std::clamp(s.axes[map.steering.code] * (map.steering.mode == '-' ? -1.0f : 1.0f), -1.0f, 1.0f);
++            out.steering = std::clamp(s.axes[map.steering.code] * (map.steering.mode == '-' ? -1.0f : 1.0f) *
++                                          steeringGain(map),
++                                      -1.0f, 1.0f);
+         out.throttle = pedalValue(s, map.throttle, map.pedalDeadzone);
+         out.brake = pedalValue(s, map.brake, map.pedalDeadzone);
+         out.pov = s.pov;
+@@ -326,8 +361,11 @@ namespace ps2x::lgdev
+     }
+ 
+     // invert (F1_VOLANTE_INVERTIR_FUERZA=1): the forces the other way (constant, ramp and periodic; the spring and the
+-    // damper act around a position and keep their sign).
+-    inline ForceParams translateEffect(const uint8_t *effect, bool invert = false)
++    // damper act around a position and keep their sign). scale (T6, steeringScale: giro / grados_volante): a steering
++    // position of the game as a fraction of the wheel's physical range, so the spring centre and dead band fall on the
++    // physical angle the game steers to and the coefficients keep the game's force per degree (clamped to 10000).
++    // Constant, ramp and periodic forces do not refer to a position and do not change.
++    inline ForceParams translateEffect(const uint8_t *effect, bool invert = false, double scale = 1.0)
+     {
+         ForceParams p;
+         const uint8_t type = effect[0];
+@@ -366,13 +404,13 @@ namespace ps2x::lgdev
+         else if (type == 7u || type == 8u)
+         {
+             p.kind = type == 7u ? ForceKind::Spring : ForceKind::Damper;
+-            p.offset = forceScale(effectWord(effect, 0x0C), 32767.0);
++            p.offset = forceScale(effectWord(effect, 0x0C) * scale, 32767.0);
+             const int32_t band = std::clamp(effectWord(effect, 0x10), 0, 0x10000);
+-            p.deadBand = static_cast<uint32_t>(forceScale(band / 2, 32767.0));
++            p.deadBand = static_cast<uint32_t>(forceScale(band / 2 * scale, 32767.0));
+             p.positiveSaturation = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, 0x14), 0, 255), 255.0));
+             p.negativeSaturation = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, 0x18), 0, 255), 255.0));
+-            p.positiveCoefficient = forceScale(effectWord(effect, 0x1C), 255.0);
+-            p.negativeCoefficient = forceScale(effectWord(effect, 0x20), 255.0);
++            p.positiveCoefficient = forceScale(effectWord(effect, 0x1C) / scale, 255.0);
++            p.negativeCoefficient = forceScale(effectWord(effect, 0x20) / scale, 255.0);
+         }
+         return p;
+     }
+@@ -624,8 +662,9 @@ namespace ps2x::lgdev
+             return static_cast<int32_t>(kErrInvalid);
+         }
+ 
+-        // The effects as the wheel must play them (none while closed: Close stops and forgets them).
+-        ForceState forceState(bool invert = false) const
++        // The effects as the wheel must play them (none while closed: Close stops and forgets them). scale: as
++        // translateEffect.
++        ForceState forceState(bool invert = false, double scale = 1.0) const
+         {
+             ForceState state;
+             if (!m_open)
+@@ -633,7 +672,7 @@ namespace ps2x::lgdev
+             state.gain = m_props[3];
+             state.autocenter = m_props[2] != 0u;
+             for (const StoredEffect &stored : m_store)
+-                state.effects.push_back({stored.id, translateEffect(stored.bytes.data(), invert), stored.playing,
++                state.effects.push_back({stored.id, translateEffect(stored.bytes.data(), invert, scale), stored.playing,
+                                          stored.starts});
+             return state;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 2284c31..6ead403 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -111,8 +111,10 @@ namespace
+         "# Mando de raylib que se lee (0 = el primero; -1 = ninguno).\n"
+         "mando = 0\n"
+         "zona_muerta = 0.15\n"
++        "# Zona muerta de los pedales del volante (y del volante como stick).\n"
+         "zona_muerta_volante = 0.02\n"
+-        "# Giro del volante: 2 = media vuelta del volante ya es todo el giro del stick.\n"
++        "# Giro del volante como stick (solo con F1_VOLANTE_STICK=1): 2 = media vuelta del volante ya es todo el giro\n"
++        "# del stick. El volante nativo usa grados_volante y giro de [volante] (abajo).\n"
+         "sensibilidad_volante = 1.0\n"
+         "# A partir de que valor una entrada analogica cuenta como boton pulsado (0 a 1).\n"
+         "umbral_boton = 0.1\n"
+@@ -175,7 +177,13 @@ namespace
+         "# cuentan (solo con F1_VOLANTE_STICK=1, el volante como stick del mando). Debajo de [volante] van la direccion,\n"
+         "# el acelerador y el freno (un eje del volante cada uno) y los botones del volante del juego (cruz circulo\n"
+         "# cuadrado triangulo l1 l2 r1 r2 l3 r3 start select; la cruceta es la del volante). Por defecto, un G29.\n"
++        "# Giro: grados_volante es el rango que tiene el volante en su programa (G HUB o el driver; 900 por defecto) y\n"
++        "# giro, los grados de tope a tope que son todo el giro del juego (200, como el Driving Force Pro del original;\n"
++        "# menos = direccion mas rapida; igual a grados_volante = todo el volante). La fuerza de centrado del juego va\n"
++        "# en la misma escala. La zona muerta de los pedales es zona_muerta_volante (arriba).\n"
+         "#[volante]\n"
++        "#grados_volante = 900\n"
++        "#giro = 200\n"
+         "#direccion = volante:X+\n"
+         "#acelerador = volante:Y~\n"
+         "#freno = volante:RZ~\n"
+@@ -362,6 +370,22 @@ namespace
+                               ps2x::lgdev::WheelMap &map, std::vector<std::string> &messages)
+     {
+         using ps2x::lgdev::WheelSource;
++        // T6: grados_volante and giro, positive numbers of degrees (finishPlayers checks giro <= grados_volante).
++        if (key == "grados_volante" || key == "giro")
++        {
++            const bool wheel = key == "grados_volante";
++            const float fallback = wheel ? ps2x::lgdev::kDefaultWheelDegrees : ps2x::lgdev::kDefaultLockDegrees;
++            char *end = nullptr;
++            float degrees = std::strtof(value.c_str(), &end);
++            if (value.empty() || end == nullptr || *end != '\0' || !std::isfinite(degrees) || degrees <= 0.0f)
++            {
++                messages.push_back(formatted("controles.ini:%d: %s no valido ('%s'): se usa %g", lineNumber,
++                                             key.c_str(), value.c_str(), static_cast<double>(fallback)));
++                degrees = fallback;
++            }
++            (wheel ? map.wheelDegrees : map.lockDegrees) = degrees;
++            return;
++        }
+         WheelSource *axis = key == "direccion" ? &map.steering : key == "acelerador" ? &map.throttle
+                             : key == "freno"   ? &map.brake : nullptr;
+         int button = -1;
+@@ -531,6 +555,16 @@ namespace
+         Config &one = p.player[0];
+         Config &two = p.player[1];
+         one.nativeWheel.pedalDeadzone = one.wheelDeadzone;
++        // T6: giro cannot be more than the wheel turns: 200, or the whole wheel if it turns less.
++        ps2x::lgdev::WheelMap &wheel = one.nativeWheel;
++        if (wheel.lockDegrees > wheel.wheelDegrees)
++        {
++            const float lock = std::min(ps2x::lgdev::kDefaultLockDegrees, wheel.wheelDegrees);
++            messages.push_back(formatted("controles.ini: giro = %g es mayor que grados_volante = %g: se usa giro = %g",
++                                         static_cast<double>(wheel.lockDegrees),
++                                         static_cast<double>(wheel.wheelDegrees), static_cast<double>(lock)));
++            wheel.lockDegrees = lock;
++        }
+         if (!p.second)
+         {
+             two.gamepad = -1;
+@@ -935,6 +969,11 @@ namespace ps2x
+         return lgdev::wheelInputFrom(wheel, config().nativeWheel, out);
+     }
+ 
++    const lgdev::WheelMap &nativeWheelMap()
++    {
++        return config().nativeWheel;
++    }
++
+     bool secondPadPortConnected(const PadPlayerInfo &player2, bool gamepadPresent)
+     {
+         return player2.configured &&
+@@ -1104,10 +1143,15 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+         for (const std::string &name : ps2_pad_win::listGameControllers())
+             std::fprintf(stderr, "[pad] DirectInput: %s\n", name.c_str());
+         if (ps2_pad_win::openWheel(cfg.wheel))
++        {
+             std::fprintf(stderr, ps2x::lgdev::nativeWheelEnabled()
+                                      ? "[pad] volante nativo del juego: Driving Force Pro (%s)\n"
+                                      : "[pad] volante: %s\n",
+                          ps2_pad_win::wheelName().c_str());
++            if (ps2x::lgdev::nativeWheelEnabled())
++                std::fprintf(stderr, "[pad] volante nativo: %s\n",
++                             ps2x::lgdev::describeSteering(cfg.nativeWheel).c_str());
++        }
+         else
+             std::fprintf(stderr, "[pad] sin volante (volante = %s)\n", cfg.wheel.c_str()); });
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad_players.h b/ps2xRuntime/src/lib/ps2_pad_players.h
+index 6e2477c..717e85e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_players.h
++++ b/ps2xRuntime/src/lib/ps2_pad_players.h
+@@ -60,4 +60,6 @@ namespace ps2x
+     // The wheel as the game's Logitech library sees it: the last state the pad read (DirectInput) through the
+     // [volante] map of controles.ini. false without a wheel.
+     bool readNativeWheel(lgdev::WheelInput &out);
++    // T6: that [volante] map (its grados_volante and giro scale the game's spring to the wheel).
++    const lgdev::WheelMap &nativeWheelMap();
+ }
+diff --git a/ps2xTest/src/ps2_lgdev_tests.cpp b/ps2xTest/src/ps2_lgdev_tests.cpp
+index bf2808f..d5b7986 100644
+--- a/ps2xTest/src/ps2_lgdev_tests.cpp
++++ b/ps2xTest/src/ps2_lgdev_tests.cpp
+@@ -202,12 +202,12 @@ namespace
+                 t.Equals(in.brake, 0.0f, "brake released");
+                 t.Equals(in.pov, -1, "POV centred");
+                 t.Equals(in.buttons, 0u, "no buttons");
+-                s.axes[0] = -0.25f;
++                s.axes[0] = -0.125f; // 56.25 degrees of the 900 to the left
+                 s.axes[1] = -1.0f; // throttle floored
+                 s.axes[5] = 0.0f;  // brake half way
+                 s.pov = 9000;
+                 t.IsTrue(ps2x::lgdev::wheelInputFrom(s, map, in), "present");
+-                t.Equals(in.steering, -0.25f, "steering linear over the full range");
++                t.Equals(in.steering, -0.5625f, "steering linear, 200 of the 900 degrees as the full lock");
+                 t.Equals(in.throttle, 1.0f, "throttle floored");
+                 t.IsTrue(in.brake > 0.48f && in.brake < 0.5f, "brake half way (less the 0.02 dead zone)");
+                 t.Equals(in.pov, 9000, "POV kept");
+@@ -229,6 +229,164 @@ namespace
+                 t.IsFalse(ps2x::lgdev::wheelInputFrom(ps2_pad_win::JoystickState{}, map, in), "no wheel");
+             });
+ 
++            tc.Run("T6: by default 200 of the wheel's 900 degrees are the game's full lock, as the original DFP",
++                   [](TestCase &t)
++                   {
++                const ps2x::lgdev::WheelMap map = ps2x::lgdev::defaultWheelMap();
++                t.Equals(map.wheelDegrees, 900.0f, "grados_volante 900 by default (G HUB)");
++                t.Equals(map.lockDegrees, 200.0f, "giro 200 by default");
++                // DirectInput gives the wheel's whole range (900 degrees) as -1..1: d degrees = d / 450.
++                auto steeringAt = [&map](float degrees)
++                {
++                    ps2_pad_win::JoystickState s = g29AtRest();
++                    s.axes[0] = degrees / 450.0f;
++                    WheelInput in;
++                    ps2x::lgdev::wheelInputFrom(s, map, in);
++                    return s16At(position(in).data(), 2);
++                };
++                t.Equals(steeringAt(0.0f), int16_t{0}, "centre exact");
++                t.Equals(steeringAt(100.0f), int16_t{32767}, "100 degrees right: full lock");
++                t.Equals(steeringAt(-100.0f), int16_t{-32767}, "100 degrees left: full lock");
++                const int16_t half = steeringAt(50.0f), halfLeft = steeringAt(-50.0f);
++                t.IsTrue(half >= 16383 && half <= 16384, "50 degrees right: half (" + std::to_string(half) + ")");
++                t.IsTrue(halfLeft >= -16384 && halfLeft <= -16383,
++                         "50 degrees left: half (" + std::to_string(halfLeft) + ")");
++                t.Equals(steeringAt(300.0f), int16_t{32767}, "beyond 100 degrees: clamped");
++                t.Equals(steeringAt(-450.0f), int16_t{-32767}, "the wheel's own stop: clamped");
++            });
++
++            tc.Run("T6: grados_volante and giro of [volante] set the steering ratio", [](TestCase &t)
++                   {
++                const ps2x::PadPlayersInfo info =
++                    ps2x::describePadPlayers("[volante]\ngrados_volante = 540\ngiro = 270\n", false);
++                t.IsTrue(info.messages.empty(), "no warnings");
++                t.Equals(info.nativeWheel.wheelDegrees, 540.0f, "grados_volante 540");
++                t.Equals(info.nativeWheel.lockDegrees, 270.0f, "giro 270");
++                ps2_pad_win::JoystickState s = g29AtRest();
++                s.axes[0] = 0.25f; // 67.5 of the 540 degrees
++                WheelInput in;
++                ps2x::lgdev::wheelInputFrom(s, info.nativeWheel, in);
++                t.Equals(in.steering, 0.5f, "67.5 degrees of a 270 lock: half");
++                s.axes[0] = -0.75f;
++                ps2x::lgdev::wheelInputFrom(s, info.nativeWheel, in);
++                t.Equals(in.steering, -1.0f, "past the lock: clamped");
++                const ps2x::PadPlayersInfo inverted =
++                    ps2x::describePadPlayers("[volante]\ndireccion = volante:X-\ngiro = 450\n", false);
++                s.axes[0] = 0.25f;
++                ps2x::lgdev::wheelInputFrom(s, inverted.nativeWheel, in);
++                t.Equals(in.steering, -0.5f, "with the axis inverted, the same ratio the other way");
++                t.Equals(ps2x::lgdev::describeSteering(info.nativeWheel),
++                         std::string("giro = 270 grados de tope a tope sobre grados_volante = 540 (x2.00)"), "logged");
++                t.Equals(ps2x::lgdev::describeSteering(ps2x::lgdev::defaultWheelMap()),
++                         std::string("giro = 200 grados de tope a tope sobre grados_volante = 900 (x4.50)"),
++                         "logged defaults");
++            });
++
++            tc.Run("T6: invalid grados_volante or giro fall back with a warning", [](TestCase &t)
++                   {
++                ps2x::PadPlayersInfo info =
++                    ps2x::describePadPlayers("[volante]\ngrados_volante = -5\ngiro = abc\n", false);
++                t.Equals(info.nativeWheel.wheelDegrees, 900.0f, "negative: 900");
++                t.Equals(info.nativeWheel.lockDegrees, 200.0f, "not a number: 200");
++                t.Equals(info.messages.size(), size_t{2}, "two warnings");
++                t.IsTrue(!info.messages.empty() &&
++                             info.messages[0] == "controles.ini:2: grados_volante no valido ('-5'): se usa 900",
++                         "grados_volante warning");
++                t.IsTrue(info.messages.size() > 1 &&
++                             info.messages[1] == "controles.ini:3: giro no valido ('abc'): se usa 200",
++                         "giro warning");
++
++                info = ps2x::describePadPlayers("[volante]\ngiro = 0\ngrados_volante = 12x\n", false);
++                t.Equals(info.nativeWheel.lockDegrees, 200.0f, "0: 200");
++                t.Equals(info.nativeWheel.wheelDegrees, 900.0f, "trailing text: 900");
++                t.Equals(info.messages.size(), size_t{2}, "two warnings");
++
++                info = ps2x::describePadPlayers("[volante]\ngrados_volante = 270\ngiro = 300\n", false);
++                t.Equals(info.nativeWheel.wheelDegrees, 270.0f, "grados_volante kept");
++                t.Equals(info.nativeWheel.lockDegrees, 200.0f, "giro above grados_volante: 200");
++                t.IsTrue(info.messages.size() == 1u &&
++                             info.messages[0] ==
++                                 "controles.ini: giro = 300 es mayor que grados_volante = 270: se usa giro = 200",
++                         "cross warning");
++
++                info = ps2x::describePadPlayers("[volante]\ngrados_volante = 180\n", false);
++                t.Equals(info.nativeWheel.lockDegrees, 180.0f, "a wheel of less than 200 degrees: all of it");
++                t.IsTrue(info.messages.size() == 1u &&
++                             info.messages[0] ==
++                                 "controles.ini: giro = 200 es mayor que grados_volante = 180: se usa giro = 180",
++                         "cross warning with the default giro");
++
++                info = ps2x::describePadPlayers("[jugador2]\ngiro = 100\n", false);
++                t.Equals(info.nativeWheel.lockDegrees, 200.0f, "giro outside [volante]: not taken");
++                t.IsTrue(info.messages.size() == 1u &&
++                             info.messages[0] == "controles.ini:2: control desconocido 'giro'",
++                         "unknown outside [volante]");
++            });
++
++            tc.Run("T6: the spring and damper act on the same physical angle as the steering", [](TestCase &t)
++                   {
++                using ps2x::lgdev::ForceKind;
++                const double scale = 200.0 / 900.0; // giro / grados_volante
++                const Effect spring = gameEffect(7, {{0x0C, 32767}, {0x10, 6554}, {0x14, 255}, {0x18, 128},
++                                                     {0x1C, 50}, {0x20, -255}});
++                ps2x::lgdev::ForceParams p = ps2x::lgdev::translateEffect(spring.data(), false, scale);
++                t.IsTrue(p.kind == ForceKind::Spring, "spring");
++                t.Equals(p.offset, 2222, "centre at full lock: 100 of the 450 degrees");
++                t.Equals(p.deadBand, 222u, "dead band on the same scale");
++                t.Equals(p.positiveCoefficient, 8824, "coefficient 50: the same force per degree (x4.5)");
++                t.Equals(p.negativeCoefficient, -10000, "coefficient -255 x4.5: clamped");
++                t.Equals(p.positiveSaturation, 10000u, "saturation unchanged");
++                t.Equals(p.negativeSaturation, 5020u, "saturation unchanged");
++                p = ps2x::lgdev::translateEffect(gameEffect(7, {{0x0C, -16384}}).data(), false, scale);
++                t.Equals(p.offset, -1111, "half lock to the left: 50 degrees");
++                p = ps2x::lgdev::translateEffect(gameEffect(7, {{0x0C, 0}}).data(), false, scale);
++                t.Equals(p.offset, 0, "centre exact");
++                p = ps2x::lgdev::translateEffect(gameEffect(8, {{0x0C, 10664}, {0x1C, 20}}).data(), false, scale);
++                t.IsTrue(p.kind == ForceKind::Damper, "damper");
++                t.Equals(p.offset, 723, "the damper too");
++                t.Equals(p.positiveCoefficient, 3529, "its coefficient too");
++
++                const Effect constant = gameEffect(0, {{0x0C, 255}, {0x10, 90}});
++                t.IsTrue(ps2x::lgdev::translateEffect(constant.data(), false, scale) ==
++                             ps2x::lgdev::translateEffect(constant.data()), "a constant force does not change");
++                const Effect sine = gameEffect(2, {{0x0C, 255}, {0x10, 90}, {0x14, 50}, {0x1C, 100}});
++                t.IsTrue(ps2x::lgdev::translateEffect(sine.data(), false, scale) ==
++                             ps2x::lgdev::translateEffect(sine.data()), "a periodic force does not change");
++
++                ps2x::lgdev::HostLibrary lib;
++                int32_t handle = 0;
++                lib.open(0, true, handle);
++                uint32_t id = 0;
++                lib.downloadEffect(handle, id, spring.data());
++                t.Equals(effectAt(lib.forceState(false, scale), 0).params.offset, 2222, "the host library scales it");
++                t.Equals(effectAt(lib.forceState(), 0).params.offset, 10000, "without a scale, as patch 0175");
++            });
++
++            // PRESERVE: giro = grados_volante is the mapping of patches 0174-0175 (the whole wheel is the full lock).
++            tc.Run("T6: with giro = grados_volante the whole wheel is the full lock, as patch 0174", [](TestCase &t)
++                   {
++                const ps2x::PadPlayersInfo info =
++                    ps2x::describePadPlayers("[volante]\ngrados_volante = 900\ngiro = 900\n", false);
++                t.IsTrue(info.messages.empty(), "no warnings");
++                ps2_pad_win::JoystickState s = g29AtRest();
++                WheelInput in;
++                const float axes[] = {-1.0f, -0.25f, 0.0f, 0.5f, 1.0f};
++                for (float axis : axes)
++                {
++                    s.axes[0] = axis;
++                    ps2x::lgdev::wheelInputFrom(s, info.nativeWheel, in);
++                    t.Equals(in.steering, axis, "steering = the axis " + std::to_string(axis));
++                }
++                s.axes[0] = 1.0f;
++                ps2x::lgdev::wheelInputFrom(s, info.nativeWheel, in);
++                t.Equals(s16At(position(in).data(), 2), int16_t{32767}, "full right at the wheel's stop");
++                const Effect spring = gameEffect(7, {{0x0C, 16384}, {0x10, 6554}, {0x1C, 50}, {0x20, 50}});
++                const double scale = static_cast<double>(info.nativeWheel.lockDegrees) / info.nativeWheel.wheelDegrees;
++                t.IsTrue(ps2x::lgdev::translateEffect(spring.data(), false, scale) ==
++                             ps2x::lgdev::translateEffect(spring.data()), "the spring as patch 0175");
++                t.Equals(ps2x::lgdev::translateEffect(spring.data(), false, scale).offset, 5000, "offset 16384");
++            });
++
+             tc.Run("pedals keep the wheel dead zone at rest", [](TestCase &t)
+                    {
+                 ps2x::lgdev::WheelMap map = ps2x::lgdev::defaultWheelMap();

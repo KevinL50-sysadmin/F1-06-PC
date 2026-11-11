@@ -1,0 +1,56 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 888a11b..b4c6a0c 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -75,7 +75,8 @@
+ // but decodes and mixes nothing: the cost of the sound without changing what the IOP sees), 106 (patch 0112) no SPU2
+ // IRQ in the sound data input areas (0x2000-0x27FF), as before patch 0112, 107 (patch 0113) the IOP interpreter loop of
+ // before patch 0113 (step() and IopCpuCore::executeInstruction for every instruction, without iop_cpu_fast.h), 108
+-// (patch 0115) the SPU2 voices interpolated with Catmull-Rom instead of the hardware gaussian table, as before.
++// (patch 0115) the SPU2 voices interpolated with Catmull-Rom instead of the hardware gaussian table, as before, 109
++// (patch 0119) GS triangles sampled at the pixel centre instead of its integer coordinate, as before.
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index b665fbc..f4ca778 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2469,6 +2469,20 @@ namespace
+         t.fy1 = v1.y - static_cast<float>(ofy);
+         t.fx2 = v2.x - static_cast<float>(ofx);
+         t.fy2 = v2.y - static_cast<float>(ofy);
++        // Patch 0119: the GS samples a pixel at its integer coordinate, not at its centre (PCSX2 GSRasterizer: rows from
++        // ceil(y), attributes at (x, y)). The loops below evaluate at x + 0.5 and y + 0.5, so the vertices move half a
++        // pixel the same way. F1 06 puts its 2D boxes on half pixels so that each pixel lands on a texel centre; at the
++        // pixel centre the UV fell on texel edges and rounding picked neighbouring atlas texels (red dots in the grid
++        // list, dark dots on the race HUD). A/B mode 109: as before.
++        if (g_ps2AbMode.load(std::memory_order_relaxed) != 109)
++        {
++            t.fx0 += 0.5f;
++            t.fy0 += 0.5f;
++            t.fx1 += 0.5f;
++            t.fy1 += 0.5f;
++            t.fx2 += 0.5f;
++            t.fy2 += 0.5f;
++        }
+ 
+         t.minX = clampInt(static_cast<int>(std::floor(std::min({t.fx0, t.fx1, t.fx2}))), ctx.scissor.x0, ctx.scissor.x1);
+         t.maxX = clampInt(static_cast<int>(std::ceil(std::max({t.fx0, t.fx1, t.fx2}))), ctx.scissor.x0, ctx.scissor.x1);
+@@ -5760,6 +5774,16 @@ void GSCpuBackend::DrawTriangleReference(const GSPrimitiveBatch &batch)
+     float fy1 = v1.y - static_cast<float>(ofy);
+     float fx2 = v2.x - static_cast<float>(ofx);
+     float fy2 = v2.y - static_cast<float>(ofy);
++    // Patch 0119: sampled at the integer pixel coordinate, as prepareTriangle (A/B mode 109: at its centre).
++    if (g_ps2AbMode.load(std::memory_order_relaxed) != 109)
++    {
++        fx0 += 0.5f;
++        fy0 += 0.5f;
++        fx1 += 0.5f;
++        fy1 += 0.5f;
++        fx2 += 0.5f;
++        fy2 += 0.5f;
++    }
+ 
+     int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
+     int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));

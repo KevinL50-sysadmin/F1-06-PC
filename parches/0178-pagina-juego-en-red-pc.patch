@@ -1,0 +1,452 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index e02a6fe..ab9db4e 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -136,6 +136,10 @@ namespace ps2x
+     // Nativizacion T5: the same for some options only (the rows of one page of the game's OPTIONS); unknown keys are
+     // ignored.
+     void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys);
++    // Nativizacion T6: red_puerto, red_calidad and red_publicas apply when the host starts, so they are fixed while it
++    // runs or is asked to start (hosting): the F2 menu shows them disabled and the game's OPTIONS > PC NETPLAY page
++    // cannot change them (PS2OptionsMenu::setGameOptionNumber, setGameOptionText, resetGameOptions).
++    bool netplayOptionLocked(std::string_view key, bool hosting);
+     // The values to write: current, except the forced options, which keep the file's value.
+     std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model);
+     bool menuHasChanges(const OptionsMenuModel &model);
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index 41a332a..a07b421 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -3,6 +3,7 @@
+ #include "ps2_options.h"
+ #include "ps2_user_paths.h"
+ 
++#include <array>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -155,6 +156,18 @@ public:
+     static void resetGameOptions(const std::vector<std::string> &keys);
+     static std::vector<std::string> gameWindowSizes();
+     static std::string gameGsInUse();
++    // Nativizacion T6 (OPTIONS > PC NETPLAY): red_puerto, red_calidad and red_publicas do not change through the three
++    // functions above nor setGameOptionNumber while the host runs or is asked to start (ps2x::netplayOptionLocked).
++    // The page's read-only rows: the host's state (ps2x::netplay::HostPageState as a number), its port and the IPv4
++    // addresses a guest can connect to. A start or stop asked for (red_anfitrion) is taken by update() on the main
++    // thread: this waits up to waitMs for it first.
++    struct GameNetplayState
++    {
++        int state = 0;
++        int port = 0;
++        std::vector<std::array<int, 4>> addresses;
++    };
++    static GameNetplayState gameNetplayState(int waitMs);
+ 
+ private:
+     struct State;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+index b72315b..25de940 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -253,6 +253,46 @@ namespace ps2x::netplay
+         return "Juego en red: esperando invitado en " + where + " - clave " + status.password;
+     }
+ 
++    HostPageState hostPageState(const HostSessionStatus &status, int request)
++    {
++        if (request == 0)
++            return HostPageState::Off;
++        if (request == 1)
++            return HostPageState::Starting;
++        if (status.hosting)
++            return status.guestConnected ? HostPageState::GuestConnected : HostPageState::Waiting;
++        return status.error.empty() ? HostPageState::Off : HostPageState::Failed;
++    }
++
++    std::vector<std::array<int, 4>> hostPageAddresses(const HostSessionStatus &status)
++    {
++        std::vector<std::array<int, 4>> parts;
++        if (!status.hosting)
++            return parts;
++        for (const std::string &address : status.addresses)
++        {
++            std::array<int, 4> numbers{};
++            size_t at = 0;
++            bool good = true;
++            for (size_t i = 0; good && i < numbers.size(); ++i)
++            {
++                const size_t end = i + 1 < numbers.size() ? address.find('.', at) : address.size();
++                const std::string part = end == std::string::npos ? std::string() : address.substr(at, end - at);
++                good = !part.empty() && part.size() <= 3u && (part.size() == 1u || part[0] != '0') &&
++                       std::all_of(part.begin(), part.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
++                if (good)
++                {
++                    numbers[i] = std::atoi(part.c_str());
++                    good = numbers[i] <= 255;
++                }
++                at = end + 1;
++            }
++            if (good)
++                parts.push_back(numbers);
++        }
++        return parts;
++    }
++
+     struct HostSession::Impl
+     {
+         mutable std::mutex mutex;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+index b9edc9d..e83aec2 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2_netplay.h"
+ 
++#include <array>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -9,10 +10,10 @@
+ #include <string_view>
+ #include <vector>
+ 
+-// Fase 5 (T15, netplay N4): the netplay without the command line. The host starts and stops from the game (AJUSTES PC
+-// row JUEGO EN RED, F2 menu section "Juego en red") while the game runs; the guest fills a small form in its window
+-// (F1-06.exe --invitado with no address), which remembers the last address and port in config\red.ini (never the
+-// password).
++// Fase 5 (T15, netplay N4): the netplay without the command line. The host starts and stops from the game (OPTIONS >
++// PC NETPLAY, Nativizacion T6, a row of AJUSTES PC before; F2 menu section "Juego en red") while the game runs; the
++// guest fills a small form in its window (F1-06.exe --invitado with no address), which remembers the last address and
++// port in config\red.ini (never the password).
+ namespace ps2x::netplay
+ {
+     // A session password a player can read out or type: no 0/O, 1/I/L (ambiguous), uppercase and digits only.
+@@ -85,6 +86,22 @@ namespace ps2x::netplay
+     // One line for the host's overlay and log (ASCII: the window's default font has no accents).
+     std::string hostStatusText(const HostSessionStatus &status);
+ 
++    // Nativizacion T6: the read-only rows of the game's OPTIONS > PC NETPLAY page (numbers only: the page's Lua gets no
++    // text from the host). request: a start (1) or stop (0) asked for and not taken by the F2 menu's update() yet, or
++    // -1. A stop asked for is off already; a start asked for is starting, also while an older session runs.
++    enum class HostPageState
++    {
++        Off = 0,
++        Starting = 1,
++        Waiting = 2,
++        GuestConnected = 3,
++        Failed = 4, // the last start failed (status.error)
++    };
++    HostPageState hostPageState(const HostSessionStatus &status, int request);
++    // The addresses a guest can connect to that are dotted IPv4 ones (four numbers of 0-255, no leading zeros), as
++    // their numbers; none when not hosting.
++    std::vector<std::array<int, 4>> hostPageAddresses(const HostSessionStatus &status);
++
+     // The host that can start and stop while the game runs (one per process: hostSession()). Starting again first
+     // stops the running one (its guest gets a goodbye, port 2 goes back to controles.ini).
+     class HostSession
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 09d01f7..8454910 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -203,7 +203,7 @@ namespace ps2x
+              "Dificultad de los rivales mas fina: 0 = la del juego (FACIL, MEDIA o DIFICIL en DIFFICULTY > OPPONENT AI);\n"
+              "de 1 a 100, un punto entre ellas (0 FACIL, 50 MEDIA, 100 DIFICIL). Solo cuenta mientras la del juego sea\n"
+              "la mas cercana (la fila del juego pone las dos)."},
+-            // Fase 5 (T15, netplay N4): the host started from the game (F2 > Juego en red, AJUSTES PC > JUEGO EN RED;
++            // Fase 5 (T15, netplay N4): the host started from the game (F2 > Juego en red, OPTIONS > PC NETPLAY;
+             // ps2_netplay_session.h). Its password is never saved: each session has a new one.
+             {"red_puerto", "PS2X_RED_PUERTO", "50650", {}, 1024, 65535,
+              "Juego en red: puerto TCP en el que el juego espera al invitado al ser anfitrion (de 1024 a 65535). El\n"
+@@ -564,6 +564,11 @@ namespace ps2x
+                 model.current[key] = optionDefault(*spec, model.development);
+     }
+ 
++    bool netplayOptionLocked(std::string_view key, bool hosting)
++    {
++        return hosting && (key == "red_puerto" || key == "red_calidad" || key == "red_publicas");
++    }
++
+     std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model)
+     {
+         std::map<std::string, std::string> values = model.current;
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index e66d9ab..a598420 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+ #include <fstream>
+@@ -25,6 +26,7 @@
+ #include <mutex>
+ #include <sstream>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ // Phase 3 (T3): the options menu window. This file is built with /utf-8 (CMakeLists.txt): its Spanish texts carry
+@@ -161,8 +163,9 @@ namespace
+         return list;
+     }
+ 
+-    // Fase 5 (T15, netplay N4): the in-game host. The AJUSTES PC row asks from the EE thread and the menu from the
+-    // main thread; update() starts or stops the host on the main thread. -1: nothing asked, 0: stop, 1: start.
++    // Fase 5 (T15, netplay N4): the in-game host. The game's OPTIONS > PC NETPLAY page (Nativizacion T6; a row of
++    // AJUSTES PC before) asks from the EE thread and the menu from the main thread; update() starts or stops the host
++    // on the main thread. -1: nothing asked, 0: stop, 1: start.
+     constexpr const char *kNetplayKey = "red_anfitrion";
+     constexpr int kNetplaySection = 4;
+     std::atomic<int> g_netplayRequest{-1};
+@@ -176,8 +179,7 @@ namespace
+     // Port, quality and public addresses are fixed while hosting (they apply when the host starts).
+     bool netplayRowLocked(const char *key)
+     {
+-        const std::string name = key;
+-        return (name == "red_puerto" || name == "red_calidad" || name == "red_publicas") && netplayHostingWanted();
++        return ps2x::netplayOptionLocked(key, netplayHostingWanted());
+     }
+ 
+     // Fase 5 (T9): the key of tecla_hud.
+@@ -779,7 +781,7 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     if (s.modelReady)
+         applyLive(s.model, s.applied, runtime);
+ 
+-    // Fase 5 (T15, N4): the host asked for by the AJUSTES PC row, the menu or PS2X_MENU_GUION.
++    // Fase 5 (T15, N4): the host asked for by the PC NETPLAY page, the menu or PS2X_MENU_GUION.
+     if (const int request = g_netplayRequest.exchange(-1); request >= 0)
+     {
+         ensureModel(s);
+@@ -1094,7 +1096,7 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+ 
+ bool PS2OptionsMenu::gameOptionNumber(const std::string &key, float &number)
+ {
+-    // Fase 5 (T15, N4): AJUSTES PC > JUEGO EN RED shows the host's state (or what was just asked for).
++    // Fase 5 (T15, N4): OPTIONS > PC NETPLAY > HOST (Nativizacion T6) shows the host's state (or what was just asked for).
+     if (key == kNetplayKey)
+     {
+         number = netplayHostingWanted() ? 1.0f : 0.0f;
+@@ -1110,6 +1112,8 @@ bool PS2OptionsMenu::gameOptionNumber(const std::string &key, float &number)
+ 
+ bool PS2OptionsMenu::setGameOptionNumber(const std::string &key, float number)
+ {
++    if (!std::isfinite(number))
++        return false;
+     if (key == kNetplayKey)
+     {
+         const bool host = std::lround(number) == 1;
+@@ -1117,8 +1121,9 @@ bool PS2OptionsMenu::setGameOptionNumber(const std::string &key, float number)
+             g_netplayRequest = host ? 1 : 0;
+         return true;
+     }
++    // The lock is read holding g_modelMutex: update() starts the host holding it, so it cannot start in between.
+     std::lock_guard<std::mutex> lock(g_modelMutex);
+-    if (g_gameMenu == nullptr)
++    if (g_gameMenu == nullptr || netplayRowLocked(key.c_str()))
+         return false;
+     State &s = *g_gameMenu->m_state;
+     ensureModel(s);
+@@ -1163,7 +1168,7 @@ bool PS2OptionsMenu::gameOptionText(const std::string &key, std::string &value)
+ bool PS2OptionsMenu::setGameOptionText(const std::string &key, const std::string &value)
+ {
+     std::lock_guard<std::mutex> lock(g_modelMutex);
+-    if (g_gameMenu == nullptr)
++    if (g_gameMenu == nullptr || netplayRowLocked(key.c_str()))
+         return false;
+     State &s = *g_gameMenu->m_state;
+     ensureModel(s);
+@@ -1177,7 +1182,11 @@ void PS2OptionsMenu::resetGameOptions(const std::vector<std::string> &keys)
+         return;
+     State &s = *g_gameMenu->m_state;
+     ensureModel(s);
+-    ps2x::resetMenuOptionsToDefaults(s.model, keys);
++    std::vector<std::string> unlocked;
++    for (const std::string &key : keys)
++        if (!netplayRowLocked(key.c_str()))
++            unlocked.push_back(key);
++    ps2x::resetMenuOptionsToDefaults(s.model, unlocked);
+ }
+ 
+ std::vector<std::string> PS2OptionsMenu::gameWindowSizes()
+@@ -1202,3 +1211,21 @@ std::string PS2OptionsMenu::gameGsInUse()
+     ensureModel(s);
+     return s.runningGs;
+ }
++
++PS2OptionsMenu::GameNetplayState PS2OptionsMenu::gameNetplayState(int waitMs)
++{
++    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, waitMs));
++    while (g_netplayRequest.load() >= 0 && std::chrono::steady_clock::now() < until)
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    // update() takes the request and starts or stops the host holding g_modelMutex: once it is free, that is done.
++    {
++        std::lock_guard<std::mutex> lock(g_modelMutex);
++    }
++    const int request = g_netplayRequest.load();
++    const ps2x::netplay::HostSessionStatus status = ps2x::netplay::hostSession().status();
++    GameNetplayState state;
++    state.state = static_cast<int>(ps2x::netplay::hostPageState(status, request));
++    state.port = status.hosting ? status.port : 0;
++    state.addresses = ps2x::netplay::hostPageAddresses(status);
++    return state;
++}
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 27aef75..b1ba8a5 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -10,6 +10,7 @@
+ #include "ps2_netplay_video.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+@@ -1882,5 +1883,42 @@ void register_ps2_netplay_tests()
+             session.stop();
+             t.IsFalse(remotePadActive(), "nothing left");
+             t.Equals(padPortState(rdram, 1), port2Before, "port 2 as before, at the end");
++        });
++
++        // Nativizacion T6: the read-only rows of the game's OPTIONS > PC NETPLAY page.
++        tc.Run("the PC NETPLAY page's state: off, starting, waiting, guest, failed", [](TestCase &t)
++        {
++            HostSessionStatus off;
++            t.Equals(hostPageState(off, -1), HostPageState::Off, "nothing running, nothing asked: off");
++            t.Equals(hostPageState(off, 1), HostPageState::Starting, "a start asked for and not taken yet");
++            HostSessionStatus waiting;
++            waiting.hosting = true;
++            waiting.port = 50650;
++            t.Equals(hostPageState(waiting, -1), HostPageState::Waiting, "hosting without a guest: waiting");
++            t.Equals(hostPageState(waiting, 0), HostPageState::Off, "a stop asked for: off already");
++            t.Equals(hostPageState(waiting, 1), HostPageState::Starting, "a restart asked for: starting");
++            HostSessionStatus guest = waiting;
++            guest.guestConnected = true;
++            t.Equals(hostPageState(guest, -1), HostPageState::GuestConnected, "a guest in");
++            HostSessionStatus failed;
++            failed.error = "puerto en uso";
++            t.Equals(hostPageState(failed, -1), HostPageState::Failed, "the last start failed");
++            t.Equals(hostPageState(failed, 0), HostPageState::Off, "turned off after the failure");
++            t.Equals(hostPageState(failed, 1), HostPageState::Starting, "tried again");
++        });
++
++        tc.Run("the PC NETPLAY page's addresses: the dotted IPv4 ones, as four numbers", [](TestCase &t)
++        {
++            HostSessionStatus status;
++            status.hosting = true;
++            status.addresses = {"192.168.1.5", "10.0.0.255", "fe80::1", "256.1.1.1", "1.2.3", "1.2.3.4.5", "a.b.c.d",
++                                "01.2.3.4", "127.0.0.1", " 1.2.3.4", ""};
++            const std::vector<std::array<int, 4>> parts = hostPageAddresses(status);
++            t.Equals(parts.size(), size_t{3u}, "three of them");
++            t.IsTrue(parts.size() == 3u && parts[0] == std::array<int, 4>{192, 168, 1, 5}, "192.168.1.5");
++            t.IsTrue(parts.size() == 3u && parts[1] == std::array<int, 4>{10, 0, 0, 255}, "10.0.0.255");
++            t.IsTrue(parts.size() == 3u && parts[2] == std::array<int, 4>{127, 0, 0, 1}, "127.0.0.1");
++            status.hosting = false;
++            t.IsTrue(hostPageAddresses(status).empty(), "none when not hosting");
+         }); });
+ }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 8b615f7..a0ca35d 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -11,6 +11,7 @@
+ #include "ps2_user_paths.h"
+ 
+ #include <chrono>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -649,6 +650,88 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "red_publicas"), std::string("1"), "saving writes it");
+         });
+ 
++        // Nativizacion T6: the game's OPTIONS > PC NETPLAY page.
++        tc.Run("the netplay port, quality and public addresses are fixed while the host runs, nothing else", [](TestCase &t)
++        {
++            for (const char *key : {"red_puerto", "red_calidad", "red_publicas"})
++            {
++                t.IsTrue(ps2x::netplayOptionLocked(key, true), std::string(key) + ": fixed while hosting");
++                t.IsFalse(ps2x::netplayOptionLocked(key, false), std::string(key) + ": free with the host off");
++            }
++            for (const char *key : {"red_anfitrion", "red_clave", "aspecto", "volumen", "red_puerto ", ""})
++                t.IsFalse(ps2x::netplayOptionLocked(key, true), std::string("never fixed: '") + key + "'");
++        });
++
++        tc.Run("the PC NETPLAY rows: numbers, checks and defaults of their options, never a password", [](TestCase &t)
++        {
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                "red_puerto = 50700\nred_calidad = alta\nred_publicas = 1\nfiltro = crt\n", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "red_puerto", value) && value == 50700.0f, "the port as is");
++            t.IsTrue(ps2x::menuOptionNumber(model, "red_calidad", value) && value == 2.0f, "alta: the third choice");
++            t.IsTrue(ps2x::menuOptionNumber(model, "red_publicas", value) && value == 1.0f, "public addresses on");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "red_puerto", 50651.0f), "another port");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "red_puerto", 1023.0f), "not a reserved port");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "red_puerto", 65536.0f), "not past 65535");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "red_calidad", 3.0f), "no fourth quality");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "red_publicas", 2.0f), "public addresses: 0 or 1");
++            t.Equals(model.current.at("red_puerto"), std::string("50651"), "the refused values change nothing");
++            t.Equals(model.current.at("red_calidad"), std::string("alta"), "quality as it was");
++            t.Equals(model.current.at("red_publicas"), std::string("1"), "public addresses as they were");
++
++            ps2x::resetMenuOptionsToDefaults(model, {"red_puerto", "red_calidad", "red_publicas"});
++            t.Equals(model.current.at("red_puerto"), std::string("50650"), "default port");
++            t.Equals(model.current.at("red_calidad"), std::string("media"), "default quality");
++            t.Equals(model.current.at("red_publicas"), std::string("0"), "private and VPN addresses only");
++            t.Equals(model.current.at("filtro"), std::string("crt"), "the other pages' options do not change");
++            const std::map<std::string, std::string> toSave = ps2x::menuValuesToSave(model);
++            t.IsTrue(toSave.count("red_clave") == 0u && toSave.count("red_anfitrion") == 0u,
++                     "neither a password nor the host's state is saved");
++            const std::string saved = ps2x::rewriteOptionsText("", toSave, false);
++            t.IsFalse(contains(saved, "red_clave") || contains(saved, "red_anfitrion"), "not in opciones.ini either");
++            t.Equals(fileValue(saved, "red_publicas"), std::string("0"), "saving writes the defaults");
++        });
++
++        tc.Run("the PC NETPLAY rows refuse numbers that are not finite and change nothing", [](TestCase &t)
++        {
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                "red_puerto = 50700\nred_calidad = alta\nred_publicas = 1\n", false, {}, environmentOf({}));
++            const std::map<std::string, std::string> before = model.current;
++            for (const char *key : {"red_puerto", "red_calidad", "red_publicas"})
++                for (const float number : {std::nanf(""), INFINITY, -INFINITY})
++                    t.IsFalse(ps2x::setMenuOptionNumber(model, key, number),
++                              std::string(key) + ": refuses " + std::to_string(number));
++            t.IsTrue(model.current == before, "the model as it was");
++        });
++
++        // PS2OptionsMenu (ps2_options_menu.cpp) is built into the runner only, so its game setters are checked in the
++        // source: a number that is not finite is refused first (red_anfitrion would reach std::lround), and the netplay
++        // lock is read holding g_modelMutex (the host starts in update() holding it: no change between check and set).
++        tc.Run("the game's setters refuse numbers that are not finite and read the netplay lock holding the model",
++               [](TestCase &t)
++        {
++            const std::string source = readText(PS2X_TEST_SOURCE_DIR "/../ps2xRuntime/src/lib/ps2_options_menu.cpp");
++            t.IsFalse(source.empty(), "ps2_options_menu.cpp read");
++            const auto body = [&source](const std::string &name)
++            {
++                const size_t start = source.find("PS2OptionsMenu::" + name + "(");
++                const size_t end = start == std::string::npos ? std::string::npos : source.find("\n}\n", start);
++                return end == std::string::npos ? std::string() : source.substr(start, end - start);
++            };
++            const std::string number = body("setGameOptionNumber");
++            t.IsTrue(contains(number, "std::isfinite(number)") &&
++                         number.find("std::isfinite(number)") < number.find("kNetplayKey"),
++                     "setGameOptionNumber: not finite is refused before red_anfitrion");
++            for (const char *name : {"setGameOptionNumber", "setGameOptionText", "resetGameOptions"})
++            {
++                const std::string code = body(name);
++                const size_t lock = code.find("std::lock_guard<std::mutex> lock(g_modelMutex);");
++                const size_t check = code.find("netplayRowLocked(");
++                t.IsTrue(lock != std::string::npos && check != std::string::npos && lock < check,
++                         std::string(name) + ": the netplay lock is read holding g_modelMutex");
++            }
++        });
++
+         tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)
+         {
+             t.Equals(ps2x::aiDifficultyNearestLevel(0), 0, "0: EASY");

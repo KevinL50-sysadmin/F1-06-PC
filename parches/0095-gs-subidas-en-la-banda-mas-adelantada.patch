@@ -1,0 +1,253 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1a2dda9..00ed05b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2315,8 +2315,10 @@ namespace
+         // Patch 0063: before running it, a worker waits until every worker has finished the jobs below this (what the
+         // coordinator used to wait for before queueing it). 0: nothing.
+         uint64_t waitAll = 0u;
+-        // Patch 0065: and worker 0, which runs the upload jobs, has finished the jobs below this.
++        // Patch 0065: and worker 0, which runs the upload jobs, has finished the jobs below this (patch 0095: worker
++        // waitFirstWorker, which ran the upload job it depends on).
+         uint64_t waitFirst = 0u;
++        uint8_t waitFirstWorker = 0u;
+     };
+ 
+     // UploadImage's pixel loop (below), also run by a band worker for an upload job.
+@@ -4440,7 +4442,7 @@ struct GSCpuBackend::BandState
+     std::array<uint32_t, kPageCount> textureMask{}; // textureBlocks by page
+     uint64_t textureWriteJob = 0u; // the last job writing any of textureBlocks
+     // ... split as Depend does (patch 0065): the last upload job of worker 0 and the last of the others.
+-    uint64_t textureFirstWriteJob = 0u, textureAllWriteJob = 0u;
++    uint64_t textureFirstWriteJob = 0u, textureAllWriteJob = 0u; // patch 0095: textureFirstWriteJob, the last upload job
+ 
+     // PS2X_GS_COMPROBAR_ESPERAS=1 (diagnostic): every job keeps the blocks it writes and reads as a texture, and every
+     // wait checks that no job still pending after it touches what it asked for ("[gs:bandas] comprobar: ... fallos";
+@@ -4519,29 +4521,49 @@ struct GSCpuBackend::BandState
+             if ((mask & textureMask[page]) != 0u)
+             {
+                 textureWriteJob = tag;
++                // Patch 0095: the texture's last upload job no longer implies the earlier ones when they ran on
++                // another worker: an earlier one of another worker still pending goes to the jobs every worker waits
++                // for.
++                if (firstOnly && textureFirstWriteJob > minDone &&
++                    jobs[(textureFirstWriteJob - 1u) % kJobCapacity].uploadWorker !=
++                        jobs[(tag - 1u) % kJobCapacity].uploadWorker)
++                    textureAllWriteJob = std::max(textureAllWriteJob, textureFirstWriteJob);
+                 (firstOnly ? textureFirstWriteJob : textureAllWriteJob) = tag;
+             }
+         }
+     }
+     // Patch 0065: every upload job runs on worker 0 (A/B mode 39: spread, as before), so a job depending on one only
+     // needs worker 0 past it; one depending on a draw needs every worker past it. Tags at or below minDone are done.
++    // Patch 0095: each upload job runs on one worker (the one furthest ahead when it is queued; A/B mode 95: worker 0,
++    // as patch 0065), and a job depending on it only needs that worker past it ("first"); one depending on upload
++    // jobs of two workers needs, for the second, every worker past it.
+     static bool UploadsOnFirst() { return g_ps2AbMode.load(std::memory_order_relaxed) != 39; }
+-    bool FirstOnly(uint64_t tag) const
++    struct FirstNeed
++    {
++        uint64_t tag = 0u;
++        uint8_t worker = 0u;
++    };
++    // The worker of a pending upload job (-1: not one, or done).
++    int FirstOnly(uint64_t tag) const
+     {
+         if (tag <= minDone || !UploadsOnFirst())
+-            return false;
++            return -1;
+         const BandJob &job = jobs[(tag - 1u) % kJobCapacity]; // pending, so its slot is not reused yet
+-        return job.isUpload && job.uploadWorker == 0u;
++        return job.isUpload ? static_cast<int>(job.uploadWorker) : -1;
+     }
+-    void Depend(uint64_t tag, uint64_t &all, uint64_t &first) const
++    void Depend(uint64_t tag, uint64_t &all, FirstNeed &first) const
+     {
+-        if (FirstOnly(tag))
+-            first = std::max(first, tag);
++        const int w = FirstOnly(tag);
++        if (w >= 0 && (first.tag == 0u || first.worker == static_cast<uint8_t>(w)))
++        {
++            first.tag = std::max(first.tag, tag);
++            first.worker = static_cast<uint8_t>(w);
++        }
+         else
+             all = std::max(all, tag);
+     }
+     // LastBlockWrite split as Depend does.
+-    void LastBlockWriteSplit(const BlockMasks &blocks, uint64_t &all, uint64_t &first) const
++    void LastBlockWriteSplit(const BlockMasks &blocks, uint64_t &all, FirstNeed &first) const
+     {
+         for (const auto &[page, mask] : blocks)
+             for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u)
+@@ -4640,12 +4662,14 @@ struct GSCpuBackend::BandState
+ 
+     // Returns once every worker has finished the jobs below `target` (publishing the pending ones first).
+     // first (patch 0065): worker 0 also past the jobs below it.
+-    void WaitDone(uint64_t target, int reason, uint64_t first = 0u)
++    void WaitDone(uint64_t target, int reason, FirstNeed firstNeed = {})
+     {
++        uint64_t first = firstNeed.tag;
++        const unsigned firstWorker = firstNeed.worker;
+         if (first <= target)
+             first = 0u;
+         if ((target <= minDone || RefreshMinDone() >= target) &&
+-            (first == 0u || worker[0].done.load(std::memory_order_acquire) >= first))
++            (first == 0u || worker[firstWorker].done.load(std::memory_order_acquire) >= first))
+             return;
+         if (std::max(target, first) > published.load(std::memory_order_relaxed))
+             Publish(prepared);
+@@ -4655,7 +4679,7 @@ struct GSCpuBackend::BandState
+         for (unsigned k = 0; k < threads; ++k)
+         {
+             std::atomic<uint64_t> &done = worker[k].done;
+-            const uint64_t goal = k == 0u && first != 0u ? first : target;
++            const uint64_t goal = k == firstWorker && first != 0u ? first : target;
+             uint64_t value = done.load(std::memory_order_acquire);
+             for (int i = 0; value < goal && i < spin; ++i)
+             {
+@@ -4684,7 +4708,7 @@ struct GSCpuBackend::BandState
+     // A worker's wait for a job's dependency (patch 0063): every worker has finished the jobs below `target`. Its own
+     // jobs below it are done (target <= the job it is on), and the others only wait for earlier jobs, so the one that
+     // is furthest behind never waits: no deadlock.
+-    void WaitAll(uint64_t all, uint64_t first, unsigned self)
++    void WaitAll(uint64_t all, uint64_t first, unsigned firstWorker, unsigned self)
+     {
+         std::chrono::steady_clock::time_point start{};
+         bool waited = false;
+@@ -4694,7 +4718,7 @@ struct GSCpuBackend::BandState
+         {
+             if (k == self)
+                 continue;
+-            const uint64_t target = k == 0u ? std::max(all, first) : all;
++            const uint64_t target = k == firstWorker ? std::max(all, first) : all;
+             std::atomic<uint64_t> &done = worker[k].done;
+             uint64_t value = done.load(std::memory_order_acquire);
+             if (value >= target)
+@@ -4797,7 +4821,11 @@ struct GSCpuBackend::BandState
+         uint32_t ignoredPage = 0u;
+         textureWriteJob = LastBlockWrite(textureBlocks, ignoredPage);
+         textureAllWriteJob = textureFirstWriteJob = 0u;
+-        LastBlockWriteSplit(textureBlocks, textureAllWriteJob, textureFirstWriteJob);
++        {
++            FirstNeed first;
++            LastBlockWriteSplit(textureBlocks, textureAllWriteJob, first);
++            textureFirstWriteJob = first.tag;
++        }
+         textureBlocksApplied = false;
+         textureKey0 = key0;
+         textureKey1 = clamp;
+@@ -4872,7 +4900,8 @@ struct GSCpuBackend::BandState
+         uint64_t need = 0u;
+         uint32_t needPage = 0u;
+         bool needRead = false;
+-        uint64_t needAll = 0u, needFirst = 0u;
++        uint64_t needAll = 0u;
++        FirstNeed needFirst;
+         if (LastJobs())
+         {
+             need = LastBlockWrite(blocks, needPage);
+@@ -4981,7 +5010,7 @@ struct GSCpuBackend::BandState
+                 {
+                     if (job.uploadWorker == index)
+                     {
+-                        WaitAll(job.waitAll, 0u, index);
++                        WaitAll(job.waitAll, job.waitFirst, job.waitFirstWorker, index);
+                         Upload &upload = uploads[next % kJobCapacity];
+                         GSTransferSnapshot state = upload.start;
+                         uploadPixels(upload.transfer, state, upload.data.data(),
+@@ -4991,7 +5020,7 @@ struct GSCpuBackend::BandState
+                 else if (job.isCopy)
+                 {
+                     if (job.waitAll != 0u)
+-                        WaitAll(job.waitAll, 0u, index);
++                        WaitAll(job.waitAll, 0u, 0u, index);
+                     const Upload &copy = uploads[next % kJobCapacity];
+                     const size_t share = ((static_cast<size_t>(copy.copyBytes) + count - 1u) / count + 63u) & ~size_t{63u};
+                     const size_t begin = std::min<size_t>(copy.copyBytes, share * index);
+@@ -5002,7 +5031,7 @@ struct GSCpuBackend::BandState
+                 {
+                     // A job with a new band height (A/B mode 53): every worker waits, as the rows change hands.
+                     if ((job.waitAll | job.waitFirst) != 0u)
+-                        WaitAll(job.waitAll, job.waitFirst, index);
++                        WaitAll(job.waitAll, job.waitFirst, job.waitFirstWorker, index);
+                     if (!job.layoutChange || jobTouchesBand(job, job.shift, count, index))
+                         rasterJobRows(job, job.shift, count, index);
+                 }
+@@ -5260,6 +5289,7 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     job.unordered = false;
+     job.waitAll = 0u;
+     job.waitFirst = 0u;
++    job.waitFirstWorker = 0u;
+     // A/B modes 53 and 54: bands of twice and half the height (16 and 4 rows). A job with another band height than the
+     // last one waits for every worker to finish the jobs before it (its pixels may belong to another worker now).
+     const int bandMode = g_ps2AbMode.load(std::memory_order_relaxed);
+@@ -5335,7 +5365,8 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+             addRectBlocks(bs.targetBlocks, job.pp.zbp, job.pp.fbw, job.pp.zpsm, job.minX, job.minY, job.maxX, job.maxY);
+     }
+     uint64_t needTexture = 0u, needLayout = 0u, needRead = 0u;
+-    uint64_t needAll = 0u, needFirst = 0u; // patch 0065: the same, split as BandState::Depend does
++    uint64_t needAll = 0u; // patch 0065: the same, split as BandState::Depend does
++    BandState::FirstNeed needFirst;
+     if (texturePages != nullptr)
+     {
+         if (lastJobs)
+@@ -5384,7 +5415,7 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     if (lastJobs)
+         needAll = std::max(needAll, needRead);
+     else
+-        needAll = need, needFirst = 0u;
++        needAll = need, needFirst = {};
+     if (need > bs.minDone)
+     {
+         const int reason = need == needTexture ? kWaitTexture : need == needLayout ? kWaitLayout : kWaitTextureRead;
+@@ -5404,8 +5435,11 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+             bs.RefreshMinDone();
+             if (needAll > bs.minDone)
+                 job.waitAll = needAll;
+-            if (needFirst > std::max(needAll, bs.minDone))
+-                job.waitFirst = needFirst;
++            if (needFirst.tag > std::max(needAll, bs.minDone))
++            {
++                job.waitFirst = needFirst.tag;
++                job.waitFirstWorker = needFirst.worker;
++            }
+             if ((job.waitAll | job.waitFirst) != 0u)
+                 ++bs.deferredJobs;
+         }
+@@ -5980,7 +6014,8 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     // Patch 0065: on worker 0, after the earlier upload jobs of worker 0 anyway; it waits for the draws writing its
+     // blocks or reading them, and for upload jobs of other workers (left by A/B mode 39).
+     const bool onFirst = BandState::UploadsOnFirst();
+-    uint64_t needAll = reads, needFirst = 0u;
++    uint64_t needAll = reads;
++    BandState::FirstNeed needFirst;
+     bs.LastBlockWriteSplit(bs.transferBlocks, needAll, needFirst);
+ 
+     const uint64_t index = bs.prepared;
+@@ -5991,9 +6026,24 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     job.isSprite = false;
+     job.isUpload = true;
+     job.isCopy = false;
+-    job.uploadWorker = static_cast<uint8_t>(onFirst ? 0u : index % bs.threads);
++    // Patch 0095: on the worker of the upload job it depends on, if one is pending (it runs after it anyway), else on
++    // the worker furthest ahead (A/B mode 95: worker 0, as patch 0065).
++    unsigned uploadWorker = 0u;
++    if (!onFirst)
++        uploadWorker = static_cast<unsigned>(index % bs.threads);
++    else if (needFirst.tag > bs.minDone)
++        uploadWorker = needFirst.worker;
++    else if (g_ps2AbMode.load(std::memory_order_relaxed) != 95)
++    {
++        uint64_t furthest = 0u;
++        for (unsigned k = 0; k < bs.threads; ++k)
++            if (const uint64_t done = bs.worker[k].done.load(std::memory_order_relaxed); done > furthest)
++                furthest = done, uploadWorker = k;
++    }
++    job.uploadWorker = static_cast<uint8_t>(uploadWorker);
+     job.waitAll = onFirst ? (needAll > bs.minDone ? needAll : 0u) : need;
+     job.waitFirst = 0u;
++    job.waitFirstWorker = 0u;
+     job.minX = job.minY = 0;
+     job.maxX = job.maxY = -1;
+     BandState::Upload &upload = bs.uploads[slot];

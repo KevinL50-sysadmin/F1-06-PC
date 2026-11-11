@@ -1,0 +1,1045 @@
+diff --git a/ps2xRuntime/src/lib/ps2_lgdev.h b/ps2xRuntime/src/lib/ps2_lgdev.h
+new file mode 100644
+index 0000000..9d0df23
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_lgdev.h
+@@ -0,0 +1,346 @@
++#pragma once
++
++#include "ps2_pad_win.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++// T2 of the native wheel (F1 06, patch 0174, odd/tasks/volante-nativo.md): the game's Logitech library (liblgdev 1.11,
++// 0x2F6950-0x2F77F8 and lgDevASync 0x2F7880) is replaced by the host (src/f1_overrides.cpp), so the game itself sees
++// a Logitech Driving Force Pro fed from the PC wheel (DirectInput). Contract: analisis/volante-liblgdev.md. This header
++// holds the pure part: the descriptor, the 0x18-byte position, the device state machine and the wheel mapping.
++namespace ps2x::lgdev
++{
++    // Error codes of the IRX (returned as negative s32).
++    constexpr uint32_t kErrNoMoreDevices = 0x80000002u;
++    constexpr uint32_t kErrInvalid = 0x80000004u;
++    constexpr uint32_t kErrAlreadyOpen = 0x80000005u;
++    constexpr uint32_t kErrDeviceGone = 0x80000006u;
++    constexpr size_t kDescriptorSize = 0x18u;
++    constexpr size_t kPositionSize = 0x18u;
++
++    // The Driving Force Pro buttons, in the order of their bit in pos + 0x14 (bit 16 + value).
++    enum DfpButton : int
++    {
++        kCross = 0, kSquare, kCircle, kTriangle, kStart, kSelect, kL1, kR1, kL2, kR2, kL3, kR3,
++        kButtonCount
++    };
++    // Their names in the [volante] section of controles.ini (the DualShock 2 names of the pad mapping).
++    inline const char *const kButtonNames[kButtonCount] = {"cruz", "cuadrado", "circulo", "triangulo", "start", "select",
++                                                           "l1", "r1", "l2", "r2", "l3", "r3"};
++
++    // The wheel as the game wants it, before packing it into the position.
++    struct WheelInput
++    {
++        float steering = 0.0f; // -1 (left) .. 1 (right)
++        float throttle = 0.0f; // 0 released .. 1 floored
++        float brake = 0.0f;
++        int pov = -1;          // hundredths of a degree, -1 = centred
++        uint32_t buttons = 0u; // bit = DfpButton
++    };
++
++    // An input of the PC wheel (the volante: entries of controles.ini).
++    struct WheelSource
++    {
++        enum class Kind : uint8_t
++        {
++            Axis,   // code = axis of JoystickState (X Y Z RX RY RZ S0 S1); mode '+', '-', '~' or '='
++            Button, // code = button (B1 = 0)
++            Pov     // code = direction in hundredths of a degree
++        };
++        Kind kind = Kind::Button;
++        int code = 0;
++        char mode = '+';
++    };
++
++    struct WheelMap
++    {
++        WheelSource steering{WheelSource::Kind::Axis, 0, '+'};
++        WheelSource throttle{WheelSource::Kind::Axis, 1, '~'};
++        WheelSource brake{WheelSource::Kind::Axis, 5, '~'};
++        std::array<std::vector<WheelSource>, kButtonCount> buttons;
++        float pedalDeadzone = 0.02f; // zona_muerta_volante
++    };
++
++    // A Logitech G29 through DirectInput (G HUB): B1 cross, B2 square, B3 circle, B4 triangle, B5 right paddle (R1),
++    // B6 left paddle (L1), B7 R2, B8 L2, B9 share (select), B10 options (start), B11 R3, B12 L3; X steering, Y throttle
++    // and RZ brake (released at +1). The d-pad is the POV.
++    inline WheelMap defaultWheelMap()
++    {
++        WheelMap map;
++        const DfpButton order[12] = {kCross, kSquare, kCircle, kTriangle, kR1, kL1, kR2, kL2, kSelect, kStart, kR3, kL3};
++        for (int b = 0; b < 12; ++b)
++            map.buttons[order[b]].push_back({WheelSource::Kind::Button, b, '+'});
++        return map;
++    }
++
++    // An axis of JoystickState (-1..1) as a 0..1 travel: '+'/'-' half axis, '~' pedal released at +1, '=' at -1.
++    inline float axisTravel(float v, char mode)
++    {
++        switch (mode)
++        {
++        case '-': return std::clamp(-v, 0.0f, 1.0f);
++        case '~': return std::clamp((1.0f - v) * 0.5f, 0.0f, 1.0f);
++        case '=': return std::clamp((v + 1.0f) * 0.5f, 0.0f, 1.0f);
++        default: return std::clamp(v, 0.0f, 1.0f);
++        }
++    }
++
++    inline float pedalValue(const ps2_pad_win::JoystickState &s, const WheelSource &src, float deadzone)
++    {
++        if (src.kind != WheelSource::Kind::Axis || src.code < 0 || src.code >= 8)
++            return 0.0f;
++        const float v = axisTravel(s.axes[src.code], src.mode);
++        return v <= deadzone ? 0.0f : std::min(1.0f, (v - deadzone) / std::max(1e-3f, 1.0f - deadzone));
++    }
++
++    inline bool sourcePressed(const ps2_pad_win::JoystickState &s, const WheelSource &src)
++    {
++        switch (src.kind)
++        {
++        case WheelSource::Kind::Button:
++            return src.code >= 0 && src.code < 128 && s.buttons[src.code] != 0u;
++        case WheelSource::Kind::Pov:
++        {
++            if (s.pov < 0)
++                return false;
++            int diff = std::abs(s.pov - src.code) % 36000;
++            diff = std::min(diff, 36000 - diff);
++            return diff <= 4500; // diagonals count for both directions, as in the pad mapping
++        }
++        case WheelSource::Kind::Axis:
++            return src.code >= 0 && src.code < 8 && axisTravel(s.axes[src.code], src.mode) >= 0.5f;
++        }
++        return false;
++    }
++
++    // The wheel state of DirectInput through the map. Steering linear over the wheel's full physical range (the game
++    // applies its own handling and sensitivity). false (and out at rest) without a wheel.
++    inline bool wheelInputFrom(const ps2_pad_win::JoystickState &s, const WheelMap &map, WheelInput &out)
++    {
++        out = WheelInput{};
++        if (!s.present)
++            return false;
++        if (map.steering.kind == WheelSource::Kind::Axis && map.steering.code >= 0 && map.steering.code < 8)
++            out.steering = std::clamp(s.axes[map.steering.code] * (map.steering.mode == '-' ? -1.0f : 1.0f), -1.0f, 1.0f);
++        out.throttle = pedalValue(s, map.throttle, map.pedalDeadzone);
++        out.brake = pedalValue(s, map.brake, map.pedalDeadzone);
++        out.pov = s.pov;
++        for (int b = 0; b < kButtonCount; ++b)
++            for (const WheelSource &src : map.buttons[b])
++                if (sourcePressed(s, src))
++                    out.buttons |= 1u << b;
++        return true;
++    }
++
++    inline void put16(uint8_t *p, uint16_t v) { std::memcpy(p, &v, 2); }
++    inline void put32(uint8_t *p, uint32_t v) { std::memcpy(p, &v, 4); }
++
++    // Enumerate's descriptor: {0x12, 0x7E8, 7, 0, 0, handle} (Driving Force Pro; the game names it "DrivingForcePro").
++    inline void buildDescriptor(int32_t handle, uint8_t *desc)
++    {
++        const uint32_t words[6] = {0x12u, 0x7E8u, 7u, 0u, 0u, static_cast<uint32_t>(handle)};
++        for (int i = 0; i < 6; ++i)
++            put32(desc + i * 4, words[i]);
++    }
++
++    // The 0x18-byte position as the IRX leaves it: +0 status 0 (new data), +2 s16 steering +-32767, +4 s16
++    // (brake - throttle) >> 1 (-32768 saturates), +0xE/+0x10 u16 throttle/brake 0..0xFFFF, +0x12 d-pad (0 N, 2 E, 4 S,
++    // 6 W, odd diagonals, 0xFF centred), +0x13 0xFF, +0x14 buttons in bits 16-27.
++    inline void buildPosition(const WheelInput &in, uint8_t *pos)
++    {
++        std::memset(pos, 0, kPositionSize);
++        const int steering = static_cast<int>(std::lround(std::clamp(in.steering, -1.0f, 1.0f) * 32767.0f));
++        const int throttle = static_cast<int>(std::lround(std::clamp(in.throttle, 0.0f, 1.0f) * 65535.0f));
++        const int brake = static_cast<int>(std::lround(std::clamp(in.brake, 0.0f, 1.0f) * 65535.0f));
++        const int combined = std::max((brake - throttle) >> 1, -32767);
++        put16(pos + 0x02, static_cast<uint16_t>(static_cast<int16_t>(steering)));
++        put16(pos + 0x04, static_cast<uint16_t>(static_cast<int16_t>(combined)));
++        put16(pos + 0x0E, static_cast<uint16_t>(throttle));
++        put16(pos + 0x10, static_cast<uint16_t>(brake));
++        pos[0x12] = in.pov < 0 ? 0xFFu : static_cast<uint8_t>(((in.pov + 2250) / 4500) % 8);
++        pos[0x13] = 0xFFu;
++        put32(pos + 0x14, (in.buttons & 0xFFFu) << 16);
++    }
++
++    // F1_VOLANTE_FALSO=<steering>,<throttle>,<brake> (tests without hardware): steering -1..1, pedals 0..1.
++    inline bool parseFakeWheel(const char *text, WheelInput &out)
++    {
++        if (text == nullptr)
++            return false;
++        float values[3] = {};
++        const char *p = text;
++        for (int i = 0; i < 3; ++i)
++        {
++            char *end = nullptr;
++            values[i] = std::strtof(p, &end);
++            if (end == p)
++                return false;
++            while (*end == ' ')
++                ++end;
++            if (i < 2 && *end != ',')
++                return false;
++            if (i == 2 && *end != '\0')
++                return false;
++            p = end + (i < 2 ? 1 : 0);
++        }
++        out = WheelInput{};
++        out.steering = std::clamp(values[0], -1.0f, 1.0f);
++        out.throttle = std::clamp(values[1], 0.0f, 1.0f);
++        out.brake = std::clamp(values[2], 0.0f, 1.0f);
++        return true;
++    }
++
++    // F1_VOLANTE_FALSO=mando (tests): the wheel follows the DualShock 2 report of port 0 (bytes 2-19, after the test
++    // scripts and the autopilot wrote it): its buttons and d-pad, the left stick X as the steering and the cross and
++    // square pressures as the throttle and brake (F1 06 accelerates with cross and brakes with square on the pad).
++    inline WheelInput wheelInputFromPadReport(const uint8_t *report)
++    {
++        WheelInput in;
++        const uint32_t pressed = ~static_cast<uint32_t>(report[2] | (report[3] << 8)) & 0xFFFFu;
++        const struct
++        {
++            int bit;
++            DfpButton button;
++        } kButtons[] = {{14, kCross}, {15, kSquare}, {13, kCircle}, {12, kTriangle}, {3, kStart}, {0, kSelect},
++                        {10, kL1},    {11, kR1},     {8, kL2},      {9, kR2},       {1, kL3},    {2, kR3}};
++        for (const auto &b : kButtons)
++            if ((pressed & (1u << b.bit)) != 0u)
++                in.buttons |= 1u << b.button;
++        const bool up = (pressed & 0x10u) != 0u, right = (pressed & 0x20u) != 0u, down = (pressed & 0x40u) != 0u,
++                   left = (pressed & 0x80u) != 0u;
++        in.pov = up && right     ? 4500
++                 : right && down ? 13500
++                 : down && left  ? 22500
++                 : left && up    ? 31500
++                 : up            ? 0
++                 : right         ? 9000
++                 : down          ? 18000
++                 : left          ? 27000
++                                 : -1;
++        in.steering = std::clamp((static_cast<float>(report[6]) - 127.5f) / 127.5f, -1.0f, 1.0f);
++        if (report[6] == 0x80u || report[6] == 0x7Fu)
++            in.steering = 0.0f; // the centre of the stick
++        in.throttle = (in.buttons & (1u << kCross)) != 0u ? static_cast<float>(report[14]) / 255.0f : 0.0f;
++        in.brake = (in.buttons & (1u << kSquare)) != 0u ? static_cast<float>(report[15]) / 255.0f : 0.0f;
++        return in;
++    }
++
++    // The library's state on the host: one wheel (index 0) in slot 0. present: whether the wheel is there now. Not
++    // thread safe (the caller locks).
++    class HostLibrary
++    {
++    public:
++        // EnumHint: non-zero once at start and whenever the wheel comes or goes; 0 otherwise (the game re-enumerates
++        // on non-zero, closing every device first).
++        uint32_t enumHint(bool present)
++        {
++            const bool changed = m_firstHint || present != m_hintPresent;
++            m_firstHint = false;
++            m_hintPresent = present;
++            return changed ? 1u : 0u;
++        }
++
++        int32_t enumerate(uint32_t index, bool present, uint8_t *desc)
++        {
++            if (index != 0u || !present)
++                return static_cast<int32_t>(kErrNoMoreDevices);
++            buildDescriptor(m_open ? m_handle : -1, desc);
++            return 0;
++        }
++
++        // handle = (counter << 4) | slot, as the IRX.
++        int32_t open(uint32_t index, bool present, int32_t &handle)
++        {
++            handle = -1;
++            if (index != 0u || !present)
++                return static_cast<int32_t>(kErrNoMoreDevices);
++            if (m_open)
++            {
++                handle = m_handle;
++                return static_cast<int32_t>(kErrAlreadyOpen);
++            }
++            m_open = true;
++            m_handle = static_cast<int32_t>((++m_counter & 0x7FFFFFFu) << 4);
++            m_props = {0u, 0u, 0u, 255u, 0u, 0u}; // the IRX sets the gain to 255 on open
++            m_effects = 0u;
++            handle = m_handle;
++            return 0;
++        }
++
++        int32_t close(int32_t handle)
++        {
++            if (!valid(handle))
++                return static_cast<int32_t>(kErrInvalid);
++            m_open = false;
++            return 0;
++        }
++
++        // Properties 2 (centring spring, inferred), 3 (gain 0-255), 4 and 5: stored and returned.
++        int32_t getProperty(int32_t handle, uint32_t prop, uint32_t &value)
++        {
++            if (!valid(handle) || prop < 2u || prop > 5u)
++                return static_cast<int32_t>(kErrInvalid);
++            value = m_props[prop];
++            return 0;
++        }
++
++        int32_t setProperty(int32_t handle, uint32_t prop, uint32_t value)
++        {
++            if (!valid(handle) || prop < 2u || prop > 5u)
++                return static_cast<int32_t>(kErrInvalid);
++            m_props[prop] = value;
++            return 0;
++        }
++
++        // One device of ReadMulti. input: the wheel now, nullptr if it is gone. On error, status 0xFF (the game only
++        // copies positions with status 0).
++        int32_t readPosition(int32_t handle, const WheelInput *input, uint8_t *pos)
++        {
++            if (!valid(handle) || input == nullptr)
++            {
++                std::memset(pos, 0, kPositionSize);
++                put16(pos, 0xFFu);
++                return static_cast<int32_t>(valid(handle) ? kErrDeviceGone : kErrInvalid);
++            }
++            buildPosition(*input, pos);
++            return 0;
++        }
++
++        // Force effects (T4 will drive them): id = (handle << 16) | n.
++        int32_t downloadEffect(int32_t handle, uint32_t &id)
++        {
++            if (!valid(handle))
++                return static_cast<int32_t>(kErrInvalid);
++            m_effects = (m_effects % 0xFFFFu) + 1u;
++            id = (static_cast<uint32_t>(handle) << 16) | m_effects;
++            return 0;
++        }
++
++        bool isOpen() const { return m_open; }
++        int32_t handle() const { return m_open ? m_handle : -1; }
++
++    private:
++        bool valid(int32_t handle) const { return m_open && handle == m_handle; }
++
++        bool m_firstHint = true;
++        bool m_hintPresent = false;
++        bool m_open = false;
++        int32_t m_handle = -1;
++        uint32_t m_counter = 0u;
++        uint32_t m_effects = 0u;
++        std::array<uint32_t, 6> m_props{};
++    };
++
++    // Whether the game reads the wheel through the replaced library (set by the game's overrides before the first pad
++    // read). While it does, the wheel does not feed the DualShock 2 of player 1 (F1_VOLANTE_STICK=1 keeps it off).
++    inline std::atomic<bool> g_nativeWheel{false};
++    inline void setNativeWheelEnabled(bool enabled) { g_nativeWheel.store(enabled, std::memory_order_relaxed); }
++    inline bool nativeWheelEnabled() { return g_nativeWheel.load(std::memory_order_relaxed); }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 9cb7ad0..4c33517 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -81,6 +81,8 @@ namespace
+         float wheelSensitivity = 1.0f;
+         float buttonThreshold = 0.1f;
+         bool rumble = true;
++        // Patch 0174: the [volante] section, the wheel as the game's own Logitech wheel (player 1 only).
++        ps2x::lgdev::WheelMap nativeWheel = ps2x::lgdev::defaultWheelMap();
+     };
+ 
+     const char *const kDefaultConfig =
+@@ -166,7 +168,29 @@ namespace
+         "#izquierda = tecla:J, mando:IZQUIERDA\n"
+         "#derecha = tecla:L, mando:DERECHA\n"
+         "#stick_izq_izquierda = tecla:J, mando:LX-\n"
+-        "#stick_izq_derecha = tecla:L, mando:LX+\n";
++        "#stick_izq_derecha = tecla:L, mando:LX+\n"
++        "\n"
++        "# Volante nativo (F1 06): el juego lee el volante como su volante Logitech (un Driving Force Pro), con la\n"
++        "# direccion, los pedales y los botones por separado, y las entradas volante: de los controles de arriba no\n"
++        "# cuentan (solo con F1_VOLANTE_STICK=1, el volante como stick del mando). Debajo de [volante] van la direccion,\n"
++        "# el acelerador y el freno (un eje del volante cada uno) y los botones del volante del juego (cruz circulo\n"
++        "# cuadrado triangulo l1 l2 r1 r2 l3 r3 start select; la cruceta es la del volante). Por defecto, un G29.\n"
++        "#[volante]\n"
++        "#direccion = volante:X+\n"
++        "#acelerador = volante:Y~\n"
++        "#freno = volante:RZ~\n"
++        "#cruz = volante:B1\n"
++        "#cuadrado = volante:B2\n"
++        "#circulo = volante:B3\n"
++        "#triangulo = volante:B4\n"
++        "#r1 = volante:B5\n"
++        "#l1 = volante:B6\n"
++        "#r2 = volante:B7\n"
++        "#l2 = volante:B8\n"
++        "#select = volante:B9\n"
++        "#start = volante:B10\n"
++        "#r3 = volante:B11\n"
++        "#l3 = volante:B12\n";
+ 
+     struct Named
+     {
+@@ -332,13 +356,60 @@ namespace
+         return s.kind == SourceKind::PadButton || s.kind == SourceKind::PadAxis || s.kind == SourceKind::PadTrigger;
+     }
+ 
++    // Patch 0174: a line of [volante] (the native wheel of player 1): direccion, acelerador and freno take one wheel axis;
++    // the button names, a list of volante: inputs (it replaces the default).
++    void parseNativeWheelLine(const std::string &key, const std::string &value, int lineNumber,
++                              ps2x::lgdev::WheelMap &map, std::vector<std::string> &messages)
++    {
++        using ps2x::lgdev::WheelSource;
++        WheelSource *axis = key == "direccion" ? &map.steering : key == "acelerador" ? &map.throttle
++                            : key == "freno"   ? &map.brake : nullptr;
++        int button = -1;
++        for (int b = 0; b < ps2x::lgdev::kButtonCount; ++b)
++            if (key == ps2x::lgdev::kButtonNames[b])
++                button = b;
++        if (!axis && button < 0)
++        {
++            messages.push_back(formatted("controles.ini:%d: control desconocido '%s'", lineNumber, key.c_str()));
++            return;
++        }
++        if (button >= 0)
++            map.buttons[static_cast<size_t>(button)].clear();
++        std::istringstream items(value);
++        std::string item;
++        while (std::getline(items, item, ','))
++        {
++            item = trim(item);
++            if (item.empty())
++                continue;
++            Source src;
++            if (!parseSource(item, src))
++                messages.push_back(formatted("controles.ini:%d: entrada desconocida '%s'", lineNumber, item.c_str()));
++            else if (!isWheelSource(src))
++                messages.push_back(formatted("controles.ini:%d: [volante] solo admite entradas volante: ('%s')",
++                                             lineNumber, item.c_str()));
++            else if (axis && src.kind != SourceKind::WheelAxis)
++                messages.push_back(formatted("controles.ini:%d: %s necesita un eje del volante ('%s')", lineNumber,
++                                             key.c_str(), item.c_str()));
++            else if (axis)
++                *axis = {WheelSource::Kind::Axis, src.code, src.mode};
++            else
++                map.buttons[static_cast<size_t>(button)].push_back(
++                    {src.kind == SourceKind::WheelButton ? WheelSource::Kind::Button
++                     : src.kind == SourceKind::WheelPov  ? WheelSource::Kind::Pov
++                                                         : WheelSource::Kind::Axis,
++                     src.code, src.mode});
++        }
++    }
++
+     // messages: los avisos, sin el "[pad] " (config() los saca por stderr).
+     void parseConfig(const std::string &text, Players &players, std::vector<std::string> &messages)
+     {
+         std::istringstream in(text);
+         std::string line;
+         int lineNumber = 0;
+-        int section = 0; // 0 = jugador 1 (sin seccion o [jugador1]), 1 = [jugador2], -1 = seccion desconocida
++        // 0 = jugador 1 (sin seccion o [jugador1]), 1 = [jugador2], 2 = [volante] (parche 0174), -1 = desconocida
++        int section = 0;
+         while (std::getline(in, line))
+         {
+             ++lineNumber;
+@@ -358,6 +429,8 @@ namespace
+                     section = 1;
+                     players.second = true;
+                 }
++                else if (name == "volante")
++                    section = 2;
+                 else
+                 {
+                     section = -1;
+@@ -368,12 +441,17 @@ namespace
+             }
+             if (section < 0)
+                 continue;
+-            Config &cfg = players.player[section];
+             const size_t eq = line.find('=');
+             if (eq == std::string::npos)
+                 continue;
+             const std::string key = lowercase(trim(line.substr(0, eq)));
+             const std::string value = trim(line.substr(eq + 1u));
++            if (section == 2)
++            {
++                parseNativeWheelLine(key, value, lineNumber, players.player[0].nativeWheel, messages);
++                continue;
++            }
++            Config &cfg = players.player[section];
+             if (section == 1 && (key == "volante" || key == "zona_muerta_volante" || key == "sensibilidad_volante"))
+             {
+                 messages.push_back(formatted("controles.ini:%d: el volante es del jugador 1: '%s' no vale en [jugador2]",
+@@ -452,6 +530,7 @@ namespace
+     {
+         Config &one = p.player[0];
+         Config &two = p.player[1];
++        one.nativeWheel.pedalDeadzone = one.wheelDeadzone;
+         if (!p.second)
+         {
+             two.gamepad = -1;
+@@ -824,9 +903,38 @@ namespace ps2x
+         finishPlayers(p, noDevices, info.messages);
+         info.players[0] = describePlayer(p.player[0], true);
+         info.players[1] = describePlayer(p.player[1], p.second);
++        info.nativeWheel = p.player[0].nativeWheel;
+         return info;
+     }
+ 
++    std::array<uint8_t, 21> padReportFromWheel(const std::string &iniText, const ps2_pad_win::JoystickState &wheel,
++                                               bool wheelFeedsPad)
++    {
++        Players p = defaultPlayers();
++        std::vector<std::string> messages;
++        parseConfig(iniText, p, messages);
++        finishPlayers(p, false, messages);
++        const Config &cfg = p.player[0];
++        Frame f;
++        if (wheelFeedsPad)
++            f.wheel = wheel;
++        float value[kTargetCount] = {};
++        readValues(cfg, f, value);
++        std::array<uint8_t, 21> data{};
++        writeReport(data.data(), pressedButtons(value, cfg), value, cfg);
++        return data;
++    }
++
++    bool readNativeWheel(lgdev::WheelInput &out)
++    {
++        ps2_pad_win::JoystickState wheel;
++        {
++            std::lock_guard<std::mutex> lock(g_lastWheelMutex);
++            wheel = g_lastWheel;
++        }
++        return lgdev::wheelInputFrom(wheel, config().nativeWheel, out);
++    }
++
+     bool secondPadPortConnected(const PadPlayerInfo &player2, bool gamepadPresent)
+     {
+         return player2.configured &&
+@@ -991,7 +1099,10 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+         for (const std::string &name : ps2_pad_win::listGameControllers())
+             std::fprintf(stderr, "[pad] DirectInput: %s\n", name.c_str());
+         if (ps2_pad_win::openWheel(cfg.wheel))
+-            std::fprintf(stderr, "[pad] volante: %s\n", ps2_pad_win::wheelName().c_str());
++            std::fprintf(stderr, ps2x::lgdev::nativeWheelEnabled()
++                                     ? "[pad] volante nativo del juego: Driving Force Pro (%s)\n"
++                                     : "[pad] volante: %s\n",
++                         ps2_pad_win::wheelName().c_str());
+         else
+             std::fprintf(stderr, "[pad] sin volante (volante = %s)\n", cfg.wheel.c_str()); });
+ 
+@@ -1004,6 +1115,10 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+         std::lock_guard<std::mutex> lock(g_lastWheelMutex);
+         g_lastWheel = f.wheel;
+     }
++    // Patch 0174: the game reads the wheel as its own Logitech wheel (ps2x::readNativeWheel): its volante: entries do
++    // not reach the DualShock 2 (in the menus the throttle pedal was the cross).
++    if (ps2x::lgdev::nativeWheelEnabled())
++        f.wheel = ps2_pad_win::JoystickState{};
+ 
+     float value[kTargetCount] = {};
+     readValues(cfg, f, value);
+diff --git a/ps2xRuntime/src/lib/ps2_pad_players.h b/ps2xRuntime/src/lib/ps2_pad_players.h
+index f744535..7c633aa 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_players.h
++++ b/ps2xRuntime/src/lib/ps2_pad_players.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++#include "ps2_lgdev.h"
++#include "ps2_pad_win.h"
++
++#include <array>
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+@@ -23,6 +28,8 @@ namespace ps2x
+     {
+         PadPlayerInfo players[2];
+         std::vector<std::string> messages; // the warnings the game logs as "[pad] <message>"
++        // Patch 0174: the [volante] section (the game's own Logitech wheel), over the G29 defaults.
++        lgdev::WheelMap nativeWheel = lgdev::defaultWheelMap();
+     };
+ 
+     // Parses a controles.ini text over the defaults, as the game does (without reading or writing any file).
+@@ -42,4 +49,13 @@ namespace ps2x
+     float scaledRumble(float motor, int percent);
+     int rumbleIntensityFromText(const char *text);
+     void setRumbleIntensity(int percent);
++
++    // Patch 0174 (T2 of odd/tasks/volante-nativo.md): bytes 0-20 of player 1's DualShock 2 report from a wheel state
++    // alone (no keys, no gamepad), as the game's pad gets it with controles.ini = iniText. wheelFeedsPad: the wheel as
++    // stick (F1_VOLANTE_STICK=1, or no native wheel); false: the game reads the wheel itself and the pad ignores it.
++    std::array<uint8_t, 21> padReportFromWheel(const std::string &iniText, const ps2_pad_win::JoystickState &wheel,
++                                               bool wheelFeedsPad);
++    // The wheel as the game's Logitech library sees it: the last state the pad read (DirectInput) through the
++    // [volante] map of controles.ini. false without a wheel.
++    bool readNativeWheel(lgdev::WheelInput &out);
+ }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 7d0e9a0..1171658 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -74,6 +74,8 @@ endif()
+ 
+ add_executable(ps2x_tests
+     src/main.cpp
++    # Registers itself with a static object (main.cpp does not call it): linked here, not through ps2_test_lib.
++    src/ps2_lgdev_tests.cpp
+     $<TARGET_OBJECTS:ps2_test_function_table>
+ )
+ 
+@@ -89,6 +91,7 @@ target_include_directories(ps2x_tests PRIVATE
+     ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+     ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
++    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+ )
+ 
+ target_link_libraries(ps2x_tests PRIVATE
+diff --git a/ps2xTest/src/ps2_lgdev_tests.cpp b/ps2xTest/src/ps2_lgdev_tests.cpp
+new file mode 100644
+index 0000000..4166faf
+--- /dev/null
++++ b/ps2xTest/src/ps2_lgdev_tests.cpp
+@@ -0,0 +1,424 @@
++#include "MiniTest.h"
++#include "ps2_lgdev.h"
++#include "ps2_pad_players.h"
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++
++// T2 of odd/tasks/volante-nativo.md (F1 06, patch 0174): the game's Logitech library (liblgdev 1.11) replaced by the
++// host. This file registers itself (it is linked into ps2x_tests directly, not through ps2_test_lib).
++namespace
++{
++    using ps2x::lgdev::WheelInput;
++
++    uint16_t u16At(const uint8_t *p, size_t offset)
++    {
++        uint16_t v = 0;
++        std::memcpy(&v, p + offset, 2);
++        return v;
++    }
++
++    int16_t s16At(const uint8_t *p, size_t offset)
++    {
++        int16_t v = 0;
++        std::memcpy(&v, p + offset, 2);
++        return v;
++    }
++
++    uint32_t u32At(const uint8_t *p, size_t offset)
++    {
++        uint32_t v = 0;
++        std::memcpy(&v, p + offset, 4);
++        return v;
++    }
++
++    // The code of the i-th input of a button, -1 if it has fewer.
++    int codeAt(const std::vector<ps2x::lgdev::WheelSource> &sources, size_t i)
++    {
++        return i < sources.size() ? sources[i].code : -1;
++    }
++
++    std::array<uint8_t, 24> position(const WheelInput &in)
++    {
++        std::array<uint8_t, 24> pos{};
++        pos.fill(0xAA);
++        ps2x::lgdev::buildPosition(in, pos.data());
++        return pos;
++    }
++
++    // A G29 at rest as DirectInput reports it: wheel centred, pedals released (+1 with the "~" mode), POV centred.
++    ps2_pad_win::JoystickState g29AtRest()
++    {
++        ps2_pad_win::JoystickState s;
++        s.present = true;
++        s.axes[1] = 1.0f; // Y: throttle released
++        s.axes[2] = 1.0f; // Z: clutch released
++        s.axes[5] = 1.0f; // RZ: brake released
++        s.pov = -1;
++        return s;
++    }
++
++    void registerLgDevTests()
++    {
++        MiniTest::Case("LgDev", [](TestCase &tc)
++                       {
++            tc.Run("the descriptor is a Driving Force Pro with the handle in its last word", [](TestCase &t)
++                   {
++                std::array<uint8_t, 24> desc{};
++                desc.fill(0xAA);
++                ps2x::lgdev::buildDescriptor(0x10, desc.data());
++                t.Equals(u32At(desc.data(), 0), 0x12u, "desc[0]: type 0x12");
++                t.Equals(u32At(desc.data(), 4), 0x7E8u, "desc[1]: 0x7E8, Driving Force Pro");
++                t.Equals(u32At(desc.data(), 8), 7u, "desc[2]: 7");
++                t.Equals(u32At(desc.data(), 12), 0u, "desc[3]: 0");
++                t.Equals(u32At(desc.data(), 16), 0u, "desc[4]: 0");
++                t.Equals(u32At(desc.data(), 20), 0x10u, "desc[5]: the handle");
++                ps2x::lgdev::buildDescriptor(-1, desc.data());
++                t.Equals(u32At(desc.data(), 20), 0xFFFFFFFFu, "desc[5]: -1 when closed");
++            });
++
++            tc.Run("the position at rest: status 0, axes 0, d-pad and +0x13 0xFF, no buttons", [](TestCase &t)
++                   {
++                const auto pos = position(WheelInput{});
++                t.Equals(u16At(pos.data(), 0), uint16_t{0}, "status 0 (new data)");
++                t.Equals(s16At(pos.data(), 2), int16_t{0}, "steering centred");
++                t.Equals(s16At(pos.data(), 4), int16_t{0}, "combined axis 0");
++                for (size_t o = 6; o < 0x0E; ++o)
++                    t.Equals(pos[o], uint8_t{0}, "unused bytes 0x06-0x0D are 0");
++                t.Equals(u16At(pos.data(), 0x0E), uint16_t{0}, "throttle released");
++                t.Equals(u16At(pos.data(), 0x10), uint16_t{0}, "brake released");
++                t.Equals(pos[0x12], uint8_t{0xFF}, "d-pad centred");
++                t.Equals(pos[0x13], uint8_t{0xFF}, "+0x13 always 0xFF");
++                t.Equals(u32At(pos.data(), 0x14), 0u, "no buttons");
++            });
++
++            tc.Run("steering and pedals use the full 16-bit range and the combined axis is (brake - throttle) >> 1",
++                   [](TestCase &t)
++                   {
++                WheelInput in;
++                in.steering = -1.0f;
++                in.throttle = 1.0f;
++                auto pos = position(in);
++                t.Equals(s16At(pos.data(), 2), int16_t{-32767}, "full left");
++                t.Equals(u16At(pos.data(), 0x0E), uint16_t{0xFFFF}, "throttle floored");
++                t.Equals(u16At(pos.data(), 0x10), uint16_t{0}, "brake released");
++                t.Equals(s16At(pos.data(), 4), int16_t{-32767}, "-32768 saturates to -32767");
++                in = WheelInput{};
++                in.steering = 1.0f;
++                in.brake = 1.0f;
++                pos = position(in);
++                t.Equals(s16At(pos.data(), 2), int16_t{32767}, "full right");
++                t.Equals(u16At(pos.data(), 0x10), uint16_t{0xFFFF}, "brake floored");
++                t.Equals(s16At(pos.data(), 4), int16_t{32767}, "brake alone: +32767");
++                in.throttle = 1.0f;
++                pos = position(in);
++                t.Equals(s16At(pos.data(), 4), int16_t{0}, "both pedals: 0");
++                in = WheelInput{};
++                in.steering = 0.5f;
++                in.throttle = 0.5f;
++                pos = position(in);
++                t.Equals(s16At(pos.data(), 2), int16_t{16384}, "half right, linear");
++                t.Equals(u16At(pos.data(), 0x0E), uint16_t{32768}, "half throttle");
++                t.Equals(s16At(pos.data(), 4), int16_t{-16384}, "half throttle: -16384");
++                in.steering = 3.0f;
++                in.throttle = -2.0f;
++                pos = position(in);
++                t.Equals(s16At(pos.data(), 2), int16_t{32767}, "steering clamped");
++                t.Equals(u16At(pos.data(), 0x0E), uint16_t{0}, "throttle clamped");
++            });
++
++            tc.Run("the d-pad byte comes from the POV: 0 N, 2 E, 4 S, 6 W, odd diagonals, 0xFF centred", [](TestCase &t)
++                   {
++                const int povs[] = {0, 4500, 9000, 13500, 18000, 22500, 27000, 31500, 35900, -1};
++                const uint8_t expected[] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 0xFF};
++                for (size_t i = 0; i < std::size(povs); ++i)
++                {
++                    WheelInput in;
++                    in.pov = povs[i];
++                    t.Equals(position(in)[0x12], expected[i], "POV " + std::to_string(povs[i]));
++                }
++            });
++
++            tc.Run("the buttons go to bits 16-27 of +0x14", [](TestCase &t)
++                   {
++                const struct
++                {
++                    ps2x::lgdev::DfpButton button;
++                    uint32_t mask;
++                } cases[] = {{ps2x::lgdev::kCross, 0x00010000u},    {ps2x::lgdev::kSquare, 0x00020000u},
++                             {ps2x::lgdev::kCircle, 0x00040000u},   {ps2x::lgdev::kTriangle, 0x00080000u},
++                             {ps2x::lgdev::kStart, 0x00100000u},    {ps2x::lgdev::kSelect, 0x00200000u},
++                             {ps2x::lgdev::kL1, 0x00400000u},       {ps2x::lgdev::kR1, 0x00800000u},
++                             {ps2x::lgdev::kL2, 0x01000000u},       {ps2x::lgdev::kR2, 0x02000000u},
++                             {ps2x::lgdev::kL3, 0x04000000u},       {ps2x::lgdev::kR3, 0x08000000u}};
++                uint32_t all = 0;
++                for (const auto &c : cases)
++                {
++                    WheelInput in;
++                    in.buttons = 1u << c.button;
++                    t.Equals(u32At(position(in).data(), 0x14), c.mask, std::string("button ") +
++                                                                           ps2x::lgdev::kButtonNames[c.button]);
++                    all |= 1u << c.button;
++                }
++                WheelInput in;
++                in.buttons = all;
++                t.Equals(u32At(position(in).data(), 0x14), 0x0FFF0000u, "all twelve");
++            });
++
++            tc.Run("a G29 maps with the defaults: X steering, Y and RZ pedals, B1-B12 the face and shoulder buttons",
++                   [](TestCase &t)
++                   {
++                const ps2x::lgdev::WheelMap map = ps2x::lgdev::defaultWheelMap();
++                WheelInput in;
++                in.buttons = 0xFFFFFFFFu;
++                ps2_pad_win::JoystickState s = g29AtRest();
++                t.IsTrue(ps2x::lgdev::wheelInputFrom(s, map, in), "present");
++                t.Equals(in.steering, 0.0f, "centred");
++                t.Equals(in.throttle, 0.0f, "throttle released");
++                t.Equals(in.brake, 0.0f, "brake released");
++                t.Equals(in.pov, -1, "POV centred");
++                t.Equals(in.buttons, 0u, "no buttons");
++                s.axes[0] = -0.25f;
++                s.axes[1] = -1.0f; // throttle floored
++                s.axes[5] = 0.0f;  // brake half way
++                s.pov = 9000;
++                t.IsTrue(ps2x::lgdev::wheelInputFrom(s, map, in), "present");
++                t.Equals(in.steering, -0.25f, "steering linear over the full range");
++                t.Equals(in.throttle, 1.0f, "throttle floored");
++                t.IsTrue(in.brake > 0.48f && in.brake < 0.5f, "brake half way (less the 0.02 dead zone)");
++                t.Equals(in.pov, 9000, "POV kept");
++                const ps2x::lgdev::DfpButton order[12] = {
++                    ps2x::lgdev::kCross, ps2x::lgdev::kSquare, ps2x::lgdev::kCircle, ps2x::lgdev::kTriangle,
++                    ps2x::lgdev::kR1,    ps2x::lgdev::kL1,     ps2x::lgdev::kR2,     ps2x::lgdev::kL2,
++                    ps2x::lgdev::kSelect, ps2x::lgdev::kStart, ps2x::lgdev::kR3,     ps2x::lgdev::kL3};
++                for (int b = 0; b < 12; ++b)
++                {
++                    ps2_pad_win::JoystickState pressed = g29AtRest();
++                    pressed.buttons[b] = 1u;
++                    t.IsTrue(ps2x::lgdev::wheelInputFrom(pressed, map, in), "present");
++                    t.Equals(in.buttons, 1u << order[b], "B" + std::to_string(b + 1));
++                }
++                ps2_pad_win::JoystickState other = g29AtRest();
++                other.buttons[12] = 1u; // B13 (+ on the G29): no place in a DFP
++                t.IsTrue(ps2x::lgdev::wheelInputFrom(other, map, in), "present");
++                t.Equals(in.buttons, 0u, "B13 maps to nothing");
++                t.IsFalse(ps2x::lgdev::wheelInputFrom(ps2_pad_win::JoystickState{}, map, in), "no wheel");
++            });
++
++            tc.Run("pedals keep the wheel dead zone at rest", [](TestCase &t)
++                   {
++                ps2x::lgdev::WheelMap map = ps2x::lgdev::defaultWheelMap();
++                ps2_pad_win::JoystickState s = g29AtRest();
++                s.axes[1] = 0.98f; // throttle barely touched: 0.01 of travel
++                WheelInput in;
++                ps2x::lgdev::wheelInputFrom(s, map, in);
++                t.Equals(in.throttle, 0.0f, "inside the 0.02 dead zone");
++            });
++
++            tc.Run("EnumHint is non-zero once at start, then zero until the wheel comes or goes", [](TestCase &t)
++                   {
++                ps2x::lgdev::HostLibrary lib;
++                t.Equals(lib.enumHint(false), 1u, "first call: enumerate");
++                t.Equals(lib.enumHint(false), 0u, "then 0");
++                t.Equals(lib.enumHint(false), 0u, "still 0");
++                t.Equals(lib.enumHint(true), 1u, "wheel connected");
++                t.Equals(lib.enumHint(true), 0u, "then 0");
++                t.Equals(lib.enumHint(false), 1u, "wheel disconnected");
++                t.Equals(lib.enumHint(false), 0u, "then 0");
++            });
++
++            tc.Run("Enumerate gives the one wheel for index 0 and no more after it", [](TestCase &t)
++                   {
++                ps2x::lgdev::HostLibrary lib;
++                std::array<uint8_t, 24> desc{};
++                t.Equals(lib.enumerate(0, true, desc.data()), 0, "index 0 with a wheel");
++                t.Equals(u32At(desc.data(), 0), 0x12u, "a type 0x12");
++                t.Equals(u32At(desc.data(), 20), 0xFFFFFFFFu, "not open yet");
++                t.IsTrue(lib.enumerate(1, true, desc.data()) < 0, "index 1: no more devices");
++                t.Equals(static_cast<uint32_t>(lib.enumerate(1, true, desc.data())), ps2x::lgdev::kErrNoMoreDevices,
++                         "0x80000002");
++                t.IsTrue(lib.enumerate(0, false, desc.data()) < 0, "index 0 without a wheel");
++            });
++
++            tc.Run("Open, properties, ReadMulti and Close of the wheel", [](TestCase &t)
++                   {
++                ps2x::lgdev::HostLibrary lib;
++                int32_t handle = 0;
++                t.IsTrue(lib.open(0, false, handle) < 0, "no wheel: open fails");
++                t.Equals(handle, -1, "handle -1");
++                t.Equals(lib.open(0, true, handle), 0, "open");
++                t.IsTrue(handle >= 0 && (handle & 7) == 0, "handle (counter << 4) | slot 0");
++                std::array<uint8_t, 24> desc{};
++                lib.enumerate(0, true, desc.data());
++                t.Equals(static_cast<int32_t>(u32At(desc.data(), 20)), handle, "the descriptor carries the handle");
++                int32_t again = 0;
++                t.Equals(static_cast<uint32_t>(lib.open(0, true, again)), ps2x::lgdev::kErrAlreadyOpen, "already open");
++                t.Equals(again, handle, "the same handle");
++
++                uint32_t value = 99;
++                t.Equals(lib.getProperty(handle, 2, value), 0, "prop 2");
++                t.Equals(value, 0u, "prop 2 starts at 0");
++                t.Equals(lib.getProperty(handle, 3, value), 0, "prop 3");
++                t.Equals(value, 255u, "gain 255 after open");
++                t.Equals(lib.setProperty(handle, 2, 1), 0, "set prop 2");
++                t.Equals(lib.setProperty(handle, 3, 200), 0, "set prop 3");
++                lib.getProperty(handle, 2, value);
++                t.Equals(value, 1u, "prop 2 stored");
++                lib.getProperty(handle, 3, value);
++                t.Equals(value, 200u, "prop 3 stored");
++                t.Equals(static_cast<uint32_t>(lib.getProperty(handle, 9, value)), ps2x::lgdev::kErrInvalid, "prop 9");
++                t.Equals(static_cast<uint32_t>(lib.setProperty(handle + 1, 2, 0)), ps2x::lgdev::kErrInvalid,
++                         "wrong handle");
++
++                WheelInput in;
++                in.steering = 1.0f;
++                std::array<uint8_t, 24> pos{};
++                pos.fill(0xAA);
++                t.Equals(lib.readPosition(handle, &in, pos.data()), 0, "read");
++                t.Equals(u16At(pos.data(), 0), uint16_t{0}, "status 0");
++                t.Equals(s16At(pos.data(), 2), int16_t{32767}, "steering");
++                pos.fill(0xAA);
++                t.Equals(static_cast<uint32_t>(lib.readPosition(handle, nullptr, pos.data())),
++                         ps2x::lgdev::kErrDeviceGone, "wheel gone");
++                t.Equals(u16At(pos.data(), 0), uint16_t{0xFF}, "status 0xFF: the game does not copy it");
++                t.Equals(static_cast<uint32_t>(lib.readPosition(handle + 16, &in, pos.data())),
++                         ps2x::lgdev::kErrInvalid, "unknown handle");
++                t.Equals(u16At(pos.data(), 0), uint16_t{0xFF}, "status 0xFF");
++
++                uint32_t id1 = 0, id2 = 0;
++                t.Equals(lib.downloadEffect(handle, id1), 0, "download an effect");
++                t.Equals(lib.downloadEffect(handle, id2), 0, "and another");
++                t.Equals(id1 >> 16, static_cast<uint32_t>(handle), "id = (handle << 16) | n");
++                t.IsTrue(id1 != id2 && (id1 & 0xFFFFu) != 0u, "distinct, non-zero ids");
++
++                t.Equals(lib.close(handle), 0, "close");
++                t.Equals(static_cast<uint32_t>(lib.close(handle)), ps2x::lgdev::kErrInvalid, "closed twice");
++                t.Equals(static_cast<uint32_t>(lib.close(-1)), ps2x::lgdev::kErrInvalid, "handle -1");
++                int32_t reopened = 0;
++                t.Equals(lib.open(0, true, reopened), 0, "open again");
++                t.IsTrue(reopened != handle, "a new handle");
++                lib.getProperty(reopened, 3, value);
++                t.Equals(value, 255u, "gain back to 255");
++            });
++
++            tc.Run("F1_VOLANTE_FALSO: steering, throttle and brake", [](TestCase &t)
++                   {
++                WheelInput in;
++                t.IsTrue(ps2x::lgdev::parseFakeWheel("0.5,1,0", in), "three values");
++                t.Equals(in.steering, 0.5f, "steering");
++                t.Equals(in.throttle, 1.0f, "throttle");
++                t.Equals(in.brake, 0.0f, "brake");
++                t.Equals(in.pov, -1, "POV centred");
++                t.Equals(in.buttons, 0u, "no buttons");
++                t.IsTrue(ps2x::lgdev::parseFakeWheel(" -2 , 0.25 , 3 ", in), "spaces, out of range");
++                t.Equals(in.steering, -1.0f, "steering clamped");
++                t.Equals(in.throttle, 0.25f, "throttle");
++                t.Equals(in.brake, 1.0f, "brake clamped");
++                t.IsFalse(ps2x::lgdev::parseFakeWheel(nullptr, in), "unset");
++                t.IsFalse(ps2x::lgdev::parseFakeWheel("", in), "empty");
++                t.IsFalse(ps2x::lgdev::parseFakeWheel("0.5,1", in), "two values");
++                t.IsFalse(ps2x::lgdev::parseFakeWheel("a,b,c", in), "not numbers");
++            });
++
++            tc.Run("F1_VOLANTE_FALSO=mando: the wheel follows the pad report of the test scripts", [](TestCase &t)
++                   {
++                std::array<uint8_t, 21> report{};
++                report[2] = report[3] = 0xFF;
++                report[4] = report[5] = report[6] = report[7] = 0x80;
++                WheelInput in = ps2x::lgdev::wheelInputFromPadReport(report.data());
++                t.Equals(in.steering, 0.0f, "stick centred: straight");
++                t.Equals(in.throttle, 0.0f, "no throttle");
++                t.Equals(in.brake, 0.0f, "no brake");
++                t.Equals(in.pov, -1, "d-pad released");
++                t.Equals(in.buttons, 0u, "no buttons");
++                report[3] = static_cast<uint8_t>(~((1u << 6) | (1u << 3))); // cross and R1 (byte 3 bits 6 and 3)
++                report[2] = static_cast<uint8_t>(~((1u << 4) | (1u << 5) | (1u << 3))); // up, right, start
++                report[6] = 0xFF;  // left stick full right
++                report[14] = 0xFF; // cross pressure
++                in = ps2x::lgdev::wheelInputFromPadReport(report.data());
++                t.Equals(in.steering, 1.0f, "full right");
++                t.Equals(in.throttle, 1.0f, "cross pressure: throttle");
++                t.Equals(in.brake, 0.0f, "no brake");
++                t.Equals(in.pov, 4500, "up and right: north-east");
++                t.Equals(in.buttons,
++                         (1u << ps2x::lgdev::kCross) | (1u << ps2x::lgdev::kR1) | (1u << ps2x::lgdev::kStart),
++                         "cross, R1 and start");
++                report[3] = static_cast<uint8_t>(~(1u << 7)); // square
++                report[2] = static_cast<uint8_t>(~(1u << 7)); // left
++                report[6] = 0x00;
++                report[15] = 0x80; // square pressure
++                in = ps2x::lgdev::wheelInputFromPadReport(report.data());
++                t.Equals(in.steering, -1.0f, "full left");
++                t.Equals(in.throttle, 0.0f, "cross released: no throttle (its pressure is stale)");
++                t.IsTrue(in.brake > 0.5f && in.brake < 0.51f, "square pressure 0x80: half brake");
++                t.Equals(in.pov, 27000, "left");
++                t.Equals(in.buttons, 1u << ps2x::lgdev::kSquare, "square");
++            });
++
++            tc.Run("controles.ini [volante] remaps the native wheel without touching player 1", [](TestCase &t)
++                   {
++                const ps2x::PadPlayersInfo base = ps2x::describePadPlayers("", false);
++                t.IsTrue(base.messages.empty(), "defaults: no warnings");
++                const ps2x::lgdev::WheelMap defaults = ps2x::lgdev::defaultWheelMap();
++                t.Equals(base.nativeWheel.buttons[ps2x::lgdev::kCross].size(), size_t{1}, "cross: one input");
++                t.Equals(codeAt(base.nativeWheel.buttons[ps2x::lgdev::kCross], 0), 0, "cross = B1 by default");
++                t.Equals(base.nativeWheel.throttle.code, defaults.throttle.code, "throttle = Y by default");
++
++                const ps2x::PadPlayersInfo info = ps2x::describePadPlayers(
++                    "[volante]\ncruz = volante:B3, volante:B4\nacelerador = volante:Z=\ndireccion = volante:X-\n"
++                    "freno = volante:RZ~\nfoo = volante:B1\ncirculo = tecla:X\n", false);
++                t.IsTrue(info.players[0].controls == base.players[0].controls, "player 1 controls unchanged");
++                t.Equals(info.nativeWheel.buttons[ps2x::lgdev::kCross].size(), size_t{2}, "cross: two inputs");
++                t.Equals(codeAt(info.nativeWheel.buttons[ps2x::lgdev::kCross], 0), 2, "B3");
++                t.Equals(codeAt(info.nativeWheel.buttons[ps2x::lgdev::kCross], 1), 3, "B4");
++                t.Equals(info.nativeWheel.throttle.code, 2, "throttle on Z");
++                t.Equals(info.nativeWheel.throttle.mode, '=', "released at -1");
++                t.Equals(info.nativeWheel.steering.mode, '-', "steering inverted");
++                t.Equals(info.nativeWheel.brake.code, 5, "brake on RZ");
++                t.Equals(codeAt(info.nativeWheel.buttons[ps2x::lgdev::kSquare], 0), 1, "square keeps B2");
++                t.Equals(info.messages.size(), size_t{2}, "two warnings");
++                t.IsTrue(!info.messages.empty() && info.messages[0] == "controles.ini:6: control desconocido 'foo'",
++                         "unknown control in [volante]");
++                t.IsTrue(info.messages.size() > 1 &&
++                             info.messages[1] == "controles.ini:7: [volante] solo admite entradas volante: ('tecla:X')",
++                         "only volante: inputs in [volante]");
++            });
++
++            tc.Run("with the native wheel the wheel does not reach player 1's DualShock 2", [](TestCase &t)
++                   {
++                ps2_pad_win::JoystickState s = g29AtRest();
++                s.axes[0] = 1.0f;  // full right
++                s.axes[1] = -1.0f; // throttle floored
++                s.buttons[4] = 1u; // B5: r1 in the stick mapping
++                const auto report = ps2x::padReportFromWheel("", s, false);
++                t.Equals(report[2], uint8_t{0xFF}, "no buttons (low byte)");
++                t.Equals(report[3], uint8_t{0xFF}, "no buttons (high byte)");
++                t.Equals(report[6], uint8_t{0x80}, "left stick X centred");
++                t.Equals(report[7], uint8_t{0x80}, "left stick Y centred");
++                t.Equals(report[8 + 6], uint8_t{0}, "no cross pressure");
++            });
++
++            // PRESERVE: F1_VOLANTE_STICK=1 (and every game without the native wheel) keeps the wheel on the stick.
++            tc.Run("with the wheel as stick the previous mapping holds: X steering, Y~ cross, B5 r1", [](TestCase &t)
++                   {
++                ps2_pad_win::JoystickState s = g29AtRest();
++                s.axes[0] = 1.0f;
++                s.axes[1] = -1.0f;
++                s.buttons[4] = 1u;
++                const auto report = ps2x::padReportFromWheel("", s, true);
++                const uint16_t buttons = static_cast<uint16_t>(report[2] | (report[3] << 8));
++                t.Equals(buttons, static_cast<uint16_t>(~((1u << 14) | (1u << 11))), "cross and r1 pressed");
++                t.Equals(report[6], uint8_t{0xFF}, "left stick full right");
++                t.Equals(report[7], uint8_t{0x80}, "left stick Y centred");
++                t.Equals(report[8 + 6], uint8_t{0xFF}, "cross pressure 255 from the throttle");
++                t.Equals(report[8 + 10], uint8_t{0xFF}, "r1 pressure 255");
++                t.Equals(report[20], uint8_t{1}, "pressures valid");
++            });
++        });
++    }
++
++    const bool g_registered = (registerLgDevTests(), true);
++}

@@ -1,0 +1,113 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 2da8853..0caf664 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -4,7 +4,8 @@
+ 
+ // A/B switch for performance work. Optimized paths that keep their previous implementation check it: 0 runs the
+ // current code, 1 the previous one (GS: drawing on the EE thread with the reference rasterizer), 2 the GS without its
+-// band workers (everything rasterized on the GS thread), 3 the VU1 interpreter without blocks (ps2_vu1_blocks.h). A
++// band workers (everything rasterized on the GS thread), 3 the VU1 interpreter without blocks (ps2_vu1_blocks.h), 4 the
++// IOP advanced on every EE checkpoint instead of in batches (EeScheduler::accountCycles). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 03e3103..899b360 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
++#include "runtime/ps2_ab.h"
+ #include "runtime/ps2_intc_queue.h"
+ 
+ #include <algorithm>
+@@ -57,6 +58,11 @@ namespace
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
++    // IOP cycles (in EE cycles) accounted but not run yet, and those run since the last "[iop:ritmo]" report: the IOP
++    // advances in batches (see EeScheduler::accountCycles).
++    uint64_t g_iopBatchCycles = 0u;
++    uint64_t g_iopGivenCycles = 0u;
++
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+     {
+@@ -173,6 +179,16 @@ void EeScheduler::run()
+             GuestThread *next = selectReady();
+             if (!next && m_pendingInvocations.empty())
+             {
++                // Before going idle, run the IOP's unfinished batch (see accountCycles): it may wake an EE thread
++                // (a SIF command or DMA completion) that would otherwise wait for the next timer or VBLANK.
++                if (g_iopBatchCycles != 0u)
++                {
++                    const uint64_t batch = g_iopBatchCycles;
++                    g_iopBatchCycles = 0u;
++                    g_iopGivenCycles += batch;
++                    m_runtime.advanceIopEeCycles(batch);
++                    continue;
++                }
+                 copyMainContextToRuntime();
+                 publishIdleDebugContext();
+                 publishSnapshot();
+@@ -459,16 +475,25 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     // stood still meanwhile. An idle IOP jumps straight to its next event, so the catch-up only costs host time when it
+     // has work; if it cannot keep up, the debt is capped at 100 ms. PS2X_IOP_TIEMPO_REAL=0: executed cycles only.
+     // "[iop:ritmo]" (every 10 s): IOP cycles per second (36.8 MHz on the real console) and the time dropped.
++    // The IOP runs in batches of PS2X_IOP_PASO_US microseconds of EE time (32 by default; 0 = on every call): each
++    // advance walks the IOP thread list two or three times (IopKernel::beginNextReady/nextWakeCycle) even when no thread
++    // is ready, and with a checkpoint every few dozen EE cycles that was ~10 % of the EE thread in a race. The IOP may
++    // now trail the EE by up to one batch, like a slightly longer SIF latency; run() hands it the rest of the batch
++    // before the EE goes idle. g_ps2AbMode 4 runs it on every call (A/B).
+     {
+         static const bool s_iopRealTime = []
+         {
+             const char *value = std::getenv("PS2X_IOP_TIEMPO_REAL");
+             return value == nullptr || value[0] != '0';
+         }();
++        static const uint64_t s_iopBatch = []
++        {
++            const char *value = std::getenv("PS2X_IOP_PASO_US");
++            return microsecondsToEeCycles(value != nullptr ? std::strtoull(value, nullptr, 10) : 32u);
++        }();
+         constexpr uint64_t kIopCatchUpPerCall = microsecondsToEeCycles(2000u);
+         constexpr uint64_t kMaxIopDebt = microsecondsToEeCycles(100000u);
+         static uint64_t s_iopDebt = 0u;
+-        static uint64_t s_iopGiven = 0u;
+         static uint64_t s_iopDropped = 0u;
+         static std::chrono::steady_clock::time_point s_iopReportStart = std::chrono::steady_clock::now();
+         uint64_t iopCycles = elapsed;
+@@ -488,19 +513,25 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+         {
+             s_iopDropped += catchUp;
+         }
+-        m_runtime.advanceIopEeCycles(iopCycles);
+-        s_iopGiven += iopCycles;
++        g_iopBatchCycles += iopCycles;
++        if (g_iopBatchCycles >= s_iopBatch || g_ps2AbMode.load(std::memory_order_relaxed) == 4)
++        {
++            const uint64_t batch = g_iopBatchCycles;
++            g_iopBatchCycles = 0u;
++            g_iopGivenCycles += batch;
++            m_runtime.advanceIopEeCycles(batch);
++        }
+         if (report)
+         {
+             const auto now = std::chrono::steady_clock::now();
+             const double seconds = std::chrono::duration<double>(now - s_iopReportStart).count();
+-            const double total = static_cast<double>(s_iopGiven + s_iopDropped);
++            const double total = static_cast<double>(g_iopGivenCycles + s_iopDropped);
+             std::fprintf(stderr, "[iop:ritmo] ciclosIOP/s=%.0f deuda=%.1fms descartado=%.0f%%\n",
+-                         static_cast<double>(s_iopGiven) / 8.0 / seconds,
++                         static_cast<double>(g_iopGivenCycles) / 8.0 / seconds,
+                          1000.0 * static_cast<double>(s_iopDebt) / static_cast<double>(EeScheduler::kEeClockHz),
+                          total > 0.0 ? 100.0 * static_cast<double>(s_iopDropped) / total : 0.0);
+             s_iopReportStart = now;
+-            s_iopGiven = 0u;
++            g_iopGivenCycles = 0u;
+             s_iopDropped = 0u;
+         }
+     }

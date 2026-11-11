@@ -1,0 +1,90 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 57f4aa6..8e63226 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -82,6 +82,11 @@ private:
+     static constexpr uint64_t kChunk = 512u;
+     static constexpr uint64_t kMaxPendingCost = 2000000u; // about 5 full 640x448 screens of pixels
+     static constexpr uint32_t kPublishCost = 65536u;       // the worker reports progress at least this often
++    // Waking the worker costs the producer a kernel call: a waiting worker is woken once per kNotifyBatch commands
++    // (or kNotifyCost pixels), and otherwise looks at the queue every kWorkerPollUs by itself.
++    static constexpr uint32_t kNotifyBatch = 32u;
++    static constexpr uint64_t kNotifyCost = 50000u;
++    static constexpr uint32_t kWorkerPollUs = 500u;
+ 
+     template <typename T>
+     void Push(T &&command, uint32_t cost);
+@@ -102,6 +107,7 @@ private:
+     uint64_t m_tail = 0u;        // next free slot
+     uint64_t m_pendingCost = 0u; // cost of the commands in [m_head, m_tail)
+     uint32_t m_producersWaiting = 0u;
++    uint32_t m_unnotified = 0u;  // commands queued since the waiting worker was last woken
+     bool m_workerBusy = false;
+     bool m_workerWaiting = false;
+     bool m_stop = false;
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 75dd409..b244970 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -107,6 +107,11 @@ void GSThreadedBackend::Push(T &&command, uint32_t cost)
+     };
+     if (!hasRoom())
+     {
++        if (m_workerWaiting)
++        {
++            m_unnotified = 0u;
++            m_notEmpty.notify_one();
++        }
+         m_fullWaits.fetch_add(1u, std::memory_order_relaxed);
+         const auto waitStart = std::chrono::steady_clock::now();
+         ++m_producersWaiting;
+@@ -124,7 +129,17 @@ void GSThreadedBackend::Push(T &&command, uint32_t cost)
+     if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
+         m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
+     ++m_tail;
+-    if (m_workerWaiting)
++    // Waking a waiting worker costs a kernel call, and two when done inside the lock (the woken worker then finds the
++    // mutex taken): once per kNotifyBatch commands or kNotifyCost pixels, after unlocking. A waiting worker also looks
++    // at the queue every kWorkerPollUs, and Drain() wakes it at once.
++    bool wake = false;
++    if (m_workerWaiting && (++m_unnotified >= kNotifyBatch || m_pendingCost >= kNotifyCost))
++    {
++        m_unnotified = 0u;
++        wake = true;
++    }
++    lock.unlock();
++    if (wake)
+         m_notEmpty.notify_one();
+ }
+ 
+@@ -142,7 +157,11 @@ bool GSThreadedBackend::TryPush(T &&command, uint32_t cost)
+     if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
+         m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
+     ++m_tail;
+-    if (m_workerWaiting)
++    const bool wake = m_workerWaiting;
++    if (wake)
++        m_unnotified = 0u;
++    lock.unlock();
++    if (wake)
+         m_notEmpty.notify_one();
+     return true;
+ }
+@@ -153,6 +172,8 @@ void GSThreadedBackend::Drain() const
+     if (m_head == m_tail && !m_workerBusy)
+         return;
+     m_drains.fetch_add(1u, std::memory_order_relaxed);
++    if (m_workerWaiting)
++        m_notEmpty.notify_one(); // the commands since the last wake-up
+     m_idle.wait(lock, [this]()
+                 { return m_head == m_tail && !m_workerBusy; });
+ }
+@@ -181,7 +202,7 @@ void GSThreadedBackend::WorkerLoop()
+         {
+             m_workerWaiting = true;
+             m_idle.notify_all();
+-            m_notEmpty.wait(lock);
++            m_notEmpty.wait_for(lock, std::chrono::microseconds(kWorkerPollUs)); // producers wake it once per batch
+             m_workerWaiting = false;
+         }
+         if (m_head == m_tail)

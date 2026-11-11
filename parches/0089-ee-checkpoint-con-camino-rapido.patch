@@ -1,0 +1,135 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..4beabfb 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -427,6 +427,12 @@ private:
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
++    // Patch 0089: checkpointDue's fast path. Until m_eeCycle reaches m_fastCheckCycle it only adds the cycles (and keeps
++    // them in m_deferredCycles for the timers and the IOP, which accountCycles hands over on its next full call).
++    // 0: the next call takes the full path. Set by a full call that returns false: the earliest of the slice end, the
++    // next deadline and kFastCheckpointCycles ahead; cleared when the deadline or the slice changes.
++    std::atomic<uint64_t> m_fastCheckCycle{0};
++    uint64_t m_deferredCycles = 0;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+     std::atomic<bool> m_guestExecuting{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index e190f9c..4bb3454 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -506,8 +506,38 @@ void EeScheduler::postEvent(EeEvent event)
+     m_eventCv.notify_one();
+ }
+ 
++// Patch 0089: checkpointDue is called on every backward branch and guest call of the translated code (32 and 8 cycles):
++// ~6 % of the EE thread in a race went into its full work each time (the timers, the IOP batch, the wall-time catch-up,
++// three atomic flags, the deadline and the slice). Between full calls it now only adds the cycles, for at most
++// kFastCheckpointCycles and never past the slice end or the next deadline: an event posted from another thread (the
++// flags) or a timer interrupt is seen at most that many EE cycles later (~3.4 us), and the timers and the IOP get the
++// cycles in batches of that size. PS2X_EE_CHECKPOINT_RAPIDO=0 (and A/B mode 82): every call takes the full path.
++namespace
++{
++    constexpr uint64_t kFastCheckpointCycles = 1024u;
++    bool fastCheckpointsOn()
++    {
++        static const bool on = []
++        {
++            const char *value = std::getenv("PS2X_EE_CHECKPOINT_RAPIDO");
++            return value == nullptr || value[0] != '0';
++        }();
++        return on;
++    }
++}
++
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
++    {
++        const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
++        if (m_eeCycle + elapsed < m_fastCheckCycle.load(std::memory_order_relaxed))
++        {
++            m_eeCycle += elapsed;
++            m_deferredCycles += elapsed;
++            return false;
++        }
++    }
++    m_fastCheckCycle.store(0u, std::memory_order_relaxed);
+     accountCycles(cycles);
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+@@ -524,27 +554,38 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
+-    if (m_eeCycle < m_sliceEndCycle)
++    if (m_eeCycle >= m_sliceEndCycle)
+     {
+-        return false;
+-    }
++        const GuestThread *running = currentThread();
++        if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++        {
++            m_rescheduleRequested = true;
++            m_timeSliceExpired = true;
++            return true;
++        }
+ 
+-    const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++        renewTimeSlice();
++    }
++    if (fastCheckpointsOn() && g_ps2AbMode.load(std::memory_order_relaxed) != 82)
+     {
+-        m_rescheduleRequested = true;
+-        m_timeSliceExpired = true;
+-        return true;
++        uint64_t until = std::min(m_eeCycle + kFastCheckpointCycles, m_sliceEndCycle);
++        if (nextEventCycle != 0u)
++            until = std::min(until, nextEventCycle);
++        m_fastCheckCycle.store(until, std::memory_order_relaxed);
++        // A deadline moved earlier by another thread meanwhile: take the full path next time.
++        const uint64_t again = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        if (again != nextEventCycle)
++            m_fastCheckCycle.store(0u, std::memory_order_relaxed);
+     }
+-
+-    renewTimeSlice();
+     return false;
+ }
+ 
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+-    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+-    m_eeCycle += elapsed;
++    m_eeCycle += std::max<uint64_t>(1u, cycles);
++    // Patch 0089: plus the cycles checkpointDue's fast path added to m_eeCycle without the timers and the IOP.
++    const uint64_t elapsed = std::max<uint64_t>(1u, cycles) + m_deferredCycles;
++    m_deferredCycles = 0u;
+ 
+     // Guest cycles only count executed EE instructions, but host work that real hardware does in
+     // parallel (software GS rasterisation, VU1 interpretation, waits) also takes wall time. Without
+@@ -2349,6 +2390,7 @@ void EeScheduler::updateNextDeadline()
+     if (m_deadlines.empty())
+     {
+         m_nextDeadlineCycle.store(0u, std::memory_order_release);
++        m_fastCheckCycle.store(0u, std::memory_order_relaxed);
+         return;
+     }
+     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+@@ -2361,6 +2403,7 @@ void EeScheduler::updateNextDeadline()
+                                          return left.sequence < right.sequence;
+                                      });
+     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
++    m_fastCheckCycle.store(0u, std::memory_order_relaxed); // patch 0089
+ }
+ 
+ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
+@@ -2380,6 +2423,7 @@ void EeScheduler::renewTimeSlice()
+ {
+     m_sliceEndCycle = m_eeCycle + kDefaultTimeSliceCycles;
+     m_timeSliceExpired = false;
++    m_fastCheckCycle.store(0u, std::memory_order_relaxed); // patch 0089
+ }
+ 
+ void EeScheduler::copyMainContextToRuntime()

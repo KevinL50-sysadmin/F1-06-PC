@@ -1,0 +1,307 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 1d46e5e..9cae78c 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -26,7 +26,8 @@
+ // tests the A/B mode on every pair (before patch 0056; mode 0 runs one without the tests), 28 the EE
+ // timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056), 29 the VU1
+ // schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057), 30 the
+-// compiled schedules with the upper FMAC through calls instead of inline (before patch 0058). A
++// compiled schedules with the upper FMAC through calls instead of inline (before patch 0058), 31 the compiled schedules with LQ,
++// SQ, the pc and the block end through calls (before patch 0059). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 3c5ae17..75a6df1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -622,7 +622,7 @@ namespace
+         // it points into.
+         void *jit = nullptr;
+         bool jitTried = false;
+-        void *jitCalls = nullptr; // A/B mode 30: compiled without the inline FMAC
++        void *jitCalls = nullptr; // A/B modes 30 and 31: compiled without the inline FMAC or lower steps
+         bool jitCallsTried = false;
+         std::vector<JitCommitRange> jitRanges;
+     };
+@@ -1962,18 +1962,18 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s))))
++            if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s, host))))
+             {
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 30 && s_jitEnabled &&
+-                     (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, false))))
++            else if ((abMode == 30 || abMode == 31) && s_jitEnabled &&
++                     (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+-                reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B mode 30: FMAC through calls
++                reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || abMode == 29 || abMode == 30)
++            else if (abMode == 0 || abMode == 29 || abMode == 30 || abMode == 31)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 1475519..8fd2421 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -24,6 +24,13 @@
+ 
+     using JitCode = void (*)(VU1State *, BlockState *, void *);
+ 
++    // PS2X_VU1_JIT_INFERIORES=0: LQ, SQ, the pc and the end of the block through calls (patch 0058's JIT).
++    const bool s_jitInlineLower = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT_INFERIORES");
++        return value == nullptr || value[0] != '0';
++    }();
++
+     // PS2X_VU1_JIT_FMAC=0: the FMAC through upperEarly calls, as the first version of the JIT.
+     const bool s_jitInlineFmac = []()
+     {
+@@ -158,6 +165,18 @@
+             for (int i = 0; i < 4; ++i)
+                 m_code[after - 4 + i] = static_cast<uint8_t>(rel >> (i * 8));
+         }
++        size_t jae32()
++        {
++            bytes({0x0F, 0x83});
++            imm32(0u);
++            return m_code.size();
++        }
++        size_t je32()
++        {
++            bytes({0x0F, 0x84});
++            imm32(0u);
++            return m_code.size();
++        }
+         const std::vector<uint8_t> &code() const { return m_code; }
+ 
+     private:
+@@ -607,13 +626,174 @@
+         host.catchUpXgkick(st.cycle);
+     }
+ 
++    // The rare halves of the inline steps below.
++    template <typename Host>
++    void jitCatchUpPair(const BlockPair &p, VU1State &, BlockState &st, Host &host)
++    {
++        host.catchUpXgkick(st.cycle + p.issue);
++    }
++    template <typename Host>
++    void jitCatchUpEnd(const Schedule &, VU1State &, BlockState &st, Host &host)
++    {
++        host.catchUpXgkick(st.cycle);
++    }
++    template <typename Host>
++    void jitPcPending(const BlockPair &, VU1State &vu, BlockState &, Host &host)
++    {
++        if (vu.branchDelay == 0u)
++        {
++            vu.pc = vu.branchTarget & host.pcMask();
++            vu.branchPending = false;
++        }
++        else
++            --vu.branchDelay;
++    }
++
++    // Where the data memory pointer and size live in the host (offsets taken from the real object).
++    struct JitHostLayout
++    {
++        uint32_t data;
++        uint32_t dataBytes;
++        uint32_t codeSize;
++    };
++
++    // eax = (vi[base] + imm) * 16 & (dataBytes - 1); rcx = data (offsetAddress of fastLowerBody).
++    inline void jitDataAddress(JitEmitter &e, const JitHostLayout &h, uint8_t base, int16_t imm)
++    {
++        using B = JitEmitter;
++        e.load32(0, B::Vu, offsetof(VU1State, vi) + 4u * base);
++        e.bytes({0x05}); // add eax, imm
++        e.imm32(static_cast<uint32_t>(static_cast<int32_t>(imm)));
++        e.bytes({0xC1, 0xE0, 0x04}); // shl eax, 4
++        e.load32(1, B::HostReg, h.dataBytes);
++        e.bytes({0xFF, 0xC9}); // dec ecx
++        e.bytes({0x21, 0xC8}); // and eax, ecx
++        e.bytes({0x48, 0x8B}); // mov rcx, [rdi + data]
++        e.modrm(1, B::HostReg, h.data);
++    }
++
++    inline uint8_t jitBlendImm(uint8_t lanes) // x = bit 3 -> lane i = bit i
++    {
++        return static_cast<uint8_t>(((lanes >> 3) & 1u) | (((lanes >> 2) & 1u) << 1) | (((lanes >> 1) & 1u) << 2) |
++                                    ((lanes & 1u) << 3));
++    }
++
++    // LQ.dest vfT, imm(viS) inline (fastLowerBody's FastLq). False: not this case.
++    inline bool jitEmitLq(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        if (p.lowerExec != LowerFast || p.fastOp != FastLq || !s_jitSse41)
++            return false;
++        if (p.lowerDst != DstVf && p.lowerDst != DstVfPending)
++            return true; // writes nothing
++        jitDataAddress(e, h, p.fastA, p.fastImm);
++        e.bytes({0x0F, 0x10, 0x0C, 0x01}); // movups xmm1, [rcx + rax]
++        const B::Base base = p.lowerDst == DstVf ? B::Vu : B::St;
++        const size_t target = p.lowerDst == DstVf ? offsetof(VU1State, vf) + 16u * p.lowerReg
++                                                  : offsetof(BlockState, pendingVf) + 16u * p.lowerReg;
++        const uint8_t imm = jitBlendImm(p.lowerLanes);
++        if (imm == 0xFu)
++            e.storeXmm(base, target, 1);
++        else if (imm != 0u)
++        {
++            e.loadXmm(0, base, target);
++            e.blendXmm0Xmm1(imm);
++            e.storeXmm(base, target, 0);
++        }
++        return true;
++    }
++
++    // XGKICK brought up to cycle st.cycle + issue first, as store() does: the call only when it is behind.
++    template <typename Host>
++    void jitEmitCatchUp(JitEmitter &e, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        e.bytes({0x48, 0x8B}); // mov rax, [rsi + cycle]
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++        e.bytes({0x48, 0x05}); // add rax, issue
++        e.imm32(p.issue);
++        e.bytes({0x48, 0x39}); // cmp [rsi + xgkickThrough], rax
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, xgkickThrough)));
++        const size_t skip = e.jae32();
++        e.call(reinterpret_cast<const void *>(&jitCatchUpPair<Host>), &p);
++        e.bind(skip);
++    }
++
++    // SQ.dest vfS, imm(viT) inline (FastSq). False: not this case.
++    template <typename Host>
++    bool jitEmitSq(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        if (p.lowerExec != LowerFast || p.fastOp != FastSq || !s_jitSse41)
++            return false;
++        jitEmitCatchUp<Host>(e, p);
++        jitDataAddress(e, h, p.fastB, p.fastImm);
++        e.loadXmm(1, B::Vu, offsetof(VU1State, vf) + 16u * p.fastA);
++        const uint8_t imm = jitBlendImm(p.fastDest);
++        if (imm == 0xFu)
++            e.bytes({0x0F, 0x11, 0x0C, 0x01}); // movups [rcx + rax], xmm1
++        else if (imm != 0u)
++        {
++            e.bytes({0x0F, 0x10, 0x04, 0x01}); // movups xmm0, [rcx + rax]
++            e.blendXmm0Xmm1(imm);
++            e.bytes({0x0F, 0x11, 0x04, 0x01}); // movups [rcx + rax], xmm0
++        }
++        return true;
++    }
++
++    // jitPc inline: the next pc, then the pending branch (rare) through jitPcPending.
++    template <typename Host>
++    void jitEmitPc(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        uint32_t nextPc = p.pc + 8u;
++        if (nextPc >= h.codeSize)
++            nextPc = 0u;
++        e.bytes({0xC7}); // mov dword [rbx + pc], nextPc
++        e.modrm(0, B::Vu, static_cast<uint32_t>(offsetof(VU1State, pc)));
++        e.imm32(nextPc);
++        e.bytes({0x80}); // cmp byte [rbx + branchPending], 0
++        e.modrm(7, B::Vu, static_cast<uint32_t>(offsetof(VU1State, branchPending)));
++        e.bytes({0x00});
++        const size_t skip = e.je32();
++        e.call(reinterpret_cast<const void *>(&jitPcPending<Host>), &p);
++        e.bind(skip);
++    }
++
++    // jitEnd inline: the cycle and the timing state, then XGKICK up to the end (the call only when it is behind).
++    template <typename Host>
++    void jitEmitEnd(JitEmitter &e, const Schedule &s)
++    {
++        using B = JitEmitter;
++        e.bytes({0x48, 0x81}); // add qword [rsi + cycle], exitCycle
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++        e.imm32(s.exitCycle);
++        e.bytes({0xC7}); // mov dword [rsi + sig], exitSig
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, sig)));
++        e.imm32(s.exitSig);
++        e.bytes({0x48, 0x8B}); // mov rax, [rsi + cycle]
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++        e.bytes({0x48, 0x39}); // cmp [rsi + xgkickThrough], rax
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, xgkickThrough)));
++        const size_t skip = e.jae32();
++        e.call(reinterpret_cast<const void *>(&jitCatchUpEnd<Host>), &s);
++        e.bind(skip);
++    }
++
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
+-    // inlineFmac false: the FMAC through upperEarly calls (A/B mode 30, s.jitCalls).
++    // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls) and 31 (LQ, SQ, the pc and the
++    // end of the block through calls), in s.jitCalls.
+     template <typename Host>
+-    bool jitCompile(BlockEngine &engine, Schedule &s, bool inlineFmac = true)
++    bool jitCompile(BlockEngine &engine, Schedule &s, Host &host, int alternative = 0)
+     {
+-        (inlineFmac ? s.jitTried : s.jitCallsTried) = true;
++        const bool inlineFmac = alternative != 30;
++        const bool inlineLower = alternative != 31 && s_jitInlineLower;
++        const char *const hostBase = reinterpret_cast<const char *>(&host);
++        const JitHostLayout layout{
++            static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
++            static_cast<uint32_t>(reinterpret_cast<const char *>(&host.dataSize) - hostBase), host.codeSize()};
++        (alternative == 0 ? s.jitTried : s.jitCallsTried) = true;
+         s.jitRanges.clear();
+         s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
+         JitEmitter e;
+@@ -658,7 +838,10 @@
+                     e.store32(JitEmitter::St, offsetof(BlockState, jitOldVi), 0);
+                 }
+                 if (p.lowerExec == LowerFast)
+-                    e.call(reinterpret_cast<const void *>(kLowerFast<Host>[p.fastOp]), &p);
++                {
++                    if (!(inlineLower && (jitEmitLq(e, layout, p) || jitEmitSq<Host>(e, layout, p))))
++                        e.call(reinterpret_cast<const void *>(kLowerFast<Host>[p.fastOp]), &p);
++                }
+                 else if (p.lowerExec == LowerImmediate)
+                     e.call(reinterpret_cast<const void *>(&jitImmediate<Host>), &p);
+                 if (p.backup != 0u)
+@@ -670,17 +853,25 @@
+                 e.call(reinterpret_cast<const void *>(&jitUpperDst<Host>), &p);
+ 
+             if (p.branch || &p == &s.pairs.back())
+-                e.call(reinterpret_cast<const void *>(&jitPc<Host>), &p);
++            {
++                if (inlineLower)
++                    jitEmitPc<Host>(e, layout, p);
++                else
++                    e.call(reinterpret_cast<const void *>(&jitPc<Host>), &p);
++            }
+         }
+         commitsUpTo(s.commits.size());
+-        e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
++        if (inlineLower)
++            jitEmitEnd<Host>(e, s);
++        else
++            e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
+         e.epilogue();
+ 
+         uint8_t *const code = engine.jit.alloc(e.code().size());
+         if (code == nullptr)
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+-        (inlineFmac ? s.jit : s.jitCalls) = code;
++        (alternative == 0 ? s.jit : s.jitCalls) = code;
+         return true;
+     }
+ 

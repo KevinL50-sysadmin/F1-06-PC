@@ -1,0 +1,111 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6014f0f..1a2dda9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4333,6 +4333,21 @@ struct GSCpuBackend::BandState
+ {
+     static constexpr uint64_t kJobCapacity = 4096u;
+     static constexpr size_t kPaletteCount = 256u;
++    // Patch 0094: how many jobs the coordinator may have pending: 1024 (4096 before). With fewer pending jobs, the
++    // coordinator's waits for a job (the CLUT's, a texture read back) wait for fewer jobs, and the bands that are
++    // ahead of worker 0 (which also does the uploads, and is the one the others wait for) stop sooner instead of
++    // filling the ring: in a race, 1024 was +18 % over 4096 (the EE waited for the GS 16 points less), 512 +15 %,
++    // 2048 +9 %, and 16384 -28 %. A/B modes 91, 92 and 94: 4096 (as before), 2048 and 512.
++    static uint64_t RingLimit()
++    {
++        switch (g_ps2AbMode.load(std::memory_order_relaxed))
++        {
++        case 91: return 4096u;
++        case 92: return 2048u;
++        case 94: return 512u;
++        default: return 1024u;
++        }
++    }
+     // Jobs are published in batches, and an idle worker spins only briefly before sleeping: when the GS is not the
+     // bottleneck (a race), workers spinning between jobs that come every few microseconds kept four cores busy and
+     // slowed down the EE thread (turbo, hyper-threading siblings).
+@@ -4355,6 +4370,8 @@ struct GSCpuBackend::BandState
+     std::atomic<bool> stop{false};
+     alignas(64) std::atomic<bool> coordinatorWaiting{false};
+     std::atomic<uint32_t> bandWaiters{0u}; // workers waiting for another one (patch 0063)
++    // Patch 0094 (diagnostic in [gs:bandas]): time the workers spent waiting for each worker in WaitAll.
++    std::array<std::atomic<uint64_t>, 16> blockerNs{};
+ 
+     struct alignas(64) Worker
+     {
+@@ -4687,6 +4704,7 @@ struct GSCpuBackend::BandState
+                 waited = true;
+                 start = std::chrono::steady_clock::now();
+             }
++            const auto blockedSince = std::chrono::steady_clock::now();
+             for (int i = 0; value < target && i < spin; ++i)
+             {
+                 spinPause();
+@@ -4702,6 +4720,11 @@ struct GSCpuBackend::BandState
+                 bandWaiters.fetch_sub(1u, std::memory_order_seq_cst);
+                 value = done.load(std::memory_order_acquire);
+             }
++            if (k < blockerNs.size())
++                blockerNs[k].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                 std::chrono::steady_clock::now() - blockedSince)
++                                                                 .count()),
++                                       std::memory_order_relaxed);
+         }
+         if (waited)
+         {
+@@ -5022,11 +5045,21 @@ struct GSCpuBackend::BandState
+                                 0.1 * waitedMs / seconds);
+         {
+             uint64_t dependencyWaits = 0u, dependencyNs = 0u;
++            char perBand[160] = "";
++            int perLength = 0;
+             for (unsigned k = 0; k < threads; ++k)
+             {
+                 dependencyWaits += worker[k].dependencyWaits.exchange(0u, std::memory_order_relaxed);
+-                dependencyNs += worker[k].dependencyNs.exchange(0u, std::memory_order_relaxed);
++                const uint64_t ns = worker[k].dependencyNs.exchange(0u, std::memory_order_relaxed);
++                dependencyNs += ns;
++                const uint64_t blocked = k < blockerNs.size() ? blockerNs[k].exchange(0u, std::memory_order_relaxed) : 0u;
++                if (perLength < 120)
++                    perLength += std::snprintf(perBand + perLength, sizeof(perBand) - perLength, "%s%.0f>%.0f",
++                                               k ? "/" : "", 1e-6 * static_cast<double>(ns),
++                                               1e-6 * static_cast<double>(blocked));
+             }
++            // Patch 0094: by worker, "ms it waited>ms the others waited for it".
++            length += std::snprintf(line + length, sizeof(line) - length, " esperaBanda>frena=%s", perBand);
+             length += std::snprintf(line + length, sizeof(line) - length,
+                                     " diferidos=%llu subidas=%llu copias=%llu esperasBandas=%llu/%.0fms nucleosE=",
+                                     static_cast<unsigned long long>(deferredJobs),
+@@ -5216,8 +5249,8 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+ {
+     BandState &bs = *m_bands;
+     const uint64_t index = bs.prepared;
+-    if (index - bs.minDone >= BandState::kJobCapacity)
+-        bs.WaitDone(index + 1u - BandState::kJobCapacity, kWaitRing);
++    if (const uint64_t limit = BandState::RingLimit(); index - bs.minDone >= limit)
++        bs.WaitDone(index + 1u - limit, kWaitRing);
+ 
+     // The slot of `index` is free: the job that used it before is done. Nothing reads it until it is published.
+     BandJob &job = bs.jobs[index % BandState::kJobCapacity];
+@@ -5951,8 +5984,8 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     bs.LastBlockWriteSplit(bs.transferBlocks, needAll, needFirst);
+ 
+     const uint64_t index = bs.prepared;
+-    if (index - bs.minDone >= BandState::kJobCapacity)
+-        bs.WaitDone(index + 1u - BandState::kJobCapacity, kWaitRing);
++    if (const uint64_t limit = BandState::RingLimit(); index - bs.minDone >= limit)
++        bs.WaitDone(index + 1u - limit, kWaitRing);
+     const size_t slot = static_cast<size_t>(index % BandState::kJobCapacity);
+     BandJob &job = bs.jobs[slot];
+     job.isSprite = false;
+@@ -6033,8 +6066,8 @@ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+         bs.copyReference.assign(m_vram, m_vram + m_vramSize);
+     }
+     const uint64_t index = bs.prepared;
+-    if (index - bs.minDone >= BandState::kJobCapacity)
+-        bs.WaitDone(index + 1u - BandState::kJobCapacity, kWaitRing);
++    if (const uint64_t limit = BandState::RingLimit(); index - bs.minDone >= limit)
++        bs.WaitDone(index + 1u - limit, kWaitRing);
+     const size_t slot = static_cast<size_t>(index % BandState::kJobCapacity);
+     BandJob &job = bs.jobs[slot];
+     job.isSprite = false;

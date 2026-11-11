@@ -1,0 +1,3691 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index b54ce6e..a46e547 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -405,6 +405,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_pad_win.cpp
+     src/lib/ps2_netplay.cpp
++    src/lib/ps2_netplay_audio.cpp
+     src/lib/ps2_netplay_crypto.cpp
+     src/lib/ps2_netplay_guest.cpp
+     src/lib/ps2_netplay_protocol.cpp
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index a3c16f1..0986f29 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -1,5 +1,9 @@
+ #include "ps2_netplay.h"
++#include "ps2_netplay_audio.h"
+ #include "ps2_netplay_video.h"
++#include "ps2_photo_mode.h"
++#include "ps2_replay_scrub.h"
++#include "ps2x/iop/iop_spu2_audio.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -34,6 +38,11 @@
+ // in the queue (the network is behind): that picture is skipped at the source, so the H.264 chain stays whole. The
+ // guest checks and reassembles the chunks (VideoAssembler, after the tag) and decodes them in a thread of its own.
+ // Encoded bytes reach FFmpeg only after their tag was verified.
++// N3: the host's sound. The SPU2 synthesis thread copies every frame it plays into a lock-free ring (offerHostAudio,
++// the output tap; it never waits); the host's sound thread takes 10 ms frames out of it, encodes them and queues one
++// AUDIO_PACKET each, which goes out after the control frames and before the video. The guest checks the packets
++// (AudioReceiver, after the tag), decodes them in its network thread and puts them in the jitter buffer that its audio
++// device drains.
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -56,6 +65,9 @@ namespace ps2x::netplay
+         constexpr int kAckIntervalMs = 250;
+         constexpr size_t kMaxDecodeQueue = 8;         // pictures waiting for the guest's decoder
+         constexpr int kBusyLingerMs = 2000;           // a refused second guest: time to read its REJECT
++        // N3.
++        constexpr int kAudioPollMs = 2;               // the sound thread looks at the tap this often
++        constexpr size_t kMaxHeldCaptures = 16;       // capture times of frames the encoder still holds
+ 
+         void logLine(const char *format, ...)
+         {
+@@ -135,6 +147,37 @@ namespace ps2x::netplay
+             }
+         }
+ 
++        // N3: the SPU2 output copied for the host that has a guest (one at a time).
++        AudioTapRing g_audioTap;
++        std::atomic<bool> g_audioWanted{false};
++        std::mutex g_audioOwnerMutex;
++        const void *g_audioOwner = nullptr;
++
++        void spu2Tap(const int16_t *stereo, size_t frames) noexcept
++        {
++            offerHostAudio(stereo, frames);
++        }
++
++        void setAudioOwner(const void *owner)
++        {
++            std::lock_guard<std::mutex> lock(g_audioOwnerMutex);
++            g_audioOwner = owner;
++            g_audioTap.skipAll();
++            g_audioWanted = true;
++            ps2x::iop::setSpu2OutputTap(&spu2Tap);
++        }
++
++        void clearAudioOwner(const void *owner)
++        {
++            std::lock_guard<std::mutex> lock(g_audioOwnerMutex);
++            if (g_audioOwner == owner)
++            {
++                ps2x::iop::setSpu2OutputTap(nullptr);
++                g_audioWanted = false;
++                g_audioOwner = nullptr;
++            }
++        }
++
+         void put32(uint8_t *out, uint32_t value)
+         {
+             for (int i = 0; i < 4; ++i)
+@@ -308,6 +351,26 @@ namespace ps2x::netplay
+         slot->ready.notify_one();
+     }
+ 
++    void offerHostAudio(const int16_t *stereo, size_t frames) noexcept
++    {
++        if (!g_audioWanted.load(std::memory_order_relaxed) || stereo == nullptr || frames == 0)
++            return;
++        const uint32_t now = clockMs();
++        if (!ps2x::photoModeActive() && !ps2x::replayScrubMuted())
++        {
++            g_audioTap.push(stereo, frames, now);
++            return;
++        }
++        // The host is silent (photo mode, replay paused or rewinding): so is the guest, at the same pace.
++        static const int16_t s_silence[256 * 2] = {};
++        for (size_t done = 0; done < frames;)
++        {
++            const size_t n = std::min<size_t>(frames - done, 256);
++            done += n;
++            g_audioTap.push(s_silence, n, now);
++        }
++    }
++
+     void setHostPictureAspect(float aspect)
+     {
+         if (aspect > 0.25f && aspect < 8.0f)
+@@ -385,6 +448,17 @@ namespace ps2x::netplay
+         uint64_t statsPictures = 0, statsSkipped = 0, statsBytes = 0; // since the last stats line
+         double statsEncodeMs = 0.0;
+ 
++        // N3: the sound thread.
++        std::thread audioThread;
++        std::mutex audioMutex;
++        std::condition_variable audioWake;
++        bool audioStop = false;
++        uint32_t audioStream = 0;
++        HostAudioStats audio;                                // statsMutex
++        uint64_t statsAudioPackets = 0, statsAudioBytes = 0; // since the last stats line (statsMutex)
++        uint64_t statsAudioFrames = 0;                       // 10 ms frames encoded (statsMutex)
++        double statsAudioEncodeMs = 0.0;
++
+         bool listen(std::string &error);
+         void run();
+         void acceptOne();
+@@ -399,6 +473,9 @@ namespace ps2x::netplay
+         void startVideo();
+         void stopVideo();
+         void encodeLoop();
++        void startAudio();
++        void stopAudio();
++        void audioLoop();
+     };
+ 
+     bool Host::Impl::listen(std::string &error)
+@@ -499,6 +576,12 @@ namespace ps2x::netplay
+                     stats.bytes += out.size();
+                     statsBytes += out.size();
+                 }
++                else if (m.audio)
++                {
++                    std::lock_guard<std::mutex> lock(statsMutex);
++                    audio.bytes += out.size();
++                    statsAudioBytes += out.size();
++                }
+             }
+             const int n = send(client, reinterpret_cast<const char *>(out.data() + outSent),
+                                static_cast<int>(out.size() - outSent), 0);
+@@ -537,6 +620,7 @@ namespace ps2x::netplay
+         if (phase == Phase::Session)
+         {
+             stopVideo();
++            stopAudio();
+             std::lock_guard<std::mutex> lock(io);
+             sessionOpen = false;
+             if (sendBye && !sendFailed)
+@@ -761,6 +845,175 @@ namespace ps2x::netplay
+         }
+     }
+ 
++    void Host::Impl::startAudio()
++    {
++        if (settings.audio.codec == "no")
++        {
++            logLine("sonido: desactivado (--sonido-codec no)");
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(audioMutex);
++            audioStop = false;
++        }
++        {
++            std::lock_guard<std::mutex> lock(statsMutex);
++            audio = HostAudioStats{};
++            statsAudioPackets = statsAudioBytes = statsAudioFrames = 0;
++            statsAudioEncodeMs = 0.0;
++        }
++        audioThread = std::thread([this] { audioLoop(); });
++    }
++
++    void Host::Impl::stopAudio()
++    {
++        {
++            std::lock_guard<std::mutex> lock(audioMutex);
++            audioStop = true;
++        }
++        audioWake.notify_one();
++        if (audioThread.joinable())
++            audioThread.join();
++        clearAudioOwner(this);
++    }
++
++    void Host::Impl::audioLoop()
++    {
++        // Above the game's threads: it sleeps nearly all the time, and a late packet is a gap on the guest.
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++        AudioEncoder encoder;
++        std::string error, tried;
++        for (const std::string &name : audioEncoderCandidates(settings.audio.codec))
++        {
++            if (encoder.open(name, settings.audio.kbps, kAudioFrameSamples, error))
++                break;
++            tried += (tried.empty() ? "" : "; ") + name + ": " + error;
++        }
++        if (!encoder.isOpen())
++        {
++            logLine("sonido: ningun codificador abre (%s); el invitado no oira el juego", tried.c_str());
++            return;
++        }
++        if (!tried.empty())
++            logLine("sonido: probados antes: %s", tried.c_str());
++        AudioConfig config;
++        config.codec = static_cast<uint8_t>(encoder.codec());
++        config.frameSamples = kAudioFrameSamples;
++        config.kbps = encoder.kbps();
++        config.stream = ++audioStream;
++        logLine("sonido: codificador %s (%s), %u kbit/s, tramas de %u ms", encoder.encoderName().c_str(),
++                audioCodecName(config.codec), static_cast<unsigned>(config.kbps),
++                static_cast<unsigned>(kAudioFrameSamples / 48u));
++        {
++            std::lock_guard<std::mutex> lock(statsMutex);
++            audio.encoder = encoder.encoderName();
++            audio.kbps = config.kbps;
++        }
++        {
++            std::lock_guard<std::mutex> lock(io);
++            if (!sessionOpen)
++                return;
++            queue.pushAudioConfig(config);
++            flushLocked();
++        }
++        setAudioOwner(this);
++        const uint64_t droppedAtStart = g_audioTap.dropped();
++        std::vector<int16_t> chunk(4096u * 2u), pending;
++        std::deque<uint32_t> captures; // capture time of each frame given to the encoder, oldest first
++        std::vector<std::vector<uint8_t>> packets;
++        uint64_t pendingFirst = 0, expected = 0;
++        bool haveExpected = false;
++        uint32_t sequence = 0;
++        bool failed = false;
++        // The stream starts (and starts again after a gap) with a 5 ms fade-in: the tap cuts in anywhere in a sound,
++        // and the codec's delay would put that edge after the guest's own fade-in.
++        constexpr uint32_t kSourceFade = kAudioFrameSamples / 2u;
++        uint32_t sourceFade = 0;
++        while (!failed)
++        {
++            {
++                std::unique_lock<std::mutex> lock(audioMutex);
++                audioWake.wait_for(lock, std::chrono::milliseconds(kAudioPollMs), [&] { return audioStop; });
++                if (audioStop)
++                    break;
++            }
++            uint64_t first = 0;
++            size_t n = 0;
++            while ((n = g_audioTap.read(chunk.data(), 4096u, first)) > 0)
++            {
++                if (haveExpected && first != expected)
++                {
++                    // This thread was late and the tap overwrote frames: the part of a frame waiting goes too, and a
++                    // sequence number is skipped so the guest fades over the gap.
++                    pending.clear();
++                    ++sequence;
++                    sourceFade = 0;
++                }
++                for (size_t i = 0; i < n && sourceFade < kSourceFade; ++i, ++sourceFade)
++                {
++                    chunk[i * 2u] = static_cast<int16_t>(chunk[i * 2u] * static_cast<int32_t>(sourceFade) /
++                                                         static_cast<int32_t>(kSourceFade));
++                    chunk[i * 2u + 1u] = static_cast<int16_t>(chunk[i * 2u + 1u] * static_cast<int32_t>(sourceFade) /
++                                                              static_cast<int32_t>(kSourceFade));
++                }
++                if (pending.empty())
++                    pendingFirst = first;
++                pending.insert(pending.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n * 2u));
++                expected = first + n;
++                haveExpected = true;
++            }
++            size_t used = 0;
++            while (!failed && pending.size() - used >= kAudioFrameSamples * 2u)
++            {
++                captures.push_back(g_audioTap.captureMsOf(pendingFirst));
++                packets.clear();
++                const Clock::time_point encodeStart = Clock::now();
++                if (!encoder.encode(pending.data() + used, packets, error))
++                {
++                    logLine("sonido: %s; el invitado deja de oir el juego", error.c_str());
++                    failed = true;
++                    break;
++                }
++                {
++                    std::lock_guard<std::mutex> statsLock(statsMutex);
++                    ++statsAudioFrames;
++                    statsAudioEncodeMs += std::chrono::duration<double, std::milli>(Clock::now() - encodeStart).count();
++                }
++                used += kAudioFrameSamples * 2u;
++                pendingFirst += kAudioFrameSamples;
++                for (std::vector<uint8_t> &data : packets)
++                {
++                    AudioPacket packet;
++                    packet.sequence = ++sequence;
++                    packet.captureMs = captures.empty() ? clockMs() : captures.front();
++                    if (!captures.empty())
++                        captures.pop_front();
++                    packet.data = std::move(data);
++                    std::vector<uint8_t> payload = encodeAudioPacket(packet, config.stream);
++                    if (payload.empty())
++                        continue; // larger than the protocol allows (no codec here makes one)
++                    std::lock_guard<std::mutex> lock(io);
++                    if (!sessionOpen)
++                    {
++                        failed = true;
++                        break;
++                    }
++                    queue.pushAudio(std::move(payload));
++                    flushLocked();
++                    std::lock_guard<std::mutex> statsLock(statsMutex);
++                    ++audio.packets;
++                    ++statsAudioPackets;
++                    audio.queueDropped = queue.droppedAudio();
++                    audio.tapDropped = g_audioTap.dropped() - droppedAtStart;
++                }
++                while (captures.size() > kMaxHeldCaptures)
++                    captures.pop_front();
++            }
++            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(used));
++        }
++        clearAudioOwner(this);
++    }
++
+     void Host::Impl::acceptOne()
+     {
+         sockaddr_storage from{};
+@@ -902,6 +1155,7 @@ namespace ps2x::netplay
+                     sessionOpen = true;
+                 }
+                 startVideo();
++                startAudio();
+             }
+             else if (step == HostHandshake::Result::Rejected)
+             {
+@@ -990,6 +1244,27 @@ namespace ps2x::netplay
+                         static_cast<double>(bytes) * 8.0 / 1000.0 / statsMs, static_cast<unsigned long long>(skipped),
+                         pictures > 0 ? encodeMs / static_cast<double>(pictures) : 0.0,
+                         static_cast<unsigned>(s.latencyMs), static_cast<unsigned>(roundTripMs.load()));
++            HostAudioStats a;
++            uint64_t audioPackets = 0, audioBytes = 0, audioFrames = 0;
++            double audioEncodeMs = 0.0;
++            {
++                std::lock_guard<std::mutex> lock(statsMutex);
++                a = audio;
++                audioPackets = statsAudioPackets;
++                audioBytes = statsAudioBytes;
++                audioFrames = statsAudioFrames;
++                audioEncodeMs = statsAudioEncodeMs;
++                statsAudioPackets = statsAudioBytes = statsAudioFrames = 0;
++                statsAudioEncodeMs = 0.0;
++            }
++            if (!a.encoder.empty())
++                logLine("sonido: %s, %.1f paquetes/s, %.0f kbit/s, codificar %.3f ms por trama de 10 ms (%.1f %% de un "
++                        "nucleo), perdidos en la toma %llu marcos, descartados por la red %llu paquetes",
++                        a.encoder.c_str(), static_cast<double>(audioPackets) * 1000.0 / statsMs,
++                        static_cast<double>(audioBytes) * 8.0 / statsMs,
++                        audioFrames > 0 ? audioEncodeMs / static_cast<double>(audioFrames) : 0.0,
++                        audioEncodeMs * 100.0 / statsMs, static_cast<unsigned long long>(a.tapDropped),
++                        static_cast<unsigned long long>(a.queueDropped));
+             statsStart = now;
+             statsPads = 0;
+         }
+@@ -1119,6 +1394,12 @@ namespace ps2x::netplay
+         return m_impl->stats;
+     }
+ 
++    HostAudioStats Host::audioStats() const
++    {
++        std::lock_guard<std::mutex> lock(m_impl->statsMutex);
++        return m_impl->audio;
++    }
++
+     struct Guest::Impl
+     {
+         GuestSettings settings;
+@@ -1159,6 +1440,11 @@ namespace ps2x::netplay
+         uint64_t pictureSerial = 0, takenSerial = 0;
+         Shown shown;
+ 
++        // N3: the host's sound, drained by the audio device's thread; the picture on screen, for the sync.
++        AudioJitterBuffer jitter;
++        std::atomic<uint64_t> shownStamp{0}; // (capture ms << 32) | guest ms when it was taken
++        std::atomic<bool> shownValid{false};
++
+         void setStatus(GuestState state, const std::string &text)
+         {
+             std::lock_guard<std::mutex> lock(mutex);
+@@ -1348,6 +1634,8 @@ namespace ps2x::netplay
+ 
+     void Guest::Impl::run()
+     {
++        // N3: above the picture's decoder, which can take whole cores: this thread feeds the sound (light work).
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+         SOCKET s = connectToHost();
+         if (s == INVALID_SOCKET)
+             return;
+@@ -1369,6 +1657,16 @@ namespace ps2x::netplay
+                           rateStart = started;
+         uint64_t videoBytes = 0, rateBytes = 0, rateDecoded = 0, statsDecoded = 0, statsVideoBytes = 0;
+         uint16_t lastLatency = 0;
++        // N3.
++        AudioReceiver audioReceiver;
++        AudioDecoder audioDecoder;
++        bool audioDecoding = false;
++        std::vector<int16_t> pcm;
++        uint64_t audioBytes = 0, rateAudioBytes = 0, audioPackets = 0, streamPackets = 0;
++        int audioErrorsLogged = 0;
++        int32_t avMin = INT32_MAX, avMax = INT32_MIN;
++        jitter.requestReset();
++        shownValid = false;
+         {
+             std::lock_guard<std::mutex> lock(decodeMutex);
+             decodeQueue.clear();
+@@ -1513,6 +1811,55 @@ namespace ps2x::netplay
+                             }
+                             break;
+                         }
++                        case MessageType::AudioConfig:
++                        {
++                            if (!audioReceiver.configure(frame.payload.data(), frame.size))
++                            {
++                                end(GuestState::Failed, "Sonido no valido del anfitrion: " + audioReceiver.why(), true,
++                                    ByeReason::Protocol);
++                                break;
++                            }
++                            const AudioConfig &c = audioReceiver.config();
++                            std::string error;
++                            audioDecoding = audioDecoder.open(c, error);
++                            streamPackets = 0;
++                            jitter.requestReset();
++                            logLine("sonido: %s, %u kbit/s, tramas de %u muestras (secuencia %u)%s%s",
++                                    audioCodecName(c.codec), static_cast<unsigned>(c.kbps),
++                                    static_cast<unsigned>(c.frameSamples), static_cast<unsigned>(c.stream),
++                                    audioDecoding ? "" : "; no se puede decodificar: ", audioDecoding ? "" : error.c_str());
++                            std::lock_guard<std::mutex> lock(mutex);
++                            status.audioCodec = audioCodecName(c.codec);
++                            break;
++                        }
++                        case MessageType::AudioPacket:
++                        {
++                            audioBytes += frame.size;
++                            AudioPacket packet;
++                            if (audioReceiver.add(frame.payload.data(), frame.size, packet) ==
++                                AudioReceiver::Result::Error)
++                            {
++                                end(GuestState::Failed, "Sonido no valido del anfitrion: " + audioReceiver.why(), true,
++                                    ByeReason::Protocol);
++                                break;
++                            }
++                            if (!audioDecoding)
++                                break;
++                            pcm.clear();
++                            std::string error;
++                            if (!audioDecoder.decode(packet.data.data(), packet.data.size(), pcm, error))
++                            {
++                                if (audioErrorsLogged < 20 && ++audioErrorsLogged)
++                                    logLine("sonido: paquete %u no decodificado: %s",
++                                            static_cast<unsigned>(packet.sequence), error.c_str());
++                                break;
++                            }
++                            jitter.push(pcm.data(), pcm.size() / 2u, packet.captureMs,
++                                        audioReceiver.gapBeforeLast() && streamPackets > 0);
++                            ++streamPackets;
++                            ++audioPackets;
++                            break;
++                        }
+                         default:
+                             end(GuestState::Failed, "Mensaje fuera de lugar del anfitrion", true, ByeReason::Protocol);
+                             break;
+@@ -1597,6 +1944,32 @@ namespace ps2x::netplay
+                 status.latencyMs = lastLatency;
+                 status.pictures = decodedNow;
+                 status.lost = assembler.lostPictures() + lostInDecoder.load();
++                // N3: the sound, and how far it is from the picture (each against its own host capture time).
++                const AudioJitterBuffer::Stats js = jitter.stats();
++                status.audioKbps = static_cast<float>((audioBytes - rateAudioBytes) * 8.0 / rateMs);
++                status.audioBufferMs = js.fillFrames / 48u;
++                status.audioTargetMs = js.targetFrames / 48u;
++                status.audioUnderruns = js.underruns;
++                status.audioPackets = audioPackets;
++                status.audioLost = audioReceiver.lostPackets();
++                status.avValid = false;
++                if (js.playing && js.hasCapture)
++                {
++                    // The device plays what it was handed about one request later.
++                    status.audioDelayMs = static_cast<int32_t>(js.pullMs + js.pullFrames * 1000u / kAudioSampleRate -
++                                                               js.playingCaptureMs);
++                    if (shownValid.load())
++                    {
++                        const uint64_t shownNow = shownStamp.load();
++                        const int32_t videoDelay =
++                            static_cast<int32_t>(static_cast<uint32_t>(shownNow) - static_cast<uint32_t>(shownNow >> 32));
++                        status.avValid = true;
++                        status.avOffsetMs = status.audioDelayMs - videoDelay;
++                        avMin = std::min(avMin, status.avOffsetMs);
++                        avMax = std::max(avMax, status.avOffsetMs);
++                    }
++                }
++                rateAudioBytes = audioBytes;
+                 rateDecoded = decodedNow;
+                 rateBytes = videoBytes;
+                 rateStart = now;
+@@ -1620,6 +1993,23 @@ namespace ps2x::netplay
+                             static_cast<double>(videoBytes - statsVideoBytes) * 8.0 / 1000.0 / statsMs,
+                             static_cast<unsigned>(st.roundTripMs), static_cast<unsigned>(st.latencyMs),
+                             static_cast<unsigned long long>(st.lost));
++                if (!st.audioCodec.empty())
++                {
++                    const AudioJitterBuffer::Stats js = jitter.stats();
++                    char sync[96] = "sin imagen para comparar";
++                    if (avMin <= avMax)
++                        std::snprintf(sync, sizeof(sync), "%+d ms (de %+d a %+d en 5 s)", static_cast<int>(st.avOffsetMs),
++                                      static_cast<int>(avMin), static_cast<int>(avMax));
++                    logLine("sonido recibido: %s, %.0f kbit/s, %llu paquetes, buffer %u ms (objetivo %u), cortes %llu, "
++                            "saltos %llu, perdidos %llu, velocidad %+.0f ppm, captura->dispositivo %d ms, sonido-imagen %s",
++                            st.audioCodec.c_str(), static_cast<double>(st.audioKbps),
++                            static_cast<unsigned long long>(st.audioPackets), static_cast<unsigned>(st.audioBufferMs),
++                            static_cast<unsigned>(st.audioTargetMs), static_cast<unsigned long long>(st.audioUnderruns),
++                            static_cast<unsigned long long>(js.skips), static_cast<unsigned long long>(st.audioLost),
++                            js.ratioPpm, static_cast<int>(st.audioDelayMs), sync);
++                }
++                avMin = INT32_MAX;
++                avMax = INT32_MIN;
+                 statsDecoded = decodedNow;
+                 statsVideoBytes = videoBytes;
+                 statsStart = now;
+@@ -1674,9 +2064,36 @@ namespace ps2x::netplay
+         m.shown.captureMs = m.pictureCaptureMs;
+         m.shown.at = Clock::now();
+         m.shown.fresh = true;
++        m.shownStamp.store((static_cast<uint64_t>(m.pictureCaptureMs) << 32) | clockMs());
++        m.shownValid = true;
+         return true;
+     }
+ 
++    void Guest::pullAudio(int16_t *stereo, size_t frames)
++    {
++        m_impl->jitter.pull(stereo, frames, clockMs());
++    }
++
++    void Guest::setAudioVolume(float volume)
++    {
++        m_impl->jitter.setVolume(volume);
++    }
++
++    void Guest::setAudioMuted(bool muted)
++    {
++        m_impl->jitter.setMuted(muted);
++    }
++
++    float Guest::audioVolume() const
++    {
++        return m_impl->jitter.volume();
++    }
++
++    bool Guest::audioMuted() const
++    {
++        return m_impl->jitter.muted();
++    }
++
+     void Guest::stop()
+     {
+         m_impl->running = false;
+@@ -1700,6 +2117,7 @@ namespace ps2x::netplay
+     uint64_t Host::padMessages() const { return 0; }
+     uint64_t Host::rejectedLogins() const { return 0; }
+     HostVideoStats Host::videoStats() const { return {}; }
++    HostAudioStats Host::audioStats() const { return {}; }
+     struct Guest::Impl
+     {
+         GuestStatus status;
+@@ -1713,6 +2131,11 @@ namespace ps2x::netplay
+     void Guest::setPad(const PadWire &) {}
+     GuestStatus Guest::status() const { return m_impl->status; }
+     bool Guest::takePicture(std::vector<uint8_t> &, uint16_t &, uint16_t &) { return false; }
++    void Guest::pullAudio(int16_t *stereo, size_t frames) { std::memset(stereo, 0, frames * 2u * sizeof(int16_t)); }
++    void Guest::setAudioVolume(float) {}
++    void Guest::setAudioMuted(bool) {}
++    float Guest::audioVolume() const { return 1.0f; }
++    bool Guest::audioMuted() const { return false; }
+     void Guest::stop() {}
+ #endif
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.h b/ps2xRuntime/src/lib/ps2_netplay.h
+index 5b07405..0f8e506 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.h
++++ b/ps2xRuntime/src/lib/ps2_netplay.h
+@@ -9,7 +9,9 @@
+ // Fase 5 (T15, netplay N1): own netplay inside F1-06.exe, by IP (LAN or a VPN like Tailscale/ZeroTier, no router
+ // ports). The host runs the game and listens on one TCP port for one guest; the guest (no game, a small window) sends
+ // its pad, which the host's game reads on the second PS2 port. N2: the host sends its picture (encoded in a thread of
+-// its own, never holding up the game) and the guest shows it. N3 adds the sound.
++// its own, never holding up the game) and the guest shows it. N3: the host's sound (ps2_netplay_audio.h), copied from
++// the SPU2 output without holding up the synthesis, encoded in a thread of its own and played by the guest through a
++// jitter buffer.
+ // Logs: "[red] ...".
+ namespace ps2x::netplay
+ {
+@@ -20,12 +22,29 @@ namespace ps2x::netplay
+         std::string codec = "auto"; // videoEncoderCandidates; "no" = no picture
+     };
+ 
++    struct HostAudioSettings
++    {
++        std::string codec = "auto"; // audioEncoderCandidates; "no" = no sound
++        uint32_t kbps = 128;        // Opus
++    };
++
+     struct HostSettings
+     {
+         std::string listenAddress; // empty: every interface (IPv6 and IPv4)
+         uint16_t port = kDefaultPort; // 0: any free port (tests)
+         std::string password;
+         HostVideoSettings video;
++        HostAudioSettings audio;
++    };
++
++    struct HostAudioStats
++    {
++        std::string encoder;     // empty: no encoder open
++        uint32_t kbps = 0;
++        uint64_t packets = 0;    // encoded and queued
++        uint64_t bytes = 0;      // audio bytes sent
++        uint64_t tapDropped = 0; // frames the sender did not take in time (overwritten in the tap)
++        uint64_t queueDropped = 0; // packets dropped because the network was behind
+     };
+ 
+     struct HostVideoStats
+@@ -54,6 +73,7 @@ namespace ps2x::netplay
+         uint64_t padMessages() const;
+         uint64_t rejectedLogins() const;
+         HostVideoStats videoStats() const;
++        HostAudioStats audioStats() const;
+ 
+     private:
+         struct Impl;
+@@ -68,6 +88,11 @@ namespace ps2x::netplay
+     // The aspect the host's window shows the picture at (width / height): 4:3, 16:9 or the frame's own.
+     void setHostPictureAspect(float aspect);
+ 
++    // The host's sound (N3): the SPU2 output tap (ps2x::iop::setSpu2OutputTap) while a guest is connected. Frames of
++    // interleaved 48 kHz stereo, just synthesized; never waits (silence while the photo mode or the replay mutes the
++    // host). Without a guest it does nothing.
++    void offerHostAudio(const int16_t *stereo, size_t frames) noexcept;
++
+     enum class GuestState
+     {
+         Idle,
+@@ -92,6 +117,18 @@ namespace ps2x::netplay
+         uint32_t latencyMs = 0; // the host's estimate: capture -> this screen
+         uint64_t pictures = 0;  // decoded
+         uint64_t lost = 0;      // pictures lost or dropped
++        // N3: the host's sound.
++        std::string audioCodec; // empty: no sound yet
++        float audioKbps = 0.0f; // received
++        uint32_t audioBufferMs = 0, audioTargetMs = 0;
++        uint64_t audioPackets = 0, audioLost = 0, audioUnderruns = 0;
++        // Sound against picture: how much later the sound reaches the device than the picture the screen (host
++        // capture -> guest, both measured on the guest, the clocks' offset cancels out); + = the sound is later.
++        bool avValid = false;
++        int32_t avOffsetMs = 0;
++        // Host capture -> handed to the guest's audio device, on the two clocks (the real delay when both are the same
++        // PC, as in the tests on 127.0.0.1).
++        int32_t audioDelayMs = 0;
+     };
+ 
+     struct GuestSettings
+@@ -117,6 +154,13 @@ namespace ps2x::netplay
+         // The last decoded picture of the host (RGBA) if it is newer than the one taken before; taking it counts as
+         // showing it (the latency is measured up to here).
+         bool takePicture(std::vector<uint8_t> &rgba, uint16_t &width, uint16_t &height);
++        // N3, from the audio device's thread: `frames` frames of the host's sound (interleaved 48 kHz stereo; silence
++        // while there is none). Never waits.
++        void pullAudio(int16_t *stereo, size_t frames);
++        void setAudioVolume(float volume); // 0..1
++        void setAudioMuted(bool muted);
++        float audioVolume() const;
++        bool audioMuted() const;
+         // Says goodbye to the host and closes.
+         void stop();
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_audio.cpp b/ps2xRuntime/src/lib/ps2_netplay_audio.cpp
+new file mode 100644
+index 0000000..54616d3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_audio.cpp
+@@ -0,0 +1,835 @@
++#include "ps2_netplay_audio.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++#if !defined(PS2X_HAS_FFMPEG)
++#define PS2X_HAS_FFMPEG 1
++#endif
++
++#if PS2X_HAS_FFMPEG
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++#include <libavutil/channel_layout.h>
++#include <libavutil/error.h>
++#include <libavutil/frame.h>
++#include <libavutil/opt.h>
++}
++#endif
++
++// Fase 5 (T15, netplay N3): see ps2_netplay_audio.h.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        uint32_t pack(int16_t left, int16_t right)
++        {
++            return static_cast<uint16_t>(left) | (static_cast<uint32_t>(static_cast<uint16_t>(right)) << 16);
++        }
++
++        int16_t clamp16(double value)
++        {
++            return static_cast<int16_t>(std::clamp<long>(std::lround(value), -32768L, 32767L));
++        }
++
++        // Catmull-Rom between p1 and p2 at t in [0, 1) (as the host's Spu2OutputResampler).
++        double interpolate(double p0, double p1, double p2, double p3, double t)
++        {
++            return p1 + 0.5 * t * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)));
++        }
++
++        // A host time from a stamp (ms, low 32 bits of a frame's number) and another frame's number, 48 per ms.
++        uint32_t timeOf(uint64_t stamp, uint64_t frame)
++        {
++            const int32_t delta = static_cast<int32_t>(static_cast<uint32_t>(frame) - static_cast<uint32_t>(stamp));
++            return static_cast<uint32_t>(stamp >> 32) +
++                   static_cast<uint32_t>(static_cast<int64_t>(delta) * 1000 / static_cast<int64_t>(kAudioSampleRate));
++        }
++    }
++
++    std::vector<std::string> audioEncoderCandidates(const std::string &preference)
++    {
++        if (preference == "auto")
++            return {"opus", "pcm"};
++        if (preference == "opus" || preference == "pcm")
++            return {preference};
++        return {};
++    }
++
++    void AudioTapRing::push(const int16_t *stereo, size_t frames, uint32_t nowMs) noexcept
++    {
++        if (stereo == nullptr || frames == 0)
++            return;
++        // Seqlock order: the reservation is seen before any frame it covers (the release fence), so a reader that
++        // copied an overwritten frame sees the reservation that overwrote it.
++        const uint64_t w = m_write.load(std::memory_order_relaxed);
++        m_reserve.store(w + frames, std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_release);
++        for (size_t i = 0; i < frames; ++i)
++            m_frames[(w + i) % kCapacity].store(pack(stereo[i * 2u], stereo[i * 2u + 1u]), std::memory_order_relaxed);
++        m_write.store(w + frames, std::memory_order_release);
++        m_stamp.store((static_cast<uint64_t>(nowMs) << 32) | static_cast<uint32_t>(w + frames), std::memory_order_release);
++    }
++
++    size_t AudioTapRing::read(int16_t *stereo, size_t maxFrames, uint64_t &firstFrame) noexcept
++    {
++        const uint64_t w = m_write.load(std::memory_order_acquire);
++        if (w - m_read > kCapacity)
++        {
++            m_dropped.fetch_add(w - kCapacity - m_read, std::memory_order_relaxed);
++            m_read = w - kCapacity;
++        }
++        size_t n = static_cast<size_t>(std::min<uint64_t>(maxFrames, w - m_read));
++        if (n == 0 || stereo == nullptr)
++            return 0;
++        for (size_t i = 0; i < n; ++i)
++        {
++            const uint32_t packed = m_frames[(m_read + i) % kCapacity].load(std::memory_order_relaxed);
++            stereo[i * 2u] = static_cast<int16_t>(packed & 0xFFFFu);
++            stereo[i * 2u + 1u] = static_cast<int16_t>(packed >> 16);
++        }
++        // The producer may have come round while they were copied: a frame is good only if the one a ring later had
++        // not been reserved (the push under way may have written part of it already).
++        std::atomic_thread_fence(std::memory_order_acquire);
++        const uint64_t limit = m_reserve.load(std::memory_order_relaxed);
++        uint64_t start = m_read;
++        if (limit > start + kCapacity)
++        {
++            const size_t lost = static_cast<size_t>(std::min<uint64_t>(n, limit - kCapacity - start));
++            if (lost > 0)
++            {
++                std::memmove(stereo, stereo + lost * 2u, (n - lost) * 2u * sizeof(int16_t));
++                n -= lost;
++                start += lost;
++                m_dropped.fetch_add(lost, std::memory_order_relaxed);
++            }
++        }
++        m_read = start + n;
++        firstFrame = start;
++        return n;
++    }
++
++    void AudioTapRing::skipAll() noexcept
++    {
++        m_read = m_write.load(std::memory_order_acquire);
++    }
++
++    size_t AudioTapRing::available() const noexcept
++    {
++        return static_cast<size_t>(std::min<uint64_t>(m_write.load(std::memory_order_acquire) - m_read, kCapacity));
++    }
++
++    uint32_t AudioTapRing::captureMsOf(uint64_t frame) const noexcept
++    {
++        return timeOf(m_stamp.load(std::memory_order_acquire), frame);
++    }
++
++    AudioJitterBuffer::AudioJitterBuffer(const AudioJitterSettings &settings) : m_settings(settings)
++    {
++        m_target = std::clamp(m_settings.startTarget, m_settings.minTarget, m_settings.maxTarget);
++        m_fadeIn = m_settings.fadeFrames;
++        m_statTarget.store(m_target, std::memory_order_relaxed);
++    }
++
++    void AudioJitterBuffer::push(const int16_t *stereo, size_t frames, uint32_t captureMs, bool discontinuity)
++    {
++        if (stereo == nullptr || frames == 0)
++            return;
++        const uint64_t w = m_write.load(std::memory_order_relaxed);
++        const uint64_t r = m_read.load(std::memory_order_acquire);
++        const size_t room = static_cast<size_t>(kCapacity - std::min<uint64_t>(w - r, kCapacity));
++        const size_t n = std::min(frames, room);
++        if (n == 0)
++        {
++            m_dropped.fetch_add(frames, std::memory_order_relaxed);
++            m_producerGap = true;
++            return;
++        }
++        if (discontinuity || m_producerGap)
++            m_discontinuity.store(w, std::memory_order_relaxed);
++        m_producerGap = n < frames;
++        for (size_t i = 0; i < n; ++i)
++            m_ring[(w + i) % kCapacity].store(pack(stereo[i * 2u], stereo[i * 2u + 1u]), std::memory_order_relaxed);
++        m_stamp.store((static_cast<uint64_t>(captureMs) << 32) | static_cast<uint32_t>(w), std::memory_order_relaxed);
++        m_stampValid.store(true, std::memory_order_relaxed);
++        m_write.store(w + n, std::memory_order_release);
++        if (n < frames)
++            m_dropped.fetch_add(frames - n, std::memory_order_relaxed);
++    }
++
++    AudioJitterBuffer::Frame AudioJitterBuffer::frameAt(uint64_t index) const noexcept
++    {
++        const uint32_t packed = m_ring[index % kCapacity].load(std::memory_order_relaxed);
++        return {static_cast<double>(static_cast<int16_t>(packed & 0xFFFFu)),
++                static_cast<double>(static_cast<int16_t>(packed >> 16))};
++    }
++
++    void AudioJitterBuffer::startTail() noexcept
++    {
++        m_tail = m_settings.fadeFrames;
++    }
++
++    void AudioJitterBuffer::writeTail(int16_t *out, size_t frames) noexcept
++    {
++        for (size_t i = 0; i < frames; ++i)
++        {
++            if (m_tail > 0)
++            {
++                const double gain = static_cast<double>(--m_tail) / m_settings.fadeFrames;
++                out[i * 2u] = clamp16(m_lastLeft * gain);
++                out[i * 2u + 1u] = clamp16(m_lastRight * gain);
++            }
++            else
++            {
++                out[i * 2u] = 0;
++                out[i * 2u + 1u] = 0;
++            }
++        }
++        if (m_tail == 0)
++            m_lastLeft = m_lastRight = 0.0;
++    }
++
++    void AudioJitterBuffer::setVolume(float volume) noexcept
++    {
++        m_volume.store(std::isfinite(volume) ? std::clamp(volume, 0.0f, 1.0f) : 1.0f, std::memory_order_relaxed);
++    }
++
++    void AudioJitterBuffer::pull(int16_t *out, size_t frames, uint32_t nowMs)
++    {
++        if (out == nullptr || frames == 0)
++            return;
++        const AudioJitterSettings &s = m_settings;
++        const double fade = static_cast<double>(s.fadeFrames);
++        if (m_resetRequest.exchange(false, std::memory_order_acq_rel))
++        {
++            if (m_state != State::Buffering)
++                startTail();
++            m_state = State::Buffering;
++            m_index = m_write.load(std::memory_order_acquire);
++            m_read.store(m_index, std::memory_order_release);
++            m_gapAt = UINT64_MAX;
++            m_discontinuity.store(UINT64_MAX, std::memory_order_relaxed);
++        }
++        const uint64_t w = m_write.load(std::memory_order_acquire);
++        if (const uint64_t d = m_discontinuity.exchange(UINT64_MAX, std::memory_order_relaxed); d != UINT64_MAX)
++            m_gapAt = d;
++        const uint64_t fill = w - m_index;
++        m_statFill.store(static_cast<uint32_t>(std::min<uint64_t>(fill, UINT32_MAX)), std::memory_order_relaxed);
++        m_statPullMs.store(nowMs, std::memory_order_relaxed);
++        m_statPullFrames.store(static_cast<uint32_t>(frames), std::memory_order_relaxed);
++        size_t i = 0; // frames of `out` written
++        if (m_state == State::Buffering)
++        {
++            // The fade-out of the last underrun ends first, even if the sound is back already (no jump to the fade-in).
++            if (m_tail > 0)
++            {
++                i = std::min<size_t>(m_tail, frames);
++                writeTail(out, i);
++            }
++            if (fill < m_target || i == frames)
++            {
++                writeTail(out + i * 2u, frames - i);
++                m_statPlaying.store(false, std::memory_order_relaxed);
++                m_statHasCapture.store(false, std::memory_order_relaxed);
++                m_statTarget.store(m_target, std::memory_order_relaxed);
++                return;
++            }
++            // Starting from silence: what piled up beyond the target (a host that caught up after a stall) is skipped
++            // now, under the fade-in, rather than later with a fade out and in.
++            if (fill > static_cast<uint64_t>(m_target) + s.fadeFrames)
++                m_index = w - m_target;
++            m_state = State::Playing;
++            m_floor = m_index;
++            m_phase = 0.0;
++            m_fadeIn = 0;
++            m_fill = static_cast<double>(w - m_index);
++            m_tail = 0;
++        }
++        // The capture time of the first frame handed now (for the sync with the picture).
++        if (m_stampValid.load(std::memory_order_relaxed))
++        {
++            m_statCapture.store(timeOf(m_stamp.load(std::memory_order_relaxed), m_index), std::memory_order_relaxed);
++            m_statHasCapture.store(true, std::memory_order_relaxed);
++        }
++        // The speed follows the smoothed fill toward the target (the host's clock against this device's).
++        m_fill += (static_cast<double>(fill) - m_fill) *
++                  std::min(1.0, static_cast<double>(frames) / (static_cast<double>(kAudioSampleRate) * s.smoothingSeconds));
++        m_step = 1.0 + std::clamp((m_fill - m_target) * (s.maxDeviation / s.controlSpan), -s.maxDeviation, s.maxDeviation);
++        if (m_state == State::Playing && fill > static_cast<uint64_t>(m_target) + s.valveMargin)
++        {
++            m_state = State::Skipping;
++            m_skipFade = s.fadeFrames;
++            m_skips.fetch_add(1, std::memory_order_relaxed);
++        }
++        const double wantGain = m_muted.load(std::memory_order_relaxed) ? 0.0 : m_volume.load(std::memory_order_relaxed);
++        const double gainStep = 1.0 / 480.0; // 10 ms from silence to full volume
++        const uint64_t startIndex = m_index;
++        for (; i < frames; ++i)
++        {
++            if (m_index + 2u >= w)
++            {
++                // Dry: fade the last frame out, play silence and wait for the target again (a little higher).
++                m_underruns.fetch_add(1, std::memory_order_relaxed);
++                m_target = std::min(m_target + s.targetRaise, s.maxTarget);
++                m_played = 0;
++                m_state = State::Buffering;
++                m_gapAt = UINT64_MAX;
++                startTail();
++                break;
++            }
++            const Frame p0 = frameAt(m_index > m_floor ? m_index - 1u : m_index);
++            const Frame p1 = frameAt(m_index), p2 = frameAt(m_index + 1u), p3 = frameAt(m_index + 2u);
++            double gain = 1.0;
++            if (m_fadeIn < s.fadeFrames)
++                gain = static_cast<double>(m_fadeIn++) / fade;
++            if (m_state == State::Skipping)
++                gain *= static_cast<double>(m_skipFade) / fade;
++            if (m_gapAt != UINT64_MAX)
++            {
++                const double at = static_cast<double>(m_index) + m_phase, gap = static_cast<double>(m_gapAt);
++                if (at < gap)
++                    gain *= std::min(1.0, (gap - at) / fade);
++                else if (at - gap < fade)
++                    gain *= (at - gap) / fade;
++                else
++                    m_gapAt = UINT64_MAX;
++            }
++            m_gain += std::clamp(wantGain - m_gain, -gainStep, gainStep);
++            m_lastLeft = interpolate(p0.left, p1.left, p2.left, p3.left, m_phase) * gain * m_gain;
++            m_lastRight = interpolate(p0.right, p1.right, p2.right, p3.right, m_phase) * gain * m_gain;
++            out[i * 2u] = clamp16(m_lastLeft);
++            out[i * 2u + 1u] = clamp16(m_lastRight);
++            if (m_state == State::Skipping && --m_skipFade == 0)
++            {
++                // Faded out: jump to the target behind the newest frame and fade back in.
++                m_index = std::max(m_index, w - m_target);
++                m_floor = m_index;
++                m_phase = 0.0;
++                m_fadeIn = 0;
++                m_fill = static_cast<double>(m_target);
++                m_gapAt = UINT64_MAX;
++                m_state = State::Playing;
++                continue;
++            }
++            m_phase += m_step;
++            while (m_phase >= 1.0)
++            {
++                m_phase -= 1.0;
++                ++m_index;
++            }
++        }
++        if (i < frames)
++            writeTail(out + i * 2u, frames - i);
++        m_read.store(m_state == State::Buffering ? m_index : std::max(m_floor, m_index - 1u), std::memory_order_release);
++        m_played += m_index - startIndex;
++        if (m_played >= s.lowerAfterFrames)
++        {
++            m_played = 0;
++            m_target = std::max(s.minTarget, m_target > s.targetLower ? m_target - s.targetLower : 0u);
++        }
++        m_statTarget.store(m_target, std::memory_order_relaxed);
++        m_statRatio.store((m_step - 1.0) * 1e6, std::memory_order_relaxed);
++        m_statPlaying.store(m_state != State::Buffering, std::memory_order_relaxed);
++    }
++
++    AudioJitterBuffer::Stats AudioJitterBuffer::stats() const noexcept
++    {
++        Stats s;
++        s.fillFrames = m_statFill.load(std::memory_order_relaxed);
++        s.targetFrames = m_statTarget.load(std::memory_order_relaxed);
++        s.underruns = m_underruns.load(std::memory_order_relaxed);
++        s.skips = m_skips.load(std::memory_order_relaxed);
++        s.droppedFrames = m_dropped.load(std::memory_order_relaxed);
++        s.ratioPpm = m_statRatio.load(std::memory_order_relaxed);
++        s.playing = m_statPlaying.load(std::memory_order_relaxed);
++        s.hasCapture = m_statHasCapture.load(std::memory_order_relaxed);
++        s.playingCaptureMs = m_statCapture.load(std::memory_order_relaxed);
++        s.pullMs = m_statPullMs.load(std::memory_order_relaxed);
++        s.pullFrames = m_statPullFrames.load(std::memory_order_relaxed);
++        return s;
++    }
++
++#if PS2X_HAS_FFMPEG
++    namespace
++    {
++        std::string avError(int code)
++        {
++            char text[AV_ERROR_MAX_STRING_SIZE] = {};
++            av_strerror(code, text, sizeof(text));
++            return text;
++        }
++
++        // The sample format the codec takes, the first of the ones converted here.
++        AVSampleFormat sampleFormat(const AVCodec *codec, AVCodecContext *ctx)
++        {
++            const void *list = nullptr;
++            int count = 0;
++            if (avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &list, &count) < 0 ||
++                list == nullptr)
++                return AV_SAMPLE_FMT_FLTP;
++            const AVSampleFormat *formats = static_cast<const AVSampleFormat *>(list);
++            for (AVSampleFormat wanted : {AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_S16})
++                for (int i = 0; i < count; ++i)
++                    if (formats[i] == wanted)
++                        return wanted;
++            return AV_SAMPLE_FMT_NONE;
++        }
++    }
++#endif
++
++    struct AudioEncoder::Impl
++    {
++        std::string name;
++        AudioCodec codec = AudioCodec::Pcm16;
++        uint32_t kbps = 0;
++        uint16_t frameSamples = 0;
++        bool open = false;
++#if PS2X_HAS_FFMPEG
++        AVCodecContext *ctx = nullptr;
++        AVFrame *frame = nullptr;
++        AVPacket *packet = nullptr;
++        int64_t pts = 0;
++#endif
++
++        void release()
++        {
++#if PS2X_HAS_FFMPEG
++            av_packet_free(&packet);
++            av_frame_free(&frame);
++            avcodec_free_context(&ctx);
++            pts = 0;
++#endif
++            name.clear();
++            open = false;
++        }
++
++#if PS2X_HAS_FFMPEG
++        bool openOpus(const AVCodec *c, const std::string &which, std::string &why)
++        {
++            ctx = avcodec_alloc_context3(c);
++            if (ctx == nullptr)
++            {
++                why = "sin memoria";
++                return false;
++            }
++            ctx->sample_rate = static_cast<int>(kAudioSampleRate);
++            av_channel_layout_default(&ctx->ch_layout, kAudioChannels);
++            ctx->sample_fmt = sampleFormat(c, ctx);
++            if (ctx->sample_fmt == AV_SAMPLE_FMT_NONE)
++            {
++                why = "sin formato de muestras compatible";
++                release();
++                return false;
++            }
++            ctx->bit_rate = static_cast<int64_t>(kbps) * 1000;
++            ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL; // FFmpeg's own Opus encoder is marked so
++            const std::string ms = frameSamples == 120 ? "2.5" : std::to_string(frameSamples / 48);
++            if (which == "libopus")
++            {
++                av_opt_set(ctx->priv_data, "frame_duration", ms.c_str(), 0);
++                av_opt_set(ctx->priv_data, "application", "lowdelay", 0);
++            }
++            else
++                av_opt_set(ctx->priv_data, "opus_delay", ms.c_str(), 0); // the most it may hold back: one frame
++            const int opened = avcodec_open2(ctx, c, nullptr);
++            if (opened < 0)
++            {
++                why = avError(opened);
++                release();
++                return false;
++            }
++            // FFmpeg's own encoder takes 2.5 ms pieces and gives a packet per opus_delay: the frame goes in pieces.
++            if (ctx->frame_size <= 0 || frameSamples % ctx->frame_size != 0)
++            {
++                why = "toma tramas de " + std::to_string(ctx->frame_size) + " muestras, no divide " +
++                      std::to_string(frameSamples);
++                release();
++                return false;
++            }
++            frame = av_frame_alloc();
++            packet = av_packet_alloc();
++            if (frame == nullptr || packet == nullptr)
++            {
++                why = "sin memoria";
++                release();
++                return false;
++            }
++            frame->format = ctx->sample_fmt;
++            frame->nb_samples = ctx->frame_size;
++            frame->sample_rate = ctx->sample_rate;
++            av_channel_layout_copy(&frame->ch_layout, &ctx->ch_layout);
++            const int buffer = av_frame_get_buffer(frame, 0);
++            if (buffer < 0)
++            {
++                why = avError(buffer);
++                release();
++                return false;
++            }
++            name = which;
++            return true;
++        }
++#endif
++    };
++
++    AudioEncoder::AudioEncoder() : m_impl(std::make_unique<Impl>()) {}
++
++    AudioEncoder::~AudioEncoder()
++    {
++        close();
++    }
++
++    bool AudioEncoder::open(const std::string &name, uint32_t kbps, uint16_t frameSamples, std::string &error)
++    {
++        close();
++        Impl &m = *m_impl;
++        if (frameSamples != 120 && frameSamples != 240 && frameSamples != 480 && frameSamples != 960)
++        {
++            error = "tamano de trama de sonido no valido: " + std::to_string(frameSamples);
++            return false;
++        }
++        m.frameSamples = frameSamples;
++        if (name == "pcm")
++        {
++            m.codec = AudioCodec::Pcm16;
++            m.kbps = kAudioSampleRate * kAudioChannels * 16u / 1000u;
++            m.name = "pcm";
++            m.open = true;
++            return true;
++        }
++        if (name != "opus")
++        {
++            error = "codificador de sonido desconocido: " + name;
++            return false;
++        }
++#if PS2X_HAS_FFMPEG
++        m.codec = AudioCodec::Opus;
++        m.kbps = std::clamp<uint32_t>(kbps, 16u, 510u);
++        std::string tried;
++        for (const char *which : {"libopus", "opus"})
++        {
++            std::string why;
++            const AVCodec *c = avcodec_find_encoder_by_name(which);
++            if (c == nullptr)
++                why = "no esta en esta version de FFmpeg";
++            else if (m.openOpus(c, which, why))
++            {
++                m.open = true;
++                return true;
++            }
++            tried += (tried.empty() ? "" : "; ") + std::string(which) + ": " + why;
++        }
++        error = "Opus no abre (" + tried + ")";
++        return false;
++#else
++        (void)kbps;
++        error = "esta compilacion no lleva FFmpeg (sin Opus)";
++        return false;
++#endif
++    }
++
++    void AudioEncoder::close()
++    {
++        m_impl->release();
++    }
++
++    bool AudioEncoder::isOpen() const
++    {
++        return m_impl->open;
++    }
++
++    AudioCodec AudioEncoder::codec() const
++    {
++        return m_impl->codec;
++    }
++
++    const std::string &AudioEncoder::encoderName() const
++    {
++        return m_impl->name;
++    }
++
++    uint32_t AudioEncoder::kbps() const
++    {
++        return m_impl->kbps;
++    }
++
++    uint16_t AudioEncoder::frameSamples() const
++    {
++        return m_impl->frameSamples;
++    }
++
++    bool AudioEncoder::encode(const int16_t *stereo, std::vector<std::vector<uint8_t>> &packets, std::string &error)
++    {
++        Impl &m = *m_impl;
++        if (!m.open || stereo == nullptr)
++        {
++            error = "codificador de sonido cerrado";
++            return false;
++        }
++        const size_t samples = static_cast<size_t>(m.frameSamples) * kAudioChannels;
++        if (m.codec == AudioCodec::Pcm16)
++        {
++            std::vector<uint8_t> out(samples * 2u);
++            for (size_t i = 0; i < samples; ++i)
++            {
++                const uint16_t v = static_cast<uint16_t>(stereo[i]);
++                out[i * 2u] = static_cast<uint8_t>(v & 0xFFu);
++                out[i * 2u + 1u] = static_cast<uint8_t>(v >> 8);
++            }
++            packets.push_back(std::move(out));
++            return true;
++        }
++#if PS2X_HAS_FFMPEG
++        const int n = m.ctx->frame_size;
++        for (int piece = 0; piece < m.frameSamples / n; ++piece)
++        {
++            const int16_t *in = stereo + static_cast<size_t>(piece) * n * kAudioChannels;
++            const int writable = av_frame_make_writable(m.frame);
++            if (writable < 0)
++            {
++                error = avError(writable);
++                return false;
++            }
++            switch (m.ctx->sample_fmt)
++            {
++            case AV_SAMPLE_FMT_FLTP:
++            {
++                float *left = reinterpret_cast<float *>(m.frame->data[0]);
++                float *right = reinterpret_cast<float *>(m.frame->data[1]);
++                for (int i = 0; i < n; ++i)
++                {
++                    left[i] = in[i * 2] / 32768.0f;
++                    right[i] = in[i * 2 + 1] / 32768.0f;
++                }
++                break;
++            }
++            case AV_SAMPLE_FMT_FLT:
++            {
++                float *both = reinterpret_cast<float *>(m.frame->data[0]);
++                for (int i = 0; i < n * 2; ++i)
++                    both[i] = in[i] / 32768.0f;
++                break;
++            }
++            default:
++                std::memcpy(m.frame->data[0], in, static_cast<size_t>(n) * kAudioChannels * sizeof(int16_t));
++                break;
++            }
++            m.frame->pts = m.pts;
++            m.pts += n;
++            const int sent = avcodec_send_frame(m.ctx, m.frame);
++            if (sent < 0)
++            {
++                error = "el codificador de sonido falla: " + avError(sent);
++                return false;
++            }
++            for (;;)
++            {
++                const int got = avcodec_receive_packet(m.ctx, m.packet);
++                if (got == AVERROR(EAGAIN) || got == AVERROR_EOF)
++                    break;
++                if (got < 0)
++                {
++                    error = "el codificador de sonido falla: " + avError(got);
++                    return false;
++                }
++                if (m.packet->size > 0)
++                    packets.emplace_back(m.packet->data, m.packet->data + m.packet->size);
++                av_packet_unref(m.packet);
++            }
++        }
++        return true;
++#else
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++#endif
++    }
++
++    struct AudioDecoder::Impl
++    {
++        AudioConfig config;
++        bool open = false;
++#if PS2X_HAS_FFMPEG
++        AVCodecContext *ctx = nullptr;
++        AVFrame *frame = nullptr;
++        AVPacket *packet = nullptr;
++#endif
++
++        void release()
++        {
++#if PS2X_HAS_FFMPEG
++            av_packet_free(&packet);
++            av_frame_free(&frame);
++            avcodec_free_context(&ctx);
++#endif
++            open = false;
++        }
++    };
++
++    AudioDecoder::AudioDecoder() : m_impl(std::make_unique<Impl>()) {}
++
++    AudioDecoder::~AudioDecoder()
++    {
++        close();
++    }
++
++    bool AudioDecoder::open(const AudioConfig &config, std::string &error)
++    {
++        close();
++        // The same checks as on the wire, whoever builds the config.
++        const auto bytes = encodeAudioConfig(config);
++        AudioConfig checked;
++        if (!decodeAudioConfig(bytes.data(), bytes.size(), checked, error))
++            return false;
++        Impl &m = *m_impl;
++        m.config = checked;
++        if (checked.codec == static_cast<uint8_t>(AudioCodec::Pcm16))
++        {
++            m.open = true;
++            return true;
++        }
++#if PS2X_HAS_FFMPEG
++        const AVCodec *c = avcodec_find_decoder(AV_CODEC_ID_OPUS);
++        if (c == nullptr)
++        {
++            error = "no hay decodificador opus";
++            return false;
++        }
++        m.ctx = avcodec_alloc_context3(c);
++        m.frame = av_frame_alloc();
++        m.packet = av_packet_alloc();
++        if (m.ctx == nullptr || m.frame == nullptr || m.packet == nullptr)
++        {
++            error = "sin memoria";
++            m.release();
++            return false;
++        }
++        m.ctx->sample_rate = static_cast<int>(kAudioSampleRate);
++        av_channel_layout_default(&m.ctx->ch_layout, kAudioChannels);
++        m.ctx->thread_count = 1;
++        const int opened = avcodec_open2(m.ctx, c, nullptr);
++        if (opened < 0)
++        {
++            error = avError(opened);
++            m.release();
++            return false;
++        }
++        m.open = true;
++        return true;
++#else
++        error = "esta compilacion no lleva FFmpeg (sin Opus)";
++        return false;
++#endif
++    }
++
++    void AudioDecoder::close()
++    {
++        m_impl->release();
++    }
++
++    bool AudioDecoder::isOpen() const
++    {
++        return m_impl->open;
++    }
++
++    bool AudioDecoder::decode(const uint8_t *data, size_t size, std::vector<int16_t> &stereo, std::string &error)
++    {
++        Impl &m = *m_impl;
++        if (!m.open)
++        {
++            error = "decodificador de sonido cerrado";
++            return false;
++        }
++        if (data == nullptr || size == 0 || size > kMaxAudioPacketData)
++        {
++            error = "paquete de sonido de tamano no valido";
++            return false;
++        }
++        if (m.config.codec == static_cast<uint8_t>(AudioCodec::Pcm16))
++        {
++            if (size != static_cast<size_t>(m.config.frameSamples) * kAudioChannels * 2u)
++            {
++                error = "paquete PCM de longitud no valida: " + std::to_string(size);
++                return false;
++            }
++            const size_t at = stereo.size();
++            stereo.resize(at + size / 2u);
++            for (size_t i = 0; i < size / 2u; ++i)
++                stereo[at + i] = static_cast<int16_t>(data[i * 2u] | (data[i * 2u + 1u] << 8));
++            return true;
++        }
++#if PS2X_HAS_FFMPEG
++        const int made = av_new_packet(m.packet, static_cast<int>(size)); // zeroed padding after the data
++        if (made < 0)
++        {
++            error = avError(made);
++            return false;
++        }
++        std::memcpy(m.packet->data, data, size);
++        const int sent = avcodec_send_packet(m.ctx, m.packet);
++        av_packet_unref(m.packet);
++        if (sent < 0)
++        {
++            error = "paquete de sonido que no se puede decodificar: " + avError(sent);
++            return false;
++        }
++        for (;;)
++        {
++            const int received = avcodec_receive_frame(m.ctx, m.frame);
++            if (received == AVERROR(EAGAIN) || received == AVERROR_EOF)
++                break;
++            if (received < 0)
++            {
++                error = "paquete de sonido que no se puede decodificar: " + avError(received);
++                return false;
++            }
++            const int n = m.frame->nb_samples;
++            // At most 120 ms per packet (the largest Opus packet), stereo at 48 kHz.
++            if (m.frame->ch_layout.nb_channels != kAudioChannels || m.frame->sample_rate != static_cast<int>(kAudioSampleRate) ||
++                n <= 0 || n > 5760)
++            {
++                error = "sonido decodificado de formato inesperado";
++                av_frame_unref(m.frame);
++                return false;
++            }
++            const size_t at = stereo.size();
++            stereo.resize(at + static_cast<size_t>(n) * 2u);
++            int16_t *out = stereo.data() + at;
++            switch (m.frame->format)
++            {
++            case AV_SAMPLE_FMT_FLTP:
++            {
++                const float *left = reinterpret_cast<const float *>(m.frame->data[0]);
++                const float *right = reinterpret_cast<const float *>(m.frame->data[1]);
++                for (int i = 0; i < n; ++i)
++                {
++                    out[i * 2] = clamp16(left[i] * 32768.0);
++                    out[i * 2 + 1] = clamp16(right[i] * 32768.0);
++                }
++                break;
++            }
++            case AV_SAMPLE_FMT_FLT:
++            {
++                const float *both = reinterpret_cast<const float *>(m.frame->data[0]);
++                for (int i = 0; i < n * 2; ++i)
++                    out[i] = clamp16(both[i] * 32768.0);
++                break;
++            }
++            case AV_SAMPLE_FMT_S16:
++                std::memcpy(out, m.frame->data[0], static_cast<size_t>(n) * 2u * sizeof(int16_t));
++                break;
++            default:
++                stereo.resize(at);
++                av_frame_unref(m.frame);
++                error = "formato de muestras decodificadas no soportado";
++                return false;
++            }
++            av_frame_unref(m.frame);
++        }
++        return true;
++#else
++        error = "esta compilacion no lleva FFmpeg";
++        return false;
++#endif
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_audio.h b/ps2xRuntime/src/lib/ps2_netplay_audio.h
+new file mode 100644
+index 0000000..07e1908
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_audio.h
+@@ -0,0 +1,209 @@
++#pragma once
++
++#include "ps2_netplay_protocol.h"
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// Fase 5 (T15, netplay N3): the host's sound for the guest.
++//
++// Host: the SPU2 synthesis hands every frame it puts in the host's output ring to a tap (ps2x::iop::setSpu2OutputTap),
++// which copies it into an AudioTapRing (lock-free, never waits: the synthesis thread is never held up and what the host
++// hears does not change). A sender thread takes 10 ms frames out of it, encodes them (Opus, or 16-bit PCM) and queues
++// one AUDIO_PACKET per frame, stamped with the host time its first sample was synthesized (the picture carries the
++// time it was captured, on the same clock).
++//
++// Guest: the packets are checked (AudioReceiver), decoded and put in an AudioJitterBuffer, which the audio device's
++// thread drains: it starts once ~40 ms are buffered, follows the host's clock with a small resampling (+-0.5 %, no
++// clicks), fades out and rebuffers when it runs dry (and buffers a little more after each time, up to 80 ms), and skips
++// with a fade when too much piled up (a network stall that came in all at once).
++namespace ps2x::netplay
++{
++    // 10 ms frames.
++    constexpr uint16_t kAudioFrameSamples = 480;
++
++    // The encoders tried for a preference, in order: "auto" = opus, pcm. A single name = only that one.
++    std::vector<std::string> audioEncoderCandidates(const std::string &preference);
++
++    // Host side: one producer (the synthesis thread) and one consumer (the sender thread). The producer never waits:
++    // when the consumer falls more than kCapacity frames behind, the oldest frames are overwritten (the consumer sees
++    // them as dropped). Frames are counted from 0 since the ring was made.
++    class AudioTapRing
++    {
++    public:
++        static constexpr size_t kCapacity = 1u << 15; // frames (683 ms at 48 kHz)
++
++        // Producer: frames of interleaved stereo, synthesized just before nowMs (host clock).
++        void push(const int16_t *stereo, size_t frames, uint32_t nowMs) noexcept;
++        // Consumer: up to maxFrames of the oldest frames still there; firstFrame = the number of the first one. Frames
++        // overwritten before they were read are skipped and counted in dropped().
++        size_t read(int16_t *stereo, size_t maxFrames, uint64_t &firstFrame) noexcept;
++        // Consumer: skips everything waiting (the next read starts at the newest frame).
++        void skipAll() noexcept;
++        size_t available() const noexcept;
++        uint64_t dropped() const noexcept { return m_dropped.load(std::memory_order_relaxed); }
++        // The host time a frame was synthesized, from the producer's latest push (48 frames per ms).
++        uint32_t captureMsOf(uint64_t frame) const noexcept;
++
++    private:
++        std::atomic<uint32_t> m_frames[kCapacity]{};
++        std::atomic<uint64_t> m_write{0};
++        std::atomic<uint64_t> m_reserve{0}; // m_write + the push under way (its frames may be half written)
++        std::atomic<uint64_t> m_stamp{0}; // (ms << 32) | low 32 bits of the frame count after the latest push
++        uint64_t m_read = 0;              // consumer only
++        std::atomic<uint64_t> m_dropped{0};
++    };
++
++    struct AudioJitterSettings
++    {
++        uint32_t minTarget = 1920;         // frames buffered before playing (40 ms)
++        uint32_t maxTarget = 3840;         // 80 ms: the most the target rises to after underruns
++        uint32_t startTarget = 1920;
++        uint32_t targetRaise = 480;        // per underrun (10 ms)
++        uint32_t targetLower = 240;        // per lowerAfterFrames played without one (5 ms)
++        uint64_t lowerAfterFrames = 20u * 48000u;
++        uint32_t valveMargin = 2880;       // 60 ms above the target: skip back to it (with a fade)
++        uint32_t fadeFrames = 240;         // 5 ms fades (underrun, skip, gap, start)
++        double maxDeviation = 0.005;       // +-0.5 % of speed (under 9 cents)
++        double controlSpan = 960.0;        // frames off the target that give the full deviation (20 ms)
++        double smoothingSeconds = 1.0;     // of the fill the speed follows
++    };
++
++    // Guest side: one producer (the network thread) and one consumer (the audio device's thread); no locks.
++    class AudioJitterBuffer
++    {
++    public:
++        static constexpr size_t kCapacity = 1u << 14; // frames (341 ms)
++
++        explicit AudioJitterBuffer(const AudioJitterSettings &settings = {});
++
++        // Producer: decoded frames of interleaved stereo; captureMs = host time of the first one. discontinuity = some
++        // frames before these were lost: the sound fades out before them and in after them. Frames that do not fit are
++        // dropped (counted, and the next push starts after a gap).
++        void push(const int16_t *stereo, size_t frames, uint32_t captureMs, bool discontinuity);
++        // Consumer: always writes `frames` frames (silence while buffering); nowMs = the guest's clock now.
++        void pull(int16_t *out, size_t frames, uint32_t nowMs);
++        // Any thread: the consumer drops what is buffered and starts again (a new stream).
++        void requestReset() noexcept { m_resetRequest.store(true, std::memory_order_release); }
++        // Any thread: 0..1, and silence (both change with a 10 ms ramp, no click).
++        void setVolume(float volume) noexcept;
++        void setMuted(bool muted) noexcept { m_muted.store(muted, std::memory_order_relaxed); }
++        float volume() const noexcept { return m_volume.load(std::memory_order_relaxed); }
++        bool muted() const noexcept { return m_muted.load(std::memory_order_relaxed); }
++
++        struct Stats
++        {
++            uint32_t fillFrames = 0;   // buffered at the last pull
++            uint32_t targetFrames = 0;
++            uint64_t underruns = 0;
++            uint64_t skips = 0;        // times the valve skipped
++            uint64_t droppedFrames = 0; // pushed frames that did not fit
++            double ratioPpm = 0.0;     // input frames per output frame - 1, in ppm (+ = draining)
++            bool playing = false;
++            // The host time of the sound handed to the device at the last pull, and the guest time of that pull.
++            bool hasCapture = false;
++            uint32_t playingCaptureMs = 0;
++            uint32_t pullMs = 0;
++            uint32_t pullFrames = 0;
++        };
++        Stats stats() const noexcept;
++
++    private:
++        struct Frame
++        {
++            double left = 0.0, right = 0.0;
++        };
++        Frame frameAt(uint64_t index) const noexcept;
++        void startTail() noexcept;
++        void writeTail(int16_t *out, size_t frames) noexcept;
++
++        AudioJitterSettings m_settings;
++        std::atomic<uint32_t> m_ring[kCapacity]{};
++        std::atomic<uint64_t> m_write{0};
++        std::atomic<uint64_t> m_read{0};                 // the oldest frame the consumer still needs
++        std::atomic<uint64_t> m_stamp{0};                // (captureMs << 32) | low 32 bits of the frame's number
++        std::atomic<bool> m_stampValid{false};
++        std::atomic<uint64_t> m_discontinuity{UINT64_MAX}; // number of the first frame after a gap
++        std::atomic<bool> m_resetRequest{false};
++        std::atomic<float> m_volume{1.0f};
++        std::atomic<bool> m_muted{false};
++        bool m_producerGap = false; // producer only: frames were dropped since the last push
++
++        // Consumer only.
++        enum class State : uint8_t
++        {
++            Buffering,
++            Playing,
++            Skipping, // fading out before the valve's jump
++        };
++        State m_state = State::Buffering;
++        uint64_t m_index = 0;      // the frame at the playing position
++        uint64_t m_floor = 0;      // the first frame of this playing run (none before it is read)
++        double m_phase = 0.0;      // between m_index and m_index + 1
++        double m_step = 1.0;
++        double m_fill = 0.0;       // smoothed
++        uint32_t m_target = 0;
++        uint32_t m_fadeIn = 0;     // frames of the fade-in done (fadeFrames: none running)
++        uint32_t m_skipFade = 0;
++        uint32_t m_tail = 0;       // fade-out frames of the last output still to write
++        double m_lastLeft = 0.0, m_lastRight = 0.0;
++        double m_gain = 1.0;       // volume ramp
++        uint64_t m_played = 0;     // frames since the last underrun or target change
++        uint64_t m_gapAt = UINT64_MAX;
++
++        // Published by the consumer.
++        std::atomic<uint32_t> m_statFill{0}, m_statTarget{0};
++        std::atomic<uint64_t> m_underruns{0}, m_skips{0}, m_dropped{0};
++        std::atomic<double> m_statRatio{0.0};
++        std::atomic<bool> m_statPlaying{false}, m_statHasCapture{false};
++        std::atomic<uint32_t> m_statCapture{0}, m_statPullMs{0}, m_statPullFrames{0};
++    };
++
++    // The host's encoder: one frame of frameSamples() stereo frames in, the packets the codec gives back out (normally
++    // one; the Opus encoder may hold the first ones back a frame).
++    class AudioEncoder
++    {
++    public:
++        AudioEncoder();
++        ~AudioEncoder();
++        AudioEncoder(const AudioEncoder &) = delete;
++        AudioEncoder &operator=(const AudioEncoder &) = delete;
++
++        // name: "opus" (FFmpeg: libopus if the build has it, else its own encoder) or "pcm".
++        bool open(const std::string &name, uint32_t kbps, uint16_t frameSamples, std::string &error);
++        void close();
++        bool isOpen() const;
++        AudioCodec codec() const;
++        const std::string &encoderName() const; // what FFmpeg opened ("opus", "libopus") or "pcm"
++        uint32_t kbps() const;
++        uint16_t frameSamples() const;
++        bool encode(const int16_t *stereo, std::vector<std::vector<uint8_t>> &packets, std::string &error);
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++
++    // The guest's decoder: appends the interleaved stereo frames of one packet.
++    class AudioDecoder
++    {
++    public:
++        AudioDecoder();
++        ~AudioDecoder();
++        AudioDecoder(const AudioDecoder &) = delete;
++        AudioDecoder &operator=(const AudioDecoder &) = delete;
++
++        bool open(const AudioConfig &config, std::string &error);
++        void close();
++        bool isOpen() const;
++        bool decode(const uint8_t *data, size_t size, std::vector<int16_t> &stereo, std::string &error);
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index e163fa9..ab71893 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -3,8 +3,11 @@
+ #include "runtime/ps2_pad.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
+@@ -19,11 +22,30 @@ extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hW
+ // Fase 5 (T15, netplay N1): the guest's window. It does not run the game: it shows the connection and sends the local
+ // pad (player 1 of this PC's controles.ini: keys, gamepad, wheel) to the host ~60 times per second. N2: the host's
+ // picture fills the window (its aspect kept, black bars), with a line of figures (size, pictures per second, bit rate,
+-// round trip, latency; F3 hides it).
++// round trip, latency; F3 hides it). N3: the host's sound through this PC's audio device (M silences it, Re Pag / Av Pag
++// or + / - on the keypad change the volume), with its figures on a second line.
+ namespace ps2x::netplay
+ {
+     namespace
+     {
++        // N3: the guest whose sound the audio device's thread plays, and PS2X_INVITADO_WAV.
++        std::atomic<Guest *> g_audioGuest{nullptr};
++        FILE *g_guestWav = nullptr;
++
++        // The audio device's thread: what the jitter buffer gives (silence without a guest). PS2X_INVITADO_WAV=<path>
++        // (debugging, as the host's PS2X_SALIDA_WAV): what is handed to the device, 48 kHz stereo after a 44-byte
++        // header left at zero (the scripts read it raw).
++        void guestAudioCallback(void *buffer, unsigned int frames)
++        {
++            int16_t *out = static_cast<int16_t *>(buffer);
++            if (Guest *guest = g_audioGuest.load(std::memory_order_acquire))
++                guest->pullAudio(out, frames);
++            else
++                std::memset(out, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
++            if (g_guestWav)
++                std::fwrite(out, sizeof(int16_t) * 2u, frames, g_guestWav);
++        }
++
+         const char *stateName(GuestState state)
+         {
+             switch (state)
+@@ -131,6 +153,36 @@ namespace ps2x::netplay
+ 
+         Guest guest;
+         guest.start(settings);
++        // N3: the host's sound. The automated runs (background window) keep it silent so they do not play over the
++        // user's sound, as the game's window does; PS2X_SONIDO=1 makes them audible. PS2X_VOLUMEN (0-100) starts it.
++        InitAudioDevice();
++        AudioStream sound{};
++        const bool soundReady = IsAudioDeviceReady();
++        if (const char *volume = std::getenv("PS2X_VOLUMEN"))
++            guest.setAudioVolume(static_cast<float>(std::clamp(std::atoi(volume), 0, 100)) / 100.0f);
++        if (soundReady)
++        {
++            if (const char *path = std::getenv("PS2X_INVITADO_WAV"))
++            {
++                g_guestWav = std::fopen(path, "wb");
++                if (g_guestWav)
++                {
++                    const uint8_t header[44]{};
++                    std::fwrite(header, 1, sizeof(header), g_guestWav);
++                }
++            }
++            SetAudioStreamBufferSizeDefault(1024);
++            sound = LoadAudioStream(kAudioSampleRate, 16, kAudioChannels);
++            g_audioGuest.store(&guest, std::memory_order_release);
++            SetAudioStreamCallback(sound, guestAudioCallback);
++            const char *soundEnv = std::getenv("PS2X_SONIDO");
++            if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
++                SetAudioStreamVolume(sound, 0.0f);
++            PlayAudioStream(sound);
++        }
++        else
++            std::fprintf(stderr, "[red] sin dispositivo de sonido: el invitado no oira el juego\n");
++        double soundMessageUntil = 0.0;
+         PSPadBackend pad;
+         uint8_t report[32] = {};
+         GuestState lastState = GuestState::Idle;
+@@ -168,6 +220,20 @@ namespace ps2x::netplay
+             }
+             if (IsKeyPressed(KEY_F3))
+                 showFigures = !showFigures;
++            if (IsKeyPressed(KEY_M))
++            {
++                guest.setAudioMuted(!guest.audioMuted());
++                soundMessageUntil = GetTime() + 2.0;
++            }
++            const bool louder = IsKeyPressed(KEY_PAGE_UP) || IsKeyPressed(KEY_KP_ADD);
++            const bool quieter = IsKeyPressed(KEY_PAGE_DOWN) || IsKeyPressed(KEY_KP_SUBTRACT);
++            if (louder || quieter)
++            {
++                const float step = louder ? 0.1f : -0.1f;
++                guest.setAudioVolume(std::round((guest.audioVolume() + step) * 10.0f) / 10.0f);
++                guest.setAudioMuted(false);
++                soundMessageUntil = GetTime() + 2.0;
++            }
+ 
+             // Drawn into a texture first: the capture asked for by PS2X_CAPTURA_PETICION reads it back even with the
+             // window hidden (automated runs).
+@@ -200,10 +266,34 @@ namespace ps2x::netplay
+                                                   static_cast<unsigned long long>(status.lost));
+                     DrawRectangle(0, 0, MeasureText(line, 16) + 16, 24, Color{0, 0, 0, 160});
+                     DrawText(line, 8, 4, 16, RAYWHITE);
++                    if (!status.audioCodec.empty())
++                    {
++                        const char *sync = status.avValid ? TextFormat("  sonido-imagen %+d ms", static_cast<int>(status.avOffsetMs))
++                                                          : "";
++                        const std::string syncText = sync; // TextFormat reuses its buffers
++                        const char *audioLine = TextFormat(
++                            "sonido %s  %.0f kbit/s  buffer %u ms  cortes %llu%s  volumen %d %%%s  (M, Re/Av Pag)",
++                            status.audioCodec.c_str(), static_cast<double>(status.audioKbps),
++                            static_cast<unsigned>(status.audioBufferMs),
++                            static_cast<unsigned long long>(status.audioUnderruns), syncText.c_str(),
++                            static_cast<int>(std::lround(guest.audioVolume() * 100.0f)),
++                            guest.audioMuted() ? "  SILENCIO" : "");
++                        DrawRectangle(0, 24, MeasureText(audioLine, 16) + 16, 22, Color{0, 0, 0, 160});
++                        DrawText(audioLine, 8, 27, 16, RAYWHITE);
++                    }
+                 }
+             }
+             else
+                 drawStatus(status, wire, screenHeight);
++            if (GetTime() < soundMessageUntil)
++            {
++                const char *message = guest.audioMuted()
++                                          ? "Sonido: silencio (M)"
++                                          : TextFormat("Sonido: %d %%", static_cast<int>(std::lround(guest.audioVolume() * 100.0f)));
++                const int width = MeasureText(message, 24) + 24;
++                DrawRectangle((screenWidth - width) / 2, screenHeight - 64, width, 36, Color{0, 0, 0, 180});
++                DrawText(message, (screenWidth - width) / 2 + 12, screenHeight - 58, 24, RAYWHITE);
++            }
+             EndTextureMode();
+             saveRequestedCapture(canvas);
+             BeginDrawing();
+@@ -217,6 +307,18 @@ namespace ps2x::netplay
+             UnloadRenderTexture(canvas);
+         if (picture.id != 0)
+             UnloadTexture(picture);
++        if (soundReady)
++        {
++            StopAudioStream(sound);
++            g_audioGuest.store(nullptr, std::memory_order_release);
++            UnloadAudioStream(sound);
++        }
++        CloseAudioDevice();
++        if (g_guestWav)
++        {
++            std::fclose(g_guestWav);
++            g_guestWav = nullptr;
++        }
+         guest.stop();
+         const GuestStatus last = guest.status();
+         std::fprintf(stderr, "[red] invitado cerrado: %s - %s\n", stateName(last.state), last.text.c_str());
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+index 11e2e7e..c74333c 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+@@ -4,7 +4,7 @@
+ #include <cctype>
+ #include <cstring>
+ 
+-// Fase 5 (T15, netplay N1, N2): see ps2_netplay_protocol.h.
++// Fase 5 (T15, netplay N1, N2, N3): see ps2_netplay_protocol.h.
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -81,6 +81,8 @@ namespace ps2x::netplay
+         case MessageType::VideoChunk: return -1;
+         case MessageType::VideoKeyRequest: return 4;
+         case MessageType::VideoAck: return 12;
++        case MessageType::AudioConfig: return static_cast<int>(kAudioConfigPayloadSize);
++        case MessageType::AudioPacket: return -1;
+         }
+         return -1;
+     }
+@@ -93,6 +95,12 @@ namespace ps2x::netplay
+             maxSize = kVideoChunkHeaderSize + kMaxVideoChunkData;
+             return true;
+         }
++        if (type == static_cast<uint8_t>(MessageType::AudioPacket))
++        {
++            minSize = kAudioPacketHeaderSize + 1;
++            maxSize = kAudioPacketHeaderSize + kMaxAudioPacketData;
++            return true;
++        }
+         const int exact = payloadSizeOf(type);
+         if (exact < 0)
+             return false;
+@@ -102,7 +110,7 @@ namespace ps2x::netplay
+ 
+     bool isReservedType(uint8_t type)
+     {
+-        return type >= 0x24 && type <= 0x3F;
++        return (type >= 0x24 && type <= 0x2F) || (type >= 0x32 && type <= 0x3F);
+     }
+ 
+     const char *rejectReasonText(uint8_t reason)
+@@ -678,6 +686,130 @@ namespace ps2x::netplay
+         return Result::Picture;
+     }
+ 
++    const char *audioCodecName(uint8_t codec)
++    {
++        switch (static_cast<AudioCodec>(codec))
++        {
++        case AudioCodec::Opus: return "opus";
++        case AudioCodec::Pcm16: return "pcm";
++        }
++        return "?";
++    }
++
++    std::array<uint8_t, kAudioConfigPayloadSize> encodeAudioConfig(const AudioConfig &config)
++    {
++        std::array<uint8_t, kAudioConfigPayloadSize> out{};
++        out[0] = config.codec;
++        out[1] = config.channels;
++        put16(out.data() + 2, config.frameSamples);
++        put32(out.data() + 4, config.sampleRate);
++        put32(out.data() + 8, config.kbps);
++        put32(out.data() + 12, config.stream);
++        return out;
++    }
++
++    bool decodeAudioConfig(const uint8_t *payload, size_t size, AudioConfig &config, std::string &why)
++    {
++        if (payload == nullptr || size != kAudioConfigPayloadSize)
++        {
++            why = "configuracion de sonido de tamano no valido";
++            return false;
++        }
++        AudioConfig c;
++        c.codec = payload[0];
++        c.channels = payload[1];
++        c.frameSamples = get16(payload + 2);
++        c.sampleRate = get32(payload + 4);
++        c.kbps = get32(payload + 8);
++        c.stream = get32(payload + 12);
++        const bool opus = c.codec == static_cast<uint8_t>(AudioCodec::Opus);
++        const bool pcm = c.codec == static_cast<uint8_t>(AudioCodec::Pcm16);
++        if (!opus && !pcm)
++            why = "codec de sonido desconocido (" + std::to_string(c.codec) + ")";
++        else if (c.channels != kAudioChannels)
++            why = "canales de sonido no validos: " + std::to_string(c.channels);
++        else if (c.sampleRate != kAudioSampleRate)
++            why = "frecuencia de sonido no valida: " + std::to_string(c.sampleRate);
++        else if (c.frameSamples != 120 && c.frameSamples != 240 && c.frameSamples != 480 && c.frameSamples != 960)
++            why = "tamano de trama de sonido no valido: " + std::to_string(c.frameSamples);
++        else if (opus && (c.kbps < 16 || c.kbps > 510))
++            why = "tasa de bits de sonido no valida: " + std::to_string(c.kbps);
++        else if (pcm && c.kbps != kAudioSampleRate * kAudioChannels * 16u / 1000u)
++            why = "tasa de bits de PCM no valida: " + std::to_string(c.kbps);
++        else if (c.stream == 0)
++            why = "numero de secuencia de sonido 0";
++        else
++        {
++            config = c;
++            return true;
++        }
++        return false;
++    }
++
++    std::vector<uint8_t> encodeAudioPacket(const AudioPacket &packet, uint32_t stream)
++    {
++        if (packet.data.empty() || packet.data.size() > kMaxAudioPacketData)
++            return {};
++        std::vector<uint8_t> out(kAudioPacketHeaderSize, 0);
++        put16(out.data(), static_cast<uint16_t>(stream & 0xFFFFu));
++        put32(out.data() + 4, packet.sequence);
++        put32(out.data() + 8, packet.captureMs);
++        out.insert(out.end(), packet.data.begin(), packet.data.end());
++        return out;
++    }
++
++    AudioReceiver::Result AudioReceiver::fail(const std::string &why)
++    {
++        m_why = why;
++        return Result::Error;
++    }
++
++    bool AudioReceiver::configure(const uint8_t *payload, size_t size)
++    {
++        AudioConfig config;
++        if (!decodeAudioConfig(payload, size, config, m_why))
++            return false;
++        if (config.stream <= m_config.stream)
++        {
++            m_why = "la secuencia de sonido no avanza (" + std::to_string(config.stream) + ")";
++            return false;
++        }
++        m_config = config;
++        m_any = false; // the packet numbers start again
++        return true;
++    }
++
++    AudioReceiver::Result AudioReceiver::add(const uint8_t *payload, size_t size, AudioPacket &out)
++    {
++        if (m_config.stream == 0)
++            return fail("paquete de sonido antes de su configuracion");
++        if (payload == nullptr || size <= kAudioPacketHeaderSize || size > kAudioPacketHeaderSize + kMaxAudioPacketData)
++            return fail("paquete de sonido de tamano no valido");
++        const uint16_t stream = get16(payload);
++        const uint32_t sequence = get32(payload + 4);
++        const size_t dataSize = size - kAudioPacketHeaderSize;
++        if (stream != static_cast<uint16_t>(m_config.stream & 0xFFFFu))
++            return fail("paquete de otra secuencia de sonido");
++        if (payload[2] != 0 || payload[3] != 0)
++            return fail("banderas del paquete de sonido no validas");
++        if (m_config.codec == static_cast<uint8_t>(AudioCodec::Pcm16)
++                ? dataSize != static_cast<size_t>(m_config.frameSamples) * kAudioChannels * 2u
++                : dataSize > kMaxOpusPacketData)
++            return fail("paquete de sonido de longitud no valida para " + std::string(audioCodecName(m_config.codec)) +
++                        ": " + std::to_string(dataSize));
++        if (m_any && sequence <= m_last)
++            return fail("numero de paquete de sonido que no avanza");
++        m_gap = !m_any || sequence != m_last + 1u;
++        if (m_any)
++            m_lost += sequence - m_last - 1u;
++        m_any = true;
++        m_last = sequence;
++        out.sequence = sequence;
++        out.captureMs = get32(payload + 8);
++        out.data.assign(payload + kAudioPacketHeaderSize, payload + size);
++        return Result::Packet;
++    }
++
+     void SendQueue::pushControl(MessageType type, const uint8_t *payload, size_t size)
+     {
+         Message m;
+@@ -717,6 +849,46 @@ namespace ps2x::netplay
+         m_video.push_back(std::move(item));
+     }
+ 
++    void SendQueue::pushAudioConfig(const AudioConfig &config)
++    {
++        const auto bytes = encodeAudioConfig(config);
++        Message m;
++        m.type = MessageType::AudioConfig;
++        m.payload.assign(bytes.begin(), bytes.end());
++        m.audio = true;
++        m_audio.push_back(std::move(m));
++    }
++
++    void SendQueue::pushAudio(std::vector<uint8_t> packet)
++    {
++        if (packet.empty())
++            return;
++        if (waitingAudio() >= kMaxWaitingAudio)
++        {
++            // The network is behind: the oldest packet goes (the guest fades over the gap).
++            for (auto it = m_audio.begin(); it != m_audio.end(); ++it)
++                if (it->type == MessageType::AudioPacket)
++                {
++                    m_audio.erase(it);
++                    ++m_droppedAudio;
++                    break;
++                }
++        }
++        Message m;
++        m.type = MessageType::AudioPacket;
++        m.payload = std::move(packet);
++        m.audio = true;
++        m_audio.push_back(std::move(m));
++    }
++
++    size_t SendQueue::waitingAudio() const
++    {
++        size_t n = 0;
++        for (const Message &m : m_audio)
++            n += m.type == MessageType::AudioPacket ? 1u : 0u;
++        return n;
++    }
++
+     bool SendQueue::next(Message &out)
+     {
+         if (!m_control.empty())
+@@ -725,6 +897,12 @@ namespace ps2x::netplay
+             m_control.erase(m_control.begin());
+             return true;
+         }
++        if (!m_audio.empty())
++        {
++            out = std::move(m_audio.front());
++            m_audio.pop_front();
++            return true;
++        }
+         if (m_video.empty())
+             return false;
+         VideoItem &item = m_video.front();
+@@ -737,7 +915,7 @@ namespace ps2x::netplay
+ 
+     bool SendQueue::empty() const
+     {
+-        return m_control.empty() && m_video.empty();
++        return m_control.empty() && m_audio.empty() && m_video.empty();
+     }
+ 
+     size_t SendQueue::waitingPictures() const
+@@ -767,6 +945,7 @@ namespace ps2x::netplay
+     void SendQueue::clear()
+     {
+         m_control.clear();
++        m_audio.clear();
+         m_video.clear();
+         m_inProgress = false;
+     }
+@@ -841,8 +1020,8 @@ namespace ps2x::netplay
+     {
+         std::vector<std::string> rest;
+         bool host = false, guest = false, portGiven = false, listenGiven = false, passwordGiven = false;
+-        bool videoGiven = false;
+-        std::string guestAddress, portText, heightText, kbpsText, codecText;
++        bool videoGiven = false, audioGiven = false;
++        std::string guestAddress, portText, heightText, kbpsText, codecText, audioCodecText, audioKbpsText;
+         for (size_t i = 0; i < args.size(); ++i)
+         {
+             const std::string &a = args[i];
+@@ -888,14 +1067,20 @@ namespace ps2x::netplay
+                 if (!value(a == "--imagen-alto" ? heightText : a == "--imagen-kbps" ? kbpsText : codecText))
+                     return false;
+             }
++            else if (a == "--sonido-codec" || a == "--sonido-kbps")
++            {
++                audioGiven = true;
++                if (!value(a == "--sonido-codec" ? audioCodecText : audioKbpsText))
++                    return false;
++            }
+             else
+                 rest.push_back(a);
+         }
+         if (!host && !guest)
+         {
+-            if (portGiven || listenGiven || passwordGiven || videoGiven)
++            if (portGiven || listenGiven || passwordGiven || videoGiven || audioGiven)
+             {
+-                error = "--puerto, --escuchar, --clave y --imagen-* van con --anfitrion o --invitado";
++                error = "--puerto, --escuchar, --clave, --imagen-* y --sonido-* van con --anfitrion o --invitado";
+                 return false;
+             }
+             options.mode = NetplayMode::Off;
+@@ -916,6 +1101,11 @@ namespace ps2x::netplay
+             error = "--imagen-alto, --imagen-kbps y --imagen-codec son solo para el anfitrion";
+             return false;
+         }
++        if (guest && audioGiven)
++        {
++            error = "--sonido-codec y --sonido-kbps son solo para el anfitrion";
++            return false;
++        }
+         // A whole decimal number within [low, high].
+         auto number = [&](const std::string &text, const char *name, unsigned long low, unsigned long high,
+                           unsigned long &out) -> bool
+@@ -965,6 +1155,23 @@ namespace ps2x::netplay
+             }
+             options.videoCodec = codecText;
+         }
++        if (!audioCodecText.empty())
++        {
++            if (audioCodecText != "auto" && audioCodecText != "opus" && audioCodecText != "pcm" &&
++                audioCodecText != "no")
++            {
++                error = "--sonido-codec no valido: " + audioCodecText + " (auto, opus, pcm o no)";
++                return false;
++            }
++            options.audioCodec = audioCodecText;
++        }
++        if (!audioKbpsText.empty())
++        {
++            unsigned long value = 0;
++            if (!number(audioKbpsText, "--sonido-kbps", 32, 256, value))
++                return false;
++            options.audioKbps = static_cast<uint32_t>(value);
++        }
+         if (portGiven)
+         {
+             std::string ignored;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.h b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+index cef95e8..56fbd57 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+@@ -5,6 +5,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <deque>
+ #include <functional>
+ #include <string>
+ #include <vector>
+@@ -28,10 +29,16 @@
+ // (host: a piece of one encoded picture, at most kMaxVideoChunkData bytes; a picture has at most kMaxVideoChunks
+ // pieces and kMaxVideoPictureBytes bytes, sent in order), VIDEO_KEY_REQUEST (guest: a picture was lost, send a key
+ // picture) and VIDEO_ACK (guest: the picture on screen, for the latency). A version 1 peer is refused with REJECT
+-// (version). Still reserved: 0x24-0x2F (video) and 0x30-0x3F (audio, N3).
++// (version).
++//
++// Version 3 (N3, the host's sound): AUDIO_CONFIG (host: codec, frame size and rate of the stream that follows) and
++// AUDIO_PACKET (host: one encoded frame of 48 kHz stereo, a 12-byte header and at most kMaxAudioPacketData bytes; the
++// sequence grows by one per frame, a gap = frames the host dropped). In the send queue the audio goes after the
++// control frames and before the video. A version 2 peer is refused with REJECT (version). Still reserved: 0x24-0x2F
++// (video) and 0x32-0x3F (audio).
+ namespace ps2x::netplay
+ {
+-    constexpr uint16_t kProtocolVersion = 2;
++    constexpr uint16_t kProtocolVersion = 3;
+     constexpr uint16_t kDefaultPort = 50650;
+     constexpr size_t kHeaderSize = 4;
+     constexpr size_t kTagSize = 16;
+@@ -48,6 +55,12 @@ namespace ps2x::netplay
+     constexpr uint16_t kMinVideoSide = 64;
+     constexpr uint16_t kMaxVideoWidth = 1920;
+     constexpr uint16_t kMaxVideoHeight = 1080;
++    // N3: the sound. One AUDIO_PACKET carries one frame of kAudioChannels x frameSamples samples at kAudioSampleRate.
++    constexpr uint32_t kAudioSampleRate = 48000;
++    constexpr uint8_t kAudioChannels = 2;
++    constexpr size_t kAudioPacketHeaderSize = 12;
++    constexpr size_t kMaxAudioPacketData = 3840; // 20 ms of 16-bit stereo PCM
++    constexpr size_t kMaxOpusPacketData = 1275;  // one Opus frame (RFC 6716, 3.4)
+     constexpr uint32_t kKeyIterations = 20000;
+     constexpr size_t kMinPasswordSize = 4;
+     constexpr size_t kMaxPasswordSize = 256;
+@@ -68,6 +81,8 @@ namespace ps2x::netplay
+         VideoChunk = 0x21,      // host: chunk header (kVideoChunkHeaderSize) and 1..kMaxVideoChunkData bytes
+         VideoKeyRequest = 0x22, // guest: the stream it decodes (4; informative)
+         VideoAck = 0x23,        // guest: picture number (4), its capture time (4), ms since it was shown (4)
++        AudioConfig = 0x30,     // host: codec (1), channels (1), frame samples (2), rate (4), kbit/s (4), stream (4)
++        AudioPacket = 0x31,     // host: packet header (kAudioPacketHeaderSize) and 1..kMaxAudioPacketData bytes
+     };
+ 
+     enum class RejectReason : uint8_t
+@@ -86,12 +101,12 @@ namespace ps2x::netplay
+         Shutdown = 4,
+     };
+ 
+-    // The payload size of a fixed-size type of this version; -1 for VIDEO_CHUNK (a range) and unknown and reserved
+-    // types.
++    // The payload size of a fixed-size type of this version; -1 for VIDEO_CHUNK and AUDIO_PACKET (ranges) and unknown
++    // and reserved types.
+     int payloadSizeOf(uint8_t type);
+     // The payload sizes a type allows (min == max for the fixed ones); false for unknown and reserved types.
+     bool payloadRange(uint8_t type, size_t &minSize, size_t &maxSize);
+-    // 0x24-0x2F: video types of later versions; 0x30-0x3F: audio (N3).
++    // 0x24-0x2F: video types of later versions; 0x32-0x3F: audio types of later versions.
+     bool isReservedType(uint8_t type);
+     const char *rejectReasonText(uint8_t reason);
+     const char *byeReasonText(uint8_t reason);
+@@ -283,9 +298,81 @@ namespace ps2x::netplay
+         std::string m_why;
+     };
+ 
+-    // What the host sends once the session started: control frames (PING, PONG, BYE...) always before the video, which
+-    // goes picture by picture and chunk by chunk, so a control frame waits at most one chunk. Frames are signed when
+-    // they leave the queue (the tags count frames in the order they are sent).
++    // N3: the host's sound.
++    enum class AudioCodec : uint8_t
++    {
++        Opus = 1,
++        Pcm16 = 2, // 16-bit little-endian, interleaved
++    };
++    const char *audioCodecName(uint8_t codec);
++
++    // AUDIO_CONFIG: what the guest's decoder opens. stream grows with every new configuration; the packets carry it.
++    struct AudioConfig
++    {
++        uint8_t codec = 0;
++        uint8_t channels = kAudioChannels;      // always 2
++        uint16_t frameSamples = 480;            // per channel and packet: 120, 240, 480 or 960 (2.5 to 20 ms)
++        uint32_t sampleRate = kAudioSampleRate; // always 48000
++        uint32_t kbps = 0;                      // Opus 16..510; PCM exactly 1536
++        uint32_t stream = 0;                    // >= 1
++        bool operator==(const AudioConfig &other) const = default;
++    };
++    constexpr size_t kAudioConfigPayloadSize = 16;
++    std::array<uint8_t, kAudioConfigPayloadSize> encodeAudioConfig(const AudioConfig &config);
++    // False (and why) for a payload of another size, an unknown codec, another channel count or rate, a frame size
++    // or bit rate out of range, stream 0.
++    bool decodeAudioConfig(const uint8_t *payload, size_t size, AudioConfig &config, std::string &why);
++
++    // One encoded frame. On the wire: stream (2, low 16 bits of AudioConfig::stream), flags (1, 0), reserved (1, 0),
++    // sequence (4), captureMs (4: host clock when its first sample was synthesized), then the data.
++    struct AudioPacket
++    {
++        uint32_t sequence = 0;
++        uint32_t captureMs = 0;
++        std::vector<uint8_t> data;
++    };
++    // The AUDIO_PACKET payload (empty if the data is empty or larger than kMaxAudioPacketData).
++    std::vector<uint8_t> encodeAudioPacket(const AudioPacket &packet, uint32_t stream);
++
++    // Checks the guest's AUDIO_CONFIG and AUDIO_PACKET frames against the configuration and the packets before them.
++    // TCP keeps the order, so a packet of another stream, with flags, of a size its codec does not allow or a sequence
++    // that does not grow is a protocol error (the guest closes). A sequence that skips numbers = packets the host
++    // dropped (counted; the guest fades over the gap).
++    class AudioReceiver
++    {
++    public:
++        enum class Result
++        {
++            Packet,
++            Error, // why()
++        };
++
++        // A new AUDIO_CONFIG: false (why()) if it is not valid or its stream does not grow.
++        bool configure(const uint8_t *payload, size_t size);
++        Result add(const uint8_t *payload, size_t size, AudioPacket &out);
++        const AudioConfig &config() const { return m_config; }
++        bool configured() const { return m_config.stream != 0; }
++        const std::string &why() const { return m_why; }
++        // Packets skipped by the host since the start.
++        uint64_t lostPackets() const { return m_lost; }
++        // The last packet came after a gap (or is the first of a configuration).
++        bool gapBeforeLast() const { return m_gap; }
++
++    private:
++        Result fail(const std::string &why);
++
++        AudioConfig m_config;
++        bool m_any = false;
++        uint32_t m_last = 0;
++        bool m_gap = false;
++        uint64_t m_lost = 0;
++        std::string m_why;
++    };
++
++    // What the host sends once the session started: control frames (PING, PONG, BYE...) always first, then the sound
++    // (N3: small packets, every 10 ms), then the video, which goes picture by picture and chunk by chunk, so a control
++    // or audio frame waits at most one chunk. Frames are signed when they leave the queue (the tags count frames in the
++    // order they are sent).
+     class SendQueue
+     {
+     public:
+@@ -294,12 +381,22 @@ namespace ps2x::netplay
+             MessageType type = MessageType::Ping;
+             std::vector<uint8_t> payload;
+             bool video = false;
++            bool audio = false;
+         };
+ 
++        // N3: at most this many audio packets wait (500 ms of 10 ms frames); above it the oldest is dropped.
++        static constexpr size_t kMaxWaitingAudio = 50;
++
+         void pushControl(MessageType type, const uint8_t *payload, size_t size);
+         // A configuration (never dropped) or one picture's chunks (a VIDEO_CONFIG first if given).
+         void pushVideoConfig(const VideoConfig &config);
+         void pushPicture(std::vector<std::vector<uint8_t>> chunks, uint32_t picture);
++        // N3: a configuration (never dropped) or one AUDIO_PACKET payload.
++        void pushAudioConfig(const AudioConfig &config);
++        void pushAudio(std::vector<uint8_t> packet);
++        // Audio packets waiting, and those dropped because too many waited.
++        size_t waitingAudio() const;
++        uint64_t droppedAudio() const { return m_droppedAudio; }
+         bool next(Message &out);
+         bool empty() const;
+         // Pictures waiting whose first chunk has not left yet.
+@@ -319,8 +416,10 @@ namespace ps2x::netplay
+         };
+ 
+         std::vector<Message> m_control; // FIFO
++        std::deque<Message> m_audio;    // FIFO (configurations and packets)
+         std::vector<VideoItem> m_video; // FIFO
+         bool m_inProgress = false;      // m_video.front() has sent some of its chunks
++        uint64_t m_droppedAudio = 0;
+     };
+ 
+     using RandomSource = std::function<bool(void *, size_t)>;
+@@ -404,6 +503,8 @@ namespace ps2x::netplay
+     // The host's picture (N2): [--imagen-alto N] (144..1080, even; default 540) [--imagen-kbps N] (500..50000; default
+     // 8000) [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no] (default auto: the first that opens,
+     // in that order; no = no picture).
++    // The host's sound (N3): [--sonido-codec auto|opus|pcm|no] (default auto: Opus if it opens, else PCM; no = no
++    // sound) [--sonido-kbps N] (32..256; default 128; Opus only).
+     // Without --clave the password comes from environmentPassword (PS2X_RED_CLAVE), if any. Returns false with
+     // error set when a netplay argument is wrong.
+     enum class NetplayMode
+@@ -423,6 +524,8 @@ namespace ps2x::netplay
+         uint16_t videoHeight = 540;
+         uint32_t videoKbps = 8000;
+         std::string videoCodec = "auto";
++        std::string audioCodec = "auto";
++        uint32_t audioKbps = 128;
+     };
+ 
+     bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 1a7d7b8..b4174d8 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -447,6 +447,7 @@ int main(int argc, char *argv[])
+                       << "[red] uso: --anfitrion [--escuchar <direccion>] [--puerto N] --clave <contrasena>" << std::endl
+                       << "[red]      [--imagen-alto 144-1080] [--imagen-kbps 500-50000]" << std::endl
+                       << "[red]      [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no]" << std::endl
++                      << "[red]      [--sonido-codec auto|opus|pcm|no] [--sonido-kbps 32-256]" << std::endl
+                       << "[red]      --invitado <direccion>[:puerto] [--puerto N] --clave <contrasena>" << std::endl;
+             std::cout.flush();
+             std::cerr.flush();
+@@ -576,6 +577,7 @@ int main(int argc, char *argv[])
+             std::string error;
+             ps2x::netplay::HostSettings hostSettings{netplay.listenAddress, netplay.port, netplay.password};
+             hostSettings.video = {netplay.videoHeight, netplay.videoKbps, netplay.videoCodec};
++            hostSettings.audio = {netplay.audioCodec, netplay.audioKbps};
+             if (!s_netplayHost.start(hostSettings, error))
+                 std::cerr << "[red] no se puede escuchar en el puerto " << netplay.port << ": " << error
+                           << " (el juego sigue sin red)" << std::endl;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 2fe39a0..7d0e9a0 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -43,6 +43,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_display_tests.cpp
+     src/ps2_options_menu_tests.cpp
+     src/ps2_netplay_tests.cpp
++    src/ps2_netplay_audio_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 1ff9a88..1efbb79 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -24,6 +24,7 @@ void register_ps2_user_paths_tests();
+ void register_ps2_display_tests();
+ void register_ps2_options_menu_tests();
+ void register_ps2_netplay_tests();
++void register_ps2_netplay_audio_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -52,6 +53,7 @@ int main()
+     register_ps2_display_tests();
+     register_ps2_options_menu_tests();
+     register_ps2_netplay_tests();
++    register_ps2_netplay_audio_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_netplay_audio_tests.cpp b/ps2xTest/src/ps2_netplay_audio_tests.cpp
+new file mode 100644
+index 0000000..696fc90
+--- /dev/null
++++ b/ps2xTest/src/ps2_netplay_audio_tests.cpp
+@@ -0,0 +1,1155 @@
++#include "MiniTest.h"
++#include "ps2_netplay.h"
++#include "ps2_netplay_audio.h"
++#include "ps2_netplay_protocol.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++// Fase 5 (T15, netplay N3): protocol version 3 (AUDIO_CONFIG, AUDIO_PACKET, the send queue's priorities), the tap ring
++// of the host (never waits, an overflow drops the oldest frames), the guest's jitter buffer (target, underrun fades,
++// drift, valve, volume, gaps), the codecs (PCM bit for bit, Opus through FFmpeg) and a sine from the host's tap to the
++// guest's device, in this process and over 127.0.0.1.
++namespace
++{
++    using namespace ps2x::netplay;
++
++    constexpr double kPi = 3.14159265358979323846;
++    // The sine of the host's resampler tests: 441 Hz, amplitude 8000.
++    constexpr double kAmplitude = 8000.0;
++    constexpr double kSineStep = 2.0 * kPi * 441.0 / 48000.0;
++    // Largest sample-to-sample change of that sine played up to 0.5 % faster, plus rounding.
++    constexpr double kSineDelta = kAmplitude * kSineStep * 1.006 + 2.0;
++
++    int16_t sineAt(uint64_t frame, double phase = 0.0)
++    {
++        return static_cast<int16_t>(std::lround(kAmplitude * std::sin(kSineStep * static_cast<double>(frame) + phase)));
++    }
++
++    // `frames` stereo frames of the sine from frame `first` (left = right).
++    std::vector<int16_t> sineFrames(uint64_t first, size_t frames, double phase = 0.0)
++    {
++        std::vector<int16_t> out(frames * 2u);
++        for (size_t i = 0; i < frames; ++i)
++            out[i * 2u] = out[i * 2u + 1u] = sineAt(first + i, phase);
++        return out;
++    }
++
++    // What a device took from a jitter buffer: the left channel and its largest sample-to-sample change.
++    struct Played
++    {
++        std::vector<int16_t> left;
++        double maxDelta = 0.0;
++        size_t maxDeltaAt = 0;
++
++        void add(const int16_t *stereo, size_t frames)
++        {
++            for (size_t i = 0; i < frames; ++i)
++            {
++                const int16_t value = stereo[i * 2u];
++                if (!left.empty())
++                {
++                    const double delta = std::abs(static_cast<double>(value) - left.back());
++                    if (delta > maxDelta)
++                    {
++                        maxDelta = delta;
++                        maxDeltaAt = left.size();
++                    }
++                }
++                left.push_back(value);
++            }
++        }
++
++        void pull(AudioJitterBuffer &buffer, size_t frames, uint32_t nowMs = 0)
++        {
++            std::vector<int16_t> out(frames * 2u, 12345);
++            buffer.pull(out.data(), frames, nowMs);
++            add(out.data(), frames);
++        }
++
++        int peak(size_t from, size_t to) const
++        {
++            int p = 0;
++            for (size_t i = from; i < std::min(to, left.size()); ++i)
++                p = std::max(p, std::abs(static_cast<int>(left[i])));
++            return p;
++        }
++
++        bool silent(size_t from, size_t to) const { return peak(from, to) == 0; }
++
++        // Zero crossings upward per second over [from, to).
++        double frequency(size_t from, size_t to) const
++        {
++            int crossings = 0;
++            for (size_t i = from + 1; i < std::min(to, left.size()); ++i)
++                crossings += left[i - 1] < 0 && left[i] >= 0 ? 1 : 0;
++            return crossings * 48000.0 / static_cast<double>(std::min(to, left.size()) - from);
++        }
++
++        double rms(size_t from, size_t to) const
++        {
++            double sum = 0.0;
++            size_t n = 0;
++            for (size_t i = from; i < std::min(to, left.size()); ++i, ++n)
++                sum += static_cast<double>(left[i]) * left[i];
++            return n ? std::sqrt(sum / static_cast<double>(n)) : 0.0;
++        }
++    };
++
++    // A host clock `rate` times the guest's: packets of 480 frames against device pulls of 1024 frames, in time order.
++    struct DriftRun
++    {
++        AudioJitterBuffer buffer;
++        Played played;
++        uint64_t pushed = 0;
++        double fillSum = 0.0;
++        uint64_t fillCount = 0;
++
++        void run(double rate, double seconds, double measureFrom)
++        {
++            double producer = 0.0, consumer = 0.0;
++            const double packet = 480.0 / (48000.0 * rate), pull = 1024.0 / 48000.0;
++            while (consumer < seconds)
++            {
++                if (producer <= consumer)
++                {
++                    const std::vector<int16_t> frames = sineFrames(pushed, 480);
++                    buffer.push(frames.data(), 480, static_cast<uint32_t>(pushed / 48u), false);
++                    pushed += 480;
++                    producer += packet;
++                }
++                else
++                {
++                    played.pull(buffer, 1024);
++                    if (consumer >= measureFrom)
++                    {
++                        fillSum += buffer.stats().fillFrames;
++                        ++fillCount;
++                    }
++                    consumer += pull;
++                }
++            }
++        }
++
++        double meanFill() const { return fillCount ? fillSum / static_cast<double>(fillCount) : 0.0; }
++    };
++
++    AudioConfig audioConfig(AudioCodec codec, uint32_t stream = 1)
++    {
++        AudioConfig c;
++        c.codec = static_cast<uint8_t>(codec);
++        c.channels = 2;
++        c.frameSamples = 480;
++        c.sampleRate = 48000;
++        c.kbps = codec == AudioCodec::Pcm16 ? 1536u : 128u;
++        c.stream = stream;
++        return c;
++    }
++
++    AudioPacket packetOf(uint32_t sequence, size_t size)
++    {
++        AudioPacket p;
++        p.sequence = sequence;
++        p.captureMs = 5000u + sequence * 10u;
++        p.data.resize(size);
++        for (size_t i = 0; i < size; ++i)
++            p.data[i] = static_cast<uint8_t>(i * 3u + sequence);
++        return p;
++    }
++
++    template <typename Predicate>
++    bool waitFor(Predicate predicate, int milliseconds = 4000)
++    {
++        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
++        while (std::chrono::steady_clock::now() < end)
++        {
++            if (predicate())
++                return true;
++            std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        }
++        return predicate();
++    }
++
++    // The in-process loopback: tap ring -> sender (10 ms frames, encoder, AUDIO_PACKET, signed frame) -> reader ->
++    // receiver -> decoder -> jitter buffer -> a device pulling 1024 frames, on a simulated clock.
++    struct Loopback
++    {
++        AudioTapRing tap;
++        AudioEncoder encoder;
++        AudioDecoder decoder;
++        AudioReceiver receiver;
++        AudioJitterBuffer jitter;
++        MessageAuth hostAuth, guestAuth;
++        FrameReader reader{guestAuth};
++        Played played;
++        uint32_t sequence = 0;
++        uint64_t produced = 0, firstOfFrame = 0;
++        std::vector<int16_t> pending;
++        std::vector<uint32_t> captures;
++        uint64_t packets = 0, bytes = 0, frameErrors = 0, decodeErrors = 0;
++        std::string why;
++
++        bool start(const std::string &codec)
++        {
++            Digest key{};
++            key.fill(0x42);
++            hostAuth.start(key, true);
++            guestAuth.start(key, false);
++            if (!encoder.open(codec, 128, kAudioFrameSamples, why))
++                return false;
++            AudioConfig config;
++            config.codec = static_cast<uint8_t>(encoder.codec());
++            config.frameSamples = kAudioFrameSamples;
++            config.kbps = encoder.kbps();
++            config.stream = 1;
++            const auto bytesOfConfig = encodeAudioConfig(config);
++            if (!deliver(MessageType::AudioConfig, std::vector<uint8_t>(bytesOfConfig.begin(), bytesOfConfig.end())))
++                return false;
++            return decoder.open(receiver.config(), why);
++        }
++
++        bool deliver(MessageType type, const std::vector<uint8_t> &payload)
++        {
++            const std::vector<uint8_t> frame = encodeFrame(type, payload.data(), payload.size(), &hostAuth);
++            Frame f;
++            if (frame.empty() || !reader.feed(frame.data(), frame.size()) || reader.next(f) != FrameReader::Result::Frame)
++            {
++                ++frameErrors;
++                return false;
++            }
++            if (f.type == static_cast<uint8_t>(MessageType::AudioConfig))
++                return receiver.configure(f.payload.data(), f.size);
++            AudioPacket packet;
++            if (receiver.add(f.payload.data(), f.size, packet) != AudioReceiver::Result::Packet)
++            {
++                ++frameErrors;
++                why = receiver.why();
++                return false;
++            }
++            std::vector<int16_t> pcm;
++            if (!decoder.decode(packet.data.data(), packet.data.size(), pcm, why))
++            {
++                ++decodeErrors;
++                return false;
++            }
++            jitter.push(pcm.data(), pcm.size() / 2u, packet.captureMs, receiver.gapBeforeLast() && packets > 1);
++            return true;
++        }
++
++        // The synthesis: 64 frames at a time at simulated time nowMs.
++        void synthesize(size_t frames, uint32_t nowMs)
++        {
++            const std::vector<int16_t> s = sineFrames(produced, frames);
++            tap.push(s.data(), frames, nowMs);
++            produced += frames;
++        }
++
++        // The sender: every whole 10 ms frame waiting.
++        void send()
++        {
++            int16_t chunk[2048 * 2];
++            uint64_t first = 0;
++            size_t n = 0;
++            while ((n = tap.read(chunk, 2048, first)) > 0)
++            {
++                if (pending.empty())
++                    firstOfFrame = first;
++                pending.insert(pending.end(), chunk, chunk + n * 2u);
++            }
++            while (pending.size() >= kAudioFrameSamples * 2u)
++            {
++                captures.push_back(tap.captureMsOf(firstOfFrame));
++                std::vector<std::vector<uint8_t>> out;
++                encoder.encode(pending.data(), out, why);
++                pending.erase(pending.begin(), pending.begin() + kAudioFrameSamples * 2);
++                firstOfFrame += kAudioFrameSamples;
++                for (std::vector<uint8_t> &data : out)
++                {
++                    AudioPacket packet;
++                    packet.sequence = ++sequence;
++                    packet.captureMs = captures.empty() ? 0u : captures.front();
++                    if (!captures.empty())
++                        captures.erase(captures.begin());
++                    packet.data = std::move(data);
++                    bytes += packet.data.size();
++                    ++packets;
++                    deliver(MessageType::AudioPacket, encodeAudioPacket(packet, 1));
++                }
++            }
++        }
++
++        // `seconds` of simulated time: synthesis every 1.33 ms (64 frames), sender every 5 ms, device every 21.3 ms.
++        void run(double seconds)
++        {
++            double synth = 0.0, sender = 0.0, device = 0.0;
++            while (device < seconds)
++            {
++                const double next = std::min({synth, sender, device});
++                if (next == synth)
++                {
++                    synthesize(64, static_cast<uint32_t>(synth * 1000.0));
++                    synth += 64.0 / 48000.0;
++                }
++                else if (next == sender)
++                {
++                    send();
++                    sender += 0.005;
++                }
++                else
++                {
++                    played.pull(jitter, 1024, static_cast<uint32_t>(device * 1000.0));
++                    device += 1024.0 / 48000.0;
++                }
++            }
++        }
++    };
++}
++
++void register_ps2_netplay_audio_tests()
++{
++    MiniTest::Case("NetplayAudioProtocol", [](TestCase &tc)
++                   {
++        tc.Run("version 3: the audio types have strict sizes and 0x32-0x3F stay reserved", [](TestCase &t)
++        {
++            t.Equals(kProtocolVersion, static_cast<uint16_t>(3), "version 3");
++            t.Equals(payloadSizeOf(0x30), 16, "AUDIO_CONFIG");
++            t.Equals(payloadSizeOf(0x31), -1, "AUDIO_PACKET has no single size");
++            size_t lo = 0, hi = 0;
++            t.IsTrue(payloadRange(0x31, lo, hi), "AUDIO_PACKET range");
++            t.Equals(lo, kAudioPacketHeaderSize + 1, "at least one byte of sound");
++            t.Equals(hi, kAudioPacketHeaderSize + kMaxAudioPacketData, "at most 20 ms of PCM");
++            t.IsTrue(payloadRange(0x30, lo, hi) && lo == 16u && hi == 16u, "AUDIO_CONFIG: exact");
++            t.IsFalse(isReservedType(0x30) || isReservedType(0x31), "0x30-0x31 are audio now");
++            t.IsTrue(isReservedType(0x32) && isReservedType(0x3F) && isReservedType(0x24) && isReservedType(0x2F),
++                     "0x24-0x2F and 0x32-0x3F reserved");
++            t.IsFalse(payloadRange(0x32, lo, hi), "a reserved audio type has no size");
++            MessageAuth none;
++            FrameReader reader(none);
++            const std::vector<uint8_t> tooLong = {0x30, 0, 17, 0};
++            t.IsFalse(reader.feed(tooLong.data(), tooLong.size()) && reader.next(*std::make_unique<Frame>()) !=
++                                                                         FrameReader::Result::Error,
++                      "an AUDIO_CONFIG of 17 bytes is refused");
++            t.Equals(reader.error(), FrameError::BadLength, "bad length");
++            FrameReader reserved(none);
++            const std::vector<uint8_t> type32 = {0x32, 0, 4, 0};
++            reserved.feed(type32.data(), type32.size());
++            t.Equals(reserved.next(*std::make_unique<Frame>()), FrameReader::Result::Error, "0x32 refused");
++            t.Equals(reserved.error(), FrameError::ReservedType, "as reserved");
++        });
++
++        tc.Run("audio config: bytes, limits and refusals", [](TestCase &t)
++        {
++            const AudioConfig opus = audioConfig(AudioCodec::Opus, 7);
++            const auto bytes = encodeAudioConfig(opus);
++            const std::vector<uint8_t> expected = {1, 2, 0xE0, 0x01, 0x80, 0xBB, 0, 0, 128, 0, 0, 0, 7, 0, 0, 0};
++            t.Equals(std::vector<uint8_t>(bytes.begin(), bytes.end()), expected, "wire layout");
++            AudioConfig back;
++            std::string why;
++            t.IsTrue(decodeAudioConfig(bytes.data(), bytes.size(), back, why), "reads back: " + why);
++            t.IsTrue(back == opus, "same config");
++            const AudioConfig pcm = audioConfig(AudioCodec::Pcm16);
++            const auto pcmBytes = encodeAudioConfig(pcm);
++            t.IsTrue(decodeAudioConfig(pcmBytes.data(), pcmBytes.size(), back, why) && back == pcm, "PCM");
++            for (uint16_t samples : {120, 240, 960})
++            {
++                AudioConfig c = opus;
++                c.frameSamples = samples;
++                const auto b = encodeAudioConfig(c);
++                t.IsTrue(decodeAudioConfig(b.data(), b.size(), back, why), "frame of " + std::to_string(samples));
++            }
++            struct Bad
++            {
++                const char *what;
++                AudioConfig config;
++            };
++            std::vector<Bad> bad;
++            auto with = [&](const char *what, auto change)
++            {
++                AudioConfig c = opus;
++                change(c);
++                bad.push_back({what, c});
++            };
++            with("unknown codec", [](AudioConfig &c) { c.codec = 3; });
++            with("codec 0", [](AudioConfig &c) { c.codec = 0; });
++            with("mono", [](AudioConfig &c) { c.channels = 1; });
++            with("44.1 kHz", [](AudioConfig &c) { c.sampleRate = 44100; });
++            with("500 samples", [](AudioConfig &c) { c.frameSamples = 500; });
++            with("0 samples", [](AudioConfig &c) { c.frameSamples = 0; });
++            with("Opus 15 kbit/s", [](AudioConfig &c) { c.kbps = 15; });
++            with("Opus 511 kbit/s", [](AudioConfig &c) { c.kbps = 511; });
++            with("PCM at another rate", [](AudioConfig &c) { c.codec = 2; c.kbps = 1535; });
++            with("stream 0", [](AudioConfig &c) { c.stream = 0; });
++            for (const Bad &b : bad)
++            {
++                const auto raw = encodeAudioConfig(b.config);
++                AudioConfig untouched = opus;
++                t.IsFalse(decodeAudioConfig(raw.data(), raw.size(), untouched, why), std::string("refused: ") + b.what);
++                t.IsTrue(untouched == opus, std::string("left as it was: ") + b.what);
++                t.IsFalse(why.empty(), std::string("with a reason: ") + b.what);
++            }
++            t.IsFalse(decodeAudioConfig(bytes.data(), bytes.size() - 1, back, why), "15 bytes");
++            auto reservedFlag = bytes;
++            t.IsTrue(decodeAudioConfig(reservedFlag.data(), reservedFlag.size(), back, why), "(control)");
++        });
++
++        tc.Run("audio packets: header on the wire, gaps counted, refusals", [](TestCase &t)
++        {
++            const AudioPacket p = packetOf(9, 100);
++            const std::vector<uint8_t> payload = encodeAudioPacket(p, 0x10003);
++            t.Equals(payload.size(), kAudioPacketHeaderSize + 100, "header + data");
++            const std::vector<uint8_t> head(payload.begin(), payload.begin() + 12);
++            const std::vector<uint8_t> expected = {0x03, 0x00, 0, 0, 9, 0, 0, 0, 0xE2, 0x13, 0, 0};
++            t.Equals(head, expected, "stream (low 16 bits), flags, reserved, sequence, capture ms");
++            t.IsTrue(encodeAudioPacket(packetOf(1, 0), 1).empty(), "no data: nothing");
++            t.IsTrue(encodeAudioPacket(packetOf(1, kMaxAudioPacketData + 1), 1).empty(), "too much: nothing");
++
++            AudioReceiver r;
++            AudioPacket out;
++            const auto first = encodeAudioPacket(packetOf(1, 100), 1);
++            t.Equals(r.add(first.data(), first.size(), out), AudioReceiver::Result::Error, "a packet before its config");
++            const auto opusConfig = encodeAudioConfig(audioConfig(AudioCodec::Opus, 1));
++            t.IsTrue(r.configure(opusConfig.data(), opusConfig.size()), "configured: " + r.why());
++            t.Equals(r.add(first.data(), first.size(), out), AudioReceiver::Result::Packet, "packet 1: " + r.why());
++            t.Equals(out.sequence, 1u, "sequence");
++            t.Equals(out.captureMs, 5010u, "capture time");
++            t.Equals(out.data, packetOf(1, 100).data, "data");
++            t.IsTrue(r.gapBeforeLast(), "the first packet of a stream starts after a gap");
++            const auto second = encodeAudioPacket(packetOf(2, 100), 1);
++            t.Equals(r.add(second.data(), second.size(), out), AudioReceiver::Result::Packet, "packet 2");
++            t.IsFalse(r.gapBeforeLast(), "no gap");
++            const auto fifth = encodeAudioPacket(packetOf(5, 1275), 1);
++            t.Equals(r.add(fifth.data(), fifth.size(), out), AudioReceiver::Result::Packet, "packet 5 (largest Opus)");
++            t.IsTrue(r.gapBeforeLast(), "a gap before 5");
++            t.Equals(r.lostPackets(), static_cast<uint64_t>(2), "3 and 4 lost");
++
++            struct Bad
++            {
++                const char *what;
++                std::vector<uint8_t> payload;
++            };
++            std::vector<Bad> bad;
++            bad.push_back({"same sequence again", fifth});
++            bad.push_back({"older sequence", second});
++            bad.push_back({"another stream", encodeAudioPacket(packetOf(6, 100), 2)});
++            auto flagged = encodeAudioPacket(packetOf(6, 100), 1);
++            flagged[2] = 1;
++            bad.push_back({"flags", flagged});
++            auto reserved = encodeAudioPacket(packetOf(6, 100), 1);
++            reserved[3] = 1;
++            bad.push_back({"reserved byte", reserved});
++            bad.push_back({"an Opus packet above 1275 bytes", encodeAudioPacket(packetOf(6, 1276), 1)});
++            bad.push_back({"only a header", std::vector<uint8_t>(first.begin(), first.begin() + 12)});
++            for (const Bad &b : bad)
++            {
++                AudioReceiver copy = r;
++                t.Equals(copy.add(b.payload.data(), b.payload.size(), out), AudioReceiver::Result::Error,
++                         std::string("refused: ") + b.what);
++                t.IsFalse(copy.why().empty(), std::string("with a reason: ") + b.what);
++            }
++
++            AudioReceiver pcm;
++            const auto pcmConfig = encodeAudioConfig(audioConfig(AudioCodec::Pcm16, 3));
++            t.IsTrue(pcm.configure(pcmConfig.data(), pcmConfig.size()), "PCM config");
++            const auto whole = encodeAudioPacket(packetOf(1, 480 * 4), 3);
++            t.Equals(pcm.add(whole.data(), whole.size(), out), AudioReceiver::Result::Packet, "PCM: 480 frames");
++            AudioReceiver pcmCopy = pcm;
++            const auto shortPcm = encodeAudioPacket(packetOf(2, 480 * 4 - 4), 3);
++            t.Equals(pcmCopy.add(shortPcm.data(), shortPcm.size(), out), AudioReceiver::Result::Error,
++                     "PCM: one frame short");
++            t.IsFalse(pcm.configure(pcmConfig.data(), pcmConfig.size()), "the same stream again");
++            const auto next = encodeAudioConfig(audioConfig(AudioCodec::Opus, 4));
++            t.IsTrue(pcm.configure(next.data(), next.size()), "a later stream");
++            const auto restart = encodeAudioPacket(packetOf(1, 100), 4);
++            t.Equals(pcm.add(restart.data(), restart.size(), out), AudioReceiver::Result::Packet,
++                     "the sequence starts again with a new stream");
++        });
++
++        tc.Run("audio frames go through the reader signed, and a changed byte is caught", [](TestCase &t)
++        {
++            Digest key{};
++            key.fill(7);
++            MessageAuth host, guest;
++            host.start(key, true);
++            guest.start(key, false);
++            const auto payload = encodeAudioPacket(packetOf(1, 1920), 1);
++            const std::vector<uint8_t> frame = encodeFrame(MessageType::AudioPacket, payload.data(), payload.size(), &host);
++            t.Equals(frame.size(), kHeaderSize + payload.size() + kTagSize, "header, payload, tag");
++            FrameReader reader(guest);
++            auto f = std::make_unique<Frame>();
++            t.IsTrue(reader.feed(frame.data(), frame.size()) && reader.next(*f) == FrameReader::Result::Frame, "read");
++            t.IsTrue(f->type == 0x31 && f->size == payload.size() &&
++                         std::equal(payload.begin(), payload.end(), f->payload.begin()),
++                     "same payload");
++            const std::vector<uint8_t> second =
++                encodeFrame(MessageType::AudioPacket, payload.data(), payload.size(), &host);
++            std::vector<uint8_t> changed = second;
++            changed[kHeaderSize + 20] ^= 1;
++            t.IsTrue(reader.feed(changed.data(), changed.size()), "fed");
++            t.Equals(reader.next(*f), FrameReader::Result::Error, "a changed sample");
++            t.Equals(reader.error(), FrameError::BadTag, "bad tag");
++        });
++
++        tc.Run("the send queue: control first, then audio, then video; at most 50 audio packets wait", [](TestCase &t)
++        {
++            SendQueue q;
++            VideoPicture picture;
++            picture.picture = 1;
++            picture.key = true;
++            picture.data.assign(40000, 1);
++            VideoConfig video;
++            video.codec = static_cast<uint8_t>(VideoCodec::Mjpeg);
++            video.width = 640;
++            video.height = 480;
++            video.fps = 50;
++            video.kbps = 8000;
++            video.stream = 1;
++            q.pushVideoConfig(video);
++            q.pushPicture(chunkVideoPicture(picture, 1), 1);
++            q.pushAudioConfig(audioConfig(AudioCodec::Opus));
++            q.pushAudio(encodeAudioPacket(packetOf(1, 100), 1));
++            const uint8_t ping[8] = {1};
++            q.pushControl(MessageType::Ping, ping, 8);
++            SendQueue::Message m;
++            t.IsTrue(q.next(m) && m.type == MessageType::Ping, "the PING first");
++            t.IsTrue(q.next(m) && m.type == MessageType::AudioConfig && m.audio, "then the audio config");
++            t.IsTrue(q.next(m) && m.type == MessageType::AudioPacket && m.audio && !m.video, "then the audio packet");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoConfig && m.video, "then the video");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoChunk, "chunk 0");
++            q.pushAudio(encodeAudioPacket(packetOf(2, 100), 1));
++            t.IsTrue(q.next(m) && m.type == MessageType::AudioPacket, "a packet goes between two chunks");
++            t.IsTrue(q.next(m) && m.type == MessageType::VideoChunk, "chunk 1");
++
++            for (uint32_t s = 3; s < 63; ++s)
++                q.pushAudio(encodeAudioPacket(packetOf(s, 100), 1));
++            t.Equals(q.waitingAudio(), SendQueue::kMaxWaitingAudio, "50 wait");
++            t.Equals(q.droppedAudio(), static_cast<uint64_t>(10), "the 10 oldest were dropped");
++            t.IsTrue(q.next(m) && m.type == MessageType::AudioPacket && m.payload[4] == 13u,
++                     "the oldest kept is packet 13");
++            q.pushAudioConfig(audioConfig(AudioCodec::Opus, 2));
++            for (uint32_t s = 100; s < 160; ++s)
++                q.pushAudio(encodeAudioPacket(packetOf(s, 100), 1));
++            bool configSent = false;
++            while (q.next(m))
++                configSent = configSent || m.type == MessageType::AudioConfig;
++            t.IsTrue(configSent, "a configuration is never dropped");
++            t.IsTrue(q.empty(), "empty");
++        });
++
++        tc.Run("handshake: a version 2 guest gets REJECT (version) and a version 2 host is refused", [](TestCase &t)
++        {
++            MessageAuth hostAuth, guestAuth;
++            FrameReader toHost(hostAuth), toGuest(guestAuth);
++            HostHandshake host("clave", hostAuth);
++            uint8_t hello[12] = {'F', '1', '-', '0', '6', 'N', 'P', 0, 2, 0, 0, 0};
++            const auto helloFrame = encodeFrame(MessageType::Hello, hello, 12, nullptr);
++            auto f = std::make_unique<Frame>();
++            t.IsTrue(toHost.feed(helloFrame.data(), helloFrame.size()) && toHost.next(*f) == FrameReader::Result::Frame,
++                     "HELLO read");
++            std::vector<std::vector<uint8_t>> out;
++            t.Equals(host.onFrame(*f, out), HostHandshake::Result::Rejected, "a version 2 guest");
++            t.Equals(host.rejectReason(), RejectReason::Version, "for the version");
++            t.IsTrue(!out.empty() && toGuest.feed(out[0].data(), out[0].size()) &&
++                         toGuest.next(*f) == FrameReader::Result::Frame,
++                     "REJECT read");
++            t.IsTrue(f->type == 0x05 && f->payload[0] == 1 && f->payload[1] == 3 && f->payload[2] == 0,
++                     "REJECT (version) with our version 3");
++
++            MessageAuth auth2;
++            FrameReader toGuest2(auth2);
++            GuestHandshake guest("clave", auth2);
++            uint8_t challenge[36] = {2, 0, 0, 0};
++            const auto challengeFrame = encodeFrame(MessageType::Challenge, challenge, 36, nullptr);
++            toGuest2.feed(challengeFrame.data(), challengeFrame.size());
++            toGuest2.next(*f);
++            out.clear();
++            t.Equals(guest.onFrame(*f, out), GuestHandshake::Result::Failed, "a version 2 host");
++            t.IsTrue(out.empty(), "no AUTH for it");
++            t.IsTrue(guest.reason().find("version 2") != std::string::npos, "says which: " + guest.reason());
++        });
++
++        tc.Run("command line: the host's sound options", [](TestCase &t)
++        {
++            std::vector<std::string> args = {"--anfitrion", "--clave", "secreto"};
++            NetplayOptions o;
++            std::string error;
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "defaults: " + error);
++            t.Equals(o.audioCodec, std::string("auto"), "default codec");
++            t.Equals(o.audioKbps, 128u, "default bit rate");
++            for (const char *codec : {"opus", "pcm", "no", "auto"})
++            {
++                args = {"--anfitrion", "--clave", "secreto", "--sonido-codec", codec, "--sonido-kbps", "96"};
++                o = {};
++                t.IsTrue(parseNetplayArguments(args, nullptr, o, error), std::string("codec ") + codec + ": " + error);
++                t.Equals(o.audioCodec, std::string(codec), "--sonido-codec");
++                t.Equals(o.audioKbps, 96u, "--sonido-kbps");
++                t.IsTrue(args.empty(), "nothing left");
++            }
++            const std::vector<std::vector<std::string>> bad = {
++                {"--anfitrion", "--clave", "abcd", "--sonido-codec", "aac"},
++                {"--anfitrion", "--clave", "abcd", "--sonido-codec"},
++                {"--anfitrion", "--clave", "abcd", "--sonido-kbps", "31"},
++                {"--anfitrion", "--clave", "abcd", "--sonido-kbps", "257"},
++                {"--anfitrion", "--clave", "abcd", "--sonido-kbps", "1x0"},
++                {"--invitado", "1.2.3.4", "--clave", "abcd", "--sonido-codec", "pcm"}, // host only
++                {"--sonido-kbps", "128"},                                              // without netplay
++            };
++            for (const auto &b : bad)
++            {
++                std::vector<std::string> a = b;
++                NetplayOptions bo;
++                std::string e;
++                std::string line;
++                for (const std::string &s : b)
++                    line += s + " ";
++                t.IsFalse(parseNetplayArguments(a, nullptr, bo, e), "refused: " + line);
++                t.IsFalse(e.empty(), "with a message: " + line);
++            }
++        }); });
++
++    MiniTest::Case("NetplayAudioTap", [](TestCase &tc)
++                   {
++        tc.Run("the tap ring hands the frames over in order with the time they were made", [](TestCase &t)
++        {
++            auto ring = std::make_unique<AudioTapRing>();
++            std::vector<int16_t> in(480 * 2);
++            for (int i = 0; i < 480; ++i)
++            {
++                in[i * 2] = static_cast<int16_t>(i);
++                in[i * 2 + 1] = static_cast<int16_t>(-i);
++            }
++            ring->push(in.data(), 480, 1000);
++            t.Equals(ring->available(), static_cast<size_t>(480), "480 waiting");
++            std::vector<int16_t> out(1000 * 2);
++            uint64_t first = 99;
++            t.Equals(ring->read(out.data(), 1000, first), static_cast<size_t>(480), "480 read");
++            t.Equals(first, static_cast<uint64_t>(0), "from frame 0");
++            t.IsTrue(std::equal(in.begin(), in.end(), out.begin()), "the same samples, both channels");
++            t.Equals(ring->captureMsOf(480), 1000u, "the frame after the push: its time");
++            t.Equals(ring->captureMsOf(0), 990u, "480 frames before: 10 ms earlier");
++            t.Equals(ring->captureMsOf(240), 995u, "in between");
++            t.Equals(ring->read(out.data(), 1000, first), static_cast<size_t>(0), "nothing more");
++            ring->push(in.data(), 100, 1003);
++            ring->skipAll();
++            t.Equals(ring->available(), static_cast<size_t>(0), "skipped");
++            ring->push(in.data(), 10, 1004);
++            t.Equals(ring->read(out.data(), 1000, first), static_cast<size_t>(10), "the next ones");
++            t.Equals(first, static_cast<uint64_t>(580), "numbered after the skipped ones");
++            t.Equals(ring->dropped(), static_cast<uint64_t>(0), "a skip is not a drop");
++        });
++
++        tc.Run("the producer never waits and an overflow drops the oldest frames", [](TestCase &t)
++        {
++            auto ring = std::make_unique<AudioTapRing>();
++            const size_t total = 3 * AudioTapRing::kCapacity;
++            std::vector<int16_t> chunk(64 * 2);
++            const auto started = std::chrono::steady_clock::now();
++            for (size_t at = 0; at < total; at += 64)
++            {
++                for (size_t i = 0; i < 64; ++i)
++                {
++                    chunk[i * 2] = static_cast<int16_t>((at + i) & 0x7FFF);
++                    chunk[i * 2 + 1] = static_cast<int16_t>(((at + i) >> 15) & 0x7FFF);
++                }
++                ring->push(chunk.data(), 64, 1);
++            }
++            const double ms =
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
++            t.IsTrue(ms < 1000.0, "98304 frames with nobody reading took " + std::to_string(ms) + " ms");
++            std::vector<int16_t> out(4096 * 2);
++            uint64_t first = 0, expected = 0, readTotal = 0;
++            bool firstRead = true, inOrder = true;
++            size_t n = 0;
++            while ((n = ring->read(out.data(), 4096, first)) > 0)
++            {
++                if (firstRead)
++                    expected = first;
++                firstRead = false;
++                inOrder = inOrder && first == expected;
++                for (size_t i = 0; i < n; ++i)
++                    inOrder = inOrder && out[i * 2] == static_cast<int16_t>((first + i) & 0x7FFF) &&
++                              out[i * 2 + 1] == static_cast<int16_t>(((first + i) >> 15) & 0x7FFF);
++                expected = first + n;
++                readTotal += n;
++            }
++            t.Equals(readTotal, static_cast<uint64_t>(AudioTapRing::kCapacity), "the newest ring-full is there");
++            t.IsTrue(!firstRead, "something read");
++            t.IsTrue(inOrder, "in order, each frame the one with its number");
++            t.Equals(expected, static_cast<uint64_t>(total), "up to the last frame");
++            t.Equals(ring->dropped(), static_cast<uint64_t>(total - AudioTapRing::kCapacity), "the oldest dropped");
++        });
++
++        tc.Run("a reader racing the producer never takes an overwritten frame", [](TestCase &t)
++        {
++            auto ring = std::make_unique<AudioTapRing>();
++            constexpr uint64_t kTotal = 3000000;
++            std::atomic<bool> done{false};
++            std::thread producer([&]
++            {
++                std::vector<int16_t> chunk(64 * 2);
++                for (uint64_t at = 0; at < kTotal; at += 64)
++                {
++                    for (uint64_t i = 0; i < 64; ++i)
++                    {
++                        chunk[i * 2] = static_cast<int16_t>((at + i) & 0x7FFF);
++                        chunk[i * 2 + 1] = static_cast<int16_t>(((at + i) >> 15) & 0x7FFF);
++                    }
++                    ring->push(chunk.data(), 64, 1);
++                }
++                done = true;
++            });
++            std::vector<int16_t> out(700 * 2);
++            uint64_t readTotal = 0, wrong = 0, last = 0, rounds = 0;
++            bool any = false, backwards = false;
++            for (;;)
++            {
++                const bool finished = done.load();
++                uint64_t first = 0;
++                const size_t n = ring->read(out.data(), 700, first);
++                if (n == 0 && finished)
++                    break;
++                if (n > 0)
++                {
++                    backwards = backwards || (any && first < last);
++                    for (size_t i = 0; i < n; ++i)
++                        if (out[i * 2] != static_cast<int16_t>((first + i) & 0x7FFF) ||
++                            out[i * 2 + 1] != static_cast<int16_t>(((first + i) >> 15) & 0x7FFF))
++                            ++wrong;
++                    last = first + n;
++                    any = true;
++                    readTotal += n;
++                }
++                if (++rounds % 50 == 0)
++                    std::this_thread::sleep_for(std::chrono::microseconds(300)); // let the producer lap now and then
++            }
++            producer.join();
++            t.Equals(wrong, static_cast<uint64_t>(0), "no frame read is another's");
++            t.IsFalse(backwards, "never backwards");
++            t.Equals(readTotal + ring->dropped(), kTotal, "every frame read or counted as dropped");
++            t.Equals(last, kTotal, "the last frame read");
++        }); });
++
++    MiniTest::Case("NetplayAudioJitter", [](TestCase &tc)
++                   {
++        tc.Run("the jitter buffer waits for its target, then fades in and plays the stream as it came", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 1000);
++            buffer->push(a.data(), 1000, 0, false);
++            played.pull(*buffer, 512);
++            t.IsTrue(played.silent(0, 512), "silence below the target (40 ms)");
++            t.IsFalse(buffer->stats().playing, "not playing yet");
++            t.Equals(buffer->stats().targetFrames, 1920u, "target 40 ms");
++            const auto b = sineFrames(1000, 920); // exactly the target: the speed does not move
++            buffer->push(b.data(), 920, 0, false);
++            played.pull(*buffer, 1024);
++            t.IsTrue(buffer->stats().playing, "playing at the target");
++            t.IsTrue(std::abs(played.left[512]) <= 40, "starts from silence: " + std::to_string(played.left[512]));
++            t.IsTrue(played.peak(512, 752) < 8000, "fading in over 5 ms");
++            t.IsTrue(played.peak(752 + 200, 1536) > 7800, "then at full level");
++            bool same = true;
++            for (size_t i = 752; i < 1536; ++i)
++                same = same && std::abs(played.left[i] - sineAt(i - 512)) <= 3;
++            t.IsTrue(same, "the samples as they came (the speed barely moves near the target)");
++            t.IsTrue(played.maxDelta <= kSineDelta, "no click: largest step " + std::to_string(played.maxDelta));
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(0), "no underrun");
++        });
++
++        tc.Run("an underrun fades out, plays silence, buffers again and raises the target", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 2400);
++            buffer->push(a.data(), 2400, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024); // ~350 left: runs dry in the middle
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(1), "one underrun");
++            t.Equals(buffer->stats().targetFrames, 1920u + 480u, "the target rose 10 ms");
++            t.IsFalse(buffer->stats().playing, "buffering again");
++            t.IsTrue(played.silent(2048 + 400 + 240, 3072), "silence after the fade");
++            t.IsTrue(played.maxDelta <= kSineDelta, "the fade-out is no click: " + std::to_string(played.maxDelta) +
++                                                        " at " + std::to_string(played.maxDeltaAt));
++            const auto b = sineFrames(2400, 2000);
++            buffer->push(b.data(), 2000, 0, false);
++            played.pull(*buffer, 1024);
++            t.IsTrue(played.silent(3072, 4096), "2000 frames are below the new target (2400)");
++            const auto c = sineFrames(4400, 1000);
++            buffer->push(c.data(), 1000, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024);
++            t.IsTrue(buffer->stats().playing, "playing again");
++            t.IsTrue(played.peak(4096 + 300, 6144) > 7800, "at full level");
++            t.IsTrue(played.maxDelta <= kSineDelta, "the fade-in is no click: " + std::to_string(played.maxDelta));
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(1), "still one");
++        });
++
++        tc.Run("an underrun at the end of a request finishes its fade-out before playing again", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 1920); // exactly the target: the speed stays 1
++            buffer->push(a.data(), 1920, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024); // ~894 frames, then dry: only ~130 frames of the fade-out fit
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(1), "one underrun");
++            const auto b = sineFrames(1920, 3000); // more than the new target before the next request
++            buffer->push(b.data(), 3000, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024);
++            t.IsTrue(buffer->stats().playing, "playing again");
++            t.IsTrue(played.maxDelta <= kSineDelta, "the rest of the fade-out, then the fade-in: largest step " +
++                                                        std::to_string(played.maxDelta) + " at " +
++                                                        std::to_string(played.maxDeltaAt));
++        });
++
++        tc.Run("after an underrun a burst is skipped under the fade-in: playing starts at the target", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 2400);
++            buffer->push(a.data(), 2400, 0, false);
++            for (int i = 0; i < 3; ++i)
++                played.pull(*buffer, 1024); // runs dry: target 2400
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(1), "one underrun");
++            const auto burst = sineFrames(2400, 5000); // the host caught up after its stall
++            buffer->push(burst.data(), 5000, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024);
++            const AudioJitterBuffer::Stats s = buffer->stats();
++            t.IsTrue(s.fillFrames < 2400u - 900u, "1024 frames after starting at the target (2400): " +
++                                                       std::to_string(s.fillFrames) + " left");
++            t.Equals(s.skips, static_cast<uint64_t>(0), "no skip with a second fade");
++            t.IsTrue(played.maxDelta <= kSineDelta, "no click: " + std::to_string(played.maxDelta));
++        });
++
++        tc.Run("a host clock 0.1 % faster or slower: no underrun, no skip, no click, near the target", [](TestCase &t)
++        {
++            for (double rate : {1.001, 0.999})
++            {
++                auto run = std::make_unique<DriftRun>();
++                run->run(rate, 120.0, 60.0);
++                const AudioJitterBuffer::Stats s = run->buffer.stats();
++                const std::string which = rate > 1.0 ? "faster host: " : "slower host: ";
++                t.Equals(s.underruns, static_cast<uint64_t>(0), which + "no underrun");
++                t.Equals(s.skips, static_cast<uint64_t>(0), which + "no skip");
++                t.IsTrue(run->played.maxDelta <= kSineDelta,
++                         which + "no click, largest step " + std::to_string(run->played.maxDelta));
++                t.IsTrue(std::abs(run->meanFill() - 1920.0) < 500.0,
++                         which + "mean fill " + std::to_string(run->meanFill()) + " near 1920");
++                t.IsTrue(rate > 1.0 ? s.ratioPpm > 500.0 : s.ratioPpm < -500.0,
++                         which + "speed " + std::to_string(s.ratioPpm) + " ppm follows the host");
++            }
++        });
++
++        tc.Run("too much buffered at once is skipped with a fade, back to the target", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 2000);
++            buffer->push(a.data(), 2000, 0, false);
++            played.pull(*buffer, 1024);
++            const auto burst = sineFrames(2000, 12000);
++            buffer->push(burst.data(), 12000, 0, false); // a network stall arriving all at once (250 ms)
++            uint64_t pushed = 14000;
++            for (int i = 0; i < 4; ++i)
++            {
++                played.pull(*buffer, 1024);
++                const auto more = sineFrames(pushed, 1024); // and the stream goes on
++                buffer->push(more.data(), 1024, 0, false);
++                pushed += 1024;
++            }
++            const AudioJitterBuffer::Stats s = buffer->stats();
++            t.Equals(s.skips, static_cast<uint64_t>(1), "one skip");
++            t.IsTrue(s.fillFrames <= 1920u + 1024u, "back near the target: " + std::to_string(s.fillFrames));
++            t.IsTrue(played.maxDelta <= kSineDelta, "faded, no click: " + std::to_string(played.maxDelta));
++            t.Equals(s.underruns, static_cast<uint64_t>(0), "no underrun");
++        });
++
++        tc.Run("volume and silence change with a ramp, no click", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            uint64_t pushed = 0;
++            auto feed = [&](size_t frames)
++            {
++                const auto s = sineFrames(pushed, frames);
++                buffer->push(s.data(), frames, 0, false);
++                pushed += frames;
++            };
++            feed(2400);
++            played.pull(*buffer, 1024);
++            feed(1024);
++            buffer->setMuted(true);
++            t.IsTrue(buffer->muted(), "muted");
++            played.pull(*buffer, 1024);
++            t.IsTrue(played.silent(1024 + 480, 2048), "silent 10 ms after the key");
++            t.IsTrue(played.peak(1024, 1024 + 100) > 1000, "not cut at once");
++            feed(1024);
++            buffer->setMuted(false);
++            buffer->setVolume(0.5f);
++            t.IsTrue(std::abs(buffer->volume() - 0.5f) < 1e-6f, "volume 0.5");
++            played.pull(*buffer, 1024);
++            feed(1024);
++            played.pull(*buffer, 1024);
++            const int half = played.peak(3072, 4096);
++            t.IsTrue(half > 3800 && half < 4200, "half the level: peak " + std::to_string(half));
++            t.IsTrue(played.maxDelta <= kSineDelta, "no click: " + std::to_string(played.maxDelta));
++            buffer->setVolume(7.0f);
++            t.IsTrue(buffer->volume() <= 1.0f, "volume kept within 0..1");
++        });
++
++        tc.Run("a gap in the stream fades out before it and in after it", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            const auto a = sineFrames(0, 1000);
++            buffer->push(a.data(), 1000, 0, false);
++            const auto b = sineFrames(1000, 1000, kPi); // the sine jumps by half a period: up to 16000 apart
++            buffer->push(b.data(), 1000, 0, true);
++            played.pull(*buffer, 1024);
++            const auto c = sineFrames(2000, 1500, kPi);
++            buffer->push(c.data(), 1500, 0, false);
++            played.pull(*buffer, 1024);
++            played.pull(*buffer, 1024);
++            t.IsTrue(played.maxDelta <= kSineDelta, "no click at the gap: " + std::to_string(played.maxDelta) +
++                                                        " at " + std::to_string(played.maxDeltaAt));
++            t.IsTrue(played.peak(960, 1040) < 2000, "quiet around the gap");
++            t.IsTrue(played.peak(1400, 2000) > 7800, "full level after it");
++            t.Equals(buffer->stats().underruns, static_cast<uint64_t>(0), "no underrun");
++        });
++
++        tc.Run("what plays carries its host time, for the sync with the picture; a reset buffers again", [](TestCase &t)
++        {
++            auto buffer = std::make_unique<AudioJitterBuffer>();
++            Played played;
++            for (uint32_t i = 0; i < 4; ++i) // exactly the target
++            {
++                const auto s = sineFrames(i * 480u, 480);
++                buffer->push(s.data(), 480, 1000u + i * 10u, false);
++            }
++            t.IsFalse(buffer->stats().hasCapture, "no time before playing");
++            played.pull(*buffer, 1024, 7000);
++            AudioJitterBuffer::Stats s = buffer->stats();
++            t.IsTrue(s.hasCapture, "a time while playing");
++            t.Equals(s.playingCaptureMs, 1000u, "the first frame handed: made at 1000");
++            t.Equals(s.pullMs, 7000u, "handed at 7000");
++            t.Equals(s.pullFrames, 1024u, "1024 frames");
++            played.pull(*buffer, 1024, 7021);
++            s = buffer->stats();
++            t.IsTrue(s.playingCaptureMs >= 1020u && s.playingCaptureMs <= 1022u,
++                     "1024 frames later: ~21 ms later (" + std::to_string(s.playingCaptureMs) + ")");
++            buffer->requestReset();
++            played.pull(*buffer, 1024, 7042);
++            t.IsFalse(buffer->stats().playing, "buffering after a reset");
++            t.Equals(buffer->stats().fillFrames, 0u, "nothing left");
++        }); });
++
++    MiniTest::Case("NetplayAudioCodec", [](TestCase &tc)
++                   {
++        tc.Run("the encoders tried for each preference", [](TestCase &t)
++        {
++            t.Equals(audioEncoderCandidates("auto"), std::vector<std::string>{"opus", "pcm"}, "auto");
++            t.Equals(audioEncoderCandidates("pcm"), std::vector<std::string>{"pcm"}, "pcm");
++            t.Equals(audioEncoderCandidates("opus"), std::vector<std::string>{"opus"}, "opus");
++            t.IsTrue(audioEncoderCandidates("aac").empty(), "aac: none");
++        });
++
++        tc.Run("PCM: a packet is the frame's samples, bit for bit", [](TestCase &t)
++        {
++            AudioEncoder encoder;
++            std::string error;
++            t.IsTrue(encoder.open("pcm", 128, 480, error), "opens: " + error);
++            t.Equals(encoder.codec(), AudioCodec::Pcm16, "PCM");
++            t.Equals(encoder.kbps(), 1536u, "1536 kbit/s whatever was asked");
++            t.Equals(encoder.encoderName(), std::string("pcm"), "name");
++            const auto in = sineFrames(77, 480);
++            std::vector<std::vector<uint8_t>> packets;
++            t.IsTrue(encoder.encode(in.data(), packets, error), "encodes");
++            t.Equals(packets.size(), static_cast<size_t>(1), "one packet");
++            t.Equals(packets.at(0).size(), static_cast<size_t>(1920), "480 frames x 4 bytes");
++            t.IsTrue(packets.at(0)[0] == static_cast<uint8_t>(in[0] & 0xFF) &&
++                         packets.at(0)[1] == static_cast<uint8_t>((in[0] >> 8) & 0xFF),
++                     "little endian");
++            AudioDecoder decoder;
++            t.IsTrue(decoder.open(audioConfig(AudioCodec::Pcm16), error), "decoder opens: " + error);
++            std::vector<int16_t> out;
++            t.IsTrue(decoder.decode(packets[0].data(), packets[0].size(), out, error), "decodes");
++            t.Equals(out, in, "the same samples");
++            t.IsFalse(decoder.decode(packets[0].data(), 1916, out, error), "a short packet is refused");
++            AudioConfig mono = audioConfig(AudioCodec::Pcm16);
++            mono.channels = 1;
++            AudioDecoder other;
++            t.IsFalse(other.open(mono, error), "a config the wire refuses does not open");
++            t.IsFalse(other.decode(packets[0].data(), packets[0].size(), out, error), "a closed decoder decodes nothing");
++        });
++
++        tc.Run("Opus (FFmpeg): a sine comes back continuous, same pitch and level, ~128 kbit/s", [](TestCase &t)
++        {
++            AudioEncoder encoder;
++            std::string error;
++            if (!encoder.open("opus", 128, 480, error))
++            {
++                t.Fail("the FFmpeg of the tests has an Opus encoder: " + error);
++                return;
++            }
++            t.Equals(encoder.codec(), AudioCodec::Opus, "Opus");
++            t.Equals(encoder.frameSamples(), static_cast<uint16_t>(480), "10 ms frames");
++            AudioConfig config = audioConfig(AudioCodec::Opus);
++            AudioDecoder decoder;
++            t.IsTrue(decoder.open(config, error), "decoder opens: " + error);
++            Played played;
++            size_t packets = 0, bytes = 0, largest = 0;
++            bool decoded = true;
++            for (uint64_t frame = 0; frame < 200; ++frame)
++            {
++                const auto in = sineFrames(frame * 480u, 480);
++                std::vector<std::vector<uint8_t>> out;
++                t.IsTrue(encoder.encode(in.data(), out, error), "encodes: " + error);
++                for (const std::vector<uint8_t> &p : out)
++                {
++                    ++packets;
++                    bytes += p.size();
++                    largest = std::max(largest, p.size());
++                    std::vector<int16_t> pcm;
++                    decoded = decoder.decode(p.data(), p.size(), pcm, error) && decoded;
++                    played.add(pcm.data(), pcm.size() / 2u);
++                }
++            }
++            t.IsTrue(decoded, "every packet decodes: " + error);
++            t.IsTrue(packets >= 195, "one packet per frame (" + std::to_string(packets) + ")");
++            t.IsTrue(largest <= kMaxOpusPacketData, "each fits one Opus frame (" + std::to_string(largest) + ")");
++            const double kbps = static_cast<double>(bytes) * 8.0 / (static_cast<double>(packets) * 10.0);
++            t.IsTrue(kbps > 80.0 && kbps < 180.0, "about 128 kbit/s: " + std::to_string(kbps));
++            const size_t from = 4800, to = played.left.size();
++            t.IsTrue(to > 90000, "the frames came back (" + std::to_string(to) + ")");
++            const double freq = played.frequency(from, to);
++            t.IsTrue(std::abs(freq - 441.0) < 2.0, "same pitch: " + std::to_string(freq) + " Hz");
++            const double level = played.rms(from, to) / (kAmplitude / std::sqrt(2.0));
++            t.IsTrue(level > 0.85 && level < 1.15, "same level: " + std::to_string(level));
++            double step = 0.0;
++            for (size_t i = from + 1; i < to; ++i)
++                step = std::max(step, std::abs(static_cast<double>(played.left[i]) - played.left[i - 1]));
++            t.IsTrue(step <= kSineDelta * 1.3, "continuous (largest step " + std::to_string(step) + ")");
++            std::vector<int16_t> pcm;
++            t.IsFalse(decoder.decode(nullptr, 0, pcm, error), "an empty packet is refused");
++            std::vector<uint8_t> huge(kMaxAudioPacketData + 1, 0);
++            t.IsFalse(decoder.decode(huge.data(), huge.size(), pcm, error), "an oversized packet is refused");
++        });
++
++        tc.Run("loopback in this process: a sine from the tap to the device, Opus and PCM", [](TestCase &t)
++        {
++            for (const char *codec : {"pcm", "opus"})
++            {
++                auto loop = std::make_unique<Loopback>();
++                const std::string name = std::string(codec) + ": ";
++                if (!loop->start(codec))
++                {
++                    t.Fail(name + "starts: " + loop->why);
++                    continue;
++                }
++                loop->run(3.0);
++                const AudioJitterBuffer::Stats s = loop->jitter.stats();
++                t.Equals(loop->frameErrors, static_cast<uint64_t>(0), name + "every frame accepted " + loop->why);
++                t.Equals(loop->decodeErrors, static_cast<uint64_t>(0), name + "every packet decoded");
++                t.IsTrue(loop->packets >= 290, name + "packets " + std::to_string(loop->packets));
++                t.IsTrue(s.playing, name + "playing");
++                t.Equals(s.underruns, static_cast<uint64_t>(0), name + "no underrun");
++                const Played &p = loop->played;
++                size_t start = 0;
++                while (start < p.left.size() && p.left[start] == 0)
++                    ++start;
++                t.IsTrue(start < 48000 / 10, name + "sound within 100 ms (" + std::to_string(start) + " frames)");
++                t.IsTrue(p.maxDelta <= kSineDelta * (std::string(codec) == "pcm" ? 1.0 : 1.3),
++                         name + "continuous (largest step " + std::to_string(p.maxDelta) + ")");
++                const double freq = p.frequency(start + 4800, p.left.size());
++                t.IsTrue(std::abs(freq - 441.0) < 2.0, name + "pitch " + std::to_string(freq));
++                const double level = p.rms(start + 4800, p.left.size()) / (kAmplitude / std::sqrt(2.0));
++                t.IsTrue(level > 0.85 && level < 1.15, name + "level " + std::to_string(level));
++                // Synthesized at t, handed to the device at about t + 10 ms (frame) + 5 ms (sender) + 40 ms (buffer).
++                const int32_t delay = static_cast<int32_t>(s.pullMs - s.playingCaptureMs);
++                t.IsTrue(s.hasCapture && delay >= 30 && delay <= 110,
++                         name + "capture -> device " + std::to_string(delay) + " ms");
++            }
++        }); });
++
++    MiniTest::Case("NetplayAudioLoopback", [](TestCase &tc)
++                   {
++        tc.Run("the host's sound reaches the guest over 127.0.0.1 (PCM, then Opus)", [](TestCase &t)
++        {
++            for (const char *codec : {"pcm", "auto"})
++            {
++                const std::string name = std::string(codec) + ": ";
++                Host host;
++                HostSettings settings{"127.0.0.1", 0, "clave-de-prueba"};
++                settings.video.codec = "no";
++                settings.audio.codec = codec;
++                std::string error;
++                t.IsTrue(host.start(settings, error), name + "host listens: " + error);
++                Guest guest;
++                guest.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++                t.IsTrue(waitFor([&] { return guest.status().state == GuestState::Connected; }), name + "connected");
++                // Without a guest's sound nothing is wanted; now the host takes the synthesis' frames.
++                std::atomic<bool> stop{false};
++                std::thread synthesis([&]
++                {
++                    uint64_t frame = 0;
++                    auto next = std::chrono::steady_clock::now();
++                    while (!stop.load())
++                    {
++                        const auto s = sineFrames(frame, 240);
++                        offerHostAudio(s.data(), 240);
++                        frame += 240;
++                        next += std::chrono::microseconds(5000);
++                        std::this_thread::sleep_until(next);
++                    }
++                });
++                Played played;
++                std::vector<int16_t> out(1024 * 2);
++                auto next = std::chrono::steady_clock::now();
++                for (int i = 0; i < 100; ++i) // ~2.1 s of device pulls
++                {
++                    guest.pullAudio(out.data(), 1024);
++                    played.add(out.data(), 1024);
++                    next += std::chrono::microseconds(21333);
++                    std::this_thread::sleep_until(next);
++                }
++                stop = true;
++                synthesis.join();
++                const GuestStatus status = guest.status();
++                t.Equals(status.audioCodec, std::string(std::string(codec) == "pcm" ? "pcm" : "opus"),
++                         name + "codec on the guest");
++                t.IsTrue(status.audioPackets > 100, name + "packets " + std::to_string(status.audioPackets));
++                t.IsTrue(status.audioKbps > 50.0f, name + "kbit/s " + std::to_string(status.audioKbps));
++                const HostAudioStats hs = host.audioStats();
++                t.IsTrue(hs.packets > 100 && hs.bytes > 0, name + "counted on the host");
++                t.IsTrue(played.peak(48000, played.left.size()) > 7000, name + "the sine plays on the guest");
++                std::string around;
++                for (size_t i = played.maxDeltaAt >= 6 ? played.maxDeltaAt - 6 : 0;
++                     i < std::min(played.left.size(), played.maxDeltaAt + 6); ++i)
++                    around += std::to_string(played.left[i]) + " ";
++                t.IsTrue(played.maxDelta <= kSineDelta * 1.3,
++                         name + "continuous (largest step " + std::to_string(played.maxDelta) + " at frame " +
++                             std::to_string(played.maxDeltaAt) + ": " + around + "; underruns " +
++                             std::to_string(status.audioUnderruns) + ", lost " + std::to_string(status.audioLost) + ")");
++                t.IsTrue(status.audioDelayMs > 0 && status.audioDelayMs < 200,
++                         name + "capture -> device " + std::to_string(status.audioDelayMs) + " ms");
++                guest.setAudioMuted(true);
++                t.IsTrue(guest.audioMuted(), name + "mute");
++                guest.stop();
++                t.IsTrue(waitFor([&] { return !host.guestConnected(); }), name + "guest gone");
++                host.stop();
++            }
++            std::vector<int16_t> nothing = sineFrames(0, 64);
++            offerHostAudio(nothing.data(), 64); // without a guest: nothing happens
++            t.IsTrue(true, "a tap without a guest is harmless");
++        }); });
++}
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 3225a3b..7d612df 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -325,10 +325,10 @@ void register_ps2_netplay_tests()
+             t.IsTrue(payloadRange(0x10, lo, hi) && lo == 22u && hi == 22u, "PAD: exact");
+             t.IsFalse(payloadRange(0x24, lo, hi) || payloadRange(0x7E, lo, hi), "reserved and unknown: none");
+             t.IsFalse(isReservedType(0x20) || isReservedType(0x23), "0x20-0x23 are video now");
+-            t.IsTrue(isReservedType(0x24) && isReservedType(0x2F) && isReservedType(0x30) && isReservedType(0x3F),
+-                     "0x24-0x3F reserved");
++            t.IsTrue(isReservedType(0x24) && isReservedType(0x2F) && isReservedType(0x32) && isReservedType(0x3F),
++                     "0x24-0x2F and 0x32-0x3F reserved (N3: 0x30-0x31 are audio)");
+             t.IsFalse(isReservedType(0x40) || isReservedType(0x1F), "outside the reserved range");
+-            t.Equals(kProtocolVersion, static_cast<uint16_t>(2), "version 2");
++            t.Equals(kProtocolVersion, static_cast<uint16_t>(3), "version 3 (N3)");
+         });
+ 
+         tc.Run("a frame is header + payload and reads back whole", [](TestCase &t)
+@@ -359,7 +359,12 @@ void register_ps2_netplay_tests()
+                 {header(0x7E, 0, 1), FrameError::UnknownType, "unknown type"},
+                 {header(0x00, 0, 0), FrameError::UnknownType, "type 0"},
+                 {header(0x24, 0, 1000), FrameError::ReservedType, "a later video type"},
+-                {header(0x30, 0, 8), FrameError::ReservedType, "audio (N3) in N2"},
++                {header(0x32, 0, 8), FrameError::ReservedType, "a later audio type"},
++                {header(0x30, 0, 8), FrameError::BadLength, "AUDIO_CONFIG (N3) of 8 bytes"},
++                {header(0x31, 0, static_cast<uint16_t>(kAudioPacketHeaderSize)), FrameError::BadLength,
++                 "AUDIO_PACKET without sound bytes"},
++                {header(0x31, 0, static_cast<uint16_t>(kAudioPacketHeaderSize + kMaxAudioPacketData + 1)),
++                 FrameError::BadLength, "AUDIO_PACKET one byte over"},
+                 {header(0x20, 0, 15), FrameError::BadLength, "VIDEO_CONFIG one byte short"},
+                 {header(0x21, 0, static_cast<uint16_t>(kVideoChunkHeaderSize)), FrameError::BadLength,
+                  "VIDEO_CHUNK without picture bytes"},
+@@ -601,7 +606,7 @@ void register_ps2_netplay_tests()
+         {
+             Pipe p;
+             GuestHandshake guest("clave", p.guestAuth, counting(100));
+-            uint8_t challenge[36] = {2, 0, 0, 0};
++            uint8_t challenge[36] = {static_cast<uint8_t>(kProtocolVersion), 0, 0, 0};
+             Frame f;
+             deliver(p.toGuest, encodeFrame(MessageType::Challenge, challenge, 36, nullptr), f);
+             std::vector<std::vector<uint8_t>> out;

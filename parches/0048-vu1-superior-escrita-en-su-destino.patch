@@ -1,0 +1,251 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index ddc0aea..b3dcfb7 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -17,7 +17,8 @@
+ // instead of a function per operation, 17 the VU1 block BAL, JR, JALR, FCSET, MFP, XTOP, XITOP and XGKICK through
+ // execLower (before patch 0045), 18 the VU1 block schedules run through a call of their own (runSchedule) instead of
+ // inside runBlocks, 19 the GS band dependencies by the unions of the pending blocks instead of the last job of each
+-// block (before patch 0046), 20 the GS queue published with a full barrier on every command (before patch 0047). A
++// block (before patch 0046), 20 the GS queue published with a full barrier on every command (before patch 0047), 21 the VU1 block
++// upper results through a temporary and a dispatch on their destination instead of upperEarly (before patch 0048). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index e9897a7..671dee6 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -408,10 +408,15 @@ namespace
+     // source fixed at compile time, SimpleOp with its kind fixed. Null for NOP and CLIP.
+     struct BlockPair;
+     using UpperFn = void (*)(const BlockPair &, const VU1State &, FmacResult &);
++    // The same, also queueing its flag entry and writing its result where upperDst says (patch 0047): no temporary,
++    // no dispatch on upperDst afterwards. Only where writing before the lower instruction runs changes nothing
++    // (BlockPair::upperEarly, see earlyUpperSafe).
++    using UpperEarlyFn = void (*)(const BlockPair &, VU1State &, BlockState &);
+ 
+     struct BlockPair
+     {
+         UpperFn upperFn = nullptr;
++        UpperEarlyFn upperEarly = nullptr;
+         uint32_t pc = 0u;
+         uint32_t lower = 0u;
+         uint32_t upper = 0u;
+@@ -457,42 +462,83 @@ namespace
+     {
+         runFmacOp(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
+     }
+-    template <uint8_t Kind>
+-    constexpr UpperFn kUpperFmacBySource[4] = {&upperFmac<Kind, FmacSourceVt>, &upperFmac<Kind, FmacSourceBc>,
+-                                               &upperFmac<Kind, FmacSourceQ>, &upperFmac<Kind, FmacSourceI>};
++    // Fn expanded here, with its flag entry (as runSchedule queues it: cycle issue + 4, side 0) and the write to
++    // DstVf, DstVfPending or DstAcc. st.cycle is the block entry until the schedule ends.
++    template <UpperFn Fn, uint8_t Dst>
++    void upperEarly(const BlockPair &p, VU1State &vu, BlockState &st)
++    {
++        FmacResult up;
++        Fn(p, vu, up);
++        if (p.upperFlags != 0u)
++            setFlagSlot(st.flags[(st.cycle + p.issue + 4u) & 7u][0], up.mac, up.status, up.sticky, 0u, p.upperFlags);
++        float *const target = Dst == DstVf ? vu.vf[p.upperReg] : Dst == DstVfPending ? st.pendingVf[p.upperReg] : vu.acc;
++        blendLanes(target, up.value, p.upperLanes);
++    }
++
++    // What upperFunction returns for each operation: the plain UpperFn, or its upperEarly for one destination.
++    struct PickPlain
++    {
++        using Result = UpperFn;
++        template <UpperFn Fn>
++        static constexpr Result get() { return Fn; }
++    };
++    template <uint8_t Dst>
++    struct PickEarly
++    {
++        using Result = UpperEarlyFn;
++        template <UpperFn Fn>
++        static constexpr Result get() { return &upperEarly<Fn, Dst>; }
++    };
++
++    template <typename Pick, uint8_t Kind>
++    typename Pick::Result upperFmacBySource(uint32_t source)
++    {
++        switch (source)
++        {
++        case FmacSourceVt: return Pick::template get<&upperFmac<Kind, FmacSourceVt>>();
++        case FmacSourceBc: return Pick::template get<&upperFmac<Kind, FmacSourceBc>>();
++        case FmacSourceQ: return Pick::template get<&upperFmac<Kind, FmacSourceQ>>();
++        default: return Pick::template get<&upperFmac<Kind, FmacSourceI>>();
++        }
++    }
+ 
+     // Dispatching on every pair of the block (the upper path, then the FMAC source and kind, or the SimpleOp kind)
+     // was a large part of the block loop: the pair keeps the function for its operation.
+-    inline UpperFn upperFunction(const PairPlan &plan)
++    template <typename Pick = PickPlain>
++    typename Pick::Result upperFunction(const PairPlan &plan)
+     {
+         if (plan.upperPath == UpperFmac)
+         {
+             const uint32_t source = plan.fmac.source & 3u;
+             switch (plan.fmac.kind)
+             {
+-            case FmacAdd: return kUpperFmacBySource<FmacAdd>[source];
+-            case FmacSub: return kUpperFmacBySource<FmacSub>[source];
+-            case FmacMul: return kUpperFmacBySource<FmacMul>[source];
+-            case FmacMadd: return kUpperFmacBySource<FmacMadd>[source];
+-            case FmacMsub: return kUpperFmacBySource<FmacMsub>[source];
+-            case FmacOpmsub: return source == FmacSourceVt ? &upperFmac<FmacOpmsub, FmacSourceVt> : &upperFmacAny;
+-            case FmacOpmula: return source == FmacSourceVt ? &upperFmac<FmacOpmula, FmacSourceVt> : &upperFmacAny;
+-            default: return &upperFmacAny;
++            case FmacAdd: return upperFmacBySource<Pick, FmacAdd>(source);
++            case FmacSub: return upperFmacBySource<Pick, FmacSub>(source);
++            case FmacMul: return upperFmacBySource<Pick, FmacMul>(source);
++            case FmacMadd: return upperFmacBySource<Pick, FmacMadd>(source);
++            case FmacMsub: return upperFmacBySource<Pick, FmacMsub>(source);
++            case FmacOpmsub:
++                return source == FmacSourceVt ? Pick::template get<&upperFmac<FmacOpmsub, FmacSourceVt>>()
++                                              : Pick::template get<&upperFmacAny>();
++            case FmacOpmula:
++                return source == FmacSourceVt ? Pick::template get<&upperFmac<FmacOpmula, FmacSourceVt>>()
++                                              : Pick::template get<&upperFmacAny>();
++            default: return Pick::template get<&upperFmacAny>();
+             }
+         }
+         else if (plan.upperPath == UpperSimple)
+         {
+             switch (plan.simple.kind)
+             {
+-            case SimpleMaxBc: return &upperSimple<SimpleMaxBc>;
+-            case SimpleMiniBc: return &upperSimple<SimpleMiniBc>;
+-            case SimpleMaxI: return &upperSimple<SimpleMaxI>;
+-            case SimpleMiniI: return &upperSimple<SimpleMiniI>;
+-            case SimpleMax: return &upperSimple<SimpleMax>;
+-            case SimpleMini: return &upperSimple<SimpleMini>;
+-            case SimpleItof: return &upperSimple<SimpleItof>;
+-            case SimpleFtoi: return &upperSimple<SimpleFtoi>;
+-            default: return &upperSimple<SimpleAbs>; // runSimpleOp's default
++            case SimpleMaxBc: return Pick::template get<&upperSimple<SimpleMaxBc>>();
++            case SimpleMiniBc: return Pick::template get<&upperSimple<SimpleMiniBc>>();
++            case SimpleMaxI: return Pick::template get<&upperSimple<SimpleMaxI>>();
++            case SimpleMiniI: return Pick::template get<&upperSimple<SimpleMiniI>>();
++            case SimpleMax: return Pick::template get<&upperSimple<SimpleMax>>();
++            case SimpleMini: return Pick::template get<&upperSimple<SimpleMini>>();
++            case SimpleItof: return Pick::template get<&upperSimple<SimpleItof>>();
++            case SimpleFtoi: return Pick::template get<&upperSimple<SimpleFtoi>>();
++            default: return Pick::template get<&upperSimple<SimpleAbs>>(); // runSimpleOp's default
+             }
+         }
+         return nullptr;
+@@ -548,6 +594,41 @@ namespace
+         return true;
+     }
+ 
++    // Whether the upper result can be written before the lower instruction runs (upperEarly) with the same result.
++    // A lower instruction never reads ACC or pendingVf, and its write to the register the upper writes is dropped
++    // (DstDiscard; it restores the register only, so that case keeps the old order). Into a VF register only when the
++    // lower one is a FastLower operation (or none) that neither reads nor writes that register: the pair reads the
++    // registers as they were before it.
++    inline bool earlyUpperSafe(const BlockPair &bp)
++    {
++        if (bp.upperDst == DstAcc || bp.upperDst == DstVfPending)
++            return bp.upperLanes != 0u;
++        if (bp.upperDst != DstVf || bp.upperLanes == 0u)
++            return false;
++        if (bp.lowerExec == LowerNone || bp.lowerExec == LowerImmediate)
++            return true;
++        if (bp.lowerExec != LowerFast || bp.lowerDst == DstDiscard ||
++            (bp.lowerDst != DstNone && bp.lowerReg == bp.upperReg))
++            return false;
++        switch (bp.fastOp)
++        {
++        case FastSq:
++        case FastSqi:
++        case FastSqd:
++        case FastMove:
++        case FastMr32:
++        case FastMtir:
++            return bp.fastA != bp.upperReg;
++        case FastDiv:
++        case FastRsqrt:
++            return bp.fastA != bp.upperReg && bp.fastB != bp.upperReg;
++        case FastSqrt:
++            return bp.fastB != bp.upperReg;
++        default:
++            return true; // reads no VF register
++        }
++    }
++
+     struct BuildContext
+     {
+         const PairInfo *info = nullptr;
+@@ -961,6 +1042,15 @@ namespace
+                     viOwner[r] = viDue[r] <= exitT ? 1u : 2u;
+                 }
+             }
++            if (bp.upperFn != nullptr && earlyUpperSafe(bp))
++            {
++                if (bp.upperDst == DstVf)
++                    bp.upperEarly = upperFunction<PickEarly<DstVf>>(plan);
++                else if (bp.upperDst == DstVfPending)
++                    bp.upperEarly = upperFunction<PickEarly<DstVfPending>>(plan);
++                else
++                    bp.upperEarly = upperFunction<PickEarly<DstAcc>>(plan);
++            }
+             const bool nextIsCondBranch = k + 1u < stepCount && ctx.info[steps[k + 1u].pc >> 3].condBranch;
+             if (nextIsCondBranch || k + 1u == stepCount)
+             {
+@@ -1197,7 +1287,8 @@ namespace
+             else if (p.viMode == ViPending)
+                 st.pendingVi[p.viReg] = value;
+         };
+-        const auto store = [&](uint32_t address, const void *words)
++        // Forced inline: as its own function it was ~1.7 % of the EE thread (SQ, SQI, ISW...).
++        const auto store = [&](uint32_t address, const void *words) PS2_VU_LAMBDA_FORCEINLINE
+         {
+             host.catchUpXgkick(issue);
+             blendLanes(data + address, words, p.fastDest);
+@@ -1495,6 +1586,7 @@ namespace
+         VU1State &vu = host.state();
+         const uint64_t entry = st.cycle;
+         const bool oldDispatch = abMode == 5;
++        const bool earlyUpper = !oldDispatch && abMode != 21;
+         BlockRedirect redirect;
+         redirect.state = &st;
+         const auto commit = [&](const BlockCommit &c)
+@@ -1533,7 +1625,11 @@ namespace
+             // Upper instruction, on the registers as they were before the pair: FMAC (with its flag entry, unless it
+             // writes no lane) and SimpleOp through upperFn; CLIP here.
+             FmacResult up;
+-            if (oldDispatch && p.upperFn != nullptr)
++            // Written already (upperEarly: result, flag entry and destination in one call; A/B mode 21: never).
++            const bool upperDone = p.upperEarly != nullptr && earlyUpper;
++            if (upperDone)
++                p.upperEarly(p, vu, st);
++            else if (oldDispatch && p.upperFn != nullptr)
+             {
+                 // A/B mode 5: the dispatch before upperFn.
+                 if (p.upperPath == UpperFmac)
+@@ -1629,7 +1725,7 @@ namespace
+                 host.setBranchBackup(p.backupReg, oldVi);
+ 
+             // Upper result.
+-            switch (p.upperDst)
++            switch (upperDone ? static_cast<uint8_t>(DstNone) : p.upperDst)
+             {
+             case DstVf:
+                 blendLanes(vu.vf[p.upperReg], up.value, p.upperLanes);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 39a8015..7ddf0be 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -33,7 +33,9 @@
+ #if defined(_MSC_VER)
+ #define PS2_VU_FORCEINLINE __forceinline
+ #define PS2_VU_NOINLINE __declspec(noinline)
++#define PS2_VU_LAMBDA_FORCEINLINE [[msvc::forceinline]]
+ #else
++#define PS2_VU_LAMBDA_FORCEINLINE __attribute__((always_inline))
+ #define PS2_VU_FORCEINLINE inline __attribute__((always_inline))
+ #define PS2_VU_NOINLINE __attribute__((noinline))
+ #endif

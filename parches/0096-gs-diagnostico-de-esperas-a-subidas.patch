@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 00ed05b..55f9b0f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4871,6 +4871,10 @@ struct GSCpuBackend::BandState
+                      job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.pp.zpsm, job.minX, job.minY, job.maxX,
+                      job.maxY, job.sampler.tbp0, job.sampler.tbw, job.sampler.psm,
+                      readConflict ? "(la lee como textura)" : "(la escribe)");
++        if (job.isUpload || job.isCopy) // the job waited for is an upload or a copy
++            std::fprintf(stderr, "[gs:espera]   ... es %s (banda %u), %llu trabajos antes del ultimo preparado\n",
++                         job.isUpload ? "una subida" : "una copia", static_cast<unsigned>(job.uploadWorker),
++                         static_cast<unsigned long long>(prepared - tag));
+     }
+ 
+     // Waits for the pending jobs writing `pages` (and, for a write, reading them as textures).

@@ -1,0 +1,186 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 9cae78c..0c99e30 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -27,7 +27,8 @@
+ // timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056), 29 the VU1
+ // schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057), 30 the
+ // compiled schedules with the upper FMAC through calls instead of inline (before patch 0058), 31 the compiled schedules with LQ,
+-// SQ, the pc and the block end through calls (before patch 0059). A
++// SQ, the pc and the block end through calls (before patch 0059), 32 the compiled
++// schedules with every flag commit through a call (before patch 0060). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 75a6df1..0733b38 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1967,13 +1967,13 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32) && s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || abMode == 29 || abMode == 30 || abMode == 31)
++            else if (abMode == 0 || (abMode >= 29 && abMode <= 32))
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 8fd2421..9f5ba50 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -31,6 +31,13 @@
+         return value == nullptr || value[0] != '0';
+     }();
+ 
++    // PS2X_VU1_JIT_BANDERAS=0: every flag commit through jitCommitFlag (patch 0059's JIT).
++    const bool s_jitInlineFlags = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT_BANDERAS");
++        return value == nullptr || value[0] != '0';
++    }();
++
+     // PS2X_VU1_JIT_FMAC=0: the FMAC through upperEarly calls, as the first version of the JIT.
+     const bool s_jitInlineFmac = []()
+     {
+@@ -234,8 +241,57 @@
+     }();
+ 
+     // One commit as code: VF, VI, Q and P inline (the same values as jitCommits), flags through jitCommitFlag.
++    // rax = &st.flags[(st.cycle + due) & 7][0] - offsetof(BlockState, flags)
++    inline void jitEmitFlagRow(JitEmitter &e, uint32_t due)
++    {
++        using B = JitEmitter;
++        e.bytes({0x48, 0x8B}); // mov rax, [rsi + cycle]
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++        e.bytes({0x05}); // add eax, due
++        e.imm32(due);
++        e.bytes({0x83, 0xE0, 0x07});                                        // and eax, 7
++        e.bytes({0x6B, 0xC0, static_cast<uint8_t>(2u * sizeof(FlagSlot))}); // imul eax, eax, 40
++        e.bytes({0x48, 0x01, 0xF0});                                        // add rax, rsi
++    }
++
++    // A flag commit whose entry a pair of the same schedule queued, so its kind is known: applyFlagSlot without the
++    // tests. FMAC (MAC and status) and CLIP; false for the rest (the caller calls jitCommitFlag).
++    inline bool jitEmitFlagCommit(JitEmitter &e, const BlockCommit &c, uint8_t kind)
++    {
++        using B = JitEmitter;
++        if (kind != (kFlagMac | kFlagStatus) && kind != kFlagClip)
++            return false;
++        jitEmitFlagRow(e, c.due);
++        const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags) + c.reg * sizeof(FlagSlot));
++        const auto loadSlot = [&](uint8_t reg, size_t field) // mov reg32, [rax + slot + field]
++        {
++            e.bytes({0x8B, static_cast<uint8_t>(0x80u | (reg << 3))});
++            e.imm32(slot + static_cast<uint32_t>(field));
++        };
++        if (kind == kFlagClip)
++        {
++            loadSlot(1, offsetof(FlagSlot, clip));
++            e.store32(B::Vu, offsetof(VU1State, clip), 1);
++            return true;
++        }
++        // status = (status & 0xFF0) | current | ((current | sticky) << 6), current = entry status & 0xF; then MAC.
++        loadSlot(1, offsetof(FlagSlot, status));
++        e.andEcx(0xFu);
++        loadSlot(2, offsetof(FlagSlot, sticky));
++        e.bytes({0x09, 0xCA});       // or edx, ecx
++        e.bytes({0xC1, 0xE2, 0x06}); // shl edx, 6
++        e.bytes({0x09, 0xCA});       // or edx, ecx
++        e.load32(1, B::Vu, offsetof(VU1State, status));
++        e.andEcx(0xFF0u);
++        e.bytes({0x09, 0xD1});       // or ecx, edx
++        e.store32(B::Vu, offsetof(VU1State, status), 1);
++        loadSlot(1, offsetof(FlagSlot, mac));
++        e.store32(B::Vu, offsetof(VU1State, mac), 1);
++        return true;
++    }
++
+     template <typename Host>
+-    void jitEmitCommit(JitEmitter &e, const BlockCommit &c)
++    void jitEmitCommit(JitEmitter &e, const BlockCommit &c, uint8_t knownFlagKind = 0u)
+     {
+         using B = JitEmitter;
+         switch (c.kind)
+@@ -262,7 +318,8 @@
+             break;
+         }
+         case CommitFlag:
+-            e.call(reinterpret_cast<const void *>(&jitCommitFlag<Host>), &c);
++            if (!jitEmitFlagCommit(e, c, knownFlagKind))
++                e.call(reinterpret_cast<const void *>(&jitCommitFlag<Host>), &c);
+             break;
+         case CommitQ:
+             e.load32(0, B::St, offsetof(BlockState, fdivValue));
+@@ -422,14 +479,7 @@
+ 
+         if (p.upperFlags != 0u)
+         {
+-            // rax = &st.flags[(st.cycle + issue + 4) & 7][0] - offsetof(BlockState, flags)
+-            e.bytes({0x48, 0x8B}); // mov rax, [rsi + cycle]
+-            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
+-            e.bytes({0x05}); // add eax, issue + 4
+-            e.imm32(p.issue + 4u);
+-            e.bytes({0x83, 0xE0, 0x07});                                        // and eax, 7
+-            e.bytes({0x6B, 0xC0, static_cast<uint8_t>(2u * sizeof(FlagSlot))}); // imul eax, eax, 40
+-            e.bytes({0x48, 0x01, 0xF0});                                        // add rax, rsi
++            jitEmitFlagRow(e, p.issue + 4u);
+             const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
+             const auto storeSlot = [&](uint32_t field, uint8_t reg) // mov [rax + slot + field], reg32
+             {
+@@ -789,6 +839,7 @@
+     {
+         const bool inlineFmac = alternative != 30;
+         const bool inlineLower = alternative != 31 && s_jitInlineLower;
++        const bool inlineFlags = alternative != 32 && s_jitInlineFlags;
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+@@ -799,6 +850,12 @@
+         JitEmitter e;
+         e.prologue();
+         size_t nextCommit = 0u;
++        // Kind of the side 0 flag entry queued for each due cycle (relative to the entry) by a pair of this schedule.
++        std::vector<uint8_t> upperFlagKind;
++        const auto knownKind = [&](const BlockCommit &c) -> uint8_t
++        {
++            return c.kind == CommitFlag && c.reg == 0u && c.due < upperFlagKind.size() ? upperFlagKind[c.due] : 0u;
++        };
+         const auto commitsUpTo = [&](size_t end)
+         {
+             if (nextCommit >= end)
+@@ -806,7 +863,7 @@
+             if (s_jitSse41)
+             {
+                 for (; nextCommit < end; ++nextCommit)
+-                    jitEmitCommit<Host>(e, s.commits[nextCommit]);
++                    jitEmitCommit<Host>(e, s.commits[nextCommit], inlineFlags ? knownKind(s.commits[nextCommit]) : 0u);
+                 return;
+             }
+             s.jitRanges.push_back({&s.commits[nextCommit], static_cast<uint32_t>(end - nextCommit)});
+@@ -817,6 +874,18 @@
+         {
+             commitsUpTo(p.commitEnd);
+             const bool upperDone = p.upperEarly != nullptr;
++            // The entry this pair queues (upperEarly, the inline FMAC, jitUpperLate: upperFlags; jitClip: clip).
++            // Unknown when the lower instruction is FSSET or FCSET: they drop the status or clip of that entry.
++            {
++                const uint8_t kind = p.lowerFlag != 0u                                          ? 0u
++                                     : p.upperFlags != 0u && (p.upperFn != nullptr || upperDone) ? p.upperFlags
++                                     : p.upperPath == UpperClip                               ? kFlagClip
++                                                                                              : 0u;
++                const size_t due = static_cast<size_t>(p.issue) + 4u;
++                if (upperFlagKind.size() <= due)
++                    upperFlagKind.resize(due + 1u, 0u);
++                upperFlagKind[due] = kind;
++            }
+             if (upperDone)
+             {
+                 if (!(inlineFmac && s_jitInlineFmac && jitEmitFmac(e, p)))

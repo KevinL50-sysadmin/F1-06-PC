@@ -1,0 +1,48 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 47bb544..1fda7d9 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -459,6 +459,17 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+ set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+ set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+ 
++# Patch 0088: with /d2OptimizeHugeFunctions on the runner, the generated function that registers every translated one
++# (one function of ~200.000 lines, run once at start) took hours to compile, even with /Od. It goes in a library of
++# its own without that option, at /Od as it effectively was before (MSVC did not optimize it: C4883).
++option(PS2X_OPTIMIZE_HUGE_FUNCTIONS "Optimize the translated functions MSVC finds too big (/d2OptimizeHugeFunctions)" ON)
++set(PS2X_REGISTER_FUNCTIONS_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
++set(PS2X_REGISTER_FUNCTIONS_APART OFF)
++if(MSVC AND PS2X_OPTIMIZE_HUGE_FUNCTIONS AND EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
++    list(REMOVE_ITEM RUNNER_SRC_FILES "${PS2X_REGISTER_FUNCTIONS_CPP}")
++    set(PS2X_REGISTER_FUNCTIONS_APART ON)
++endif()
++
+ if(EXISTS "${RUNNER_MAIN_CPP}")
+     list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
+ elseif(EXISTS "${ROOT_MAIN_CPP}")
+@@ -514,6 +525,11 @@ endif()
+ 
+ if(MSVC)
+     target_compile_options(ps2EntryRunner PRIVATE /FS)
++    # Patch 0088: MSVC compiles the translated functions above its size limit without optimizing them (warning C4883;
++    # 141 of them in F1 06, among them the hottest one of the game); /d2OptimizeHugeFunctions optimizes them too.
++    if(PS2X_OPTIMIZE_HUGE_FUNCTIONS)
++        target_compile_options(ps2EntryRunner PRIVATE /d2OptimizeHugeFunctions)
++    endif()
+     if(PS2X_LTCG_RUNTIME)
+         target_link_options(ps2EntryRunner PRIVATE /LTCG)
+     endif()
+@@ -530,6 +546,13 @@ target_link_libraries(ps2EntryRunner
+     ps2_runtime
+ )
+ 
++if(PS2X_REGISTER_FUNCTIONS_APART)
++    add_library(ps2RegisterFunctions OBJECT "${PS2X_REGISTER_FUNCTIONS_CPP}")
++    target_link_libraries(ps2RegisterFunctions PRIVATE ps2_runtime)
++    target_compile_options(ps2RegisterFunctions PRIVATE /FS /Od)
++    target_sources(ps2EntryRunner PRIVATE $<TARGET_OBJECTS:ps2RegisterFunctions>)
++endif()
++
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     target_sources(ps2EntryRunner PRIVATE
+         src/lib/ps2_debug_panel.cpp

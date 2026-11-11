@@ -1,0 +1,27 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..e4bbe4e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -496,7 +497,12 @@ namespace ps2_syscalls
+                 const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+                 if (requestedSize < PS2_RAM_SIZE)
+                 {
+-                    sp = PS2_RAM_SIZE - requestedSize;
++                    // stack == -1 puts the stack at the end of RAM, [RAM_END - size, RAM_END), growing down
++                    // from its top. Reserve that range from the async-callback stack area, which is also carved
++                    // downwards from RAM_END: otherwise interrupt/callback invocation stacks end up on top of
++                    // the main thread's live frames and corrupt saved return addresses (F1 06 crashed this way).
++                    const uint32_t reservedTop = runtime->reserveAsyncCallbackStack(requestedSize, 16u);
++                    sp = reservedTop != 0u ? reservedTop + 0x10u : PS2_RAM_SIZE - requestedSize;
+                 }
+                 else
+                 {
+@@ -523,7 +529,7 @@ namespace ps2_syscalls
+         sp &= ~0xFu;
+         if (stack == 0xFFFFFFFFu)
+         {
+-            initialStack = sp;
++            initialStack = (stackSize != 0u && stackSize <= sp) ? sp - stackSize : sp;
+         }
+         else if (stack != 0u)
+         {

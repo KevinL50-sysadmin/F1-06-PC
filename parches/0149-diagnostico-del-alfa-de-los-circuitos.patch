@@ -1,0 +1,319 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index dcf611a..02a2ada 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -6749,6 +6749,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+ 
+     if (valid1 && valid2)
+     {
++        static const bool s_viewMergeFactor = []
++        {
++            const char *value = std::getenv("F1_GS_VER_ALFA");
++            return value != nullptr && value[0] == '1';
++        }();
+         GSFrameReg selected1{}, selected2{};
+         std::vector<uint8_t> crt1, crt2;
+         bool preferred1 = false, preferred2 = false;
+@@ -6782,6 +6787,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+                     dst[0] = blendPresentationChannel(src[0], dst[0], factor);
+                     dst[1] = blendPresentationChannel(src[1], dst[1], factor);
+                     dst[2] = blendPresentationChannel(src[2], dst[2], factor);
++                    if (s_viewMergeFactor) // F1_GS_VER_ALFA=1 (diagnosis): the merge factor of circuit 1 as grey
++                        dst[0] = dst[1] = dst[2] = static_cast<uint8_t>(factor);
+                     dst[3] = pmode.amod ? dst[3] : src[3];
+                 }
+             normalizePresentationAlpha(result.pixels, result.width, result.height);
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index e1bd311..390a362 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <sstream>
+@@ -199,6 +200,59 @@ namespace
+         printDumpedPacket(data, sizeBytes, "");
+     }
+ 
++    // Debug: F1_GS_CONTAR=<64-bit value in hex>[,<another>] counts the GIF packets holding that value (and the other
++    // one, if given; each at any 8-byte position) and prints the count of each 10 s ("[gs:contar]").
++    void countValuePackets(const uint8_t *data, uint32_t sizeBytes)
++    {
++        static const std::pair<uint64_t, uint64_t> s_values = []
++        {
++            const char *value = std::getenv("F1_GS_CONTAR");
++            if (value == nullptr)
++                return std::make_pair(0ull, 0ull);
++            char *end = nullptr;
++            const uint64_t first = std::strtoull(value, &end, 16);
++            const uint64_t second = end != nullptr && *end == ',' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
++            return std::make_pair(static_cast<unsigned long long>(first), static_cast<unsigned long long>(second));
++        }();
++        const uint64_t s_value = s_values.first;
++        if (s_value == 0u)
++            return;
++        static uint64_t s_count = 0u;
++        static auto s_reportAt = std::chrono::steady_clock::now();
++        static const auto s_start = s_reportAt;
++        bool first = false, second = s_values.second == 0u;
++        for (uint32_t at = 0; at + 8u <= sizeBytes; at += 8u)
++        {
++            const uint64_t word = loadLE64(data + at);
++            first = first || word == s_value;
++            second = second || word == s_values.second;
++        }
++        static std::map<uint32_t, uint64_t> s_alphas; // the alpha of the first A+D RGBAQ of the packets counted
++        if (first && second)
++        {
++            ++s_count;
++            for (uint32_t at = 16u; at + 16u <= sizeBytes; at += 16u)
++                if (loadLE64(data + at + 8u) == GS_REG_RGBAQ)
++                {
++                    ++s_alphas[static_cast<uint32_t>((loadLE64(data + at) >> 24u) & 0xFFu)];
++                    break;
++                }
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - s_reportAt >= std::chrono::seconds(10))
++        {
++            s_reportAt = now;
++            std::fprintf(stderr, "[gs:contar] t=%.0f s: %llu paquetes con %llx\n",
++                         std::chrono::duration<double>(now - s_start).count(), static_cast<unsigned long long>(s_count),
++                         static_cast<unsigned long long>(s_value));
++            for (const auto &alpha : s_alphas)
++                std::fprintf(stderr, "[gs:contar]   RGBAQ A=%02x: %llu\n", alpha.first,
++                             static_cast<unsigned long long>(alpha.second));
++            s_alphas.clear();
++            s_count = 0u;
++        }
++    }
++
+     // Patch 0148: ps2GsSetScissorFeather and ps2GsSetKeepFrameAlpha.
+     constexpr uint64_t kScissorFieldMask = 0x07FF07FF07FF07FFull;
+     std::atomic<uint64_t> s_featherScissor{0u};
+@@ -1368,6 +1422,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+         return;
+ 
+     dumpScissorPacket(data, sizeBytes);
++    countValuePackets(data, sizeBytes);
+ 
+     {
+         std::vector<uint8_t> rewritten;
+@@ -1486,6 +1541,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+         return false;
+ 
+     dumpScissorPacket(data, sizeBytes);
++    countValuePackets(data, sizeBytes);
+ 
+     {
+         std::vector<uint8_t> rewritten;
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 1feb2ee..031be9b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -383,6 +383,42 @@ namespace
+         result.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+         if (en1 && en2)
+         {
++            static const bool s_viewMergeFactor = []
++            {
++                const char *value = std::getenv("F1_GS_VER_ALFA");
++                return value != nullptr && value[0] == '1';
++            }();
++            // F1_GS_GPU_DIAG_CIRCUITOS=N (diagnosis): every N merged frames, circuit 1's alpha at (400, 60) and the
++            // vertical offset of circuit 2 against circuit 1 over (280, 40)-(470, 110) (mean difference for -2..2).
++            static const int s_diagEvery = []
++            {
++                const char *value = std::getenv("F1_GS_GPU_DIAG_CIRCUITOS");
++                return value != nullptr ? std::atoi(value) : 0;
++            }();
++            static int s_diagCount = 0;
++            if (s_diagEvery > 0 && ++s_diagCount % s_diagEvery == 0 && imageWidth >= 480u && imageHeight >= 120u)
++            {
++                char line[256];
++                int at = std::snprintf(line, sizeof(line),
++                                       "[gs:circuitos] fbp1=%u fbp2=%u A1(400,60)=%02x A2=%02x A1(100,135)=%02x tick=%llu",
++                                       static_cast<unsigned>(request.dispfb1 & 0x1FFu),
++                                       static_cast<unsigned>(request.dispfb2 & 0x1FFu),
++                                       crt1[(60u * imageWidth + 400u) * 4u + 3u],
++                                       crt2[(60u * imageWidth + 400u) * 4u + 3u],
++                                       crt1[(135u * imageWidth + 100u) * 4u + 3u],
++                                       static_cast<unsigned long long>(request.vsyncTick));
++                for (int dy = -2; dy <= 2 && at > 0 && at < static_cast<int>(sizeof(line)); ++dy)
++                {
++                    double sum = 0.0;
++                    for (uint32_t y = 40u; y < 110u; ++y)
++                        for (uint32_t x = 280u; x < 470u; ++x)
++                            for (int c = 0; c < 3; ++c)
++                                sum += std::abs(static_cast<int>(crt1[(y * imageWidth + x) * 4u + c]) -
++                                                static_cast<int>(crt2[((y + dy) * imageWidth + x) * 4u + c]));
++                    at += std::snprintf(line + at, sizeof(line) - at, " %+d=%.1f", dy, sum / (70.0 * 190.0 * 3.0));
++                }
++                std::fprintf(stderr, "%s\n", line);
++            }
+             const uint32_t alp = static_cast<uint32_t>((request.pmode >> 8u) & 0xFFu);
+             const bool mmod = ((request.pmode >> 5u) & 1u) != 0u;
+             const bool slbg = ((request.pmode >> 7u) & 1u) != 0u;
+@@ -404,6 +440,8 @@ namespace
+                         const uint32_t factor = mmod ? alp : std::min<uint32_t>(255u, src[3] * 2u);
+                         for (int c = 0; c < 3; ++c)
+                             dst[c] = blendChannel(src[c], dst[c], factor);
++                        if (s_viewMergeFactor) // F1_GS_VER_ALFA=1 (diagnosis), as PresentFromLocalMemory
++                            dst[0] = dst[1] = dst[2] = static_cast<uint8_t>(factor);
+                     }
+                     dst[3] = 0xFFu;
+                 }
+@@ -858,6 +896,7 @@ struct GSGpuBackend::Impl
+                 api.gif_transfer(context, kGifPath, payload, header.size);
+                 // Our front-end parses every packet from its first tag and drops a truncated last one: so here.
+                 api.reset_gif_path(context, kGifPath);
++                tracePixel(payload, header.size);
+                 break;
+             case Kind::Register:
+                 runDeferredScanout();
+@@ -888,6 +927,133 @@ struct GSGpuBackend::Impl
+         }
+     }
+ 
++    // F1_GS_GPU_TRAZA=x,y,seconds[,packets] (diagnosis, very slow while it runs): from that many seconds after the
++    // GPU GS starts, for that many GIF packets (default 20000), reads local memory back after each packet and prints
++    // every change of the PSMCT32 pixel (x, y) of the buffers at FBP 0 and 128 (width 512), with the packet's
++    // A+D registers and its last RGBAQ.
++    struct PixelTrace
++    {
++        bool on = false;
++        uint32_t x = 0u, y = 0u;
++        int64_t startNs = 0;
++        uint32_t packetsLeft = 0u;
++        uint32_t packetIndex = 0u;
++        uint32_t last[2] = {};
++        bool primed = false;
++        std::vector<uint8_t> copy;
++        GSCpuBackend reader;
++    };
++    PixelTrace trace;
++
++    void configureTrace()
++    {
++        const char *text = std::getenv("F1_GS_GPU_TRAZA");
++        if (text == nullptr)
++            return;
++        unsigned x = 0u, y = 0u, packets = 20000u;
++        double seconds = 0.0;
++        if (std::sscanf(text, "%u,%u,%lf,%u", &x, &y, &seconds, &packets) < 3)
++            return;
++        trace.on = true;
++        trace.x = x;
++        trace.y = y;
++        trace.startNs = nowNs() + static_cast<int64_t>(seconds * 1e9);
++        trace.packetsLeft = packets;
++    }
++
++    static std::string describePacket(const uint8_t *data, uint32_t size)
++    {
++        std::string text;
++        char item[96];
++        uint32_t offset = 0u;
++        uint64_t rgbaq = 0u;
++        bool hasRgbaq = false;
++        while (offset + 16u <= size)
++        {
++            uint64_t lo = 0u, hi = 0u;
++            std::memcpy(&lo, data + offset, 8u);
++            std::memcpy(&hi, data + offset + 8u, 8u);
++            offset += 16u;
++            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
++            const uint32_t flg = static_cast<uint32_t>((lo >> 58u) & 3u);
++            uint32_t nreg = static_cast<uint32_t>((lo >> 60u) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            if (((lo >> 46u) & 1u) != 0u)
++            {
++                std::snprintf(item, sizeof(item), " PRE=0x%llx", static_cast<unsigned long long>((lo >> 47u) & 0x7FFu));
++                text += item;
++            }
++            if (flg == 0u)
++            {
++                for (uint32_t i = 0; i < nloop * nreg && offset + 16u <= size; ++i, offset += 16u)
++                {
++                    const uint32_t reg = static_cast<uint32_t>((hi >> ((i % nreg) * 4u)) & 0xFu);
++                    uint64_t vlo = 0u, vhi = 0u;
++                    std::memcpy(&vlo, data + offset, 8u);
++                    std::memcpy(&vhi, data + offset + 8u, 8u);
++                    if (reg == 0xEu)
++                    {
++                        std::snprintf(item, sizeof(item), " %02llx=%llx", static_cast<unsigned long long>(vhi & 0xFFu),
++                                      static_cast<unsigned long long>(vlo));
++                        text += item;
++                    }
++                    else if (reg == 0x1u)
++                    {
++                        rgbaq = (vlo & 0xFFu) | (((vlo >> 32u) & 0xFFu) << 8u) | ((vhi & 0xFFu) << 16u) |
++                                (((vhi >> 32u) & 0xFFu) << 24u);
++                        hasRgbaq = true;
++                    }
++                }
++            }
++            else if (flg == 1u)
++                offset += ((nloop * nreg + 1u) / 2u) * 16u;
++            else
++            {
++                std::snprintf(item, sizeof(item), " IMAGE(%u qw)", nloop);
++                text += item;
++                offset += nloop * 16u;
++            }
++        }
++        if (hasRgbaq)
++        {
++            std::snprintf(item, sizeof(item), " rgba=%llx", static_cast<unsigned long long>(rgbaq));
++            text += item;
++        }
++        return text;
++    }
++
++    void tracePixel(const uint8_t *data, uint32_t size)
++    {
++        if (!trace.on || trace.packetsLeft == 0u || nowNs() < trace.startNs)
++            return;
++        const void *mapped = api.map_vram_read(context, 0u, kVramSize);
++        if (mapped == nullptr)
++            return;
++        if (trace.copy.empty())
++        {
++            trace.copy.resize(kVramSize);
++            trace.reader.Initialize(trace.copy.data(), static_cast<uint32_t>(kVramSize));
++        }
++        std::memcpy(trace.copy.data(), mapped, kVramSize);
++        ++trace.packetIndex;
++        --trace.packetsLeft;
++        for (int b = 0; b < 2; ++b)
++        {
++            const uint32_t fbp = b == 0 ? 0u : 128u;
++            const uint32_t value = trace.reader.ReadVram(GS_PSM_CT32, fbp * 32u, 8u, trace.x, trace.y);
++            if (trace.primed && value == trace.last[b])
++                continue;
++            std::fprintf(stderr, "[gs:traza] paquete %u fbp=%u (%u,%u) %08x -> %08x (A %02x -> %02x) |%s\n",
++                         trace.packetIndex, fbp, trace.x, trace.y, trace.last[b], value, trace.last[b] >> 24u,
++                         value >> 24u, describePacket(data, size).c_str());
++            trace.last[b] = value;
++        }
++        trace.primed = true;
++        if (trace.packetsLeft == 0u)
++            std::fprintf(stderr, "[gs:traza] fin (%u paquetes)\n", trace.packetIndex);
++    }
++
+     // Writes the driver's pipeline cache if its size changed since it was loaded or written (the saver thread, or the
+     // GS GPU thread at shutdown). The copy alone takes ~60-75 ms for the ~50 MB of a 4x session: not on the GS GPU
+     // thread while the game runs.
+@@ -1163,6 +1329,7 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     if (const char *value = std::getenv("PS2X_GS_SSAA_DINAMICO"))
+         impl.dynamicSuperSampling = std::strcmp(value, "0") != 0;
+     impl.pipelineCacheFile = ps2GsGpuPipelineCachePath();
++    impl.configureTrace();
+ 
+     impl.worker = std::thread([&impl]() { impl.workerLoop(); });
+     {

@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf..0edf8c1 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -526,17 +526,24 @@ namespace ps2_stubs
+         case 2: // PAD_MODECUREXID
+             setReturnS32(ctx, currentId);
+             return;
++        // A DualShock 2 reports two selectable modes, digital (4) and analog (7), even while it is still in
++        // digital mode. Games that require an analog pad (F1 06: "No supported controller has been detected")
++        // look for ID 7 in this table and then switch with scePadSetMainMode.
+         case 3: // PAD_MODECUROFFS
+-            setReturnS32(ctx, 0);
++            setReturnS32(ctx, portState->analogMode ? 1 : 0);
+             return;
+         case 4: // PAD_MODETABLE
+             if (index == -1)
+             {
+-                setReturnS32(ctx, 1); // one available mode
++                setReturnS32(ctx, 2);
+             }
+             else if (index == 0)
+             {
+-                setReturnS32(ctx, currentId);
++                setReturnS32(ctx, kPadTypeDigital);
++            }
++            else if (index == 1)
++            {
++                setReturnS32(ctx, kPadTypeDualShock);
+             }
+             else
+             {

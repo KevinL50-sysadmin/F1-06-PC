@@ -1,0 +1,41 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 671dee6..903dc4d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -448,13 +448,14 @@ namespace
+         SimpleOp simple;
+     };
+ 
++    // Forced inline so that upperEarly expands them (called through upperFn they stay functions of their own).
+     template <uint8_t Kind, uint8_t Source>
+-    void upperFmac(const BlockPair &p, const VU1State &vu, FmacResult &up)
++    PS2_VU_FORCEINLINE void upperFmac(const BlockPair &p, const VU1State &vu, FmacResult &up)
+     {
+         runFmacOpFixed<Kind, Source>(p.fmac, vu.vf, vu.acc, vu.q, vu.i, up);
+     }
+     template <uint8_t Kind>
+-    void upperSimple(const BlockPair &p, const VU1State &vu, FmacResult &up)
++    PS2_VU_FORCEINLINE void upperSimple(const BlockPair &p, const VU1State &vu, FmacResult &up)
+     {
+         runSimpleOpFixed<Kind>(p.simple, vu.vf, vu.i, up.value);
+     }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index 0713665..e7ff456 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -30,7 +30,14 @@ static inline int16_t IMM15(uint32_t i)
+ 
+ // VU operand normalization (inline in every VU translation unit): denormals read as signed zero and Inf/NaN as the
+ // signed maximum. Idempotent.
+-static inline float vuNormalizeOperand(float value)
++// Forced inline (MSVC): called in the blocks once per operand of DIV/SQRT/RSQRT and of the FMAC broadcast, and as a
++// function of its own it was ~0.8 % of the EE thread.
++#if defined(_MSC_VER)
++#define PS2_VU_OPERAND_INLINE static __forceinline
++#else
++#define PS2_VU_OPERAND_INLINE static inline __attribute__((always_inline))
++#endif
++PS2_VU_OPERAND_INLINE float vuNormalizeOperand(float value)
+ {
+     uint32_t bits = 0;
+     std::memcpy(&bits, &value, sizeof(bits));

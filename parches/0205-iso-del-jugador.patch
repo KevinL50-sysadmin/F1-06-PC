@@ -1,0 +1,1974 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e44ff63..e10c852 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -420,6 +420,8 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_game_font.cpp
+     src/lib/ps2_game_graphics.cpp
+     src/lib/ps2_user_paths.cpp
++    src/lib/ps2_disc_setup.cpp
++    src/lib/ps2_disc_setup_win.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+@@ -607,6 +609,8 @@ endif()
+ # Fase 5 (T15, N4): the guest's form has Spanish texts in UTF-8 (accents), drawn with a Windows font.
+ if(MSVC)
+     set_source_files_properties(src/lib/ps2_netplay_guest.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
++    # Lanzamiento T1: the first-run texts (Spanish and English, with accents) are UTF-8 too.
++    set_source_files_properties(src/lib/ps2_disc_setup.cpp src/lib/ps2_disc_setup_win.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+ endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+diff --git a/ps2xRuntime/include/ps2_disc_setup.h b/ps2xRuntime/include/ps2_disc_setup.h
+new file mode 100644
+index 0000000..059e532
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_disc_setup.h
+@@ -0,0 +1,148 @@
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <ostream>
++#include <string>
++#include <vector>
++
++// Lanzamiento T1 (F1 06): the public package has no game data. The player's own disc (an .iso, or a folder with the
++// disc already extracted) is checked once and copied into a datos folder, which is what the game boots from. Ported
++// from scripts/iso_ps2.py (ISO 9660, read only): the same files empaquetar.ps1 -Iso extracts.
++namespace ps2x::disc
++{
++    // Formula One 06, PAL (SCES-53950): the BOOT2 file of its SYSTEM.CNF.
++    inline constexpr const char *kGameBootElf = "SCES_539.50";
++    inline constexpr const char *kGameCode = "SCES-53950";
++    inline constexpr const char *kDataFolderName = "datos";
++    // Written last into datos: the disc and every file with its size, so a later run can check datos cheaply.
++    inline constexpr const char *kMarkerName = "F1-06-disco.txt";
++    // Where an extraction is written before it becomes datos (never a half datos folder).
++    inline constexpr const char *kTempFolderName = "datos.extrayendo";
++    // A datos folder that was there but incomplete is renamed to this (with -2, -3... if taken), never deleted.
++    inline constexpr const char *kPreviousFolderName = "datos.anterior";
++
++    struct DiscFile
++    {
++        std::string path; // inside the disc, '/' separated, as named on the disc ("DATA2006/F12006.WAD")
++        uint32_t lsn = 0u; // ISO sector (0 for a folder source)
++        uint64_t size = 0u;
++    };
++
++    enum class DiscStatus
++    {
++        Valid,
++        Unreadable, // missing or cannot be opened
++        NotIso,     // no ISO 9660 volume descriptor (and not a disc folder)
++        NotPs2Disc, // no SYSTEM.CNF with a BOOT2 line
++        OtherGame,  // BOOT2 is another game
++        NotPal,     // VMODE is not PAL
++        Truncated   // the image (or folder) ends before its files do
++    };
++
++    struct DiscReport
++    {
++        DiscStatus status = DiscStatus::Unreadable;
++        bool folder = false;  // an extracted disc folder rather than an image
++        std::filesystem::path source; // the image, or the folder (a SYSTEM.CNF picked by hand gives its folder)
++        std::string volumeId;
++        std::string bootElf;   // BOOT2 file name ("SCES_539.50"), when there is one
++        std::string videoMode; // VMODE ("PAL"), when there is one
++        std::vector<DiscFile> files; // sorted by path
++        uint64_t totalBytes = 0u;
++        std::string fingerprint; // 16 hex digits: FNV-1a 64 of the volume id and the file list (no content hash)
++    };
++
++    // Reads only the volume descriptor, the directories and SYSTEM.CNF (a folder: its file list and SYSTEM.CNF).
++    DiscReport inspectDisc(const std::filesystem::path &source);
++
++    // The player's text for a report that is not Valid (UTF-8, Spanish or English).
++    std::string describeDiscProblem(const DiscReport &report, bool spanish);
++
++    enum class ExtractStatus
++    {
++        Done,
++        AlreadyThere, // datos is complete and from the same disc: nothing copied
++        Cancelled,
++        InvalidDisc,
++        NoSpace,
++        ReadFailed,
++        WriteFailed
++    };
++
++    struct ExtractResult
++    {
++        ExtractStatus status = ExtractStatus::InvalidDisc;
++        std::string detail; // for the log and the error message
++        std::filesystem::path dataDirectory;
++        std::filesystem::path previousData; // where an incomplete datos was moved, if any
++    };
++
++    // Called after every block with the bytes copied so far and the file being copied; false cancels.
++    using ExtractProgress = std::function<bool(uint64_t done, uint64_t total, const std::string &file)>;
++
++    // Copies every file of a Valid report into <parent>/datos.extrayendo, writes the marker and renames it to
++    // <parent>/datos (an existing incomplete datos is renamed to datos.anterior first). On failure or cancel nothing
++    // is left but what was there before. A complete datos from the same disc is kept (AlreadyThere).
++    ExtractResult extractDisc(const DiscReport &report, const std::filesystem::path &parent,
++                              const ExtractProgress &progress);
++
++    // The player's text for a failed or cancelled extraction (UTF-8).
++    std::string describeExtractProblem(const ExtractResult &result, bool spanish);
++
++    enum class DataState
++    {
++        Missing,    // no datos folder
++        Incomplete, // datos without a bootable SYSTEM.CNF, or with files of its marker missing or of another size
++        Complete    // bootable; with a marker, every file it lists is there with its size
++    };
++
++    // Cheap: SYSTEM.CNF, its BOOT2 file and (with a marker) one size check per listed file.
++    DataState checkDataFolder(const std::filesystem::path &dataDirectory);
++
++    // The fingerprint written in a datos marker (empty without one).
++    std::string dataFolderFingerprint(const std::filesystem::path &dataDirectory);
++
++    // Folders that may hold datos, in lookup order: the .exe's folder and, for an installed game (no portable.txt),
++    // <LocalAppData>/F1-06, used when the .exe's folder cannot be written (Program Files).
++    std::vector<std::filesystem::path> dataParents(const std::filesystem::path &exeDirectory,
++                                                   const std::filesystem::path &localAppDataDirectory);
++
++    // The first of dataParents() where a folder can be created (empty if none).
++    std::filesystem::path writableDataParent(const std::vector<std::filesystem::path> &parents);
++
++    // How the command line shows progress and errors: the console (null) or the Windows dialogs (--ventana).
++    struct DiscCommandUi
++    {
++        std::function<bool(uint64_t done, uint64_t total, const std::string &file)> progress;
++        std::function<void(const std::string &message)> error;
++    };
++
++    // F1-06.exe --extraer-iso <iso or folder> [--ventana] and --comprobar-iso <iso or folder>. Returns the exit code:
++    // 0 done (or already extracted / valid), 1 bad arguments, 2 not Formula One 06 PAL, 3 read, write or space
++    // failure, 4 cancelled. Returns -1 when args is not one of these commands.
++    int runDiscCommand(const std::vector<std::string> &args, const std::filesystem::path &exeDirectory,
++                       const std::filesystem::path &localAppDataDirectory, std::ostream &out,
++                       const DiscCommandUi *ui, bool spanish);
++
++    // Windows: the Spanish or English texts follow the Windows display language (the game's language is not known
++    // before it starts).
++    bool spanishUi();
++
++    enum class SetupOutcome
++    {
++        Ready,
++        Cancelled,
++        Failed
++    };
++
++    // The first run without datos: explains what is needed, offers an ISO found in the Downloads or Desktop folders
++    // (or next to the .exe), else the Open dialog (*.iso, or the SYSTEM.CNF of an extracted disc), checks the disc
++    // (retry or cancel), extracts it with a progress window that can cancel, and returns Ready when datos is there.
++    SetupOutcome runFirstRunSetup(const std::filesystem::path &exeDirectory,
++                                  const std::filesystem::path &localAppDataDirectory, std::ostream &log);
++
++    // The Windows dialogs for runDiscCommand(--ventana); null where there are none.
++    const DiscCommandUi *windowsDiscCommandUi();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_disc_setup.cpp b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+new file mode 100644
+index 0000000..7d5f4dc
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+@@ -0,0 +1,734 @@
++#include "ps2_disc_setup.h"
++#include "ps2_user_paths.h"
++#include "ps2x/iop/ps2_iso_image.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <optional>
++#include <sstream>
++#include <string_view>
++#include <system_error>
++#include <unordered_set>
++
++namespace ps2x::disc
++{
++    namespace
++    {
++        namespace fs = std::filesystem;
++
++        constexpr uint32_t kSector = 2048u;
++        constexpr uint32_t kPvdLsn = 16u;
++        constexpr size_t kCopyBlock = 4u << 20u;
++        // Room left on the drive besides the files (the marker, the file system).
++        constexpr uint64_t kSpareBytes = 64u << 20u;
++
++        bool equalsIgnoringCase(std::string_view left, std::string_view right)
++        {
++            return left.size() == right.size() &&
++                   std::equal(left.begin(), left.end(), right.begin(), [](unsigned char a, unsigned char b)
++                              { return std::toupper(a) == std::toupper(b); });
++        }
++
++        bool endsWithIgnoringCase(std::string_view text, std::string_view suffix)
++        {
++            return text.size() >= suffix.size() && equalsIgnoringCase(text.substr(text.size() - suffix.size()), suffix);
++        }
++
++        uint32_t readLe32(const uint8_t *bytes)
++        {
++            return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8u) |
++                   (static_cast<uint32_t>(bytes[2]) << 16u) | (static_cast<uint32_t>(bytes[3]) << 24u);
++        }
++
++        std::string trim(std::string_view value)
++        {
++            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
++                value.remove_prefix(1u);
++            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
++                value.remove_suffix(1u);
++            return std::string(value);
++        }
++
++        // A "KEY = value" line of SYSTEM.CNF (key case ignored), or empty.
++        std::string systemCnfValue(std::string_view text, std::string_view key)
++        {
++            while (!text.empty())
++            {
++                const size_t end = text.find_first_of("\r\n");
++                const std::string_view line = text.substr(0u, end);
++                text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1u);
++                const size_t equals = line.find('=');
++                if (equals != std::string_view::npos && equalsIgnoringCase(trim(line.substr(0u, equals)), key))
++                    return trim(line.substr(equals + 1u));
++            }
++            return {};
++        }
++
++        std::string fingerprintOf(const std::string &volumeId, const std::vector<DiscFile> &files)
++        {
++            uint64_t hash = 0xCBF29CE484222325ull;
++            const auto add = [&](std::string_view text)
++            {
++                for (const unsigned char ch : text)
++                {
++                    hash ^= ch;
++                    hash *= 0x100000001B3ull;
++                }
++            };
++            add("F1-06-disco\n");
++            add(volumeId);
++            add("\n");
++            for (const DiscFile &file : files)
++            {
++                add(file.path);
++                add("\t" + std::to_string(file.size) + "\t" + std::to_string(file.lsn) + "\n");
++            }
++            char text[17] = {};
++            std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
++            return text;
++        }
++
++        // SYSTEM.CNF checks shared by images and folders.
++        void checkSystemCnf(DiscReport &report, const std::optional<std::string> &cnf)
++        {
++            const std::optional<std::string> boot2 =
++                cnf ? ps2x::iop::parseSystemCnfBoot2(*cnf) : std::optional<std::string>{};
++            if (!boot2)
++            {
++                report.status = DiscStatus::NotPs2Disc;
++                return;
++            }
++            report.bootElf = ps2x::iop::bootElfName(*boot2);
++            report.videoMode = systemCnfValue(*cnf, "VMODE");
++            if (!equalsIgnoringCase(report.bootElf, kGameBootElf))
++                report.status = DiscStatus::OtherGame;
++            else if (!report.videoMode.empty() && !equalsIgnoringCase(report.videoMode, "PAL"))
++                report.status = DiscStatus::NotPal;
++            else
++                report.status = DiscStatus::Valid;
++        }
++
++        const DiscFile *findListed(const std::vector<DiscFile> &files, std::string_view path)
++        {
++            for (const DiscFile &file : files)
++                if (equalsIgnoringCase(file.path, path))
++                    return &file;
++            return nullptr;
++        }
++
++        void finishReport(DiscReport &report)
++        {
++            std::sort(report.files.begin(), report.files.end(),
++                      [](const DiscFile &a, const DiscFile &b) { return a.path < b.path; });
++            report.totalBytes = 0u;
++            for (const DiscFile &file : report.files)
++                report.totalBytes += file.size;
++            report.fingerprint = fingerprintOf(report.volumeId, report.files);
++        }
++
++        DiscReport inspectImage(const fs::path &path)
++        {
++            DiscReport report;
++            report.source = path;
++            std::error_code error;
++            const uint64_t imageSize = fs::file_size(path, error);
++            std::ifstream stream(path, std::ios::binary);
++            if (error || !stream)
++                return report; // Unreadable
++            const auto read = [&](uint64_t offset, uint8_t *destination, size_t size)
++            {
++                stream.clear();
++                stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
++                stream.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(size));
++                return static_cast<size_t>(stream.gcount()) == size;
++            };
++
++            std::vector<uint8_t> pvd(kSector);
++            if (!read(static_cast<uint64_t>(kPvdLsn) * kSector, pvd.data(), pvd.size()) || pvd[0] != 1u ||
++                std::memcmp(pvd.data() + 1u, "CD001", 5u) != 0)
++            {
++                report.status = DiscStatus::NotIso;
++                return report;
++            }
++            report.volumeId = trim(std::string_view(reinterpret_cast<const char *>(pvd.data() + 40u), 32u));
++
++            // The directory tree, as scripts/iso_ps2.py walks it (multi-extent files keep their first extent).
++            struct Pending
++            {
++                std::string prefix;
++                uint32_t lsn;
++                uint32_t size;
++            };
++            std::vector<Pending> pending{{std::string{}, readLe32(pvd.data() + 156u + 2u),
++                                          readLe32(pvd.data() + 156u + 10u)}};
++            std::unordered_set<uint32_t> visited;
++            std::unordered_set<std::string> seen;
++            while (!pending.empty())
++            {
++                const Pending directory = pending.back();
++                pending.pop_back();
++                if (!visited.insert(directory.lsn).second)
++                    continue;
++                const uint64_t sectors = (static_cast<uint64_t>(directory.size) + kSector - 1u) / kSector;
++                std::vector<uint8_t> bytes(static_cast<size_t>(sectors) * kSector);
++                if (sectors == 0u || sectors > 4096u ||
++                    !read(static_cast<uint64_t>(directory.lsn) * kSector, bytes.data(), bytes.size()))
++                {
++                    report.status = DiscStatus::Truncated;
++                    return report;
++                }
++                size_t offset = 0u;
++                while (offset < directory.size)
++                {
++                    const uint8_t length = bytes[offset];
++                    if (length == 0u)
++                    {
++                        offset = (offset / kSector + 1u) * kSector;
++                        continue;
++                    }
++                    if (length < 34u || offset + length > bytes.size())
++                    {
++                        report.status = DiscStatus::Truncated;
++                        return report;
++                    }
++                    const uint8_t *record = bytes.data() + offset;
++                    offset += length;
++                    const uint8_t nameLength = record[32];
++                    if (33u + nameLength > length)
++                    {
++                        report.status = DiscStatus::Truncated;
++                        return report;
++                    }
++                    if (nameLength == 1u && (record[33] == 0u || record[33] == 1u))
++                        continue;
++                    std::string name(reinterpret_cast<const char *>(record + 33u), nameLength);
++                    if (const size_t semicolon = name.rfind(';'); semicolon != std::string::npos)
++                        name.resize(semicolon);
++                    while (!name.empty() && name.back() == '.')
++                        name.pop_back();
++                    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos)
++                        continue;
++                    const std::string path = directory.prefix + name;
++                    const uint32_t lsn = readLe32(record + 2u);
++                    const uint32_t size = readLe32(record + 10u);
++                    if (record[25] & 0x02u)
++                        pending.push_back({path + "/", lsn, size});
++                    else if (seen.insert(path).second)
++                        report.files.push_back({path, lsn, size});
++                }
++            }
++
++            for (const DiscFile &file : report.files)
++            {
++                if (static_cast<uint64_t>(file.lsn) * kSector + file.size > imageSize)
++                {
++                    report.status = DiscStatus::Truncated;
++                    return report;
++                }
++            }
++            std::optional<std::string> cnf;
++            if (const DiscFile *file = findListed(report.files, "SYSTEM.CNF"); file && file->size <= 64u * 1024u)
++            {
++                std::string text(static_cast<size_t>(file->size), '\0');
++                if (read(static_cast<uint64_t>(file->lsn) * kSector, reinterpret_cast<uint8_t *>(text.data()),
++                         text.size()))
++                    cnf = text;
++            }
++            checkSystemCnf(report, cnf);
++            if (report.status == DiscStatus::Valid && !findListed(report.files, report.bootElf))
++                report.status = DiscStatus::Truncated;
++            finishReport(report);
++            return report;
++        }
++
++        DiscReport inspectFolder(const fs::path &folder)
++        {
++            DiscReport report;
++            report.folder = true;
++            report.source = folder;
++            std::error_code error;
++            const std::optional<fs::path> cnfPath = ps2x::iop::findFileIgnoringCase(folder, "SYSTEM.CNF");
++            if (!cnfPath)
++            {
++                report.status = fs::is_directory(folder, error) ? DiscStatus::NotPs2Disc : DiscStatus::Unreadable;
++                return report;
++            }
++            // The disc files: not the cards, logs or marker an older package or this extractor left there.
++            for (fs::recursive_directory_iterator it(folder, fs::directory_options::skip_permission_denied, error), end;
++                 !error && it != end; it.increment(error))
++            {
++                std::error_code entryError;
++                const std::string name = it->path().filename().string();
++                if (it.depth() == 0 && it->is_directory(entryError) &&
++                    (equalsIgnoringCase(name, "mc0") || equalsIgnoringCase(name, "mc1")))
++                {
++                    it.disable_recursion_pending();
++                    continue;
++                }
++                if (!it->is_regular_file(entryError) || endsWithIgnoringCase(name, ".log") ||
++                    (it.depth() == 0 && equalsIgnoringCase(name, kMarkerName)))
++                    continue;
++                const uint64_t size = it->file_size(entryError);
++                if (entryError)
++                    continue;
++                report.files.push_back({it->path().lexically_relative(folder).generic_string(), 0u, size});
++            }
++            if (error)
++            {
++                report.status = DiscStatus::Unreadable;
++                return report;
++            }
++            std::ifstream stream(*cnfPath, std::ios::binary);
++            checkSystemCnf(report, std::string((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>()));
++            if (report.status == DiscStatus::Valid && !findListed(report.files, report.bootElf))
++                report.status = DiscStatus::Truncated;
++            finishReport(report);
++            return report;
++        }
++
++        struct Marker
++        {
++            std::string fingerprint;
++            std::vector<DiscFile> files;
++        };
++
++        std::optional<Marker> readMarker(const fs::path &dataDirectory)
++        {
++            std::ifstream stream(dataDirectory / kMarkerName, std::ios::binary);
++            if (!stream)
++                return std::nullopt;
++            Marker marker;
++            std::string line;
++            while (std::getline(stream, line))
++            {
++                if (!line.empty() && line.back() == '\r')
++                    line.pop_back();
++                const size_t equals = line.find('=');
++                if (line.empty() || line[0] == '#' || equals == std::string::npos)
++                    continue;
++                const std::string key = trim(std::string_view(line).substr(0u, equals));
++                const std::string value = trim(std::string_view(line).substr(equals + 1u));
++                if (key == "huella")
++                    marker.fingerprint = value;
++                else if (key == "archivo")
++                {
++                    const size_t space = value.find(' ');
++                    if (space == std::string::npos)
++                        continue;
++                    DiscFile file;
++                    file.path = value.substr(space + 1u);
++                    try
++                    {
++                        file.size = std::stoull(value.substr(0u, space));
++                    }
++                    catch (const std::exception &)
++                    {
++                        continue;
++                    }
++                    marker.files.push_back(std::move(file));
++                }
++            }
++            return marker;
++        }
++
++        bool writeMarker(const fs::path &dataDirectory, const DiscReport &report)
++        {
++            std::ofstream out(dataDirectory / kMarkerName, std::ios::binary);
++            out << "# Formula One 06: archivos copiados de tu disco. El juego lo usa para comprobar que datos esta\r\n"
++                << "# completo; no lo cambies (sin el, datos se usa igual, pero sin esa comprobacion).\r\n"
++                << "disco = " << report.bootElf << "\r\n"
++                << "modo = " << report.videoMode << "\r\n"
++                << "volumen = " << report.volumeId << "\r\n"
++                << "origen = " << (report.folder ? "carpeta" : "iso") << "\r\n"
++                << "huella = " << report.fingerprint << "\r\n"
++                << "archivos = " << report.files.size() << "\r\n"
++                << "bytes = " << report.totalBytes << "\r\n";
++            for (const DiscFile &file : report.files)
++                out << "archivo = " << file.size << " " << file.path << "\r\n";
++            out.close();
++            return static_cast<bool>(out);
++        }
++
++        std::string gigabytes(uint64_t bytes)
++        {
++            char text[32] = {};
++            std::snprintf(text, sizeof(text), "%.1f", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
++            return text;
++        }
++
++        bool sameFolder(const fs::path &a, const fs::path &b)
++        {
++            std::error_code error;
++            return fs::exists(a, error) && fs::exists(b, error) && fs::equivalent(a, b, error);
++        }
++    }
++
++    DiscReport inspectDisc(const fs::path &source)
++    {
++        std::error_code error;
++        if (fs::is_directory(source, error))
++            return inspectFolder(source);
++        if (equalsIgnoringCase(source.filename().string(), "SYSTEM.CNF"))
++            return inspectFolder(source.parent_path());
++        return inspectImage(source);
++    }
++
++    std::string describeDiscProblem(const DiscReport &report, bool spanish)
++    {
++        const std::string name = pathForLog(report.source.filename().empty() ? report.source : report.source.filename());
++        const std::string wanted = std::string(kGameCode) + ", " + kGameBootElf;
++        switch (report.status)
++        {
++        case DiscStatus::Valid:
++            return {};
++        case DiscStatus::Unreadable:
++            return spanish ? "No se puede abrir " + pathForLog(report.source) + "."
++                           : "Cannot open " + pathForLog(report.source) + ".";
++        case DiscStatus::NotIso:
++            return spanish ? name + " no es una imagen de disco ISO (ISO 9660). Si tu copia está en otro formato "
++                                    "(.bin/.cue, .mdf, .nrg...), conviértela antes a .iso."
++                           : name + " is not an ISO disc image (ISO 9660). If your copy is in another format "
++                                    "(.bin/.cue, .mdf, .nrg...), convert it to .iso first.";
++        case DiscStatus::NotPs2Disc:
++            return spanish ? name + " no es un disco de PS2: no tiene un SYSTEM.CNF con la línea BOOT2."
++                           : name + " is not a PS2 disc: it has no SYSTEM.CNF with a BOOT2 line.";
++        case DiscStatus::OtherGame:
++            return spanish ? "Este disco es de otro juego (" + report.bootElf +
++                                 "). Hace falta Formula One 06 de PS2, versión europea PAL (" + wanted + ")."
++                           : "This disc is another game (" + report.bootElf +
++                                 "). Formula One 06 for PS2 is needed, European PAL version (" + wanted + ").";
++        case DiscStatus::NotPal:
++            return spanish ? "Este disco no es la versión PAL (VMODE = " + report.videoMode +
++                                 "). Hace falta Formula One 06 europeo PAL (" + wanted + ")."
++                           : "This disc is not the PAL version (VMODE = " + report.videoMode +
++                                 "). The European PAL Formula One 06 is needed (" + wanted + ").";
++        case DiscStatus::Truncated:
++            return spanish ? name + " está incompleto o dañado: se acaba antes que sus archivos. Vuelve a copiarlo "
++                                    "o a crearlo desde el disco."
++                           : name + " is incomplete or damaged: it ends before its files do. Copy it again or make "
++                                    "it again from the disc.";
++        }
++        return {};
++    }
++
++    ExtractResult extractDisc(const DiscReport &report, const fs::path &parent, const ExtractProgress &progress)
++    {
++        ExtractResult result;
++        const fs::path data = parent / kDataFolderName;
++        const fs::path temp = parent / kTempFolderName;
++        result.dataDirectory = data;
++        if (report.status != DiscStatus::Valid)
++        {
++            result.status = ExtractStatus::InvalidDisc;
++            result.detail = describeDiscProblem(report, true);
++            return result;
++        }
++        if (checkDataFolder(data) == DataState::Complete && dataFolderFingerprint(data) == report.fingerprint)
++        {
++            result.status = ExtractStatus::AlreadyThere;
++            return result;
++        }
++        if (report.folder && sameFolder(report.source, data))
++        {
++            result.status = checkDataFolder(data) == DataState::Complete ? ExtractStatus::AlreadyThere
++                                                                         : ExtractStatus::InvalidDisc;
++            result.detail = "la carpeta elegida es la propia carpeta datos";
++            return result;
++        }
++
++        std::error_code error;
++        const auto fail = [&](ExtractStatus status, std::string detail)
++        {
++            std::error_code ignored;
++            fs::remove_all(temp, ignored);
++            result.status = status;
++            result.detail = std::move(detail);
++            return result;
++        };
++        // A temporary folder of an extraction that never finished (the PC went off): only this code writes it.
++        fs::remove_all(temp, error);
++        if (error || !fs::create_directories(temp, error) || error)
++            return fail(ExtractStatus::WriteFailed, "no se puede crear " + pathForLog(temp) +
++                                                        (error ? ": " + error.message() : std::string{}));
++        const fs::space_info space = fs::space(parent, error);
++        if (!error && space.available < report.totalBytes + kSpareBytes)
++            return fail(ExtractStatus::NoSpace, gigabytes(report.totalBytes + kSpareBytes) + " GB / " +
++                                                    gigabytes(space.available) + " GB");
++
++        std::ifstream image;
++        if (!report.folder)
++        {
++            image.open(report.source, std::ios::binary);
++            if (!image)
++                return fail(ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(report.source));
++        }
++        std::vector<char> buffer(kCopyBlock);
++        uint64_t done = 0u;
++        for (const DiscFile &file : report.files)
++        {
++            const fs::path relative = fs::path(file.path);
++            const fs::path target = temp / relative;
++            fs::create_directories(target.parent_path(), error);
++            std::ofstream out(target, std::ios::binary);
++            if (error || !out)
++                return fail(ExtractStatus::WriteFailed, "no se puede crear " + pathForLog(target));
++            std::ifstream folderFile;
++            std::istream *in = &image;
++            if (report.folder)
++            {
++                folderFile.open(report.source / relative, std::ios::binary);
++                if (!folderFile)
++                    return fail(ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(report.source / relative));
++                in = &folderFile;
++            }
++            else
++            {
++                image.clear();
++                image.seekg(static_cast<std::streamoff>(static_cast<uint64_t>(file.lsn) * kSector), std::ios::beg);
++            }
++            uint64_t left = file.size;
++            while (left != 0u)
++            {
++                const size_t want = static_cast<size_t>(std::min<uint64_t>(left, buffer.size()));
++                in->read(buffer.data(), static_cast<std::streamsize>(want));
++                const size_t got = static_cast<size_t>(in->gcount());
++                if (got != want)
++                {
++                    out.close();
++                    return fail(ExtractStatus::ReadFailed, "el disco se acaba antes de tiempo en " + file.path);
++                }
++                out.write(buffer.data(), static_cast<std::streamsize>(got));
++                if (!out)
++                {
++                    out.close();
++                    return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(target));
++                }
++                left -= got;
++                done += got;
++                if (progress && !progress(done, report.totalBytes, file.path))
++                {
++                    out.close();
++                    return fail(ExtractStatus::Cancelled, {});
++                }
++            }
++            out.close();
++            if (!out)
++                return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(target));
++        }
++        image.close();
++        if (!writeMarker(temp, report))
++            return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(temp / kMarkerName));
++
++        // The old datos (incomplete, or another dump) is kept under a new name: it may hold something of the player's.
++        if (fs::exists(data, error))
++        {
++            fs::path previous = parent / kPreviousFolderName;
++            for (int number = 2; fs::exists(previous, error); ++number)
++                previous = parent / (std::string(kPreviousFolderName) + "-" + std::to_string(number));
++            fs::rename(data, previous, error);
++            if (error)
++                return fail(ExtractStatus::WriteFailed, "no se puede apartar " + pathForLog(data) + ": " + error.message());
++            result.previousData = previous;
++        }
++        fs::rename(temp, data, error);
++        if (error)
++        {
++            const std::string message = error.message();
++            if (!result.previousData.empty())
++            {
++                std::error_code ignored;
++                fs::rename(result.previousData, data, ignored);
++                result.previousData.clear();
++            }
++            return fail(ExtractStatus::WriteFailed, "no se puede renombrar " + pathForLog(temp) + ": " + message);
++        }
++        result.status = ExtractStatus::Done;
++        return result;
++    }
++
++    std::string describeExtractProblem(const ExtractResult &result, bool spanish)
++    {
++        switch (result.status)
++        {
++        case ExtractStatus::Done:
++        case ExtractStatus::AlreadyThere:
++            return {};
++        case ExtractStatus::Cancelled:
++            return spanish ? "Copia cancelada. No se ha guardado nada: el juego volverá a pedir el disco."
++                           : "Copy cancelled. Nothing was kept: the game will ask for the disc again.";
++        case ExtractStatus::InvalidDisc:
++            return result.detail;
++        case ExtractStatus::NoSpace:
++            return spanish ? "No hay espacio suficiente en el disco duro (necesario / libre: " + result.detail + ")."
++                           : "Not enough free disk space (needed / free: " + result.detail + ").";
++        case ExtractStatus::ReadFailed:
++            return spanish ? "No se pudo leer el disco: " + result.detail + ". No se ha guardado nada."
++                           : "The disc could not be read: " + result.detail + ". Nothing was kept.";
++        case ExtractStatus::WriteFailed:
++            return spanish ? "No se pudo escribir la carpeta datos: " + result.detail + ". No se ha guardado nada."
++                           : "The datos folder could not be written: " + result.detail + ". Nothing was kept.";
++        }
++        return {};
++    }
++
++    DataState checkDataFolder(const fs::path &dataDirectory)
++    {
++        std::error_code error;
++        if (!fs::is_directory(dataDirectory, error))
++            return DataState::Missing;
++        const std::optional<fs::path> cnfPath = ps2x::iop::findFileIgnoringCase(dataDirectory, "SYSTEM.CNF");
++        if (!cnfPath)
++            return DataState::Incomplete;
++        std::ifstream stream(*cnfPath, std::ios::binary);
++        const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
++        const std::optional<std::string> boot2 = ps2x::iop::parseSystemCnfBoot2(text);
++        if (!boot2 || !ps2x::iop::findFileIgnoringCase(dataDirectory, ps2x::iop::bootElfName(*boot2)))
++            return DataState::Incomplete;
++        const std::optional<Marker> marker = readMarker(dataDirectory);
++        if (!marker)
++            return DataState::Complete; // copied by hand or by an older package: boots as before
++        if (marker->files.empty())
++            return DataState::Incomplete;
++        for (const DiscFile &file : marker->files)
++        {
++            const uint64_t size = fs::file_size(dataDirectory / fs::path(file.path), error);
++            if (error || size != file.size)
++                return DataState::Incomplete;
++        }
++        return DataState::Complete;
++    }
++
++    std::string dataFolderFingerprint(const fs::path &dataDirectory)
++    {
++        const std::optional<Marker> marker = readMarker(dataDirectory);
++        return marker ? marker->fingerprint : std::string{};
++    }
++
++    std::vector<fs::path> dataParents(const fs::path &exeDirectory, const fs::path &localAppDataDirectory)
++    {
++        std::vector<fs::path> parents{exeDirectory};
++        std::error_code error;
++        if (!localAppDataDirectory.empty() && !fs::exists(exeDirectory / "portable.txt", error))
++            parents.push_back(localAppDataDirectory / "F1-06");
++        return parents;
++    }
++
++    fs::path writableDataParent(const std::vector<fs::path> &parents)
++    {
++        for (const fs::path &parent : parents)
++        {
++            std::error_code error;
++            fs::create_directories(parent, error);
++            const fs::path probe = parent / "datos.prueba-escritura";
++            if (!error && fs::create_directory(probe, error) && !error)
++            {
++                fs::remove(probe, error);
++                return parent;
++            }
++        }
++        return {};
++    }
++
++    int runDiscCommand(const std::vector<std::string> &args, const fs::path &exeDirectory,
++                       const fs::path &localAppDataDirectory, std::ostream &out, const DiscCommandUi *ui, bool spanish)
++    {
++        if (args.empty() || (args[0] != "--extraer-iso" && args[0] != "--comprobar-iso"))
++            return -1;
++        const bool extract = args[0] == "--extraer-iso";
++        bool window = false;
++        for (size_t i = 2u; i < args.size(); ++i)
++            window = window || args[i] == "--ventana";
++        if (args.size() < 2u || args[1].empty() || args[1].rfind("--", 0u) == 0u ||
++            std::any_of(args.begin() + 2, args.end(), [](const std::string &arg) { return arg != "--ventana"; }))
++        {
++            out << "[disco] uso: --extraer-iso <ruta.iso o carpeta del disco> [--ventana] | --comprobar-iso <ruta>"
++                << std::endl;
++            return 1;
++        }
++        const DiscCommandUi *dialogs = window ? ui : nullptr;
++        const auto error = [&](const std::string &message)
++        {
++            out << "[disco] " << message << std::endl;
++            if (dialogs && dialogs->error)
++                dialogs->error(message);
++        };
++
++        const DiscReport report = inspectDisc(fs::path(args[1]));
++        out << "[disco] " << pathForLog(report.source) << ": " << (report.folder ? "carpeta" : "imagen") << ", "
++            << report.files.size() << " archivos, " << report.totalBytes << " bytes, BOOT2 "
++            << (report.bootElf.empty() ? "-" : report.bootElf) << ", VMODE "
++            << (report.videoMode.empty() ? "-" : report.videoMode) << ", huella "
++            << (report.fingerprint.empty() ? "-" : report.fingerprint) << std::endl;
++        if (report.status != DiscStatus::Valid)
++        {
++            error(describeDiscProblem(report, spanish));
++            return 2;
++        }
++        if (!extract)
++        {
++            out << "[disco] valido: Formula One 06 PAL (" << kGameCode << ")" << std::endl;
++            return 0;
++        }
++
++        const std::vector<fs::path> parents = dataParents(exeDirectory, localAppDataDirectory);
++        for (const fs::path &parent : parents)
++        {
++            const fs::path data = parent / kDataFolderName;
++            if (checkDataFolder(data) == DataState::Complete && dataFolderFingerprint(data) == report.fingerprint)
++            {
++                out << "[disco] " << pathForLog(data) << " ya tiene este disco: no se copia otra vez" << std::endl;
++                return 0;
++            }
++        }
++        const fs::path parent = writableDataParent(parents);
++        if (parent.empty())
++        {
++            ExtractResult failed;
++            failed.status = ExtractStatus::WriteFailed;
++            failed.detail = "no se puede escribir en " + pathForLog(exeDirectory);
++            error(describeExtractProblem(failed, spanish));
++            return 3;
++        }
++        int lastTenth = -1;
++        const ExtractProgress console = [&](uint64_t done, uint64_t total, const std::string &file)
++        {
++            const int tenth = total == 0u ? 10 : static_cast<int>(done * 10u / total);
++            if (tenth != lastTenth)
++            {
++                lastTenth = tenth;
++                out << "[disco] " << tenth * 10 << " % (" << done / (1024u * 1024u) << " de " << total / (1024u * 1024u)
++                    << " MB) " << file << std::endl;
++            }
++            return !(dialogs && dialogs->progress) || dialogs->progress(done, total, file);
++        };
++        out << "[disco] copiando en " << pathForLog(parent / kDataFolderName) << " (pasa por "
++            << kTempFolderName << ")" << std::endl;
++        const ExtractResult result = extractDisc(report, parent, console);
++        if (!result.previousData.empty())
++            out << "[disco] la carpeta datos anterior (incompleta) queda en " << pathForLog(result.previousData)
++                << std::endl;
++        switch (result.status)
++        {
++        case ExtractStatus::Done:
++            out << "[disco] listo: " << report.files.size() << " archivos en " << pathForLog(result.dataDirectory)
++                << std::endl;
++            return 0;
++        case ExtractStatus::AlreadyThere:
++            out << "[disco] " << pathForLog(result.dataDirectory) << " ya tiene este disco" << std::endl;
++            return 0;
++        case ExtractStatus::Cancelled:
++            error(describeExtractProblem(result, spanish));
++            return 4;
++        case ExtractStatus::InvalidDisc:
++            error(describeExtractProblem(result, spanish));
++            return 2;
++        default:
++            error(describeExtractProblem(result, spanish));
++            return 3;
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp b/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp
+new file mode 100644
+index 0000000..99d7e9f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp
+@@ -0,0 +1,371 @@
++#include "ps2_disc_setup.h"
++#include "ps2_user_paths.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cwctype>
++#include <optional>
++#include <string>
++#include <system_error>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <knownfolders.h>
++#include <shlobj.h>
++#include <shobjidl.h>
++#endif
++
++namespace ps2x::disc
++{
++#if defined(_WIN32)
++    namespace
++    {
++        namespace fs = std::filesystem;
++
++        // CLSID_ProgressDialog (shlguid.h), here so no import library is needed for it.
++        constexpr CLSID kProgressDialogClsid = {0xF8383852u, 0xFCD3u, 0x11D1u,
++                                                {0xA6u, 0xB9u, 0x00u, 0x60u, 0x97u, 0xDFu, 0x5Bu, 0xD4u}};
++        constexpr const wchar_t *kTitle = L"Formula One 06";
++        // Folders looked at for an ISO: their files and the files of their direct subfolders, up to these counts.
++        constexpr size_t kMaxSearchedFolders = 400u;
++        constexpr size_t kMaxInspectedImages = 24u;
++
++        std::wstring wide(const std::string &utf8)
++        {
++            if (utf8.empty())
++                return {};
++            const int length = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
++            std::wstring text(static_cast<size_t>(std::max(length, 0)), L'\0');
++            if (length > 0)
++                MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), text.data(), length);
++            return text;
++        }
++
++        // Once per process; a thread already initialised in another mode can still create the dialogs.
++        void comReady()
++        {
++            static const HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
++            (void)result;
++        }
++
++        int ask(const std::wstring &text, UINT flags)
++        {
++            return MessageBoxW(nullptr, text.c_str(), kTitle, flags | MB_SETFOREGROUND | MB_TOPMOST);
++        }
++
++        fs::path knownFolder(const KNOWNFOLDERID &id)
++        {
++            PWSTR raw = nullptr;
++            fs::path result;
++            if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) && raw != nullptr)
++                result = fs::path(raw);
++            CoTaskMemFree(raw);
++            return result;
++        }
++
++        bool isIso(const fs::path &path)
++        {
++            std::wstring extension = path.extension().wstring();
++            std::transform(extension.begin(), extension.end(), extension.begin(),
++                           [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
++            return extension == L".iso";
++        }
++
++        // The first Formula One 06 PAL image in the folders (and their direct subfolders).
++        std::optional<DiscReport> findGameImage(const std::vector<fs::path> &folders, std::ostream &log)
++        {
++            std::vector<fs::path> images;
++            size_t searched = 0u;
++            for (const fs::path &folder : folders)
++            {
++                std::vector<fs::path> pending{folder};
++                for (size_t i = 0u; i < pending.size() && searched < kMaxSearchedFolders; ++i, ++searched)
++                {
++                    std::error_code error;
++                    for (fs::directory_iterator it(pending[i], fs::directory_options::skip_permission_denied, error), end;
++                         !error && it != end; it.increment(error))
++                    {
++                        std::error_code entryError;
++                        if (i == 0u && it->is_directory(entryError))
++                            pending.push_back(it->path());
++                        else if (it->is_regular_file(entryError) && isIso(it->path()))
++                            images.push_back(it->path());
++                    }
++                }
++            }
++            for (size_t i = 0u; i < images.size() && i < kMaxInspectedImages; ++i)
++            {
++                DiscReport report = inspectDisc(images[i]);
++                log << "[disco] buscado " << pathForLog(images[i]) << ": "
++                    << (report.status == DiscStatus::Valid ? "Formula One 06 PAL" : "no vale") << std::endl;
++                if (report.status == DiscStatus::Valid)
++                    return report;
++            }
++            return std::nullopt;
++        }
++
++        // The Open dialog: an .iso, or the SYSTEM.CNF of an extracted disc. Empty if closed.
++        fs::path pickDisc(bool spanish, const fs::path &startFolder)
++        {
++            comReady();
++            IFileOpenDialog *dialog = nullptr;
++            if (FAILED(CoCreateInstance(__uuidof(FileOpenDialog), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
++                return {};
++            const COMDLG_FILTERSPEC types[] = {
++                {spanish ? L"Imagen de disco de PS2 (*.iso)" : L"PS2 disc image (*.iso)", L"*.iso"},
++                {spanish ? L"Disco ya extraído en una carpeta (SYSTEM.CNF)" : L"Disc already extracted to a folder (SYSTEM.CNF)",
++                 L"SYSTEM.CNF"}};
++            dialog->SetFileTypes(2u, types);
++            dialog->SetFileTypeIndex(1u);
++            dialog->SetTitle(spanish ? L"Elige tu copia de Formula One 06 (ISO)" : L"Choose your copy of Formula One 06 (ISO)");
++            DWORD options = 0u;
++            if (SUCCEEDED(dialog->GetOptions(&options)))
++                dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
++            IShellItem *start = nullptr;
++            if (!startFolder.empty() &&
++                SUCCEEDED(SHCreateItemFromParsingName(startFolder.c_str(), nullptr, IID_PPV_ARGS(&start))))
++            {
++                dialog->SetFolder(start);
++                start->Release();
++            }
++            fs::path chosen;
++            if (SUCCEEDED(dialog->Show(nullptr)))
++            {
++                IShellItem *item = nullptr;
++                if (SUCCEEDED(dialog->GetResult(&item)))
++                {
++                    PWSTR raw = nullptr;
++                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &raw)) && raw != nullptr)
++                        chosen = fs::path(raw);
++                    CoTaskMemFree(raw);
++                    item->Release();
++                }
++            }
++            dialog->Release();
++            return chosen;
++        }
++
++        // The shell's progress window (its own thread draws it; Cancel is polled).
++        class ProgressWindow
++        {
++        public:
++            ~ProgressWindow() { close(); }
++
++            void open(bool spanish)
++            {
++                if (m_dialog)
++                    return;
++                comReady();
++                if (FAILED(CoCreateInstance(kProgressDialogClsid, nullptr, CLSCTX_INPROC_SERVER,
++                                            __uuidof(IProgressDialog), reinterpret_cast<void **>(&m_dialog))))
++                {
++                    m_dialog = nullptr;
++                    return;
++                }
++                m_dialog->SetTitle(kTitle);
++                m_dialog->SetLine(1u,
++                                  spanish ? L"Copiando tu disco (solo la primera vez)..."
++                                          : L"Copying your disc (first time only)...",
++                                  FALSE, nullptr);
++                m_dialog->SetCancelMsg(spanish ? L"Cancelando..." : L"Cancelling...", nullptr);
++                m_dialog->StartProgressDialog(nullptr, nullptr, PROGDLG_NORMAL | PROGDLG_AUTOTIME | PROGDLG_NOMINIMIZE,
++                                              nullptr);
++                // In front of the installer's wizard (which waits for this process) and of the console.
++                IOleWindow *window = nullptr;
++                if (SUCCEEDED(m_dialog->QueryInterface(IID_PPV_ARGS(&window))))
++                {
++                    HWND handle = nullptr;
++                    if (SUCCEEDED(window->GetWindow(&handle)) && handle != nullptr)
++                    {
++                        SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
++                        SetForegroundWindow(handle);
++                    }
++                    window->Release();
++                }
++            }
++
++            // False once the player pressed Cancel.
++            bool update(uint64_t done, uint64_t total, const std::string &file)
++            {
++                if (!m_dialog)
++                    return true;
++                if (file != m_file)
++                {
++                    m_file = file;
++                    m_dialog->SetLine(2u, wide(file).c_str(), TRUE, nullptr);
++                }
++                m_dialog->SetProgress64(done, total == 0u ? 1u : total);
++                return !m_dialog->HasUserCancelled();
++            }
++
++            void close()
++            {
++                if (!m_dialog)
++                    return;
++                m_dialog->StopProgressDialog();
++                m_dialog->Release();
++                m_dialog = nullptr;
++                m_file.clear();
++            }
++
++        private:
++            IProgressDialog *m_dialog = nullptr;
++            std::string m_file;
++        };
++
++        ProgressWindow g_commandProgress;
++    }
++
++    bool spanishUi()
++    {
++        return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_SPANISH;
++    }
++
++    SetupOutcome runFirstRunSetup(const fs::path &exeDirectory, const fs::path &localAppDataDirectory,
++                                  std::ostream &log)
++    {
++        const bool spanish = spanishUi();
++        comReady();
++        const std::vector<fs::path> parents = dataParents(exeDirectory, localAppDataDirectory);
++        bool incomplete = false;
++        for (const fs::path &parent : parents)
++            incomplete = incomplete || checkDataFolder(parent / kDataFolderName) == DataState::Incomplete;
++        log << "[disco] primer arranque: no hay datos" << (incomplete ? " completos" : "") << "; se pide el disco"
++            << std::endl;
++
++        const fs::path downloads = knownFolder(FOLDERID_Downloads);
++        std::optional<DiscReport> found = findGameImage({downloads, knownFolder(FOLDERID_Desktop), exeDirectory}, log);
++        const std::wstring needed =
++            spanish ? L"Para jugar hace falta tu copia de Formula One 06 de PS2 (versión europea PAL, SCES-53950).\n\n"
++                      L"Solo se lee una vez: sus archivos se copian en la carpeta datos (unos 4,2 GB) y después el juego "
++                      L"arranca directamente."
++                    : L"To play you need your copy of Formula One 06 for PS2 (European PAL version, SCES-53950).\n\n"
++                      L"It is read only once: its files are copied to the datos folder (about 4.2 GB) and from then on "
++                      L"the game starts directly.";
++        const std::wstring incompleteText = incomplete ? (spanish ? L"La carpeta datos está incompleta.\n\n"
++                                                                  : L"The datos folder is incomplete.\n\n")
++                                                       : L"";
++        bool introShown = false;
++        while (true)
++        {
++            fs::path chosen;
++            if (found)
++            {
++                const std::wstring text =
++                    incompleteText + needed + (spanish ? L"\n\nSe ha encontrado tu copia:\n\n" : L"\n\nYour copy was found:\n\n") +
++                    found->source.wstring() +
++                    (spanish ? L"\n\n¿Usarla?\nSí: usar esta.   No: elegir otra.   Cancelar: salir."
++                             : L"\n\nUse it?\nYes: use this one.   No: choose another.   Cancel: quit.");
++                introShown = true;
++                const int answer = ask(text, MB_YESNOCANCEL | MB_ICONQUESTION);
++                if (answer == IDCANCEL)
++                    return SetupOutcome::Cancelled;
++                if (answer == IDYES)
++                    chosen = found->source;
++                found.reset();
++            }
++            if (chosen.empty())
++            {
++                if (!introShown)
++                {
++                    introShown = true;
++                    const std::wstring text =
++                        incompleteText + needed +
++                        (spanish ? L"\n\nElige el archivo .iso de tu copia en la ventana siguiente. ¿Ya tienes el disco "
++                                   L"extraído en una carpeta? Elige su SYSTEM.CNF."
++                                 : L"\n\nChoose the .iso file of your copy in the next window. Already have the disc "
++                                   L"extracted to a folder? Choose its SYSTEM.CNF.");
++                    if (ask(text, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
++                        return SetupOutcome::Cancelled;
++                }
++                chosen = pickDisc(spanish, downloads);
++                if (chosen.empty())
++                {
++                    log << "[disco] no se eligio ningun disco" << std::endl;
++                    return SetupOutcome::Cancelled;
++                }
++            }
++
++            const DiscReport report = inspectDisc(chosen);
++            log << "[disco] elegido " << pathForLog(chosen) << ": " << report.files.size() << " archivos, BOOT2 "
++                << (report.bootElf.empty() ? "-" : report.bootElf) << ", huella "
++                << (report.fingerprint.empty() ? "-" : report.fingerprint) << std::endl;
++            if (report.status != DiscStatus::Valid)
++            {
++                log << "[disco] no vale: " << describeDiscProblem(report, true) << std::endl;
++                if (ask(wide(describeDiscProblem(report, spanish)) +
++                            (spanish ? L"\n\n¿Elegir otro archivo?" : L"\n\nChoose another file?"),
++                        MB_RETRYCANCEL | MB_ICONWARNING) != IDRETRY)
++                    return SetupOutcome::Cancelled;
++                continue;
++            }
++
++            const fs::path parent = writableDataParent(parents);
++            if (parent.empty())
++            {
++                log << "[disco] no se puede escribir en " << pathForLog(exeDirectory) << std::endl;
++                ask(spanish ? L"No se puede escribir la carpeta datos junto al juego (" + exeDirectory.wstring() +
++                                  L"). Mueve el juego a una carpeta tuya o ábrelo como administrador una vez."
++                            : L"The datos folder cannot be written next to the game (" + exeDirectory.wstring() +
++                                  L"). Move the game to one of your folders or run it once as administrator.",
++                    MB_OK | MB_ICONERROR);
++                return SetupOutcome::Failed;
++            }
++            ProgressWindow window;
++            window.open(spanish);
++            const ExtractResult result = extractDisc(report, parent, [&](uint64_t done, uint64_t total, const std::string &file)
++                                                     { return window.update(done, total, file); });
++            window.close();
++            log << "[disco] copia en " << pathForLog(result.dataDirectory) << ": "
++                << (result.status == ExtractStatus::Done || result.status == ExtractStatus::AlreadyThere ? "lista"
++                                                                                                          : result.detail)
++                << std::endl;
++            if (!result.previousData.empty())
++                log << "[disco] la carpeta datos anterior queda en " << pathForLog(result.previousData) << std::endl;
++            if (result.status == ExtractStatus::Done || result.status == ExtractStatus::AlreadyThere)
++                return SetupOutcome::Ready;
++            if (ask(wide(describeExtractProblem(result, spanish)) +
++                        (spanish ? L"\n\n¿Probar otra vez?" : L"\n\nTry again?"),
++                    MB_RETRYCANCEL | (result.status == ExtractStatus::Cancelled ? MB_ICONINFORMATION : MB_ICONERROR)) !=
++                IDRETRY)
++                return result.status == ExtractStatus::Cancelled ? SetupOutcome::Cancelled : SetupOutcome::Failed;
++            found = report; // the same disc is offered again
++        }
++    }
++
++    const DiscCommandUi *windowsDiscCommandUi()
++    {
++        static const DiscCommandUi ui{
++            [](uint64_t done, uint64_t total, const std::string &file)
++            {
++                g_commandProgress.open(spanishUi());
++                const bool keepGoing = g_commandProgress.update(done, total, file);
++                if (done >= total || !keepGoing)
++                    g_commandProgress.close();
++                return keepGoing;
++            },
++            [](const std::string &message)
++            {
++                g_commandProgress.close();
++                ask(wide(message), MB_OK | MB_ICONWARNING);
++            }};
++        return &ui;
++    }
++#else
++    bool spanishUi() { return true; }
++
++    SetupOutcome runFirstRunSetup(const std::filesystem::path &, const std::filesystem::path &, std::ostream &log)
++    {
++        log << "[disco] no hay datos: usa --extraer-iso <ruta.iso>" << std::endl;
++        return SetupOutcome::Failed;
++    }
++
++    const DiscCommandUi *windowsDiscCommandUi() { return nullptr; }
++#endif
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index e4295b4..f842faa 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -5,6 +5,7 @@
+ #include "lib/ps2_netplay_session.h"
+ #include "lib/ps2_game_font.h"
+ #include "ps2_user_paths.h"
++#include "ps2_disc_setup.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -25,6 +26,7 @@
+ #include <cstdint>
+ #include <fstream>
+ #include <iterator>
++#include <optional>
+ #include <sstream>
+ #include <vector>
+ #include <ctime>
+@@ -276,9 +278,11 @@ namespace
+         std::filesystem::path cardDirectory;
+     };
+ 
+-    // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, a datos folder next to the .exe,
+-    // an ISO appended to the .exe, exactly one .iso next to the .exe, PS2X_DEFAULT_BOOT_ELF.
+-    BootSource chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable, std::ostream &out)
++    // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, a datos folder next to the .exe (or,
++    // installed, in LocalAppData\F1-06; lanzamiento T1), an ISO appended to the .exe, exactly one .iso next to the
++    // .exe. Nothing found: chooseBootSource() falls back to PS2X_DEFAULT_BOOT_ELF, or main() asks for the disc.
++    std::optional<BootSource> findBootSource(int argc, char *argv[], const std::filesystem::path &executable,
++                                             std::ostream &out)
+     {
+         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+         {
+@@ -286,31 +290,42 @@ namespace
+             if (hasIsoExtension(argument))
+             {
+                 out << "[arranque] ISO del argumento: " << argument.string() << std::endl;
+-                return {{}, argument, 0u};
++                return BootSource{{}, argument, 0u};
+             }
+             out << "Using argv boot path" << std::endl;
+             out << "[arranque] ELF del argumento: " << argument.string() << std::endl;
+-            return {argument};
++            return BootSource{argument};
+         }
+         if (const char *iso = std::getenv("PS2X_ISO"); iso && *iso)
+         {
+             out << "[arranque] ISO de PS2X_ISO: " << iso << std::endl;
+-            return {{}, std::filesystem::path(iso), 0u};
++            return BootSource{{}, std::filesystem::path(iso), 0u};
+         }
+         if (!executable.empty())
+         {
+-            if (const std::optional<ps2x::iop::DataFolderBoot> data =
+-                    ps2x::iop::findDataFolderBoot(executable.parent_path()))
++            // Lanzamiento T1: a datos folder with a marker must hold every file it lists (an extraction cut short
++            // by hand is asked for again).
++            for (const std::filesystem::path &parent :
++                 ps2x::disc::dataParents(executable.parent_path(), ps2x::knownLocalAppDataDirectory()))
+             {
+-                out << "[arranque] carpeta datos junto al .exe: " << data->dataDirectory.string() << " (ELF "
+-                          << data->elfPath.filename().string() << ")" << std::endl;
+-                return {data->elfPath, {}, 0u, executable.parent_path()};
++                const std::optional<ps2x::iop::DataFolderBoot> data = ps2x::iop::findDataFolderBoot(parent);
++                if (!data)
++                    continue;
++                if (ps2x::disc::checkDataFolder(data->dataDirectory) != ps2x::disc::DataState::Complete)
++                {
++                    out << "[arranque] carpeta datos incompleta: " << ps2x::pathForLog(data->dataDirectory)
++                        << std::endl;
++                    continue;
++                }
++                out << "[arranque] carpeta datos: " << ps2x::pathForLog(data->dataDirectory) << " (ELF "
++                    << data->elfPath.filename().string() << ")" << std::endl;
++                return BootSource{data->elfPath, {}, 0u, executable.parent_path()};
+             }
+ 
+             if (const std::optional<ps2x::iop::AppendedIso> appended = ps2x::iop::findAppendedIso(executable))
+             {
+                 out << "[arranque] ISO pegada al .exe (desplazamiento=" << appended->offset << ")" << std::endl;
+-                return {{}, executable, appended->offset};
++                return BootSource{{}, executable, appended->offset};
+             }
+ 
+             std::vector<std::filesystem::path> isos;
+@@ -325,7 +340,7 @@ namespace
+             if (isos.size() == 1u)
+             {
+                 out << "[arranque] ISO junto al .exe: " << isos.front().string() << std::endl;
+-                return {{}, isos.front(), 0u};
++                return BootSource{{}, isos.front(), 0u};
+             }
+             if (isos.size() > 1u)
+             {
+@@ -333,7 +348,19 @@ namespace
+                           << " ISO junto al .exe: no se elige ninguna (pasa una como argumento)" << std::endl;
+             }
+         }
+-        return {getExecutablePath()};
++        return std::nullopt;
++    }
++
++    // findBootSource(), else PS2X_DEFAULT_BOOT_ELF; without that define, nothing (the player's disc is asked for).
++    std::optional<BootSource> chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable,
++                                               std::ostream &out)
++    {
++        std::optional<BootSource> found = findBootSource(argc, argv, executable, out);
++#if defined(PS2X_DEFAULT_BOOT_ELF)
++        if (!found)
++            found = BootSource{getExecutablePath()};
++#endif
++        return found;
+     }
+ 
+     // Image mode: the disc is the image, the ELF is BOOT2 of its SYSTEM.CNF, the cards live in cardDirectory.
+@@ -401,6 +428,10 @@ namespace
+ //       does not run the game: a window that sends this PC's pad (player 1 of controles.ini) as the host's player 2.
+ // Without --clave the password comes from PS2X_RED_CLAVE. N4: --invitado without an address or a password opens the
+ // guest's form; the host can also start from the game (OPTIONS > PC OPTIONS > PC NETPLAY).
++// Lanzamiento T1 (ps2_disc_setup.h): without datos the game asks for the player's disc and copies it into datos.
++//   F1-06.exe --extraer-iso <iso or folder> [--ventana]  does only that (exit 0 done, 1 usage, 2 not the game,
++//       3 read/write/space, 4 cancelled); --ventana shows the progress and errors as windows (the installer).
++//   F1-06.exe --comprobar-iso <iso or folder>  only checks the disc (0 valid, 2 not).
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+@@ -413,6 +444,17 @@ int main(int argc, char *argv[])
+         const std::filesystem::path executable = runningExecutable(argc >= 1 ? argv[0] : nullptr);
+         // Fase 5 (T15): the netplay arguments go out first; the game sees the rest as before.
+         std::vector<std::string> arguments(argv + std::min(argc, 1), argv + argc);
++        std::error_code currentError;
++        if (const int code = ps2x::disc::runDiscCommand(
++                arguments, executable.empty() ? std::filesystem::current_path(currentError) : executable.parent_path(),
++                ps2x::knownLocalAppDataDirectory(), std::cout, ps2x::disc::windowsDiscCommandUi(),
++                ps2x::disc::spanishUi());
++            code >= 0)
++        {
++            std::cout.flush();
++            std::cerr.flush();
++            std::_Exit(code);
++        }
+         ps2x::netplay::NetplayOptions netplay;
+         std::string netplayError;
+         const bool netplayOk =
+@@ -422,22 +464,27 @@ int main(int argc, char *argv[])
+             gameArgv.push_back(argument.data());
+         const bool guestMode = netplayOk && netplay.mode == ps2x::netplay::NetplayMode::Guest;
+         std::ostringstream bootLines;
+-        BootSource boot;
++        std::optional<BootSource> found;
+         if (guestMode)
+         {
+             // The guest runs no game: the boot source only decides where its files are (and may be missing).
+             try
+             {
+-                boot = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
++                found = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
+             }
+             catch (const std::exception &)
+             {
+             }
+         }
+         else
+-            boot = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
++            found = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
++        // Lanzamiento T1: no game anywhere yet, so the player's disc is asked for once the log is open.
++        const bool discSetup = !guestMode && !found;
++        if (discSetup && executable.empty())
++            found = BootSource{getExecutablePath()}; // throws: there is no folder for datos
++        BootSource boot = found.value_or(BootSource{});
+         // Development: an ELF given by path (argument or PS2X_DEFAULT_BOOT_ELF) keeps the old layout.
+-        const bool development = boot.imagePath.empty() && boot.cardDirectory.empty();
++        const bool development = !discSetup && boot.imagePath.empty() && boot.cardDirectory.empty();
+         std::vector<std::string> pathLines;
+         const ps2x::UserPaths userPaths = prepareUserPaths(executable, development, pathLines);
+         redirectConsoleToLogFile(executable, userPaths.logsDirectory,
+@@ -446,6 +493,24 @@ int main(int argc, char *argv[])
+             std::cout << bootLines.str();
+         for (const std::string &line : pathLines)
+             std::cout << line << std::endl;
++        if (discSetup)
++        {
++            const ps2x::disc::SetupOutcome outcome =
++                ps2x::disc::runFirstRunSetup(executable.parent_path(), ps2x::knownLocalAppDataDirectory(), std::cout);
++            if (outcome != ps2x::disc::SetupOutcome::Ready)
++            {
++                std::cout << "[disco] sin los datos del juego: no se arranca" << std::endl;
++                std::cout.flush();
++                std::cerr.flush();
++                std::_Exit(outcome == ps2x::disc::SetupOutcome::Cancelled ? 0 : 1);
++            }
++            std::ostringstream setupLines;
++            found = findBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, setupLines);
++            std::cout << setupLines.str();
++            if (!found)
++                throw std::runtime_error("datos was extracted but does not boot");
++            boot = *found;
++        }
+         if (!netplayOk)
+         {
+             std::cerr << "[red] argumentos no validos: " << netplayError << std::endl
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index a1c6a13..be86118 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+     src/ps2_user_paths_tests.cpp
++    src/ps2_disc_setup_tests.cpp
+     src/ps2_display_tests.cpp
+     src/ps2_options_menu_tests.cpp
+     src/ps2_netplay_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 1e5fa65..01d15fe 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -21,6 +21,7 @@ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_ps2_user_paths_tests();
++void register_ps2_disc_setup_tests();
+ void register_ps2_display_tests();
+ void register_ps2_options_menu_tests();
+ void register_ps2_netplay_tests();
+@@ -53,6 +54,7 @@ int main()
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     register_ps2_user_paths_tests();
++    register_ps2_disc_setup_tests();
+     register_ps2_display_tests();
+     register_ps2_options_menu_tests();
+     register_ps2_netplay_tests();
+diff --git a/ps2xTest/src/ps2_disc_setup_tests.cpp b/ps2xTest/src/ps2_disc_setup_tests.cpp
+new file mode 100644
+index 0000000..3af18dd
+--- /dev/null
++++ b/ps2xTest/src/ps2_disc_setup_tests.cpp
+@@ -0,0 +1,440 @@
++#include "MiniTest.h"
++#include "ps2_disc_setup.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace
++{
++    namespace fs = std::filesystem;
++    using ps2x::disc::DataState;
++    using ps2x::disc::DiscReport;
++    using ps2x::disc::DiscStatus;
++    using ps2x::disc::ExtractResult;
++    using ps2x::disc::ExtractStatus;
++
++    constexpr uint32_t kSector = 2048u;
++    // A tiny Formula One 06 disc: SYSTEM.CNF, the BOOT2 ELF and two files in nested folders.
++    constexpr uint32_t kRootLsn = 18u;
++    constexpr uint32_t kDataLsn = 19u;
++    constexpr uint32_t kSubLsn = 20u;
++    constexpr uint32_t kCnfLsn = 21u;
++    constexpr uint32_t kElfLsn = 22u; // 3000 bytes, two sectors
++    constexpr uint32_t kElfSize = 3000u;
++    constexpr uint32_t kBinLsn = 24u; // DATA/A.BIN, 5000 bytes over three sectors
++    constexpr uint32_t kBinSize = 5000u;
++    constexpr uint32_t kTxtLsn = 27u; // DATA/SUB/B.TXT
++    constexpr uint32_t kImageSectors = 28u;
++    const std::string kTxt = "hola disco";
++    const std::string kGameCnf = "BOOT2 = cdrom0:\\SCES_539.50;1\r\nVER = 1.01\r\nVMODE = PAL\r\n";
++
++    void putBoth32(std::vector<uint8_t> &image, size_t at, uint32_t value)
++    {
++        for (uint32_t i = 0u; i < 4u; ++i)
++        {
++            image[at + i] = static_cast<uint8_t>(value >> (i * 8u));
++            image[at + 4u + i] = static_cast<uint8_t>(value >> ((3u - i) * 8u));
++        }
++    }
++
++    size_t putRecord(std::vector<uint8_t> &image, size_t at, uint32_t lsn, uint32_t size, bool directory,
++                     const std::string &name)
++    {
++        const size_t length = (33u + name.size() + 1u) & ~size_t{1u};
++        image[at] = static_cast<uint8_t>(length);
++        putBoth32(image, at + 2u, lsn);
++        putBoth32(image, at + 10u, size);
++        image[at + 25u] = directory ? 2u : 0u;
++        image[at + 28u] = 1u;
++        image[at + 31u] = 1u;
++        image[at + 32u] = static_cast<uint8_t>(name.size());
++        std::memcpy(image.data() + at + 33u, name.data(), name.size());
++        return at + length;
++    }
++
++    std::vector<uint8_t> pattern(uint32_t size, uint32_t seed)
++    {
++        std::vector<uint8_t> bytes(size);
++        for (uint32_t i = 0u; i < size; ++i)
++            bytes[i] = static_cast<uint8_t>((i * 7u + seed + i / kSector) & 0xFFu);
++        return bytes;
++    }
++
++    // An ISO 9660 image of the disc; an empty cnf leaves SYSTEM.CNF out.
++    std::vector<uint8_t> buildDisc(const std::string &cnf)
++    {
++        std::vector<uint8_t> image(static_cast<size_t>(kImageSectors) * kSector, 0u);
++        const size_t pvd = 16u * kSector;
++        image[pvd] = 1u;
++        std::memcpy(image.data() + pvd + 1u, "CD001", 5u);
++        image[pvd + 6u] = 1u;
++        std::memcpy(image.data() + pvd + 40u, "FORMULAONE06                    ", 32u);
++        putBoth32(image, pvd + 80u, kImageSectors);
++        image[pvd + 128u] = 0x00u;
++        image[pvd + 129u] = 0x08u;
++        image[pvd + 130u] = 0x08u;
++        (void)putRecord(image, pvd + 156u, kRootLsn, kSector, true, std::string(1u, '\0'));
++        image[17u * kSector] = 255u;
++        std::memcpy(image.data() + 17u * kSector + 1u, "CD001", 5u);
++
++        size_t at = kRootLsn * kSector;
++        at = putRecord(image, at, kRootLsn, kSector, true, std::string(1u, '\0'));
++        at = putRecord(image, at, kRootLsn, kSector, true, std::string(1u, '\1'));
++        at = putRecord(image, at, kDataLsn, kSector, true, "DATA");
++        if (!cnf.empty())
++            at = putRecord(image, at, kCnfLsn, static_cast<uint32_t>(cnf.size()), false, "SYSTEM.CNF;1");
++        (void)putRecord(image, at, kElfLsn, kElfSize, false, "SCES_539.50;1");
++
++        at = kDataLsn * kSector;
++        at = putRecord(image, at, kDataLsn, kSector, true, std::string(1u, '\0'));
++        at = putRecord(image, at, kRootLsn, kSector, true, std::string(1u, '\1'));
++        at = putRecord(image, at, kBinLsn, kBinSize, false, "A.BIN;1");
++        (void)putRecord(image, at, kSubLsn, kSector, true, "SUB");
++
++        at = kSubLsn * kSector;
++        at = putRecord(image, at, kSubLsn, kSector, true, std::string(1u, '\0'));
++        at = putRecord(image, at, kDataLsn, kSector, true, std::string(1u, '\1'));
++        (void)putRecord(image, at, kTxtLsn, static_cast<uint32_t>(kTxt.size()), false, "B.TXT;1");
++
++        std::memcpy(image.data() + kCnfLsn * kSector, cnf.data(), cnf.size());
++        const std::vector<uint8_t> elf = pattern(kElfSize, 1u);
++        std::memcpy(image.data() + kElfLsn * kSector, elf.data(), elf.size());
++        const std::vector<uint8_t> bin = pattern(kBinSize, 2u);
++        std::memcpy(image.data() + kBinLsn * kSector, bin.data(), bin.size());
++        std::memcpy(image.data() + kTxtLsn * kSector, kTxt.data(), kTxt.size());
++        return image;
++    }
++
++    struct TempDir
++    {
++        fs::path path;
++
++        TempDir()
++        {
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            path = fs::temp_directory_path() / ("ps2x-disc-setup-" + std::to_string(stamp));
++            fs::create_directories(path);
++        }
++
++        ~TempDir()
++        {
++            std::error_code error;
++            fs::remove_all(path, error);
++        }
++    };
++
++    void writeBytes(const fs::path &path, const std::vector<uint8_t> &bytes)
++    {
++        fs::create_directories(path.parent_path());
++        std::ofstream out(path, std::ios::binary);
++        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    }
++
++    void writeText(const fs::path &path, const std::string &text)
++    {
++        writeBytes(path, std::vector<uint8_t>(text.begin(), text.end()));
++    }
++
++    std::vector<uint8_t> readBytes(const fs::path &path)
++    {
++        std::ifstream in(path, std::ios::binary);
++        return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    }
++
++    fs::path writeDisc(const TempDir &dir, const std::string &cnf, size_t keepBytes = 0u)
++    {
++        std::vector<uint8_t> image = buildDisc(cnf);
++        if (keepBytes != 0u)
++            image.resize(keepBytes);
++        const fs::path path = dir.path / "juego.iso";
++        writeBytes(path, image);
++        return path;
++    }
++
++    // Every file under a folder as "relative path:size", sorted.
++    std::vector<std::string> listTree(const fs::path &root)
++    {
++        std::vector<std::string> files;
++        for (const auto &entry : fs::recursive_directory_iterator(root))
++            if (entry.is_regular_file())
++                files.push_back(entry.path().lexically_relative(root).generic_string() + ":" +
++                                std::to_string(entry.file_size()));
++        std::sort(files.begin(), files.end());
++        return files;
++    }
++
++    bool contains(const std::string &text, const std::string &part) { return text.find(part) != std::string::npos; }
++}
++
++void register_ps2_disc_setup_tests()
++{
++    MiniTest::Case("PS2DiscSetup", [](TestCase &tc)
++                   {
++        tc.Run("a Formula One 06 PAL image is valid and lists every file", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            t.IsTrue(report.status == DiscStatus::Valid, "the disc is valid");
++            t.IsFalse(report.folder, "an image, not a folder");
++            t.Equals(report.bootElf, std::string("SCES_539.50"), "BOOT2 file name");
++            t.Equals(report.videoMode, std::string("PAL"), "VMODE");
++            t.Equals(report.volumeId, std::string("FORMULAONE06"), "volume id without padding");
++            t.Equals(report.files.size(), size_t{4u}, "four files");
++            if (report.files.size() == 4u)
++            {
++                t.Equals(report.files[0].path, std::string("DATA/A.BIN"), "sorted by path, ';1' removed");
++                t.Equals(report.files[0].size, uint64_t{kBinSize}, "A.BIN size");
++                t.Equals(report.files[0].lsn, kBinLsn, "A.BIN sector");
++                t.Equals(report.files[1].path, std::string("DATA/SUB/B.TXT"), "nested folder");
++                t.Equals(report.files[2].path, std::string("SCES_539.50"), "the ELF");
++                t.Equals(report.files[3].path, std::string("SYSTEM.CNF"), "SYSTEM.CNF");
++            }
++            t.Equals(report.totalBytes, uint64_t{kBinSize + kTxt.size() + kElfSize + kGameCnf.size()}, "total bytes");
++            t.Equals(report.fingerprint.size(), size_t{16u}, "16 hex digits");
++            t.Equals(ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf)).fingerprint, report.fingerprint,
++                     "the same disc gives the same fingerprint");
++        });
++
++        tc.Run("another game's BOOT2 is refused with its code in the message", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report =
++                ps2x::disc::inspectDisc(writeDisc(dir, "BOOT2 = cdrom0:\\SLES_123.45;1\r\nVMODE = PAL\r\n"));
++            t.IsTrue(report.status == DiscStatus::OtherGame, "other game");
++            t.Equals(report.bootElf, std::string("SLES_123.45"), "its BOOT2");
++            const std::string es = ps2x::disc::describeDiscProblem(report, true);
++            const std::string en = ps2x::disc::describeDiscProblem(report, false);
++            t.IsTrue(contains(es, "SLES_123.45") && contains(es, "SCES-53950"), "Spanish text names both: " + es);
++            t.IsTrue(contains(en, "SLES_123.45") && contains(en, "SCES-53950"), "English text names both: " + en);
++            t.IsFalse(es == en, "two languages");
++        });
++
++        tc.Run("NTSC, no SYSTEM.CNF, not an ISO and a missing file are each refused", [](TestCase &t)
++        {
++            TempDir dir;
++            t.IsTrue(ps2x::disc::inspectDisc(writeDisc(dir, "BOOT2 = cdrom0:\\SCES_539.50;1\r\nVMODE = NTSC\r\n"))
++                             .status == DiscStatus::NotPal,
++                     "NTSC");
++            t.IsTrue(ps2x::disc::inspectDisc(writeDisc(dir, "")).status == DiscStatus::NotPs2Disc, "no SYSTEM.CNF");
++            t.IsTrue(ps2x::disc::inspectDisc(writeDisc(dir, "VER = 1.00\r\n")).status == DiscStatus::NotPs2Disc,
++                     "no BOOT2");
++            const fs::path junk = dir.path / "otro.iso";
++            writeBytes(junk, std::vector<uint8_t>(40u * kSector, 0x5Au));
++            t.IsTrue(ps2x::disc::inspectDisc(junk).status == DiscStatus::NotIso, "not ISO 9660");
++            t.IsTrue(ps2x::disc::inspectDisc(dir.path / "no-existe.iso").status == DiscStatus::Unreadable, "missing");
++            for (const DiscStatus status : {DiscStatus::NotPal, DiscStatus::NotPs2Disc, DiscStatus::NotIso,
++                                            DiscStatus::Unreadable, DiscStatus::Truncated})
++            {
++                DiscReport report;
++                report.status = status;
++                t.IsFalse(ps2x::disc::describeDiscProblem(report, true).empty(), "every problem has a text");
++            }
++        });
++
++        tc.Run("a truncated image is refused before anything is written", [](TestCase &t)
++        {
++            TempDir dir;
++            const size_t cut = static_cast<size_t>(kBinLsn) * kSector + 1000u; // inside A.BIN
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf, cut));
++            t.IsTrue(report.status == DiscStatus::Truncated, "truncated");
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::InvalidDisc, "not extracted");
++            t.IsTrue(fs::is_empty(parent), "nothing written");
++        });
++
++        tc.Run("extraction goes through a temporary folder and leaves a complete datos with its marker", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            uint64_t lastDone = 0u, lastTotal = 0u;
++            bool sawTemp = false;
++            const ExtractResult result = ps2x::disc::extractDisc(
++                report, parent, [&](uint64_t done, uint64_t total, const std::string &)
++                {
++                    lastDone = done;
++                    lastTotal = total;
++                    sawTemp = sawTemp || (fs::exists(parent / "datos.extrayendo") && !fs::exists(parent / "datos"));
++                    return true; });
++            const fs::path data = parent / "datos";
++            t.IsTrue(result.status == ExtractStatus::Done, "done: " + result.detail);
++            t.Equals(result.dataDirectory, data, "datos next to the .exe");
++            t.IsTrue(sawTemp, "written into datos.extrayendo first");
++            t.Equals(lastDone, report.totalBytes, "progress reaches the total");
++            t.Equals(lastTotal, report.totalBytes, "progress total");
++            t.IsFalse(fs::exists(parent / "datos.extrayendo"), "no temporary folder left");
++            t.Equals(readBytes(data / "DATA" / "A.BIN"), pattern(kBinSize, 2u), "A.BIN bytes");
++            t.Equals(readBytes(data / "SCES_539.50"), pattern(kElfSize, 1u), "ELF bytes");
++            const std::vector<uint8_t> txt = readBytes(data / "DATA" / "SUB" / "B.TXT");
++            t.Equals(std::string(txt.begin(), txt.end()), kTxt, "B.TXT bytes");
++            t.IsTrue(fs::exists(data / "F1-06-disco.txt"), "marker");
++            t.Equals(listTree(data).size(), size_t{5u}, "the four files and the marker");
++            t.IsTrue(ps2x::disc::checkDataFolder(data) == DataState::Complete, "complete");
++            t.Equals(ps2x::disc::dataFolderFingerprint(data), report.fingerprint, "marker fingerprint");
++
++            const ExtractResult again = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(again.status == ExtractStatus::AlreadyThere, "the same disc is not copied twice");
++        });
++
++        tc.Run("a cancelled extraction leaves nothing", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            const ExtractResult result =
++                ps2x::disc::extractDisc(report, parent, [](uint64_t, uint64_t, const std::string &) { return false; });
++            t.IsTrue(result.status == ExtractStatus::Cancelled, "cancelled");
++            t.IsTrue(fs::is_empty(parent), "no datos and no temporary folder");
++            t.IsFalse(ps2x::disc::describeExtractProblem(result, false).empty(), "a text for it");
++        });
++
++        tc.Run("an image that changes under the extraction fails and leaves nothing", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const DiscReport report = ps2x::disc::inspectDisc(iso);
++            std::vector<uint8_t> image = readBytes(iso);
++            image.resize(static_cast<size_t>(kBinLsn) * kSector + 100u);
++            writeBytes(iso, image);
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::ReadFailed, "read failure");
++            t.IsTrue(fs::is_empty(parent), "nothing left");
++            t.Equals(readBytes(iso).size(), image.size(), "the image is only read");
++        });
++
++        tc.Run("an incomplete datos is moved aside, not deleted, and a stale temporary folder is replaced", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            const fs::path parent = dir.path / "juego";
++            writeText(parent / "datos" / "mio.txt", "no borrar");
++            writeText(parent / "datos.extrayendo" / "SCES_539.50", "a half copy of an earlier run");
++            t.IsTrue(ps2x::disc::checkDataFolder(parent / "datos") == DataState::Incomplete, "no SYSTEM.CNF");
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::Done, "done: " + result.detail);
++            t.Equals(result.previousData, parent / "datos.anterior", "moved aside");
++            t.IsTrue(fs::exists(parent / "datos.anterior" / "mio.txt"), "the old files are kept");
++            t.IsFalse(fs::exists(parent / "datos.extrayendo"), "stale temporary folder gone");
++            t.Equals(readBytes(parent / "datos" / "SCES_539.50"), pattern(kElfSize, 1u), "fresh ELF");
++        });
++
++        tc.Run("datos state: missing, legacy without marker, and a marker file gone or resized", [](TestCase &t)
++        {
++            TempDir dir;
++            t.IsTrue(ps2x::disc::checkDataFolder(dir.path / "datos") == DataState::Missing, "missing");
++            writeText(dir.path / "antiguo" / "datos" / "SYSTEM.CNF", kGameCnf);
++            writeText(dir.path / "antiguo" / "datos" / "sces_539.50", "elf");
++            t.IsTrue(ps2x::disc::checkDataFolder(dir.path / "antiguo" / "datos") == DataState::Complete,
++                     "a datos copied by hand still boots");
++            t.IsTrue(ps2x::disc::dataFolderFingerprint(dir.path / "antiguo" / "datos").empty(), "no marker");
++
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            (void)ps2x::disc::extractDisc(report, parent, nullptr);
++            writeText(parent / "datos" / "DATA" / "SUB" / "B.TXT", "x");
++            t.IsTrue(ps2x::disc::checkDataFolder(parent / "datos") == DataState::Incomplete, "resized file");
++            fs::remove(parent / "datos" / "DATA" / "SUB" / "B.TXT");
++            t.IsTrue(ps2x::disc::checkDataFolder(parent / "datos") == DataState::Incomplete, "missing file");
++        });
++
++        tc.Run("an extracted disc folder is accepted and copied without cards or logs", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path disc = dir.path / "disco";
++            writeText(disc / "SYSTEM.CNF", kGameCnf);
++            writeBytes(disc / "SCES_539.50", pattern(kElfSize, 1u));
++            writeBytes(disc / "DATA" / "A.BIN", pattern(kBinSize, 2u));
++            writeText(disc / "mc0" / "tarjeta.bin", "card");
++            writeText(disc / "juego.log", "log");
++            const DiscReport report = ps2x::disc::inspectDisc(disc / "SYSTEM.CNF");
++            t.IsTrue(report.status == DiscStatus::Valid, "valid folder");
++            t.IsTrue(report.folder, "a folder");
++            t.Equals(report.source, disc, "SYSTEM.CNF gives its folder");
++            t.Equals(report.files.size(), size_t{3u}, "no mc0 or .log");
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::Done, "done: " + result.detail);
++            t.Equals(listTree(parent / "datos"),
++                     std::vector<std::string>{"DATA/A.BIN:5000", "F1-06-disco.txt:" +
++                                                  std::to_string(fs::file_size(parent / "datos" / "F1-06-disco.txt")),
++                                              "SCES_539.50:3000", "SYSTEM.CNF:" + std::to_string(kGameCnf.size())},
++                     "the same files");
++            t.IsTrue(ps2x::disc::inspectDisc(parent / "datos").status == DiscStatus::Valid,
++                     "the target can be inspected");
++            const ExtractResult self = ps2x::disc::extractDisc(ps2x::disc::inspectDisc(parent / "datos"), parent, nullptr);
++            t.IsTrue(self.status == ExtractStatus::AlreadyThere || self.status == ExtractStatus::InvalidDisc,
++                     "datos is never copied onto itself");
++            t.IsTrue(ps2x::disc::checkDataFolder(parent / "datos") == DataState::Complete, "still complete");
++        });
++
++        tc.Run("data parents: the .exe folder, and LocalAppData only when installed", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path exe = dir.path / "F1-06";
++            const fs::path local = dir.path / "local";
++            fs::create_directories(exe);
++            t.Equals(ps2x::disc::dataParents(exe, local), std::vector<fs::path>{exe, local / "F1-06"}, "installed");
++            t.Equals(ps2x::disc::dataParents(exe, {}), std::vector<fs::path>{exe}, "no LocalAppData");
++            writeText(exe / "portable.txt", "x");
++            t.Equals(ps2x::disc::dataParents(exe, local), std::vector<fs::path>{exe}, "portable");
++            t.Equals(ps2x::disc::writableDataParent({exe}), exe, "writable");
++            t.IsFalse(fs::exists(exe / "datos.extrayendo"), "no probe left");
++        });
++
++        tc.Run("command line: --comprobar-iso and --extraer-iso exit codes", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const fs::path exe = dir.path / "F1-06";
++            fs::create_directories(exe);
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            const auto run = [&](std::vector<std::string> args)
++            { return ps2x::disc::runDiscCommand(args, exe, {}, out, nullptr, true); };
++
++            t.Equals(run({"--anfitrion"}), -1, "not a disc command");
++            t.Equals(run({"--extraer-iso"}), 1, "missing path");
++            t.Equals(run({"--comprobar-iso", iso.string()}), 0, "valid");
++            t.IsFalse(fs::exists(exe / "datos"), "checking writes nothing");
++            const fs::path other = dir.path / "otro.iso";
++            {
++                const std::vector<uint8_t> image = buildDisc("BOOT2 = cdrom0:\\SLES_123.45;1\r\n");
++                writeBytes(other, image);
++            }
++            out.str("");
++            t.Equals(run({"--extraer-iso", other.string()}), 2, "another game");
++            t.IsTrue(contains(out.str(), "SLES_123.45"), "says which: " + out.str());
++            t.IsFalse(fs::exists(exe / "datos"), "nothing extracted");
++            t.Equals(run({"--extraer-iso", iso.string()}), 0, "extracted");
++            t.IsTrue(ps2x::disc::checkDataFolder(exe / "datos") == DataState::Complete, "complete datos");
++            out.str("");
++            t.Equals(run({"--extraer-iso", iso.string()}), 0, "already there");
++            t.IsTrue(contains(out.str(), "ya"), "says so: " + out.str());
++
++            const ps2x::disc::DiscCommandUi cancel{[](uint64_t, uint64_t, const std::string &) { return false; },
++                                                   [](const std::string &) {}};
++            const fs::path exe2 = dir.path / "F1-06b";
++            fs::create_directories(exe2);
++            writeText(exe2 / "portable.txt", "x");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string(), "--ventana"}, exe2, {}, out, &cancel,
++                                                false),
++                     4, "cancelled");
++            t.IsFalse(fs::exists(exe2 / "datos"), "nothing left after cancel");
++        });
++    });
++}

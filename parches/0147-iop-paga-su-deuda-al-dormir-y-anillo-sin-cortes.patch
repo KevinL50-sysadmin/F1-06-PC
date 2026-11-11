@@ -1,0 +1,619 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index a591cc5..2c91056 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_spu2.h"
++#include "iop_spu2_output.h"
+ #include "iop_spu2_resampler.h"
+ 
+ #include "ps2x/iop/iop_spu2_audio.h"
+@@ -271,8 +272,13 @@ namespace ps2x::iop::detail
+             std::atomic<uint64_t> underruns{0};
+             std::atomic<uint64_t> silentFrames{0}; // frames the device asked for and did not get (filled with zeros)
+             std::atomic<uint32_t> requestMin{UINT32_MAX}, requestMax{0}; // frames per device request, per report
++            // Latency target (patch 0147): the consumer moves it, the producer's resampler steers toward it.
++            std::atomic<uint32_t> target{Spu2OutputConsumer::MinTarget};
+         };
++        static_assert(Spu2OutputConsumer::MaxTarget + Spu2OutputResampler::ValveMargin < OutputRing::Capacity,
++                      "the ring must hold the overflow valve of the largest target");
+         OutputRing g_output;
++        Spu2OutputConsumer g_consumer; // audio device thread only
+         std::atomic<int32_t> g_outputGain{256}; // PS2X_VOLUMEN (0-100 %), 256 = 100 %
+     }
+ 
+@@ -804,9 +810,10 @@ namespace ps2x::iop::detail
+                 std::fwrite(frame, sizeof(frame), 1, wav);
+                 ++wavFrames;
+             }
+-            // Keep the host latency near 43 ms (the device pulls 1024 frames at a time): the IOP clock follows wall
++            // Keep the host latency near the target (43 ms or more, see Spu2OutputConsumer): the IOP clock follows wall
+             // time, so this only corrects small drift and the bursts in which the IOP runs ahead, by resampling the
+             // stream within +-0.5 % (patch 0146; see Spu2OutputResampler).
++            resampler.setTarget(static_cast<double>(g_output.target.load(std::memory_order_relaxed)));
+             const size_t w = g_output.write.load(std::memory_order_relaxed);
+             const size_t fill = w - g_output.read.load(std::memory_order_acquire);
+             const uint64_t overflowsBefore = resampler.overflows();
+@@ -821,7 +828,7 @@ namespace ps2x::iop::detail
+             if (resampler.overflows() != overflowsBefore && (overflowsBefore < 10u || overflowsBefore % 100u == 0u))
+                 std::fprintf(stderr, "[spu2] desborde %llu del anillo (%.0fms): fundido y salto hasta %.0fms\n",
+                              static_cast<unsigned long long>(overflowsBefore + 1u), static_cast<double>(fill) / 48.0,
+-                             Spu2OutputResampler::TargetFill / 48.0);
++                             resampler.target() / 48.0);
+         }
+ 
+         void generate(uint32_t n)
+@@ -933,7 +940,7 @@ namespace ps2x::iop::detail
+             std::fprintf(stderr,
+                          "[spu2] muestras/s=%.0f kon/s=%.1f vocesOidas=%.1f irqVoz=%llu retraso=%.1fms anillo=%.0fms "
+                          "vaciados=%llu (marcos %llu) descartes=%llu (desbordes %llu) ratio=%+.0fppm (media %+.0f) "
+-                         "pedido=%u-%u\n",
++                         "pedido=%u-%u objetivo=%.0fms\n",
+                          static_cast<double>(sample - reportSample) / seconds, static_cast<double>(keyOns) / seconds,
+                          static_cast<double>(audibleVoiceSamples) / std::max<double>(1.0, static_cast<double>(sample - reportSample)),
+                          static_cast<unsigned long long>(fetchIrqs),
+@@ -947,7 +954,8 @@ namespace ps2x::iop::detail
+                                     static_cast<double>(resampler.inputFrames() - reportInputFrames) -
+                                 1.0) * 1e6
+                              : 0.0,
+-                         requestMin == UINT32_MAX ? 0u : requestMin, requestMax);
++                         requestMin == UINT32_MAX ? 0u : requestMin, requestMax,
++                         static_cast<double>(g_output.target.load()) / 48.0);
+             reportInputFrames = resampler.inputFrames();
+             reportOutputFrames = resampler.outputFrames();
+             static const bool s_voices = std::getenv("PS2X_SPU2_VOCES") != nullptr;
+@@ -1536,7 +1544,7 @@ namespace ps2x::iop::detail
+         return raise;
+     }
+ 
+-    std::size_t readSpu2AudioImpl(int16_t *out, std::size_t frames) noexcept
++    std::size_t readSpu2OutputRaw(int16_t *out, std::size_t frames) noexcept
+     {
+         const size_t r = g_output.read.load(std::memory_order_relaxed);
+         const size_t available = g_output.write.load(std::memory_order_acquire) - r;
+@@ -1548,17 +1556,30 @@ namespace ps2x::iop::detail
+             out[i * 2u + 1u] = static_cast<int16_t>(packed >> 16);
+         }
+         g_output.read.store(r + count, std::memory_order_release);
+-        if (count < frames)
++        return count;
++    }
++
++    std::size_t readSpu2AudioImpl(int16_t *out, std::size_t frames) noexcept
++    {
++        // A dry ring fades out, rebuffers in silence and fades back in (patch 0147; see Spu2OutputConsumer).
++        const size_t r = g_output.read.load(std::memory_order_relaxed);
++        const size_t available = g_output.write.load(std::memory_order_acquire) - r;
++        const Spu2OutputConsumer::Result result = g_consumer.read(out, frames, available, g_output.target, [r](size_t i)
+         {
++            return g_output.frames[(r + i) % OutputRing::Capacity];
++        });
++        const size_t count = result.frames;
++        g_output.read.store(r + count, std::memory_order_release);
++        if (result.underrun)
+             g_output.underruns.fetch_add(1u, std::memory_order_relaxed);
++        if (count < frames)
+             g_output.silentFrames.fetch_add(frames - count, std::memory_order_relaxed);
+-        }
+         const uint32_t requested = static_cast<uint32_t>(std::min<std::size_t>(frames, UINT32_MAX));
+         if (requested < g_output.requestMin.load(std::memory_order_relaxed))
+             g_output.requestMin.store(requested, std::memory_order_relaxed);
+         if (requested > g_output.requestMax.load(std::memory_order_relaxed))
+             g_output.requestMax.store(requested, std::memory_order_relaxed);
+-        return count;
++        return result.written;
+     }
+ }
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2_output.h b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+new file mode 100644
+index 0000000..0f28be2
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+@@ -0,0 +1,128 @@
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++
++namespace ps2x::iop::detail
++{
++    // Device side of the host output ring (patch 0147). When the EE thread stalls longer than the ring holds, the
++    // device runs dry; it used to get whatever was left and zeros after it, a hard cut from full level to silence (the
++    // crackle heard from boot to the menu). Now the last frame played is held and faded out after the real frames (so
++    // a ring that runs dry exactly at a request boundary fades too), the device gets silence until the ring is back at
++    // the latency target, and playback resumes with a fade-in, so a stall is a short dip instead of a click. The target itself adapts: each underrun raises it (up to 128 ms) and 20 s of output without one lowers it
++    // slowly (never below the 43 ms of patch 0146); the producer's resampler steers the ring toward it.
++    // Single consumer: only the device thread touches this object; the target is written here and read by the producer.
++    class Spu2OutputConsumer
++    {
++    public:
++        static constexpr uint32_t MinTarget = 2048u;   // frames (43 ms; the device pulls 1024 at a time)
++        static constexpr uint32_t MaxTarget = 6144u;   // 128 ms
++        static constexpr uint32_t TargetRaise = 512u;  // per underrun
++        static constexpr uint32_t TargetLower = 256u;  // per LowerAfterFrames played without an underrun
++        static constexpr uint64_t LowerAfterFrames = 20u * 48000u;
++        static constexpr uint32_t FadeOutFrames = 128u;
++        static constexpr uint32_t FadeInFrames = 256u;
++
++        struct Result
++        {
++            size_t frames = 0;     // taken from the ring
++            size_t written = 0;    // written to `out` (those frames plus the fade-out tail); the caller zero-fills the rest
++            bool underrun = false; // the ring ran dry in this request (one per event, not per silent request)
++        };
++
++        // One device request of `frames` (interleaved stereo into `out`) with `available` frames in the ring;
++        // fetch(i) returns the packed frame i past the read position (left | right << 16).
++        template <typename Fetch>
++        Result read(int16_t *out, size_t frames, size_t available, std::atomic<uint32_t> &target, Fetch &&fetch)
++        {
++            Result result;
++            if (m_state == State::Rebuffering)
++            {
++                if (available < target.load(std::memory_order_relaxed))
++                {
++                    result.written = writeTail(out, frames);
++                    return result;
++                }
++                m_state = State::FadingIn;
++                m_fade = 0;
++                m_tail = 0;
++            }
++            const size_t count = std::min(frames, available);
++            for (size_t i = 0; i < count; ++i)
++            {
++                const uint32_t packed = fetch(i);
++                double gain = 1.0;
++                if (m_state == State::FadingIn)
++                {
++                    gain = static_cast<double>(m_fade) / FadeInFrames;
++                    if (++m_fade >= FadeInFrames)
++                        m_state = State::Playing;
++                }
++                m_lastLeft = scale(static_cast<int16_t>(packed & 0xFFFFu), gain);
++                m_lastRight = scale(static_cast<int16_t>(packed >> 16), gain);
++                out[i * 2u] = m_lastLeft;
++                out[i * 2u + 1u] = m_lastRight;
++            }
++            result.frames = count;
++            result.written = count;
++            if (count < frames)
++            {
++                result.underrun = true;
++                m_state = State::Rebuffering;
++                m_played = 0;
++                m_tail = FadeOutFrames;
++                result.written += writeTail(out + count * 2u, frames - count);
++                target.store(std::min(target.load(std::memory_order_relaxed) + TargetRaise, MaxTarget),
++                             std::memory_order_relaxed);
++                return result;
++            }
++            m_played += count;
++            if (m_played >= LowerAfterFrames)
++            {
++                m_played = 0;
++                const uint32_t current = target.load(std::memory_order_relaxed);
++                target.store(current > MinTarget + TargetLower ? current - TargetLower : MinTarget,
++                             std::memory_order_relaxed);
++            }
++            return result;
++        }
++
++    private:
++        enum class State : uint8_t
++        {
++            Rebuffering, // also the start: the device waits for the target before playing
++            FadingIn,
++            Playing,
++        };
++
++        [[nodiscard]] static int16_t scale(int16_t sample, double gain) noexcept
++        {
++            return gain >= 1.0 ? sample : static_cast<int16_t>(static_cast<double>(sample) * gain);
++        }
++
++        // The rest of the fade-out of the last frame played (it may span several requests); returns the frames written.
++        size_t writeTail(int16_t *out, size_t frames)
++        {
++            const size_t count = std::min<size_t>(frames, m_tail);
++            for (size_t i = 0; i < count; ++i)
++            {
++                const double gain = static_cast<double>(--m_tail) / FadeOutFrames;
++                out[i * 2u] = scale(m_lastLeft, gain);
++                out[i * 2u + 1u] = scale(m_lastRight, gain);
++            }
++            return count;
++        }
++
++        State m_state = State::Rebuffering;
++        uint32_t m_fade = 0;
++        uint32_t m_tail = 0;           // fade-out frames still to write
++        int16_t m_lastLeft = 0, m_lastRight = 0;
++        uint64_t m_played = 0; // frames taken from the ring since the last underrun or target change
++    };
++
++    // The host ring without the consumer above (no rebuffering or fades): the tests of the synthesis timing read it
++    // directly. Returns the frames written to `out`.
++    std::size_t readSpu2OutputRaw(int16_t *out, std::size_t frames) noexcept;
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2_resampler.h b/ps2xIOP/src/emulator/core/iop_spu2_resampler.h
+index f41041c..d1afeba 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2_resampler.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2_resampler.h
+@@ -14,13 +14,15 @@ namespace ps2x::iop::detail
+     // controller on the smoothed ring fill steers toward the target, clamped to +-0.5 % (under 9 cents, inaudible).
+     // A gross overflow (the IOP catching up after a stall) is the only case that skips input: it fades out, skips until
+     // the ring is back at the target and fades in, so it is a short dip instead of a click.
++    // Patch 0147: the target moves (Spu2OutputConsumer raises it after underruns and lowers it slowly) and the valve
++    // moves with it, ValveMargin above; the controller gain stays the one tuned for the base target.
+     class Spu2OutputResampler
+     {
+     public:
+-        static constexpr double TargetFill = 2048.0;             // frames (43 ms; the device pulls 1024 at a time)
++        static constexpr double TargetFill = 2048.0;             // base target, frames (43 ms; the device pulls 1024)
+         static constexpr double MaxDeviation = 0.005;            // +-0.5 % of speed
+         static constexpr double FillSmoothing = 1.0 / 16384.0;   // per input frame (0.34 s time constant)
+-        static constexpr size_t OverflowFill = 8192u;            // 171 ms: safety valve
++        static constexpr size_t ValveMargin = 6144u;             // 128 ms above the target: safety valve
+         static constexpr uint32_t FadeFrames = 256u;
+ 
+         // One synthesized frame; `fill` = frames in the host ring now. Calls emit(left, right) zero, one or two times
+@@ -50,7 +52,7 @@ namespace ps2x::iop::detail
+ 
+             if (m_state == State::Skipping)
+             {
+-                if (level > TargetFill)
++                if (level > m_target)
+                 {
+                     ++m_dropped;
+                     return;
+@@ -59,7 +61,7 @@ namespace ps2x::iop::detail
+                 m_fade = 0;
+                 m_fill = level; // the controller starts again from the fill it finds
+             }
+-            else if (m_state == State::Normal && fill >= OverflowFill)
++            else if (m_state == State::Normal && fill >= overflowFill())
+             {
+                 m_state = State::FadingOut;
+                 m_fade = FadeFrames;
+@@ -67,7 +69,7 @@ namespace ps2x::iop::detail
+             }
+             m_fill += (level - m_fill) * FillSmoothing;
+             // Input frames consumed per output frame: above the target, play slightly faster to drain the ring.
+-            m_step = 1.0 + std::clamp((m_fill - TargetFill) * (MaxDeviation / TargetFill), -MaxDeviation, MaxDeviation);
++            m_step = 1.0 + std::clamp((m_fill - m_target) * (MaxDeviation / TargetFill), -MaxDeviation, MaxDeviation);
+ 
+             while (m_phase < 1.0)
+             {
+@@ -96,6 +98,11 @@ namespace ps2x::iop::detail
+             m_phase -= 1.0;
+         }
+ 
++        // Ring fill the controller steers toward, in frames (the output ring holds target + ValveMargin).
++        void setTarget(double frames) noexcept { m_target = frames; }
++        [[nodiscard]] double target() const noexcept { return m_target; }
++        [[nodiscard]] size_t overflowFill() const noexcept { return static_cast<size_t>(m_target) + ValveMargin; }
++
+         // Current output speed against the synthesis, in parts per million (+ = more output frames than input).
+         [[nodiscard]] double ratioPpm() const noexcept { return (1.0 / m_step - 1.0) * 1e6; }
+         [[nodiscard]] uint64_t dropped() const noexcept { return m_dropped; }      // input frames the valve skipped
+@@ -126,6 +133,7 @@ namespace ps2x::iop::detail
+         State m_state = State::Normal;
+         uint32_t m_fade = 0;
+         double m_fill = 0.0;
++        double m_target = TargetFill;
+         double m_step = 1.0;
+         double m_phase = 0.0;
+         uint64_t m_dropped = 0, m_overflows = 0, m_inputFrames = 0, m_outputFrames = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c867cf6..e75cb0a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -150,6 +150,9 @@ namespace
+     // advances in batches (see EeScheduler::accountCycles).
+     uint64_t g_iopBatchCycles = 0u;
+     uint64_t g_iopGivenCycles = 0u;
++    // The IOP's real-time debt (in EE cycles): wall time it has not run yet, paid about 2 ms per accountCycles call and
++    // in full before the EE goes idle (see run()).
++    uint64_t g_iopDebtCycles = 0u;
+ 
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+@@ -269,10 +272,14 @@ void EeScheduler::run()
+             {
+                 // Before going idle, run the IOP's unfinished batch (see accountCycles): it may wake an EE thread
+                 // (a SIF command or DMA completion) that would otherwise wait for the next timer or VBLANK.
+-                if (g_iopBatchCycles != 0u)
++                // Patch 0147: and all its real-time debt. Paid at 2 ms per call, it stayed pinned near the 100 ms cap
++                // through the boot (the EE sleeps 69 % of the time there), the IOP dropped 5-80 % of its time and the
++                // SPU2 output ring ran dry; an idle IOP jumps to its next event, so this costs only the work it has.
++                if (g_iopBatchCycles != 0u || g_iopDebtCycles != 0u)
+                 {
+-                    const uint64_t batch = g_iopBatchCycles;
++                    const uint64_t batch = g_iopBatchCycles + g_iopDebtCycles;
+                     g_iopBatchCycles = 0u;
++                    g_iopDebtCycles = 0u;
+                     g_iopGivenCycles += batch;
+                     m_runtime.advanceIopEeCycles(batch);
+                     continue;
+@@ -724,7 +731,8 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ 
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed + catchUp);
+ 
+-    // The IOP gets the wall-time catch-up too, spread over the following calls (at most about 2 ms of it per call).
++    // The IOP gets the wall-time catch-up too, spread over the following calls (at most about 2 ms of it per call; the
++    // rest before the EE goes idle, see run()).
+     // With only the executed EE cycles it ran 25-35 times slower than real time in a race, where the EE spends most of
+     // its wall time in the VU1 and the GS: every file or stream read over the IOP took tens of seconds and the race
+     // stood still meanwhile. An idle IOP jumps straight to its next event, so the catch-up only costs host time when it
+@@ -748,20 +756,19 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+         }();
+         constexpr uint64_t kIopCatchUpPerCall = microsecondsToEeCycles(2000u);
+         constexpr uint64_t kMaxIopDebt = microsecondsToEeCycles(100000u);
+-        static uint64_t s_iopDebt = 0u;
+         static uint64_t s_iopDropped = 0u;
+         static std::chrono::steady_clock::time_point s_iopReportStart = std::chrono::steady_clock::now();
+         uint64_t iopCycles = elapsed;
+         if (s_iopRealTime)
+         {
+-            s_iopDebt += catchUp;
+-            if (s_iopDebt > kMaxIopDebt)
++            g_iopDebtCycles += catchUp;
++            if (g_iopDebtCycles > kMaxIopDebt)
+             {
+-                s_iopDropped += s_iopDebt - kMaxIopDebt;
+-                s_iopDebt = kMaxIopDebt;
++                s_iopDropped += g_iopDebtCycles - kMaxIopDebt;
++                g_iopDebtCycles = kMaxIopDebt;
+             }
+-            const uint64_t extra = std::min(s_iopDebt, kIopCatchUpPerCall);
+-            s_iopDebt -= extra;
++            const uint64_t extra = std::min(g_iopDebtCycles, kIopCatchUpPerCall);
++            g_iopDebtCycles -= extra;
+             iopCycles += extra;
+         }
+         else
+@@ -783,7 +790,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             const double total = static_cast<double>(g_iopGivenCycles + s_iopDropped);
+             std::fprintf(stderr, "[iop:ritmo] ciclosIOP/s=%.0f deuda=%.1fms descartado=%.0f%%\n",
+                          static_cast<double>(g_iopGivenCycles) / 8.0 / seconds,
+-                         1000.0 * static_cast<double>(s_iopDebt) / static_cast<double>(EeScheduler::kEeClockHz),
++                         1000.0 * static_cast<double>(g_iopDebtCycles) / static_cast<double>(EeScheduler::kEeClockHz),
+                          total > 0.0 ? 100.0 * static_cast<double>(s_iopDropped) / total : 0.0);
+             s_iopReportStart = now;
+             g_iopGivenCycles = 0u;
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index ee8e868..680c805 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "../../ps2xIOP/tests/iop_compat_test_support.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_spu2.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_spu2_resampler.h"
++#include "../../ps2xIOP/src/emulator/core/iop_spu2_output.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+ #include "../../ps2xIOP/src/emulator/services/iop_rpc.h"
+@@ -75,7 +76,7 @@ namespace
+         static void drain()
+         {
+             int16_t scratch[2048];
+-            while (ps2x::iop::readSpu2Audio(scratch, 1024u) != 0u)
++            while (ps2x::iop::detail::readSpu2OutputRaw(scratch, 1024u) != 0u)
+             {
+             }
+         }
+@@ -101,7 +102,7 @@ namespace
+             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             while (left.size() < frames && std::chrono::steady_clock::now() < deadline)
+             {
+-                const size_t got = ps2x::iop::readSpu2Audio(chunk, 256u);
++                const size_t got = ps2x::iop::detail::readSpu2OutputRaw(chunk, 256u);
+                 for (size_t i = 0; i < got; ++i)
+                     left.push_back(chunk[i * 2u]);
+                 if (got == 0u)
+@@ -175,6 +176,43 @@ namespace
+     {
+         run.run(0.0, static_cast<double>(frames) / 48000.0, 0.0, frame);
+     }
++
++    // Patch 0147: the device side of the host ring, fed a constant level (amplitude 8000) on both channels. `queued`
++    // is what the producer has written and the consumer has not taken yet.
++    struct ConsumerRun
++    {
++        static constexpr int16_t kLevel = 8000;
++
++        ps2x::iop::detail::Spu2OutputConsumer consumer;
++        std::atomic<uint32_t> target{ps2x::iop::detail::Spu2OutputConsumer::MinTarget};
++        uint64_t queued = 0, underruns = 0, silentFrames = 0;
++        std::vector<int16_t> left; // everything the device played, zero-filled like the runtime does
++
++        // One device request of `frames`; returns the frames taken from the ring.
++        size_t pull(size_t frames)
++        {
++            std::vector<int16_t> out(frames * 2u, 0);
++            const auto result = consumer.read(out.data(), frames, static_cast<size_t>(queued), target, [](size_t)
++            {
++                return static_cast<uint32_t>(static_cast<uint16_t>(kLevel)) |
++                       (static_cast<uint32_t>(static_cast<uint16_t>(kLevel)) << 16);
++            });
++            queued -= result.frames;
++            underruns += result.underrun ? 1u : 0u;
++            silentFrames += frames - result.frames;
++            for (size_t i = 0; i < frames; ++i)
++                left.push_back(i < result.written ? out[i * 2u] : int16_t{0});
++            return result.frames;
++        }
++
++        [[nodiscard]] double maxDelta(size_t from, size_t to) const
++        {
++            double delta = 0.0;
++            for (size_t i = std::max<size_t>(from, 1u); i < to && i < left.size(); ++i)
++                delta = std::max(delta, std::abs(static_cast<double>(left[i]) - left[i - 1u]));
++            return delta;
++        }
++    };
+ }
+ 
+ void register_ps2_iop_tests()
+@@ -370,5 +408,157 @@ void register_ps2_iop_tests()
+                      "the ring fill should be back near the target, mean " + std::to_string(run.meanFill()));
+         });
+ 
++        tc.Run("SPU2 output resampler steers the ring toward a raised latency target", [](TestCase &t)
++        {
++            ResamplerRun run;
++            run.resampler.setTarget(4096.0);
++            uint64_t frame = 0;
++            resamplerPreroll(run, 2048u, frame);
++            run.run(1.0, 120.0, 30.0, frame);
++            t.Equals(run.resampler.dropped(), uint64_t{0}, "no input frame should be dropped");
++            t.Equals(run.resampler.overflows(), uint64_t{0}, "the overflow safety valve should not trigger");
++            t.IsTrue(run.maxDelta <= ResamplerRun::kSineDelta, "the output should have no discontinuity, max delta " +
++                                                                std::to_string(run.maxDelta));
++            t.IsTrue(std::abs(run.meanFill() - 4096.0) < 400.0,
++                     "the ring fill should settle near the raised target, mean " + std::to_string(run.meanFill()));
++            t.Equals(run.underruns, uint64_t{0}, "the device should never run dry");
++        });
++
++        tc.Run("SPU2 output resampler overflow valve follows the latency target", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputResampler;
++            Spu2OutputResampler resampler;
++            t.Equals(resampler.overflowFill(), size_t{2048u + 6144u}, "the valve sits 128 ms above the base target");
++            resampler.setTarget(4096.0);
++            t.Equals(resampler.overflowFill(), size_t{4096u + 6144u}, "and moves with a raised target");
++
++            ResamplerRun above; // 9000 frames trip the valve at the base target (see the gross overflow test)
++            above.resampler.setTarget(4096.0);
++            uint64_t frame = 0;
++            resamplerPreroll(above, 9000u, frame);
++            above.run(1.0, 60.0, 20.0, frame);
++            t.Equals(above.resampler.overflows(), uint64_t{0}, "9000 frames are under a raised target's valve");
++            t.Equals(above.resampler.dropped(), uint64_t{0}, "so nothing is skipped");
++
++            ResamplerRun gross;
++            gross.resampler.setTarget(4096.0);
++            frame = 0;
++            resamplerPreroll(gross, 11000u, frame);
++            gross.run(1.0, 60.0, 20.0, frame);
++            t.Equals(gross.resampler.overflows(), uint64_t{1}, "above the moved valve it triggers once");
++            t.IsTrue(std::abs(gross.meanFill() - 4096.0) < 400.0,
++                     "and skips back to the raised target, mean " + std::to_string(gross.meanFill()));
++            t.Equals(gross.underruns, uint64_t{0}, "the device should never run dry");
++        });
++
++        tc.Run("SPU2 output consumer fades the tail out on an underrun instead of cutting", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputConsumer;
++            ConsumerRun run;
++            run.queued = 3500u;
++            for (int i = 0; i < 3; ++i)
++                t.Equals(run.pull(1024u), size_t{1024u}, "a primed ring plays whole requests");
++            t.Equals(run.underruns, uint64_t{0}, "no underrun while the ring has frames");
++            t.Equals(run.left[Spu2OutputConsumer::FadeInFrames + 10u], ConsumerRun::kLevel,
++                     "past the start fade-in the level plays unchanged");
++            t.Equals(run.pull(1024u), size_t{428u}, "the dry request takes what is left");
++            t.Equals(run.underruns, uint64_t{1}, "one underrun");
++            t.Equals(run.silentFrames, uint64_t{596u}, "and its missing frames are silent");
++            t.IsTrue(run.maxDelta(0u, run.left.size()) <= ConsumerRun::kLevel / 128.0 + 1.0,
++                     "no step from full level to silence, max delta " + std::to_string(run.maxDelta(0u, run.left.size())));
++            t.Equals(run.left[3072u + 428u - 1u], ConsumerRun::kLevel, "the frames left in the ring play unchanged");
++            t.IsTrue(run.left[3072u + 428u + 64u] > 0 && run.left[3072u + 428u + 64u] < ConsumerRun::kLevel,
++                     "then the last frame fades out");
++            t.Equals(run.left[3072u + 428u + Spu2OutputConsumer::FadeOutFrames - 1u], int16_t{0},
++                     "down to silence in 128 frames");
++            t.Equals(run.target.load(), Spu2OutputConsumer::MinTarget + 512u, "the underrun raises the target");
++            t.Equals(run.pull(1024u), size_t{0u}, "an empty ring plays silence");
++            t.Equals(run.underruns, uint64_t{1}, "one underrun per event, not per request");
++            t.Equals(run.silentFrames, uint64_t{596u + 1024u}, "but every silent frame counts");
++        });
++
++        tc.Run("SPU2 output consumer fades out when the ring runs dry exactly at a request boundary", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputConsumer;
++            ConsumerRun run;
++            run.queued = 3072u;
++            for (int i = 0; i < 3; ++i)
++                t.Equals(run.pull(1024u), size_t{1024u}, "whole requests while the ring has frames");
++            t.Equals(run.pull(1024u), size_t{0u}, "the next request finds the ring empty");
++            t.Equals(run.underruns, uint64_t{1}, "one underrun");
++            t.IsTrue(run.maxDelta(0u, run.left.size()) <= ConsumerRun::kLevel / 128.0 + 1.0,
++                     "no step from full level to silence, max delta " + std::to_string(run.maxDelta(0u, run.left.size())));
++            t.Equals(run.left[3072u + Spu2OutputConsumer::FadeOutFrames - 1u], int16_t{0}, "silence after the fade-out");
++        });
++
++        tc.Run("SPU2 output consumer rebuffers to the target in silence, then fades in", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputConsumer;
++            ConsumerRun run;
++            run.queued = 2048u;
++            t.Equals(run.pull(1024u), size_t{1024u}, "a ring at the target plays");
++            t.Equals(run.pull(1024u), size_t{1024u}, "until it is empty");
++            t.Equals(run.pull(1024u), size_t{0u}, "then it runs dry");
++            t.Equals(run.underruns, uint64_t{1}, "once");
++            const uint32_t target = run.target.load();
++            t.Equals(target, 2560u, "the target is now 53 ms");
++            run.queued = target - 1u;
++            const size_t before = run.left.size();
++            t.Equals(run.pull(1024u), size_t{0u}, "below the target the device keeps getting silence");
++            t.Equals(run.left[before + 1000u], int16_t{0}, "silence");
++            run.queued = target;
++            const size_t resume = run.left.size();
++            t.Equals(run.pull(1024u), size_t{1024u}, "at the target it plays again");
++            t.IsTrue(std::abs(run.left[resume]) <= ConsumerRun::kLevel / 128, "starting from silence");
++            t.IsTrue(run.maxDelta(resume - 1u, resume + 1024u) <= ConsumerRun::kLevel / 256.0 + 1.0,
++                     "with a fade-in, max delta " + std::to_string(run.maxDelta(resume - 1u, resume + 1024u)));
++            t.IsTrue(run.left[resume + 100u] > 0 && run.left[resume + 100u] < ConsumerRun::kLevel, "mid fade-in");
++            t.Equals(run.left[resume + Spu2OutputConsumer::FadeInFrames], ConsumerRun::kLevel, "full level after it");
++            t.Equals(run.underruns, uint64_t{1}, "rebuffering is not another underrun");
++        });
++
++        tc.Run("SPU2 output latency target rises with each underrun up to 128 ms", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputConsumer;
++            ConsumerRun run;
++            uint32_t expected = Spu2OutputConsumer::MinTarget;
++            for (int event = 0; event < 12; ++event)
++            {
++                run.queued = run.target.load() + 100u;
++                while (run.pull(1024u) == 1024u)
++                {
++                }
++                expected = std::min(expected + 512u, Spu2OutputConsumer::MaxTarget);
++                t.Equals(run.target.load(), expected, "each underrun raises the target by 512 frames");
++            }
++            t.Equals(run.underruns, uint64_t{12}, "one underrun per event");
++            t.Equals(run.target.load(), 6144u, "capped at 128 ms");
++        });
++
++        tc.Run("SPU2 output latency target falls 256 frames per 20 s without underruns, down to 43 ms", [](TestCase &t)
++        {
++            using ps2x::iop::detail::Spu2OutputConsumer;
++            ConsumerRun run;
++            run.target.store(4096u);
++            run.queued = UINT64_MAX / 2u;
++            auto play = [&run](int requests)
++            {
++                for (int i = 0; i < requests; ++i)
++                    run.pull(1024u);
++                run.left.clear();
++            };
++            play(937); // 959488 frames: just under 20 s
++            t.Equals(run.target.load(), 4096u, "under 20 s the target holds");
++            play(1);
++            t.Equals(run.target.load(), 4096u - 256u, "after 20 s without underruns it falls 256 frames");
++            play(937);
++            t.Equals(run.target.load(), 4096u - 256u, "the next step needs another 20 s");
++            play(1);
++            t.Equals(run.target.load(), 4096u - 512u, "and falls again");
++            play(20000);
++            t.Equals(run.target.load(), Spu2OutputConsumer::MinTarget, "never below 43 ms");
++            t.Equals(run.underruns, uint64_t{0}, "no underrun");
++        });
++
+     });
+ }

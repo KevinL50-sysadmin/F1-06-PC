@@ -1,0 +1,170 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0c99e30..02b13ae 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -28,7 +28,8 @@
+ // schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057), 30 the
+ // compiled schedules with the upper FMAC through calls instead of inline (before patch 0058), 31 the compiled schedules with LQ,
+ // SQ, the pc and the block end through calls (before patch 0059), 32 the compiled
+-// schedules with every flag commit through a call (before patch 0060). A
++// schedules with every flag commit through a call (before patch 0060), 34 the
++// compiled schedules normalizing every FMAC operand, without JitKnownNormal (before patch 0061). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 0733b38..c162109 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1967,13 +1967,13 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31 || abMode == 32) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34) && s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || (abMode >= 29 && abMode <= 32))
++            else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 9f5ba50..6e45d31 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -345,6 +345,23 @@
+         }
+     }
+ 
++    inline uint8_t jitLanesToComponents(uint8_t lanes)
++    {
++        return static_cast<uint8_t>(((lanes >> 3) & 1u) | (((lanes >> 2) & 1u) << 1) | (((lanes >> 1) & 1u) << 2) |
++                                    ((lanes & 1u) << 3));
++    }
++
++    // Lanes (component bits, x = bit 0) of each VF register and of ACC whose current value is known, at compile time,
++    // to be what normalize4 would leave (patch 0061): FMAC results always are (a value with an exponent from 2 to 253,
++    // or the signed zero or maximum it is replaced with), so an operand that a FMAC of the same schedule wrote needs no
++    // normalizing. Anything else that may write the register (lower instructions, commits, other upper operations,
++    // execLower) forgets it. vf0 is (0, 0, 0, 1) and never written in a block.
++    struct JitKnownNormal
++    {
++        uint8_t vf[32] = {0xFu};
++        uint8_t acc = 0u;
++    };
++
+     // Constants of the inline FMAC (rows of kJitConst).
+     enum JitConst : uint32_t
+     {
+@@ -394,7 +411,7 @@
+     // current MXCSR mode, the range test of fmacSse2, the flag entry (sign flags alone) and the result in its lanes.
+     // Outside that range: a call to p.upperEarly, which does all of it from the registers, still untouched.
+     // False: not one of these (the caller calls p.upperEarly).
+-    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p)
++    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -411,8 +428,10 @@
+ 
+         e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
+         // a = xmm0, b = xmm1, c = xmm2 (MADD/MSUB: ACC)
++        const uint8_t comp = op.components;
+         e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * op.fs);
+-        jitNormalize(e, 0);
++        if ((known.vf[op.fs] & comp) != comp)
++            jitNormalize(e, 0);
+         switch (op.source)
+         {
+         case FmacSourceBc:
+@@ -431,11 +450,16 @@
+             e.loadXmm(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft);
+             break;
+         }
+-        jitNormalize(e, 1);
++        const bool bKnown = op.source == FmacSourceBc ? (known.vf[op.ft] & (1u << op.bc)) != 0u
++                            : op.source == FmacSourceVt ? (known.vf[op.ft] & comp) == comp
++                                                        : false;
++        if (!bKnown)
++            jitNormalize(e, 1);
+         if (madd)
+         {
+             e.loadXmm(2, B::Vu, offsetof(VU1State, acc));
+-            jitNormalize(e, 2);
++            if ((known.acc & comp) != comp)
++                jitNormalize(e, 2);
+             // product = xmm4, value = xmm3
+             e.movaps(4, 0);
+             e.rr({0x0F, 0x59}, 4, 1); // mulps
+@@ -832,14 +856,15 @@
+ 
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
+-    // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls) and 31 (LQ, SQ, the pc and the
+-    // end of the block through calls), in s.jitCalls.
++    // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls), 31 (LQ, SQ, the pc and the end
++    // of the block through calls), 32 (flag commits through calls) and 34 (no JitKnownNormal), in s.jitCalls.
+     template <typename Host>
+     bool jitCompile(BlockEngine &engine, Schedule &s, Host &host, int alternative = 0)
+     {
+         const bool inlineFmac = alternative != 30;
+         const bool inlineLower = alternative != 31 && s_jitInlineLower;
+         const bool inlineFlags = alternative != 32 && s_jitInlineFlags;
++        const bool trackNormal = alternative != 34; // A/B mode 34: every FMAC operand normalized
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+@@ -870,8 +895,13 @@
+             e.call(reinterpret_cast<const void *>(&jitCommits<Host>), &s.jitRanges.back());
+             nextCommit = end;
+         };
++        JitKnownNormal known;
+         for (const BlockPair &p : s.pairs)
+         {
++            // Commits before the pair may write VF registers: forget those.
++            for (size_t c = nextCommit; c < p.commitEnd; ++c)
++                if (s.commits[c].kind == CommitVf)
++                    known.vf[s.commits[c].reg] = 0u;
+             commitsUpTo(p.commitEnd);
+             const bool upperDone = p.upperEarly != nullptr;
+             // The entry this pair queues (upperEarly, the inline FMAC, jitUpperLate: upperFlags; jitClip: clip).
+@@ -888,7 +918,7 @@
+             }
+             if (upperDone)
+             {
+-                if (!(inlineFmac && s_jitInlineFmac && jitEmitFmac(e, p)))
++                if (!(inlineFmac && s_jitInlineFmac && jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+             else if (p.upperFn != nullptr)
+@@ -921,6 +951,26 @@
+                 (p.upperDst == DstVf || p.upperDst == DstVfPending || p.upperDst == DstAcc))
+                 e.call(reinterpret_cast<const void *>(&jitUpperDst<Host>), &p);
+ 
++            // What this pair wrote: a FMAC result is known normalized; any other write forgets the lanes it wrote
++            // (execLower: everything but vf0).
++            if (p.upperDst == DstVf || p.upperDst == DstAcc)
++            {
++                uint8_t &lanes = p.upperDst == DstAcc ? known.acc : known.vf[p.upperReg];
++                const uint8_t written = jitLanesToComponents(p.upperLanes);
++                if (p.upperPath == UpperFmac)
++                    lanes = static_cast<uint8_t>(lanes | written);
++                else
++                    lanes = static_cast<uint8_t>(lanes & ~written);
++            }
++            if (p.lowerExec == LowerExec)
++            {
++                known = JitKnownNormal{};
++                known.acc = 0u;
++            }
++            else if (p.lowerDst == DstVf || p.lowerDst == DstVfPending || p.lowerDst == DstDiscard)
++                known.vf[p.lowerReg] = 0u;
++            known.vf[0] = 0xFu;
++
+             if (p.branch || &p == &s.pairs.back())
+             {
+                 if (inlineLower)

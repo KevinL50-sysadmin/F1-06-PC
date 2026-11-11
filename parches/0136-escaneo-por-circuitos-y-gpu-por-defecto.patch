@@ -1,0 +1,777 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index e6f79cc..c51efe3 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -10,6 +10,9 @@
+ // Phase 1 (F1 06): opciones.ini, the player's settings. Each option stands for a PS2X_* variable; a variable that is
+ // already set wins over the file (tests), and the file wins over the default. The runtime applies the file by setting
+ // the variables that are not set yet, before anything reads them.
++//
++// An option may have another default in development mode (an ELF given by path: the test scripts), so that what is
++// measured there does not change with the player's defaults: gs is gpu for the player and cpu in development.
+ namespace ps2x
+ {
+     struct OptionChoice
+@@ -27,21 +30,27 @@ namespace ps2x
+         int minimum = 0;
+         int maximum = 0;
+         const char *comment; // Spanish, written above the key in the default file ('\n' between lines)
++        const char *developmentDefault = nullptr; // the default in development mode; nullptr: defaultValue
+     };
+ 
+     const std::vector<OptionSpec> &optionSpecs();
+ 
++    // defaultValue, or developmentDefault in development mode when it has one.
++    const char *optionDefault(const OptionSpec &spec, bool development);
++
+     // The file written the first time: every option with its default value and a comment.
+-    std::string defaultOptionsText();
++    std::string defaultOptionsText(bool development = false);
+ 
+     struct OptionsFile
+     {
+         std::map<std::string, std::string> values; // every known key: its valid value or the default
+         std::vector<std::string> warnings;          // unknown keys and bad values, one line each
++        bool development = false;                   // parsed with the development defaults
+     };
+ 
+-    // Pure: '#' comments, spaces, CRLF and a UTF-8 BOM are accepted; keys and choices are case-insensitive.
+-    OptionsFile parseOptions(std::string_view text, std::string_view fileName = "opciones.ini");
++    // Pure: '#' comments, spaces, CRLF and a UTF-8 BOM are accepted; keys and choices are case-insensitive. Missing
++    // keys and bad values take the default of the mode.
++    OptionsFile parseOptions(std::string_view text, std::string_view fileName = "opciones.ini", bool development = false);
+ 
+     struct EnvironmentSetting
+     {
+@@ -54,7 +63,8 @@ namespace ps2x
+     std::vector<EnvironmentSetting> optionsEnvironment(
+         const OptionsFile &options, const std::function<const char *(const char *)> &getEnvironment);
+ 
+-    // Reads opciones.ini (creating it with the defaults if missing) and sets the variables it decides. The lines for
+-    // the log ("[opciones] ...") are appended to messages.
+-    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages);
++    // Reads opciones.ini (creating it with the defaults of the mode if missing) and sets the variables it decides. The
++    // lines for the log ("[opciones] ...") are appended to messages.
++    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages,
++                          bool development = false);
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 27ed54e..23e8836 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -12,8 +12,17 @@ struct GSRegisters;
+ // Phase 2 (F1 06): the GS on the GPU. `gs = gpu` in opciones.ini or PS2X_GS=gpu (the variable wins) runs
+ // paraLLEl-GS (Vulkan compute) through our bridge DLL pgs_puente.dll (gpu/pgs_puente, C API pgs_puente.h), loaded at
+ // run time from the .exe's folder (PS2X_GS_GPU_DLL: another path). Without the DLL or Vulkan the CPU GS is used, with
+-// one "[gs:gpu]" line in the log. `gs = cpu` (the default) does not load anything: the CPU GS ("Software" mode) is the
+-// reference.
++// one "[gs:gpu]" line in the log. `gs = cpu` does not load anything: the CPU GS ("Software" mode) is the reference.
++// gs is gpu by default for the player (portable and installed) and cpu in development mode (an ELF given by path: the
++// test scripts), see ps2_options.h; with PS2X_GS unset the runtime itself always uses the CPU GS.
++//
++// Scanout: our kernel HLE describes the display in pixels (DISPLAY DW = width - 1, MAGH 0, SMODE1/SMODE2 0), as only
++// the CPU presenter reads it. The bridge gives paraLLEl-GS hardware registers for one display pixel per scanout pixel
++// and asks it for each circuit alone (unblended, with alpha), then merges them as the CPU presenter does: same size,
++// and the same pixels for the same local memory (paraLLEl-GS's own merge takes alpha / 255 for MMOD 0, the CPU and
++// PCSX2 take min(1, 2 * alpha / 255)). PS2X_GS_GPU_ESCANEO=crudo: the registers as they are, merged by paraLLEl-GS;
++// =mezcla: translated registers merged by paraLLEl-GS; =vram: the CPU presenter over a copy of the GPU's local
++// memory (all for diagnosis).
+ //
+ // The GS front-end (gs_frontend.cpp) still parses every GIF packet: it owns CSR/IMR, SIGNAL/FINISH/LABEL and the
+ // state the game waits on. With this backend it also forwards the raw packets and register writes here, and skips
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 6bd0cce..00f0d1d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -26,9 +26,9 @@
+ 
+ namespace
+ {
+-    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 1), declared here so that the runtime
++    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 2), declared here so that the runtime
+     // does not depend on the bridge's source tree.
+-    constexpr uint32_t kPgsApiVersion = 1u;
++    constexpr uint32_t kPgsApiVersion = 2u;
+     constexpr size_t kVramSize = 4u * 1024u * 1024u;
+     struct pgs_context;
+     struct PgsCreateInfo
+@@ -46,6 +46,8 @@ namespace
+         const uint8_t *rgba;
+         uint32_t width, height, mode_width, mode_height, interlaced;
+         uint64_t serial;
++        uint32_t circuits, reserved;
++        uint64_t scanout;
+     };
+     struct PgsStats
+     {
+@@ -56,6 +58,7 @@ namespace
+         kScanoutForceProgressive = 1u << 0,
+         kScanoutAntiBlur = 1u << 2,
+         kScanoutAdaptHorizontal = 1u << 4,
++        kScanoutSplitCircuits = 1u << 6,
+     };
+ 
+     struct PgsApi
+@@ -105,42 +108,159 @@ namespace
+         }
+     }
+ 
+-    // SMODE1 as the BIOS sets it (SetGsCrt does not store it here): PAL for 512-line displays, else NTSC.
++    // SMODE1 as the BIOS sets it (SetGsCrt does not store it here): PAL (512 lines) for displays taller than NTSC's
++    // 448, else NTSC.
+     uint64_t smode1For(uint64_t smode1, uint64_t display)
+     {
+         const uint32_t lc = static_cast<uint32_t>((smode1 >> 3u) & 0x7Fu);
+         if (lc == 32u || lc == 22u || lc == 15u || lc == 29u)
+             return smode1;
+         const uint32_t lines = static_cast<uint32_t>((display >> 44u) & 0x7FFu) + 1u;
+-        return lines > 480u ? 0x740836504ull : 0x740834504ull;
++        return lines > 448u ? 0x740836504ull : 0x740834504ull;
+     }
+ 
+     // Our kernel HLE (Stubs/GS.cpp) writes DISPLAY in pixels (DW + 1 = width with MAGH 0, DH + 1 = frame lines) and
+     // leaves SMODE2 at 0 when the game does not call SetGsCrt: a CRTC description only the CPU presenter reads that
+     // way. paraLLEl-GS emulates the real CRTC (DW in video clocks, 2560 per PAL/NTSC line; 256/224 lines per field
+     // without INT), so it showed a 512-clock-wide strip of the top 256 lines. Translate such registers to the hardware
+-    // ones of the same picture: interlaced field mode (forced progressive: the whole frame), MAGH from the width, and
+-    // the standard origin (offsets do not matter: the scanout removes the common one). F1 06: 512x512, DBY 1 on
+-    // circuit 2 (its flicker filter), blended as the CPU presenter does.
++    // ones of the same picture: interlaced field mode (forced progressive: the whole frame), 4 clocks per pixel (the
++    // composite clock divider, so one display pixel is one scanout pixel: no horizontal resampling, wider frames than
++    // the 640-pixel mode are cropped as the CPU presenter does) and the standard origin at (0, 0) for both circuits
++    // (the CPU presenter ignores DX/DY). F1 06: 512x512, DBY 1 on circuit 2 (its flicker filter).
+     bool hleDisplayRegisters(uint64_t smode2, uint64_t display)
+     {
+         const uint32_t lines = static_cast<uint32_t>((display >> 44u) & 0x7FFu) + 1u;
+         return (smode2 & 1u) == 0u && lines > 300u;
+     }
+ 
+-    uint64_t hardwareDisplay(uint64_t display, bool pal)
++    // The CPU presenter's picture size of a DISPLAY register (decodeDisplaySize in gs_cpu_backend.cpp).
++    void displaySize(uint64_t display, uint32_t &width, uint32_t &height)
+     {
+         const uint32_t dw = static_cast<uint32_t>((display >> 32u) & 0xFFFu);
+         const uint32_t dh = static_cast<uint32_t>((display >> 44u) & 0x7FFu);
+         const uint32_t magh = static_cast<uint32_t>((display >> 23u) & 0xFu);
+-        const uint32_t width = (dw + 1u) / (magh + 1u);
+-        if (width < 64u || dh + 1u < 64u)
+-            return display;
+-        const uint32_t clocks = std::clamp<uint32_t>((2560u + width / 2u) / width, 1u, 16u);
+-        const uint64_t dx = (pal ? 169u : 159u) * 4u; // the mode's scan offsets (gs_renderer.cpp), so the origin is 0
++        width = (dw + 1u) / (magh + 1u);
++        height = dh + 1u;
++        if (width < 64u || height < 64u)
++        {
++            width = 640u;
++            height = 448u;
++        }
++        width = std::min(width, kHostFrameWidth);
++        height = std::min(height, kHostFrameHeight);
++    }
++
++    uint64_t hardwareDisplay(uint64_t display, bool pal)
++    {
++        uint32_t width = 0u, height = 0u;
++        displaySize(display, width, height);
++        constexpr uint64_t kClocks = 4u;
++        const uint64_t dx = (pal ? 169u : 159u) * kClocks; // the mode's scan offsets (gs_renderer.cpp): origin 0
+         const uint64_t dy = (pal ? 36u : 25u) * 2u;
+-        return dx | (dy << 12u) | (static_cast<uint64_t>(clocks - 1u) << 23u) |
+-               (static_cast<uint64_t>(width * clocks - 1u) << 32u) | (static_cast<uint64_t>(dh) << 44u);
++        return dx | (dy << 12u) | ((kClocks - 1u) << 23u) | ((width * kClocks - 1u) << 32u) |
++               (static_cast<uint64_t>(height - 1u) << 44u);
++    }
++
++    // GSCpuBackend's presentation blend (blendPresentationChannel): dst + (src - dst) * factor / 255, truncated.
++    uint8_t blendChannel(uint8_t src, uint8_t dst, uint32_t factor)
++    {
++        const int delta = static_cast<int>(src) - static_cast<int>(dst);
++        return static_cast<uint8_t>(std::clamp(static_cast<int>(dst) + (delta * static_cast<int>(factor)) / 255, 0, 255));
++    }
++
++    // paraLLEl-GS widens 16-bit colours as c << 3, the CPU presenter as (c << 3) | (c >> 2).
++    void widenCt16(uint8_t *pixel)
++    {
++        for (int c = 0; c < 3; ++c)
++            pixel[c] = static_cast<uint8_t>(pixel[c] | (pixel[c] >> 5u));
++    }
++
++    bool isCt16(uint64_t dispfb)
++    {
++        const uint32_t psm = static_cast<uint32_t>((dispfb >> 15u) & 0x1Fu);
++        return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
++    }
++
++    // The frame the CPU presenter (GSCpuBackend::PresentFromLocalMemory) makes from the same circuits, out of the
++    // circuits paraLLEl-GS scanned out alone (PGS_SCANOUT_SPLIT_CIRCUITS, registers from hardwareDisplay: each display
++    // pixel at the same place of its image): the size from DISPLAY in pixels, BGCOLOR, circuit 2 under circuit 1
++    // unless SLBG, circuit 1 blended with ALP (MMOD 1) or min(255, 2 * its alpha) (MMOD 0, 0x80 = 1.0), alpha 0xFF.
++    // paraLLEl-GS's own merge takes alpha / 255 (0x80 = one half), which blurred F1 06's flicker filter.
++    PresentationFrame composeCircuits(const GSPresentationRequest &request, const uint8_t *images, uint32_t circuits,
++                                      uint32_t imageWidth, uint32_t imageHeight)
++    {
++        PresentationFrame result{};
++        // As hasDisplaySetup: an enabled circuit without any display setup is not shown.
++        const auto hasSetup = [](uint64_t dispfb, uint64_t display) {
++            return ((dispfb >> 9u) & 0x3Fu) != 0u || ((display >> 32u) & 0xFFFu) != 0u ||
++                   ((display >> 44u) & 0x7FFu) != 0u || ((display >> 23u) & 0xFu) != 0u;
++        };
++        const uint8_t *crt1 = (circuits & 1u) != 0u ? images : nullptr;
++        const uint8_t *crt2 = (circuits & 2u) != 0u
++                                  ? images + (crt1 != nullptr ? static_cast<size_t>(imageWidth) * imageHeight * 4u : 0u)
++                                  : nullptr;
++        const bool en1 = crt1 != nullptr && hasSetup(request.dispfb1, request.display1);
++        const bool en2 = crt2 != nullptr && hasSetup(request.dispfb2, request.display2);
++        if (!en1 && !en2)
++            return result;
++        uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
++        displaySize(request.display1, width1, height1);
++        displaySize(request.display2, width2, height2);
++        const auto pixelOf = [&](const uint8_t *image, uint64_t dispfb, uint32_t x, uint32_t y, uint8_t *out) {
++            if (x >= imageWidth || y >= imageHeight)
++            {
++                std::memset(out, 0, 4u);
++                return;
++            }
++            std::memcpy(out, image + (static_cast<size_t>(y) * imageWidth + x) * 4u, 4u);
++            if (isCt16(dispfb))
++                widenCt16(out);
++        };
++        result.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
++        if (en1 && en2)
++        {
++            const uint32_t alp = static_cast<uint32_t>((request.pmode >> 8u) & 0xFFu);
++            const bool mmod = ((request.pmode >> 5u) & 1u) != 0u;
++            const bool slbg = ((request.pmode >> 7u) & 1u) != 0u;
++            result.width = std::max(width1, width2);
++            result.height = std::max(height1, height2);
++            for (uint32_t y = 0; y < result.height; ++y)
++                for (uint32_t x = 0; x < result.width; ++x)
++                {
++                    uint8_t *dst = result.pixels.data() + (static_cast<size_t>(y) * kHostFrameWidth + x) * 4u;
++                    dst[0] = static_cast<uint8_t>(request.bgcolor);
++                    dst[1] = static_cast<uint8_t>(request.bgcolor >> 8u);
++                    dst[2] = static_cast<uint8_t>(request.bgcolor >> 16u);
++                    if (!slbg && x < width2 && y < height2)
++                        pixelOf(crt2, request.dispfb2, x, y, dst);
++                    if (x < width1 && y < height1)
++                    {
++                        uint8_t src[4];
++                        pixelOf(crt1, request.dispfb1, x, y, src);
++                        const uint32_t factor = mmod ? alp : std::min<uint32_t>(255u, src[3] * 2u);
++                        for (int c = 0; c < 3; ++c)
++                            dst[c] = blendChannel(src[c], dst[c], factor);
++                    }
++                    dst[3] = 0xFFu;
++                }
++        }
++        else
++        {
++            const uint8_t *image = en1 ? crt1 : crt2;
++            const uint64_t dispfb = en1 ? request.dispfb1 : request.dispfb2;
++            result.width = en1 ? width1 : width2;
++            result.height = en1 ? height1 : height2;
++            for (uint32_t y = 0; y < result.height; ++y)
++                for (uint32_t x = 0; x < result.width; ++x)
++                {
++                    uint8_t *dst = result.pixels.data() + (static_cast<size_t>(y) * kHostFrameWidth + x) * 4u;
++                    pixelOf(image, dispfb, x, y, dst);
++                    dst[3] = 0xFFu;
++                }
++        }
++        result.displayFbp = static_cast<uint32_t>((en1 ? request.dispfb1 : request.dispfb2) & 0x1FFu);
++        result.sourceFbp = result.displayFbp;
++        return result;
+     }
+ 
+     int64_t nowNs()
+@@ -241,6 +361,7 @@ struct GSGpuBackend::Impl
+     uint32_t scanoutFlags = kScanoutForceProgressive | kScanoutAdaptHorizontal;
+     bool scanoutFromVram = false; // PS2X_GS_GPU_ESCANEO=vram: the CPU converts a copy of the GPU's local memory
+     bool translateCrtc = true;    // PS2X_GS_GPU_ESCANEO=crudo: the HLE's CRTC registers as they are
++    bool splitCircuits = true;    // PS2X_GS_GPU_ESCANEO=mezcla: translated, but merged by paraLLEl-GS (before T5)
+ 
+     // Reads: a copy of local memory, refreshed when something was queued since.
+     mutable std::mutex readMutex;
+@@ -260,6 +381,11 @@ struct GSGpuBackend::Impl
+     PresentationFrame published;
+     uint64_t lastFrameSerial = 0u;
+     GSPresentationRequest lastScanoutRequest{};
++    // The requests of the last scanouts started (pgs_vsync returned 1), by pgs_frame.scanout: split frames are
++    // composed with their own registers, not with the newest ones (up to three readbacks are in flight).
++    static constexpr uint32_t kScanoutHistory = 8u;
++    GSPresentationRequest scanoutRequests[kScanoutHistory]{};
++    uint64_t scanoutsStarted = 0u;
+ 
+     // Statistics (the 10 s "[gs:gpu]" line).
+     std::atomic<uint64_t> statPackets{0u}, statBytes{0u}, statScanouts{0u}, statFrames{0u};
+@@ -323,6 +449,20 @@ struct GSGpuBackend::Impl
+             return;
+         lastFrameSerial = frame.serial;
+         statFrames.fetch_add(1u, std::memory_order_relaxed);
++        logFrameSize(frame);
++        if (frame.circuits != 0u)
++        {
++            const uint32_t stacked = (frame.circuits & 1u) + ((frame.circuits >> 1u) & 1u);
++            if (frame.scanout == 0u || frame.scanout > scanoutsStarted ||
++                scanoutsStarted - frame.scanout >= kScanoutHistory || frame.height % stacked != 0u)
++                return;
++            const GSPresentationRequest &request = scanoutRequests[frame.scanout % kScanoutHistory];
++            PresentationFrame composed = composeCircuits(request, frame.rgba, frame.circuits, frame.width,
++                                                         frame.height / stacked);
++            if (composed)
++                publish(std::move(composed));
++            return;
++        }
+         PresentationFrame result{};
+         result.width = std::min(frame.width, kHostFrameWidth);
+         result.height = std::min(frame.height, kHostFrameHeight);
+@@ -336,16 +476,23 @@ struct GSGpuBackend::Impl
+         }
+         result.displayFbp = static_cast<uint32_t>(lastScanoutRequest.dispfb1 & 0x1FFu);
+         result.sourceFbp = result.displayFbp;
+-        static uint32_t s_sizeLogs = 0u, s_lastWidth = 0u, s_lastHeight = 0u;
+-        if ((frame.width != s_lastWidth || frame.height != s_lastHeight) && s_sizeLogs < 20u)
++        publish(std::move(result));
++    }
++
++    static void logFrameSize(const PgsFrame &frame)
++    {
++        static uint32_t s_sizeLogs = 0u, s_lastWidth = 0u, s_lastHeight = 0u, s_lastCircuits = 0u;
++        if ((frame.width != s_lastWidth || frame.height != s_lastHeight || frame.circuits != s_lastCircuits) &&
++            s_sizeLogs < 20u)
+         {
+             ++s_sizeLogs;
+-            std::fprintf(stderr, "[gs:gpu] fotograma: %ux%u (modo %ux%u, entrelazado=%u)\n", frame.width,
+-                         frame.height, frame.mode_width, frame.mode_height, frame.interlaced);
++            std::fprintf(stderr, "[gs:gpu] fotograma: %ux%u (modo %ux%u, entrelazado=%u, circuitos aparte=%u)\n",
++                         frame.width, frame.height, frame.mode_width, frame.mode_height, frame.interlaced,
++                         frame.circuits);
+         }
+         s_lastWidth = frame.width;
+         s_lastHeight = frame.height;
+-        publish(std::move(result));
++        s_lastCircuits = frame.circuits;
+     }
+ 
+     void scanout(const ScanoutCommand &command)
+@@ -373,12 +520,15 @@ struct GSGpuBackend::Impl
+         const uint64_t display = (request.pmode & 1u) != 0u ? request.display1 : request.display2;
+         PgsPrivRegs regs{request.pmode, smode1For(command.smode1, display), request.smode2, request.dispfb1,
+                          request.display1, request.dispfb2, request.display2, 0u, 0u, 0u, request.bgcolor};
++        uint32_t flags = scanoutFlags;
+         if (translateCrtc && hleDisplayRegisters(request.smode2, display))
+         {
+             const bool pal = ((regs.smode1 >> 13u) & 3u) == 3u;
+             regs.smode2 = 1u; // INT, FFMD 0
+             regs.display1 = hardwareDisplay(request.display1, pal);
+             regs.display2 = hardwareDisplay(request.display2, pal);
++            if (splitCircuits)
++                flags |= kScanoutSplitCircuits; // merged here as the CPU presenter does (composeCircuits)
+         }
+         static uint32_t s_modeLogs = 0u;
+         static PgsPrivRegs s_lastRegs{};
+@@ -394,7 +544,8 @@ struct GSGpuBackend::Impl
+                          static_cast<unsigned long long>(regs.dispfb2), static_cast<unsigned long long>(regs.display2));
+         }
+         s_lastRegs = regs;
+-        api.vsync(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), scanoutFlags);
++        if (api.vsync(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), flags) == 1)
++            scanoutRequests[++scanoutsStarted % kScanoutHistory] = request;
+     }
+ 
+     void report(int64_t now)
+@@ -608,6 +759,7 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     {
+         impl.scanoutFromVram = std::strcmp(value, "vram") == 0;
+         impl.translateCrtc = std::strcmp(value, "crudo") != 0;
++        impl.splitCircuits = std::strcmp(value, "mezcla") != 0;
+     }
+     if (const char *value = std::getenv("PS2X_GS_GPU_BANDERAS")) // scanout flags of pgs_vsync (diagnosis)
+         impl.scanoutFlags = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index f6ba45a..a1a1e60 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -76,14 +76,20 @@ namespace ps2x
+             {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
+             {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
+-            {"gs", "PS2X_GS", "cpu", {{"cpu", nullptr}, {"gpu", "gpu"}}, 0, 0,
+-             "Dibujo de los graficos: cpu = por software (el de siempre) o gpu = en la tarjeta grafica con Vulkan\n"
+-             "(en pruebas; necesita pgs_puente.dll junto al juego, si no se usa cpu)."},
++            {"gs", "PS2X_GS", "gpu", {{"cpu", nullptr}, {"gpu", "gpu"}}, 0, 0,
++             "Dibujo de los graficos: gpu = en la tarjeta grafica (Vulkan), lo normal; cpu = modo Software, mas lento\n"
++             "(el dibujo de referencia). Si falta pgs_puente.dll junto al juego o Vulkan, se usa cpu.",
++             "cpu"},
+         };
+         return specs;
+     }
+ 
+-    std::string defaultOptionsText()
++    const char *optionDefault(const OptionSpec &spec, bool development)
++    {
++        return development && spec.developmentDefault != nullptr ? spec.developmentDefault : spec.defaultValue;
++    }
++
++    std::string defaultOptionsText(bool development)
+     {
+         std::string text = kOptionsHeader;
+         for (const OptionSpec &spec : optionSpecs())
+@@ -93,16 +99,17 @@ namespace ps2x
+             std::string line;
+             while (std::getline(comment, line))
+                 text += "# " + line + "\n";
+-            text += std::string(spec.key) + " = " + spec.defaultValue + "\n";
++            text += std::string(spec.key) + " = " + optionDefault(spec, development) + "\n";
+         }
+         return text;
+     }
+ 
+-    OptionsFile parseOptions(std::string_view text, std::string_view fileName)
++    OptionsFile parseOptions(std::string_view text, std::string_view fileName, bool development)
+     {
+         OptionsFile result;
++        result.development = development;
+         for (const OptionSpec &spec : optionSpecs())
+-            result.values[spec.key] = spec.defaultValue;
++            result.values[spec.key] = optionDefault(spec, development);
+         if (text.substr(0, 3) == "\xEF\xBB\xBF")
+             text.remove_prefix(3);
+ 
+@@ -142,9 +149,9 @@ namespace ps2x
+             if (!validValue(*spec, value))
+             {
+                 result.warnings.push_back(where + std::to_string(lineNumber) + ": valor no valido '" + value +
+-                                          "' para " + spec->key + "; se usa " + spec->defaultValue + " (valores: " +
+-                                          allowedValues(*spec) + ")");
+-                result.values[spec->key] = spec->defaultValue;
++                                          "' para " + spec->key + "; se usa " + optionDefault(*spec, development) +
++                                          " (valores: " + allowedValues(*spec) + ")");
++                result.values[spec->key] = optionDefault(*spec, development);
+                 continue;
+             }
+             result.values[spec->key] = value;
+@@ -161,7 +168,8 @@ namespace ps2x
+             if (getEnvironment(spec.environment) != nullptr)
+                 continue;
+             const auto found = options.values.find(spec.key);
+-            const std::string value = found == options.values.end() ? spec.defaultValue : found->second;
++            const std::string value =
++                found == options.values.end() ? optionDefault(spec, options.development) : found->second;
+             if (spec.choices.empty())
+             {
+                 settings.push_back({spec.environment, value});
+@@ -174,7 +182,7 @@ namespace ps2x
+         return settings;
+     }
+ 
+-    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages)
++    void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages, bool development)
+     {
+         std::string text;
+         if (std::ifstream in(file, std::ios::binary); in)
+@@ -186,7 +194,7 @@ namespace ps2x
+         }
+         else
+         {
+-            text = defaultOptionsText();
++            text = defaultOptionsText(development);
+             std::error_code error;
+             std::filesystem::create_directories(file.parent_path(), error);
+             std::ofstream out(file, std::ios::binary);
+@@ -195,7 +203,7 @@ namespace ps2x
+                                (out ? " creado con los valores por defecto" : " no se pudo crear; valores por defecto"));
+         }
+ 
+-        const OptionsFile options = parseOptions(text, file.filename().string());
++        const OptionsFile options = parseOptions(text, file.filename().string(), development);
+         messages.insert(messages.end(), options.warnings.begin(), options.warnings.end());
+         for (const EnvironmentSetting &setting :
+              optionsEnvironment(options, [](const char *name) { return static_cast<const char *>(std::getenv(name)); }))
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 966e8eb..a092fcc 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -220,7 +220,9 @@ namespace
+             messages.push_back(std::move(line));
+         ps2x::createUserDirectories(paths);
+         ps2x::setUserConfigDirectory(paths.configDirectory);
+-        ps2x::applyOptionsFile(paths.configDirectory / "opciones.ini", messages);
++        // Development (the test scripts) keeps its own defaults, e.g. the CPU GS (ps2_options.h).
++        ps2x::applyOptionsFile(paths.configDirectory / "opciones.ini", messages,
++                               paths.mode == ps2x::UserPathsMode::Development);
+         if (cards && *cards)
+             messages.push_back(std::string("[rutas] PS2X_TARJETAS manda: ") + cards);
+         if (controls && *controls)
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index 1cd7576..15a6aea 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -1,10 +1,12 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
++#include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_gpu_bridge.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_test_sync.h"
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+@@ -13,6 +15,7 @@
+ #include <iostream>
+ #include <map>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace fs = std::filesystem;
+@@ -167,21 +170,113 @@ namespace
+         return {};
+ #endif
+     }
++
++    // The GPU backend over the test bridge, or null (with a [Skipped] line) when it cannot be created here.
++    std::unique_ptr<GSGpuBackend> testGpuBackend()
++    {
++        const fs::path dllPath = testBridgeDll();
++        if (dllPath.empty() || !fs::exists(dllPath))
++        {
++            std::cout << "    [Skipped] pgs_puente.dll not built (" << dllPath.string()
++                      << "): run scripts/obtener-parallel-gs.ps1" << std::endl;
++            return nullptr;
++        }
++        std::string error;
++        std::unique_ptr<GSGpuBackend> backend = GSGpuBackend::Create(dllPath, error);
++        if (!backend)
++            std::cout << "    [Skipped] no GPU bridge: " << error << std::endl;
++        return backend;
++    }
++
++    // A PSMCT32 frame at FBP 0 whose colours change on every row and column and whose alpha cycles through 0x80,
++    // 0x40, 0x00, 0xFF and 0x20: a one-line shift, a resample or another blend factor changes the picture.
++    std::vector<uint8_t> testFrameVram(uint32_t width, uint32_t height)
++    {
++        std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++        GSCpuBackend view;
++        view.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++        static constexpr uint32_t kAlphas[] = {0x80u, 0x40u, 0x00u, 0xFFu, 0x20u};
++        for (uint32_t y = 0; y < height; ++y)
++            for (uint32_t x = 0; x < width; ++x)
++            {
++                const uint32_t alpha = kAlphas[(y / 8u + x / 16u) % 5u];
++                const uint32_t color = ((x * 3u + y * 5u) & 0xFFu) | (((y * 7u) & 0xFFu) << 8u) |
++                                       (((x ^ y) & 0xFFu) << 16u) | (alpha << 24u);
++                view.WriteVram(GS_PSM_CT32, 0u, width / 64u, x, y, color);
++            }
++        return vram;
++    }
++
++    // The newest frame the GPU backend reads back after scanning request out (waits up to 5 s).
++    PresentationFrame gpuScanout(GSGpuBackend &backend, const GSPresentationRequest &request)
++    {
++        backend.QueueScanout(request);
++        for (int attempt = 0; attempt < 500; ++attempt)
++        {
++            backend.WaitIdle();
++            PresentationFrame frame = backend.PresentPublished();
++            if (frame)
++                return frame;
++            std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        }
++        return {};
++    }
++
++    // Same size and the same RGBA in every presented pixel (rows are 640 pixels apart in both).
++    void expectSamePresentation(TestCase &t, const PresentationFrame &cpu, const PresentationFrame &gpu)
++    {
++        t.Equals(gpu.width, cpu.width, "the GPU frame is as wide as the CPU one");
++        t.Equals(gpu.height, cpu.height, "the GPU frame is as tall as the CPU one");
++        if (gpu.width != cpu.width || gpu.height != cpu.height || gpu.pixels.size() != cpu.pixels.size())
++            return;
++        size_t different = 0u;
++        std::string first = "none";
++        for (uint32_t y = 0; y < cpu.height; ++y)
++            for (uint32_t x = 0; x < cpu.width; ++x)
++            {
++                const size_t offset = (static_cast<size_t>(y) * 640u + x) * 4u;
++                if (std::memcmp(cpu.pixels.data() + offset, gpu.pixels.data() + offset, 4u) == 0)
++                    continue;
++                if (different++ == 0u)
++                    first = std::to_string(x) + "," + std::to_string(y);
++            }
++        t.Equals(different, size_t{0}, "identical pixels (first difference at " + first + ")");
++    }
+ }
+ 
+ void register_ps2_gs_gpu_tests()
+ {
+     MiniTest::Case("GsGpu", [](TestCase &tc)
+     {
+-        tc.Run("the gs option is cpu by default and leaves PS2X_GS unset", [](TestCase &t)
++        tc.Run("the gs option is gpu by default for the player and sets PS2X_GS=gpu", [](TestCase &t)
+         {
+             const std::string text = ps2x::defaultOptionsText();
+-            t.IsTrue(text.find("\ngs = cpu\n") != std::string::npos, "the default file has gs = cpu");
++            t.IsTrue(text.find("\ngs = gpu\n") != std::string::npos, "the default file has gs = gpu");
++            t.IsTrue(text.find("gpu = en la tarjeta grafica (Vulkan)") != std::string::npos &&
++                         text.find("cpu = modo Software, mas lento") != std::string::npos,
++                     "the comment explains both values");
+             const ps2x::OptionsFile defaults = ps2x::parseOptions(text);
+             t.IsTrue(defaults.warnings.empty(), "the default file parses without warnings");
++            t.Equals(defaults.values.at("gs"), std::string("gpu"), "gs defaults to gpu");
++            const auto none = [](const char *) -> const char * { return nullptr; };
++            const auto settings = settingsOf(defaults, none);
++            t.IsTrue(settings.count("PS2X_GS") == 1u && settings.at("PS2X_GS") == "gpu", "PS2X_GS=gpu");
++            t.IsTrue(settingsOf(ps2x::parseOptions(""), none).count("PS2X_GS") == 1u, "also without a gs line");
++        });
++
++        tc.Run("in development the gs option is cpu by default and leaves PS2X_GS unset", [](TestCase &t)
++        {
++            const std::string text = ps2x::defaultOptionsText(true);
++            t.IsTrue(text.find("\ngs = cpu\n") != std::string::npos, "the development file has gs = cpu");
++            const ps2x::OptionsFile defaults = ps2x::parseOptions(text, "opciones.ini", true);
++            t.IsTrue(defaults.warnings.empty(), "it parses without warnings");
+             t.Equals(defaults.values.at("gs"), std::string("cpu"), "gs defaults to cpu");
+             const auto none = [](const char *) -> const char * { return nullptr; };
+             t.IsTrue(settingsOf(defaults, none).count("PS2X_GS") == 0u, "gs = cpu sets no variable");
++            t.IsTrue(settingsOf(ps2x::parseOptions("volumen = 50\n", "opciones.ini", true), none).count("PS2X_GS") == 0u,
++                     "a development file without a gs line keeps the CPU GS");
++            const ps2x::OptionsFile chosen = ps2x::parseOptions("gs = gpu\n", "opciones.ini", true);
++            t.Equals(chosen.values.at("gs"), std::string("gpu"), "an explicit gs = gpu is kept");
+         });
+ 
+         tc.Run("gs = gpu sets PS2X_GS=gpu unless the variable is already set", [](TestCase &t)
+@@ -198,15 +293,21 @@ void register_ps2_gs_gpu_tests()
+             t.IsTrue(settingsOf(options, cpuSet).count("PS2X_GS") == 0u, "PS2X_GS already set wins over the file");
+         });
+ 
+-        tc.Run("a bad gs value keeps cpu with one warning", [](TestCase &t)
++        tc.Run("a bad gs value keeps the mode's default with one warning", [](TestCase &t)
+         {
+             const ps2x::OptionsFile options = ps2x::parseOptions("gs = vulkan\n");
+-            t.Equals(options.values.at("gs"), std::string("cpu"), "falls back to cpu");
++            t.Equals(options.values.at("gs"), std::string("gpu"), "falls back to gpu");
+             t.Equals(options.warnings.size(), size_t{1}, "one warning");
+             t.IsTrue(!options.warnings.empty() &&
+                          options.warnings.front() ==
+-                             "[opciones] opciones.ini:1: valor no valido 'vulkan' para gs; se usa cpu (valores: cpu, gpu)",
++                             "[opciones] opciones.ini:1: valor no valido 'vulkan' para gs; se usa gpu (valores: cpu, gpu)",
+                      "the warning names the values");
++            const ps2x::OptionsFile development = ps2x::parseOptions("gs = vulkan\n", "opciones.ini", true);
++            t.Equals(development.values.at("gs"), std::string("cpu"), "falls back to cpu in development");
++            t.IsTrue(!development.warnings.empty() &&
++                         development.warnings.front() ==
++                             "[opciones] opciones.ini:1: valor no valido 'vulkan' para gs; se usa cpu (valores: cpu, gpu)",
++                     "the development warning names cpu");
+         });
+ 
+         tc.Run("PS2X_GS selects the GPU only for gpu", [](TestCase &t)
+@@ -310,5 +411,51 @@ void register_ps2_gs_gpu_tests()
+             t.IsTrue(gpuOut == pixels, "the GPU's local -> host data is the uploaded image");
+             t.IsTrue(gpuOut == cpuOut, "and matches the CPU GS");
+         });
++
++        tc.Run("F1 06's display (two circuits, DBY 1 flicker filter, MMOD 0) scans out as the CPU presents it", [](TestCase &t)
++        {
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++
++            // As our kernel HLE leaves them in the race: SMODE1/SMODE2 0, DISPLAY in pixels (DW 511, MAGH 0).
++            GSPresentationRequest request{};
++            request.pmode = 0x8003u; // EN1, EN2, MMOD 0 (circuit 1's alpha), ALP 0x80
++            request.dispfb1 = 8ull << 9u;                    // FBP 0, FBW 8, PSMCT32
++            request.dispfb2 = request.dispfb1 | (1ull << 43u); // DBY 1
++            request.display1 = (511ull << 32u) | (511ull << 44u);
++            request.display2 = (511ull << 32u) | (510ull << 44u);
++            request.bgcolor = 0x203040u;
++
++            const PresentationFrame expected = cpu.Present(request);
++            t.Equals(expected.width, 512u, "the CPU presents 512 pixels wide");
++            t.Equals(expected.height, 512u, "and 512 lines");
++            expectSamePresentation(t, expected, gpuScanout(*backend, request));
++        });
++
++        tc.Run("a single 640x448 circuit scans out 1:1 as the CPU presents it", [](TestCase &t)
++        {
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(640u, 448u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++
++            GSPresentationRequest request{};
++            request.pmode = 0x8001u; // EN1, MMOD 0, ALP 0x80
++            request.dispfb1 = 10ull << 9u; // FBP 0, FBW 10, PSMCT32
++            request.display1 = (639ull << 32u) | (447ull << 44u);
++
++            const PresentationFrame expected = cpu.Present(request);
++            t.Equals(expected.width, 640u, "the CPU presents 640 pixels wide");
++            t.Equals(expected.height, 448u, "and 448 lines");
++            expectSamePresentation(t, expected, gpuScanout(*backend, request));
++        });
+     });
+ }
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index f77a2d4..ea7c16e 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -324,6 +324,21 @@ void register_ps2_user_paths_tests()
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+             t.Equals(ps2x::optionSpecs().size(), size_t{6}, "six options");
++
++            const std::string development = ps2x::defaultOptionsText(true);
++            const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);
++            t.IsTrue(parsedDevelopment.warnings.empty(), "the development file parses without warnings");
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++            {
++                const std::string expected = ps2x::optionDefault(spec, true);
++                t.Equals(parsedDevelopment.values.at(spec.key), expected, std::string("development default of ") + spec.key);
++                t.IsTrue(development.find(std::string("\n") + spec.key + " = " + expected + "\n") != std::string::npos,
++                         std::string("development key line of ") + spec.key);
++            }
++            t.Equals(std::string(ps2x::optionDefault(ps2x::optionSpecs().back(), false)), std::string("gpu"),
++                     "gs: gpu for the player");
++            t.Equals(std::string(ps2x::optionDefault(ps2x::optionSpecs().back(), true)), std::string("cpu"),
++                     "gs: cpu in development");
+         });
+ 
+         tc.Run("parseOptions accepts spaces, comments, CRLF, a BOM and any case", [](TestCase &t)
+@@ -422,5 +437,26 @@ void register_ps2_user_paths_tests()
+                                  { return m.find("opcion desconocida 'volumen2'") != std::string::npos; }),
+                      "the unknown key reaches the log");
+         });
++
++        tc.Run("applyOptionsFile in development writes and applies the development defaults", [](TestCase &t)
++        {
++            EnvironmentGuard environment;
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                environment.set(spec.environment, nullptr);
++            TempDir dir;
++            const fs::path file = dir.path / "opciones.ini";
++            std::vector<std::string> messages;
++            ps2x::applyOptionsFile(file, messages, true);
++            t.Equals(readText(file), ps2x::defaultOptionsText(true), "created with the development defaults");
++            t.IsTrue(std::getenv("PS2X_GS") == nullptr, "the CPU GS: PS2X_GS stays unset");
++
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                environment.set(spec.environment, nullptr);
++            const fs::path player = dir.path / "config" / "opciones.ini";
++            messages.clear();
++            ps2x::applyOptionsFile(player, messages);
++            t.Equals(std::string(std::getenv("PS2X_GS") ? std::getenv("PS2X_GS") : ""), std::string("gpu"),
++                     "a player's new file selects the GPU GS");
++        });
+     });
+ }

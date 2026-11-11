@@ -1,0 +1,139 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..91b594e 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -732,6 +733,25 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    void IopKernel::debugDump(uint64_t currentCycle) const
++    {
++        static const char *kEstados[] = {"Dormant", "Ready", "Running", "Sleep", "Delay", "Sema", "Evento", "Suspendido", "Muerto"};
++        std::fprintf(stderr, "[iop:hilos] ciclo=%llu hilos=%zu\n", static_cast<unsigned long long>(currentCycle), m_threads.size());
++        for (const auto &[id, thread] : m_threads)
++        {
++            const unsigned estado = static_cast<unsigned>(thread.state);
++            std::fprintf(stderr,
++                         "[iop:hilos]   id=%d pri=%u %s espera=%d bits=0x%x despertar=%d entrada=0x%x pc=0x%x ra=0x%x sp=0x%x wake=%llu\n",
++                         id, thread.priority, estado < 9u ? kEstados[estado] : "?", thread.waitId, thread.waitBits,
++                         thread.wakeupCount, thread.entry, thread.cpu.pc, thread.cpu.gpr[31], thread.cpu.gpr[29],
++                         static_cast<unsigned long long>(thread.wakeCycle));
++        }
++        for (const auto &[id, semaphore] : m_semaphores)
++            std::fprintf(stderr, "[iop:hilos]   sema id=%d cuenta=%d/%d\n", id, semaphore.current, semaphore.maximum);
++        for (const auto &[id, event] : m_eventFlags)
++            std::fprintf(stderr, "[iop:hilos]   evento id=%d bits=0x%x\n", id, event.bits);
++    }
++
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+     {
+         for (auto &[id, thread] : m_threads)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..3097fc4 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -68,6 +68,9 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+ 
++        // Depuracion (F1 06): escribe en stderr el estado de los hilos, semaforos y eventos del IOP.
++        void debugDump(uint64_t currentCycle) const;
++
+     private:
+         struct Semaphore
+         {
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c8e8d9c..d1733c8 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
+ #include <map>
+ #include <optional>
+ #include <span>
+@@ -574,10 +575,32 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // Depuracion (F1 06): con F1_IOP_HILOS=<segundos>, vuelca cada tanto (tiempo real) los hilos del IOP.
++        void volcarHilosSiToca()
++        {
++            static const double s_intervalo = []
++            {
++                const char *valor = std::getenv("F1_IOP_HILOS");
++                return valor ? std::max(1.0, std::atof(valor)) : 0.0;
++            }();
++            if (s_intervalo <= 0.0)
++                return;
++            static auto s_ultimo = std::chrono::steady_clock::now();
++            const auto ahora = std::chrono::steady_clock::now();
++            if (std::chrono::duration<double>(ahora - s_ultimo).count() < s_intervalo)
++                return;
++            s_ultimo = ahora;
++            kernel.debugDump(totalCycles);
++            std::fprintf(stderr, "[iop:hilos]   callbacks pendientes=%zu dma pendientes=%zu bloques=%zu libre=%u mayorHueco=%u\n",
++                         pendingGuestCallbacks.size(), pendingDmaInterrupts.size(), memory.allocationCount(),
++                         memory.totalFreeMemory(), memory.maxFreeMemory());
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+             {
++                volcarHilosSiToca();
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 5ae537e..8088e90 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -208,24 +208,33 @@ namespace ps2_stubs
+                             const void *packet,
+                             size_t packetSize) noexcept
+     {
+-        if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
++        // El IOP no se entera de que un comando no llega al EE: avisar, porque el EE se queda esperando la respuesta.
++        static uint32_t s_perdidos = 0u;
++        const auto perdido = [&](const char *motivo)
++        {
++            if (s_perdidos++ < 50u)
++                std::cerr << "[sif:ee] comando del IOP perdido cid=0x" << std::hex << commandId << std::dec << " tam="
++                          << packetSize << " (" << motivo << ")" << std::endl;
+             return false;
++        };
++        if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
++            return perdido("paquete no valido");
+ 
+         SifCmdHandler registered{};
+         {
+             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+             const auto handler = g_sifCmdHandlers.find(commandId);
+             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+-                return false;
++                return perdido("sin manejador en el EE");
+             registered = handler->second;
+         }
+ 
+         if (!runtime->hasFunction(registered.function))
+-            return false;
++            return perdido("manejador sin funcion recompilada");
+ 
+         const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+         if (packetAddress == 0u)
+-            return false;
++            return perdido("guestMalloc agotado");
+ 
+         uint8_t *const first = getMemPtr(rdram, packetAddress);
+         uint8_t *const last = getMemPtr(rdram, packetAddress + static_cast<uint32_t>(packetSize - 1u));

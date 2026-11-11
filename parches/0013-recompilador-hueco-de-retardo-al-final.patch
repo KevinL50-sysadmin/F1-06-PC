@@ -1,0 +1,21 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 8c1c7c5..c9be80c 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -2203,6 +2203,16 @@ namespace ps2recomp
+         {
+             function.end = instructions.back().address + 4;
+         }
++        else if (instructions.back().hasDelaySlot && instructions.back().address + 4u == end &&
++                 m_elfParser->isValidAddress(end))
++        {
++            // A branch in the last slot keeps its real delay slot even when another (possibly bogus) function
++            // start begins right after it; otherwise the emitter substitutes a synthetic NOP and drops the
++            // instruction. F1 06: font bytes that look like a code pointer (0x001C0808) split 0x1C04C0 at the
++            // delay slot that stores its loop counter, and the loop never ended.
++            const uint32_t rawDelaySlot = m_elfParser->readWord(end);
++            instructions.push_back(m_decoder->decodeInstruction(end, rawDelaySlot, !m_config.lowMemoryMode));
++        }
+ 
+         m_decodedFunctions.insert_or_assign(function.start, std::move(instructions));
+ 

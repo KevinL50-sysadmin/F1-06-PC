@@ -1,0 +1,287 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index db65ef2..006abb0 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -50,6 +50,10 @@ private:
+     friend class GSThreadedBackend; // converts its presentation snapshots with PresentFromLocalMemory
+ 
+     void ResetUnlocked();
++    // The presentation copy of local memory as a band job (patch 0067): the job's tag, or 0 when copied already.
++    // SnapshotVramDone: whether that job is finished (out is then complete).
++    uint64_t SnapshotVramJob(std::vector<uint8_t> &out, bool defer);
++    bool SnapshotVramDone(uint64_t tag, const std::vector<uint8_t> &out);
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 219d726..d5d030b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -155,6 +155,8 @@ private:
+     // Presentation. The worker publishes local-memory snapshots; Present() converts the newest one.
+     std::mutex m_publishMutex;
+     std::vector<uint8_t> m_workerSnapshot;
++    uint64_t m_snapshotJob = 0u; // worker: the band job copying into m_workerSnapshot (patch 0067), 0 if none
++    GSPresentationRequest m_snapshotRequest{};
+     std::vector<uint8_t> m_publishedSnapshot;
+     GSPresentationRequest m_publishedRequest{};
+     uint64_t m_publishedSerial = 0u;
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index fe65b16..5f1436a 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -35,7 +35,8 @@
+ // (the draws wait in the band workers), 38 the GS bilinear samples reading each texel through samplerPoint (before
+ // patch 0064), 39 the GS upload jobs spread over the band workers and every dependency waiting for all of them
+ // (before patch 0065), 40 modes 35, 36 and 38 together (everything of patches 0062 to 0065 off at once), 41 the GS triangle rows one pixel at a time
+-// (before patch 0066). A
++// (before patch 0066), 42 the presentation copy of the GS local memory made by the GS thread after waiting for
++// every band job (before patch 0067). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 37106a8..1b030b6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2139,6 +2139,9 @@ namespace
+         // Patch 0063: an image upload (BandState::uploads of its slot), run by worker uploadWorker alone.
+         bool isUpload = false;
+         uint8_t uploadWorker = 0u;
++        // Patch 0067: a copy of local memory for the presentation (BandState::uploads of its slot: copyTo,
++        // copyBytes), each worker its share once every worker is past the jobs before it.
++        bool isCopy = false;
+         // Patch 0063: before running it, a worker waits until every worker has finished the jobs below this (what the
+         // coordinator used to wait for before queueing it). 0: nothing.
+         uint64_t waitAll = 0u;
+@@ -2998,9 +3001,23 @@ struct GSCpuBackend::BandState
+         std::vector<uint8_t> data;
+         uint8_t *vram = nullptr;
+         WriteVramFn write = nullptr;
++        uint8_t *copyTo = nullptr; // a copy job (patch 0067): vram[0, copyBytes) to copyTo
++        uint32_t copyBytes = 0u;
+     };
+     std::unique_ptr<Upload[]> uploads;
+-    uint64_t deferredJobs = 0u, uploadJobs = 0u; // since the last report (coordinator)
++    uint64_t deferredJobs = 0u, uploadJobs = 0u, copyJobs = 0u; // since the last report (coordinator)
++    // 1 + the last copy job (patch 0067): it reads all of local memory, so every later write orders itself after it
++    // (LastBlockRead, and WaitForPages and the draws of A/B modes 15 and 19).
++    uint64_t copyReadJob = 0u;
++    // PS2X_GS_COMPROBAR_COPIAS=1 (diagnostic): before each copy job, local memory copied here with every worker
++    // stopped; the job's copy must match it ("[gs:bandas] copias: ...").
++    const bool checkCopies = []()
++    {
++        const char *value = std::getenv("PS2X_GS_COMPROBAR_COPIAS");
++        return value != nullptr && value[0] == '1';
++    }();
++    std::vector<uint8_t> copyReference;
++    uint64_t copyChecked = 0u, copyDifferent = 0u;
+     std::unique_ptr<Worker[]> worker;
+ 
+     // Coordinator side (always under GSCpuBackend::m_mutex).
+@@ -3158,6 +3175,8 @@ struct GSCpuBackend::BandState
+     uint64_t LastBlockRead(const BlockMasks &blocks, uint32_t &atPage) const
+     {
+         uint64_t last = 0u;
++        if (!blocks.empty() && copyReadJob > minDone)
++            last = copyReadJob, atPage = blocks.front().first;
+         for (const auto &[page, mask] : blocks)
+         {
+             if ((mask & textureMask[page]) != 0u && textureLastJob > last)
+@@ -3428,6 +3447,8 @@ struct GSCpuBackend::BandState
+         if (write)
+             pages.forEachCommon(pendingReads, [&](uint32_t page)
+                                 { if (ReadJobOf(page) > need) { need = ReadJobOf(page); needPage = page; needRead = true; } });
++        if (write && copyReadJob > need)
++            need = copyReadJob, needRead = true;
+         if (need > minDone)
+             NoteWait(reason, needPage, need, needRead);
+         WaitDone(need, reason);
+@@ -3533,6 +3554,16 @@ struct GSCpuBackend::BandState
+                                      static_cast<uint32_t>(upload.data.size()), upload.vram, upload.write);
+                     }
+                 }
++                else if (job.isCopy)
++                {
++                    if (job.waitAll != 0u)
++                        WaitAll(job.waitAll, 0u, index);
++                    const Upload &copy = uploads[next % kJobCapacity];
++                    const size_t share = ((static_cast<size_t>(copy.copyBytes) + count - 1u) / count + 63u) & ~size_t{63u};
++                    const size_t begin = std::min<size_t>(copy.copyBytes, share * index);
++                    const size_t end = std::min<size_t>(copy.copyBytes, begin + share);
++                    std::memcpy(copy.copyTo + begin, copy.vram + begin, end - begin);
++                }
+                 else if (jobTouchesBand(job, shift, count, index))
+                 {
+                     if ((job.waitAll | job.waitFirst) != 0u)
+@@ -3584,11 +3615,12 @@ struct GSCpuBackend::BandState
+                 dependencyNs += worker[k].dependencyNs.exchange(0u, std::memory_order_relaxed);
+             }
+             length += std::snprintf(line + length, sizeof(line) - length,
+-                                    " diferidos=%llu subidas=%llu esperasBandas=%llu/%.0fms nucleosE=",
++                                    " diferidos=%llu subidas=%llu copias=%llu esperasBandas=%llu/%.0fms nucleosE=",
+                                     static_cast<unsigned long long>(deferredJobs),
+                                     static_cast<unsigned long long>(uploadJobs),
++                                    static_cast<unsigned long long>(copyJobs),
+                                     static_cast<unsigned long long>(dependencyWaits), 1e-6 * static_cast<double>(dependencyNs));
+-            deferredJobs = uploadJobs = 0u;
++            deferredJobs = uploadJobs = copyJobs = 0u;
+         }
+         for (unsigned k = 0; k < threads && length < 1300; ++k)
+         {
+@@ -3775,6 +3807,7 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     BandJob &job = bs.jobs[index % BandState::kJobCapacity];
+     job.isSprite = sprite;
+     job.isUpload = false;
++    job.isCopy = false;
+     job.waitAll = 0u;
+     job.waitFirst = 0u;
+     if (sprite)
+@@ -3885,6 +3918,8 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+         for (const auto &[page, mask] : bs.targetBlocks)
+             if ((mask & bs.pendingReadBlocks[page]) != 0u)
+                 needRead = std::max(needRead, bs.ReadJobOf(page));
++    if (!lastJobs && ztest != 0u)
++        needRead = std::max(needRead, bs.copyReadJob); // a pending copy job (patch 0067)
+     const uint64_t need = std::max({needTexture, needLayout, needRead});
+     if (lastJobs)
+         needAll = std::max(needAll, needRead);
+@@ -4488,6 +4523,7 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     BandJob &job = bs.jobs[slot];
+     job.isSprite = false;
+     job.isUpload = true;
++    job.isCopy = false;
+     job.uploadWorker = static_cast<uint8_t>(onFirst ? 0u : index % bs.threads);
+     job.waitAll = onFirst ? (needAll > bs.minDone ? needAll : 0u) : need;
+     job.waitFirst = 0u;
+@@ -4531,6 +4567,81 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     return true;
+ }
+ 
++uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
++{
++    // Patch 0067: the copy of local memory for the presentation as a band job, so that this thread does not wait for
++    // every pending job (the "directo" waits of [gs:bandas], one per presented frame). A/B mode 42: here, as before;
++    // also without band workers, in A/B modes 36, 37 and 40 (the coordinator waits there), while F1_GS_VERIFICAR_BANDAS
++    // checks batches, and when the caller needs it now. 0: copied already.
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_vram || m_vramSize == 0u)
++    {
++        out.clear();
++        return 0u;
++    }
++    out.resize(m_vramSize);
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    BandState *bands = m_bands.get();
++    if (!defer || bands == nullptr || mode == 42 || mode == 36 || mode == 37 || mode == 40 || bands->verifyLeft != 0u ||
++        bands->RefreshMinDone() >= bands->prepared)
++    {
++        WaitBandsUnlocked();
++        std::memcpy(out.data(), m_vram, m_vramSize);
++        return 0u;
++    }
++    BandState &bs = *bands;
++    if (bs.checkCopies)
++    {
++        // The reference: what the job must copy. The jobs after it are queued while it is pending, as usual.
++        bs.WaitDone(bs.prepared, kWaitDirect);
++        bs.copyReference.assign(m_vram, m_vram + m_vramSize);
++    }
++    const uint64_t index = bs.prepared;
++    if (index - bs.minDone >= BandState::kJobCapacity)
++        bs.WaitDone(index + 1u - BandState::kJobCapacity, kWaitRing);
++    const size_t slot = static_cast<size_t>(index % BandState::kJobCapacity);
++    BandJob &job = bs.jobs[slot];
++    job.isSprite = false;
++    job.isUpload = false;
++    job.isCopy = true;
++    job.waitAll = index > bs.minDone ? index : 0u; // every worker past the jobs before it
++    job.waitFirst = 0u;
++    job.minX = job.minY = 0;
++    job.maxX = job.maxY = -1;
++    BandState::Upload &copy = bs.uploads[slot];
++    copy.vram = m_vram;
++    copy.copyTo = out.data();
++    copy.copyBytes = m_vramSize;
++    const uint64_t tag = index + 1u;
++    bs.copyReadJob = tag;
++    bs.CheckRecord(tag, {}, nullptr);
++    ++bs.copyJobs;
++    bs.prepared = tag;
++    bs.Publish(tag);
++    return tag;
++}
++
++bool GSCpuBackend::SnapshotVramDone(uint64_t tag, const std::vector<uint8_t> &out)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    BandState &bs = *m_bands;
++    if (bs.minDone < tag && bs.RefreshMinDone() < tag)
++        return false;
++    if (bs.checkCopies && !bs.copyReference.empty())
++    {
++        ++bs.copyChecked;
++        if (bs.copyReference.size() != out.size() ||
++            std::memcmp(bs.copyReference.data(), out.data(), out.size()) != 0)
++            ++bs.copyDifferent;
++        bs.copyReference.clear();
++        if (bs.copyChecked % 200u == 0u || bs.copyDifferent == 1u)
++            std::fprintf(stderr, "[gs:bandas] copias: %llu comprobadas, %llu distintas\n",
++                         static_cast<unsigned long long>(bs.copyChecked),
++                         static_cast<unsigned long long>(bs.copyDifferent));
++    }
++    return true;
++}
++
+ void GSCpuBackend::PerformLocalToLocalTransfer()
+ {
+     if (!m_vram)
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index c03ac82..cd9c1ac 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -213,6 +213,8 @@ GSThreadedBackend::~GSThreadedBackend()
+     WakeWorker();
+     if (m_worker.joinable())
+         m_worker.join();
++    if (m_snapshotJob != 0u)
++        m_cpu->WaitBands(); // the band workers copy into m_workerSnapshot
+ }
+ 
+ bool GSThreadedBackend::HasRoom(uint64_t cost, bool reload)
+@@ -508,12 +510,30 @@ void GSThreadedBackend::Execute(Command &command, uint64_t index)
+                        if (index != m_lastSnapshotIndex.load(std::memory_order_relaxed) &&
+                            now - s_lastSnapshot < std::chrono::milliseconds(33))
+                            return;
++                       // Patch 0067: the band workers make the copy (SnapshotVramJob) and it is published by the
++                       // next snapshot command after it is done, one presentation later; while it is not done,
++                       // the newer commands are skipped. The first one, and any when a copy job cannot be
++                       // queued, is copied at once, as before.
++                       const auto publish = [this](const GSPresentationRequest &request)
++                       {
++                           std::lock_guard<std::mutex> lock(m_publishMutex);
++                           std::swap(m_workerSnapshot, m_publishedSnapshot);
++                           m_publishedRequest = request;
++                           ++m_publishedSerial;
++                       };
++                       if (m_snapshotJob != 0u)
++                       {
++                           if (!m_cpu->SnapshotVramDone(m_snapshotJob, m_workerSnapshot))
++                               return;
++                           m_snapshotJob = 0u;
++                           publish(m_snapshotRequest);
++                       }
+                        s_lastSnapshot = now;
+-                       m_cpu->SnapshotVram(m_workerSnapshot);
+-                       std::lock_guard<std::mutex> lock(m_publishMutex);
+-                       std::swap(m_workerSnapshot, m_publishedSnapshot);
+-                       m_publishedRequest = payload.request;
+-                       ++m_publishedSerial;
++                       m_snapshotJob = m_cpu->SnapshotVramJob(m_workerSnapshot, m_publishedSerial != 0u);
++                       if (m_snapshotJob == 0u)
++                           publish(payload.request);
++                       else
++                           m_snapshotRequest = payload.request;
+                    } },
+                command);
+ }

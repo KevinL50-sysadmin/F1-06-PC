@@ -1,0 +1,142 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index a7d8e81..0bac2a7 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -406,6 +406,16 @@ namespace ps2x::iop::detail
+     {
+         size = alignUp(std::max(size, 1u), 16u);
+         alignment = std::max<uint32_t>(alignment, 4u);
++        // m_allocations is kept sorted by address.
++        const auto insert = [&](uint32_t address)
++        {
++            const auto position = std::lower_bound(m_allocations.begin(), m_allocations.end(), address,
++                                                   [](const Allocation &block, uint32_t value)
++                                                   { return block.address < value; });
++            m_allocations.insert(position, {address, size});
++            markOwned(address, size);
++            m_heapCursor = std::max(m_heapCursor, address + size);
++        };
+         if (fixed)
+         {
+             const uint32_t address = *fixed;
+@@ -414,32 +424,25 @@ namespace ps2x::iop::detail
+             for (const auto &block : m_allocations)
+                 if (address < block.address + block.size && block.address < address + size)
+                     return 0u;
+-            m_allocations.push_back({address, size});
+-            markOwned(address, size);
++            insert(address);
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+-        for (;;)
++        // First fit from the bottom of the heap, like the real sysmem. The search used to start at the highest
++        // address ever used, so freed memory was never reused: F1 06 allocates and frees sound banks and buffers on
++        // every load until the heap runs out, then AllocSysMemory returns 0 and the game writes from IOP address 0
++        // upwards (over CORE.IRX itself).
++        uint32_t candidate = alignUp(HeapBase, alignment);
++        for (const auto &block : m_allocations)
+         {
+-            bool overlap = false;
+-            for (const auto &block : m_allocations)
+-            {
+-                if (candidate < block.address + block.size && block.address < candidate + size)
+-                {
+-                    candidate = alignUp(block.address + block.size, alignment);
+-                    overlap = true;
+-                    break;
+-                }
+-            }
+-            if (!overlap)
++            if (block.address >= candidate && block.address - candidate >= size)
+                 break;
++            if (block.address + block.size > candidate)
++                candidate = alignUp(block.address + block.size, alignment);
+         }
+         if (candidate > HeapLimit || size > HeapLimit - candidate)
+             return 0u;
+-        m_allocations.push_back({candidate, size});
+-        markOwned(candidate, size);
+-        m_heapCursor = std::max(m_heapCursor, candidate + size);
++        insert(candidate);
+         return candidate;
+     }
+ 
+@@ -459,7 +462,28 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        uint32_t largest = 0u;
++        uint32_t cursor = HeapBase;
++        for (const auto &block : m_allocations)
++        {
++            if (block.address > cursor)
++                largest = std::max(largest, block.address - cursor);
++            cursor = std::max(cursor, block.address + block.size);
++        }
++        return HeapLimit > cursor ? std::max(largest, HeapLimit - cursor) : largest;
++    }
++
++    uint32_t IopMemory::totalFreeMemory() const
++    {
++        uint32_t total = 0u;
++        uint32_t cursor = HeapBase;
++        for (const auto &block : m_allocations)
++        {
++            if (block.address > cursor)
++                total += block.address - cursor;
++            cursor = std::max(cursor, block.address + block.size);
++        }
++        return HeapLimit > cursor ? total + (HeapLimit - cursor) : total;
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 5ef2f60..f855128 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -58,6 +58,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+         [[nodiscard]] bool freeAllocation(uint32_t address);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
++        [[nodiscard]] uint32_t totalFreeMemory() const;
++        [[nodiscard]] size_t allocationCount() const noexcept { return m_allocations.size(); }
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+ 
+         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 4bc5a01..aed8687 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -35,6 +35,16 @@ namespace ps2x::iop::detail
+             const uint32_t address = a0 == 2u
+                                          ? m_memory.allocate(size, kSysmemBlock, a2)
+                                          : m_memory.allocate(size, kSysmemBlock);
++            if (address == 0u)
++            {
++                // Games rarely check the result: report it, the failure usually shows up much later.
++                static uint32_t s_failures = 0u;
++                if (s_failures++ < 20u)
++                    m_host.log(LogLevel::Warning, "[IOP] AllocSysMemory failed: type=" + std::to_string(a0) +
++                                                      " size=" + std::to_string(a1) +
++                                                      " largestFree=" + std::to_string(m_memory.maxFreeMemory()) +
++                                                      " totalFree=" + std::to_string(m_memory.totalFreeMemory()));
++            }
+             setV0(address);
+             return true;
+         }
+@@ -45,9 +55,11 @@ namespace ps2x::iop::detail
+             setV0(IopMemory::RamSize);
+             return true;
+         case 7: // QueryMaxFreeMemSize
+-        case 8: // QueryTotalFreeMemSize
+             setV0(m_memory.maxFreeMemory());
+             return true;
++        case 8: // QueryTotalFreeMemSize
++            setV0(m_memory.totalFreeMemory());
++            return true;
+         case 9: // QueryBlockTopAddress
+             if (const auto block = m_memory.allocationContaining(a0))
+                 setV0(block->address);

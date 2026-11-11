@@ -1,0 +1,948 @@
+diff --git a/ps2xRuntime/include/ps2_host_overlay.h b/ps2xRuntime/include/ps2_host_overlay.h
+index e6d3d83..3a26d07 100644
+--- a/ps2xRuntime/include/ps2_host_overlay.h
++++ b/ps2xRuntime/include/ps2_host_overlay.h
+@@ -149,8 +149,10 @@ namespace ps2x
+         Select,
+         LeftStick,
+         RightStick,
++        L3, // Foto y repeticion T3: the sticks pressed in, as their buttons with the names on them
++        R3,
+     };
+-    inline constexpr size_t kPadIconCount = 16u;
++    inline constexpr size_t kPadIconCount = 18u;
+ 
+     // A pad button, or with key a keyboard key (its name as on the key: "W", "F12", "CTRL").
+     struct HelpKey
+@@ -245,4 +247,30 @@ namespace ps2x
+ 
+     // Draws the bar at the bottom of the game's picture (alpha: hostNoticeAlpha); the box it takes on screen.
+     HostOverlayBox drawHostHelpBar(const HelpBar &bar, float alpha = 1.0f);
++
++    // Foto y repeticion T3: when a help bar is on screen. When its mode starts it comes for a while (seconds), and again
++    // for that long when the controls shown change (pad or keyboard). The help button (L3) hides it at once while it is
++    // on screen, or else brings it back to stay until the button hides it again or its mode ends (stop): the player
++    // asked for it, so it does not go away while they read it. now: seconds, any clock.
++    class HelpBarShow
++    {
++    public:
++        void start(double now, double seconds);
++        void controlsChanged(double now);
++        void toggle(double now);
++        void stop();
++        float alpha(double now) const;
++
++    private:
++        enum class State
++        {
++            Off,    // no mode
++            Timed,  // for its seconds from m_start
++            Pinned, // from m_start until the button
++            Hidden, // by the button
++        };
++        State m_state = State::Off;
++        double m_start = -1.0;
++        double m_seconds = 0.0;
++    };
+ }
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index a07b421..6457440 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -57,6 +57,38 @@ namespace ps2x
+         return (pressed & combo) == combo ? static_cast<uint16_t>(pressed & ~combo) : pressed;
+     }
+ 
++    // Foto y repeticion T3: L3 or R3 pressed alone (the photo mode's buttons, ps2_photo_mode.h). It acts when let go, and
++    // only if the other one was not held at any moment of the press: L3+R3 is the menu's combo, which neither must
++    // trigger. cancel: forget the press in progress (the options menu opened).
++    class StickButtonClick
++    {
++    public:
++        bool update(bool held, bool otherHeld)
++        {
++            if (held)
++            {
++                if (!m_down)
++                {
++                    m_down = true;
++                    m_spoiled = false;
++                }
++                m_spoiled = m_spoiled || otherHeld;
++                return false;
++            }
++            const bool click = m_down && !m_spoiled;
++            m_down = false;
++            return click;
++        }
++        void cancel()
++        {
++            m_spoiled = true;
++        }
++
++    private:
++        bool m_down = false;
++        bool m_spoiled = false;
++    };
++
+     // The guest's pad: neutral while the menu is open and, after it closes, until no input is held (so the button that
+     // closed it does not reach the game).
+     class GuestInputGate
+@@ -96,18 +128,25 @@ namespace ps2x
+     // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido|juego>, tecla=<arriba|abajo|izquierda|derecha|
+     // aceptar>, foto (a photo, as tecla_foto) or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
+     // ("<action>,...") run when it appears, and the file is deleted (scripts that wait for a screen of the game).
++    // Foto y repeticion T3: mando=<button>[+<button>...][:seconds] holds those buttons of the player's pad for that long
++    // (0.2 s if not said), as a pad would (the port's photo mode and replay buttons, and the game, through its filters).
+     struct MenuScriptStep
+     {
+         double seconds = 0.0;
+         std::string action;
+     };
+     std::vector<MenuScriptStep> parseMenuScript(std::string_view text);
++    // "<button>[+<button>...][:seconds]" with controles.ini's names of the PS2's buttons (cruz, l3, arriba...): their
++    // bits and the seconds; false (and both left as they were) for an unknown name or a time that is not >= 0.
++    bool parseHeldPadButtons(std::string_view text, uint16_t &bits, double &seconds);
+ 
+     // The pad side (ps2_pad.cpp). setOptionsMenuOpen/optionsMenuOpen: any thread. readMenuPad: the main thread; the pad
+     // and wheel inputs of controles.ini (not the keys) as PS2 buttons, whatever the controller (raylib, the DualSense
+     // over HID, the wheel's last state).
+     void setOptionsMenuOpen(bool open);
+     bool optionsMenuOpen();
++    // Tests (mando=...): those PS2 buttons held on the player's pad for seconds, from now (any thread).
++    void holdPadButtons(uint16_t bits, double seconds);
+     struct MenuPadState
+     {
+         uint16_t pressed = 0u; // PS2 button bits, 1 = pressed
+diff --git a/ps2xRuntime/src/lib/ps2_game_graphics.cpp b/ps2xRuntime/src/lib/ps2_game_graphics.cpp
+index 3761925..2a962d6 100644
+--- a/ps2xRuntime/src/lib/ps2_game_graphics.cpp
++++ b/ps2xRuntime/src/lib/ps2_game_graphics.cpp
+@@ -210,6 +210,8 @@ namespace ps2x
+             return {kPadSheetFile, {16, 34, 25, 17}, PadIconOrigin::Drawn, {}}; // L1's box
+         case PadIcon::LeftStick:
+         case PadIcon::RightStick:
++        case PadIcon::L3: // Foto y repeticion T3: the same button, with its name
++        case PadIcon::R3:
+             return {kPadSheetFile, kDpadUp, PadIconOrigin::Drawn, {}};
+         }
+         return {kBtnCrossFile, kButton, PadIconOrigin::Native, {}};
+diff --git a/ps2xRuntime/src/lib/ps2_host_overlay.cpp b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+index ff42d7a..c6b5638 100644
+--- a/ps2xRuntime/src/lib/ps2_host_overlay.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+@@ -79,6 +79,49 @@ namespace ps2x
+         return onScreen ? now - kHostNoticeFadeIn : now;
+     }
+ 
++    void HelpBarShow::start(double now, double seconds)
++    {
++        const bool onScreen = alpha(now) > 0.0f;
++        m_state = State::Timed;
++        m_start = onScreen ? now - kHostNoticeFadeIn : now;
++        m_seconds = seconds;
++    }
++
++    void HelpBarShow::controlsChanged(double now)
++    {
++        if (m_state == State::Timed)
++            m_start = hostNoticeStart(now, m_start, m_seconds);
++    }
++
++    void HelpBarShow::toggle(double now)
++    {
++        if (m_state == State::Off)
++            return;
++        const bool onScreen =
++            m_state == State::Pinned || (m_state == State::Timed && now >= m_start && now - m_start < m_seconds);
++        m_state = onScreen ? State::Hidden : State::Pinned;
++        m_start = now;
++    }
++
++    void HelpBarShow::stop()
++    {
++        m_state = State::Off;
++    }
++
++    float HelpBarShow::alpha(double now) const
++    {
++        if (m_state == State::Timed)
++            return hostNoticeAlpha(now - m_start, m_seconds);
++        if (m_state == State::Pinned)
++        {
++            // 1e-9: 17.15 - 17 is a hair under 0.15.
++            const double elapsed = now - m_start;
++            return elapsed + 1e-9 >= kHostNoticeFadeIn ? 1.0f
++                                                       : static_cast<float>(std::max(0.0, elapsed / kHostNoticeFadeIn));
++        }
++        return 0.0f;
++    }
++
+     namespace
+     {
+         std::vector<std::string> words(const std::string &text)
+@@ -215,6 +258,10 @@ namespace ps2x
+             return es ? "stick izquierdo" : "left stick";
+         case PadIcon::RightStick:
+             return es ? "stick derecho" : "right stick";
++        case PadIcon::L3:
++            return "L3";
++        case PadIcon::R3:
++            return "R3";
+         }
+         return {};
+     }
+@@ -932,10 +979,14 @@ namespace ps2x
+                     const Texture2D &icon = g.icons[static_cast<size_t>(p.key.icon)].texture;
+                     drawPicture(icon, Rectangle{0.0f, 0.0f, static_cast<float>(icon.width), static_cast<float>(icon.height)},
+                                 r);
+-                    if (p.key.icon == PadIcon::LeftStick || p.key.icon == PadIcon::RightStick)
++                    if (p.key.icon == PadIcon::LeftStick || p.key.icon == PadIcon::RightStick ||
++                        p.key.icon == PadIcon::L3 || p.key.icon == PadIcon::R3)
+                     {
+-                        const std::string side = p.key.icon == PadIcon::LeftStick ? "L" : "R";
+-                        const float size = textSize * 0.75f;
++                        const std::string side = p.key.icon == PadIcon::LeftStick ? "L"
++                                                 : p.key.icon == PadIcon::RightStick ? "R"
++                                                 : p.key.icon == PadIcon::L3       ? "L3"
++                                                                                   : "R3";
++                        const float size = textSize * (side.size() > 1u ? 0.6f : 0.75f);
+                         drawWord(side, r.x + (r.width - measureWith(screenLetter, side, size)) / 2.0f, middle, size);
+                     }
+                 }
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index f4b7954..386c4d5 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -3,10 +3,12 @@
+ #include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
+ 
++#include <algorithm>
+ #include <cctype>
+ #include <cmath>
+ #include <cstdlib>
+ #include <fstream>
++#include <iterator>
+ #include <set>
+ #include <sstream>
+ #include <system_error>
+@@ -196,7 +198,8 @@ namespace ps2x
+             {"tecla_modo_foto", "PS2X_TECLA_MODO_FOTO", "f8", {{"f8", "f8"}, {"f5", "f5"}, {"p", "p"}, {"no", "no"}}, 0, 0,
+              "Tecla del modo foto (f8, f5, p o no): en carrera congela el juego, quita el HUD y deja mover la camara\n"
+              "(W S A D, R F, flechas, Q E, Z X; con el mando, los sticks). La tecla de foto la saca; la misma tecla\n"
+-             "vuelve a la carrera."},
++             "vuelve a la carrera. En el mando, R3 (pulsar el stick derecho) hace lo mismo y L3 muestra u oculta la\n"
++             "ayuda."},
+             // Fase 5 (T16): also the OPPONENT AI row of the game's DIFFICULTY menu; the race reads it when it sets up
+             // the AI drivers and cars (src/f1_overrides.cpp, ps2_ai_difficulty.h).
+             {"dificultad_ia", "PS2X_DIFICULTAD_IA", "0", {}, 0, 100,
+@@ -699,4 +702,40 @@ namespace ps2x
+         }
+         return steps;
+     }
++
++    bool parseHeldPadButtons(std::string_view text, uint16_t &bits, double &seconds)
++    {
++        // The PS2's button bits in order, with controles.ini's names.
++        static constexpr std::string_view kNames[16] = {"select", "l3", "r3", "start", "arriba", "derecha",
++                                                        "abajo", "izquierda", "l2", "r2", "l1", "r1",
++                                                        "triangulo", "circulo", "cruz", "cuadrado"};
++        const std::string item = trim(text);
++        const size_t colon = item.find(':');
++        double held = 0.2;
++        if (colon != std::string::npos)
++        {
++            const std::string number = trim(std::string_view(item).substr(colon + 1u));
++            char *end = nullptr;
++            held = std::strtod(number.c_str(), &end);
++            if (number.empty() || end == nullptr || *end != '\0' || !std::isfinite(held) || held < 0.0)
++                return false;
++        }
++        uint16_t found = 0u;
++        std::string_view names = std::string_view(item).substr(0, colon);
++        while (true)
++        {
++            const size_t plus = names.find('+');
++            const std::string name = trim(names.substr(0, plus));
++            const auto at = std::find(std::begin(kNames), std::end(kNames), name);
++            if (at == std::end(kNames))
++                return false;
++            found = static_cast<uint16_t>(found | (1u << (at - std::begin(kNames))));
++            if (plus == std::string_view::npos)
++                break;
++            names.remove_prefix(plus + 1u);
++        }
++        bits = found;
++        seconds = held;
++        return true;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 2337b32..e04efcf 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -661,6 +661,15 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+             ps2x::requestPhoto();
+         else if (action == "modo_foto")
+             ps2x::togglePhotoMode();
++        else if (action.rfind("mando=", 0) == 0)
++        {
++            // Foto y repeticion T3: buttons of the player's pad held for a while (ps2_pad.cpp).
++            uint16_t bits = 0u;
++            double seconds = 0.0;
++            done = ps2x::parseHeldPadButtons(std::string_view(action).substr(6), bits, seconds);
++            if (done)
++                ps2x::holdPadButtons(bits, seconds);
++        }
+         else if (action.rfind("seccion=", 0) == 0)
+         {
+             const std::string name = action.substr(8);
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 6ead403..065e96c 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -12,6 +12,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cctype>
++#include <chrono>
+ #include <cmath>
+ #include <cstdarg>
+ #include <cstdio>
+@@ -820,6 +821,25 @@ namespace
+     std::mutex g_lastWheelMutex;
+     ps2_pad_win::JoystickState g_lastWheel;
+ 
++    // Foto y repeticion T3 (tests): PS2X_MENU_PETICION's mando=... holds these buttons until then (steady clock).
++    std::mutex g_heldTestButtonsMutex;
++    uint16_t g_heldTestButtons = 0u;
++    std::chrono::steady_clock::time_point g_heldTestButtonsUntil{};
++
++    // The held test buttons, pressed all the way, as a pad's.
++    void addHeldTestButtons(float (&value)[kTargetCount])
++    {
++        uint16_t bits = 0u;
++        {
++            std::lock_guard<std::mutex> lock(g_heldTestButtonsMutex);
++            if (g_heldTestButtons != 0u && std::chrono::steady_clock::now() < g_heldTestButtonsUntil)
++                bits = g_heldTestButtons;
++        }
++        for (int b = 0; b < 16; ++b)
++            if ((bits & (1u << b)) != 0u)
++                value[b] = 1.0f;
++    }
++
+     uint16_t pressedButtons(const float (&value)[kTargetCount], const Config &cfg)
+     {
+         uint16_t pressed = 0u;
+@@ -1067,6 +1087,15 @@ namespace ps2x
+         return g_optionsMenuOpen.load(std::memory_order_relaxed);
+     }
+ 
++    void holdPadButtons(uint16_t bits, double seconds)
++    {
++        std::lock_guard<std::mutex> lock(g_heldTestButtonsMutex);
++        g_heldTestButtons = bits;
++        g_heldTestButtonsUntil = std::chrono::steady_clock::now() +
++                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                                     std::chrono::duration<double>(std::max(0.0, seconds)));
++    }
++
+     MenuPadState readMenuPad()
+     {
+         const Config &cfg = config();
+@@ -1083,6 +1112,7 @@ namespace ps2x
+             for (const Source &s : cfg.map[static_cast<size_t>(t)])
+                 if (s.kind != SourceKind::Key) // the keyboard reaches the menu through ImGui
+                     value[t] = std::max(value[t], sourceValue(s, cfg, f));
++        addHeldTestButtons(value);
+         MenuPadState state;
+         state.pressed = pressedButtons(value, cfg);
+         state.leftX = std::clamp(value[kLsRight] - value[kLsLeft], -1.0f, 1.0f);
+@@ -1107,6 +1137,7 @@ namespace ps2x
+             for (const Source &s : cfg.map[static_cast<size_t>(t)])
+                 if (s.kind != SourceKind::Key) // the photo mode reads its own keys
+                     value[t] = std::max(value[t], sourceValue(s, cfg, f));
++        addHeldTestButtons(value);
+         PhotoModePad pad;
+         pad.pressed = pressedButtons(value, cfg);
+         pad.leftX = std::clamp(value[kLsRight] - value[kLsLeft], -1.0f, 1.0f);
+@@ -1171,6 +1202,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+ 
+     float value[kTargetCount] = {};
+     readValues(cfg, f, value);
++    addHeldTestButtons(value);
+ 
+     // Phase 3 (T3): the options menu open (or a button still held after closing it): the neutral pad above. Fase 5
+     // (T13): the photo mode too (its keys and sticks move the free camera).
+@@ -1181,15 +1213,17 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+                                 pressed != 0u))
+             return true;
+     }
+-    // L3+R3 together open the menu: the game sees neither.
+-    pressed = ps2x::maskMenuCombo(pressed);
++    // L3+R3 together open the menu: the game sees neither. Foto y repeticion T3: nor R3 where it turns the photo mode
++    // on (ps2_runtime.cpp) nor L3 in the replay, where it shows or hides the help bar.
++    const bool replay = ps2x::replayScrubActive();
++    pressed = ps2x::hidePhotoModeStickButtons(ps2x::maskMenuCombo(pressed), ps2x::photoModeReady(), replay);
+     if ((pressed & ps2x::kPadL3) == 0u)
+         value[kL3] = 0.0f;
+     if ((pressed & ps2x::kPadR3) == 0u)
+         value[kR3] = 0.0f;
+     // Fase 5 (T14): in the replay L2, R2 and SELECT rewind, fast-forward and pause it (ps2_runtime.cpp): the game sees
+     // none of them.
+-    if (ps2x::replayScrubActive())
++    if (replay)
+     {
+         pressed = static_cast<uint16_t>(pressed & ~((1u << kL2) | (1u << kR2) | (1u << kSelect)));
+         value[kL2] = value[kR2] = value[kSelect] = 0.0f;
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index 3e7a901..455affb 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -12,6 +12,9 @@
+ // game's simulation steps stop; it keeps drawing), hides the HUD, mutes the sound and hands the race camera to a free
+ // camera moved with the keyboard and the pad; the photo key (tecla_foto) or the pad's circle takes the picture and the
+ // same key or START goes back. Nativizacion T10: also PHOTO MODE in the game's pause menu (PhotoModeRequest).
++// Foto y repeticion T3: the pad's R3 alone turns it on and off as the key (the game does not use L3 nor R3 in a race nor
++// in its replay: FrontEnd/Scripts/Options/ControllerDualShock2.lua) and L3 alone shows or hides the help bar, here and
++// in the replay (ps2_runtime.cpp).
+ // The window's thread reads the input (ps2_runtime.cpp); the game's thread moves the camera on each of its frames and
+ // gives it to the game (src/f1_overrides.cpp).
+ namespace ps2x
+@@ -189,9 +192,20 @@ namespace ps2x
+     };
+ 
+     // PS2 pad bits (libpad order, as ps2_options_menu.h's).
+-    constexpr uint16_t kPhotoPadStart = 1u << 3, kPhotoPadUp = 1u << 4, kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10,
+-                       kPhotoPadR1 = 1u << 11, kPhotoPadTriangle = 1u << 12, kPhotoPadCircle = 1u << 13,
+-                       kPhotoPadCross = 1u << 14, kPhotoPadSquare = 1u << 15;
++    constexpr uint16_t kPhotoPadL3 = 1u << 1, kPhotoPadR3 = 1u << 2, kPhotoPadStart = 1u << 3, kPhotoPadUp = 1u << 4,
++                       kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10, kPhotoPadR1 = 1u << 11,
++                       kPhotoPadTriangle = 1u << 12, kPhotoPadCircle = 1u << 13, kPhotoPadCross = 1u << 14,
++                       kPhotoPadSquare = 1u << 15;
++
++    // Foto y repeticion T3: what the game does not see of the photo mode's stick buttons: R3 where it turns the photo
++    // mode on or off (photoModeReady: a race camera drawing, or the photo mode on) and L3 in the replay, where it shows
++    // or hides the help bar. Elsewhere (the menus) they reach the game as before. In the photo mode the game's pad is
++    // neutral anyway (ps2_pad.cpp).
++    inline uint16_t hidePhotoModeStickButtons(uint16_t pressed, bool photoModeReady, bool replay)
++    {
++        const uint16_t hidden = static_cast<uint16_t>((photoModeReady ? kPhotoPadR3 : 0u) | (replay ? kPhotoPadL3 : 0u));
++        return static_cast<uint16_t>(pressed & ~hidden);
++    }
+     constexpr uint16_t kPhotoPadAllHeld = 0xFFFFu; // the previous frame's buttons when it has just gone on
+ 
+     // Nativizacion T10: the pad's buttons that the camera does not use, on their press (previous: the last frame's
+@@ -253,10 +267,16 @@ namespace ps2x
+         };
+         const bool photo = !pad && !photoKey.empty() && photoKey != "no";
+         const bool mode = !pad && !modeKey.empty() && modeKey != "no" && modeKey != photoKey;
+-        bar.right = {
+-            {{photo ? keyboardKey(upper(photoKey)) : padKey(PadIcon::Circle)}, T("foto", "photo")},
+-            {{mode ? keyboardKey(upper(modeKey)) : padKey(PadIcon::Start)}, T("salir", "exit")},
+-        };
++        // Foto y repeticion T3: L3 shows or hides this bar and R3 leaves too (no keyboard key does either).
++        if (pad)
++            bar.right.push_back({{padKey(PadIcon::L3)}, T("ayuda", "help")});
++        bar.right.push_back({{photo ? keyboardKey(upper(photoKey)) : padKey(PadIcon::Circle)}, T("foto", "photo")});
++        if (mode)
++            bar.right.push_back({{keyboardKey(upper(modeKey))}, T("salir", "exit")});
++        else if (pad)
++            bar.right.push_back({{padKey(PadIcon::Start), padKey(PadIcon::R3)}, T("salir", "exit")});
++        else
++            bar.right.push_back({{padKey(PadIcon::Start)}, T("salir", "exit")});
+         return bar;
+     }
+ 
+@@ -327,6 +347,11 @@ namespace ps2x
+             }
+             return enter(now);
+         }
++        // Foto y repeticion T3: the key would turn it on now (a race camera drawing) or off (it is on).
++        bool ready(double now) const
++        {
++            return m_active || (m_lastCamera >= 0.0 && now - m_lastCamera <= kEnterWindow);
++        }
+         // On if a race camera is drawing (as the key); the new state.
+         bool enter(double now)
+         {
+@@ -410,6 +435,8 @@ namespace ps2x
+     void requestPhotoModeFromMenu();
+     void servePhotoModeRequest(bool pauseMenuOpen);
+     bool photoModeActive();
++    // Foto y repeticion T3: PhotoModeSwitch::ready now (the pad hides R3 from the game then).
++    bool photoModeReady();
+     void photoModeCameraFrame();
+     void setPhotoModeInput(const FreeCameraInput &input);
+     FreeCameraInput photoModeInput();
+diff --git a/ps2xRuntime/src/lib/ps2_replay_scrub.h b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+index 0523f13..865b8a6 100644
+--- a/ps2xRuntime/src/lib/ps2_replay_scrub.h
++++ b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+@@ -3,10 +3,13 @@
+ #include "ps2_host_overlay.h"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <initializer_list>
+ #include <string>
++#include <vector>
+ 
+ // Fase 5 (T14, F1 06): rewind, fast-forward and pause in the game's own replay. The game does not keep the cars'
+ // positions: it keeps the pad inputs of the last 1920 steps and two snapshots of the whole race state, and its replay
+@@ -25,19 +28,52 @@ namespace ps2x
+ 
+     // Aspecto T4: the help bar at the bottom of the picture when a replay starts, for kReplayHelpSeconds: what each
+     // control does, with the pad's buttons or the keyboard's keys (HelpInput), in the game's language.
++    // Foto y repeticion T4: also the game's own replay controls (logs/fyr-t3: triangle the camera, the d-pad's left and
++    // right another car, its up and down the car ahead or behind; with controles.ini's default keys V, A D and W S),
++    // and on the right L3, which shows or hides the bar (HelpBarShow), and the photo mode's R3, or its key (photoKey:
++    // tecla_foto, modeKey: tecla_modo_foto, as opciones.ini; none when it is "no" or the photo's).
+     constexpr double kReplayHelpSeconds = 6.0;
+ 
+-    inline HelpBar replayHelp(HostLanguage language, HelpInput input)
++    inline HelpBar replayHelp(HostLanguage language, HelpInput input, const std::string &photoKey,
++                              const std::string &modeKey)
+     {
+         const bool es = language == HostLanguage::Spanish;
+         const bool pad = input == HelpInput::Pad;
++        const auto keys = [pad](std::initializer_list<PadIcon> icons, std::initializer_list<const char *> names)
++        {
++            std::vector<HelpKey> out;
++            if (pad)
++                for (PadIcon icon : icons)
++                    out.push_back(padKey(icon));
++            else
++                for (const char *name : names)
++                    out.push_back(keyboardKey(name));
++            return out;
++        };
+         HelpBar bar;
+         bar.title = es ? "Repetici\xC3\xB3n" : "Replay";
+         bar.left = {
+-            {{pad ? padKey(PadIcon::L2) : keyboardKey("J")}, es ? "atr\xC3\xA1s" : "rewind"},
+-            {{pad ? padKey(PadIcon::R2) : keyboardKey("L")}, es ? "adelante (x2, x4)" : "fast-forward (x2, x4)"},
+-            {{pad ? padKey(PadIcon::Select) : keyboardKey("K")}, es ? "pausa" : "pause"},
++            {keys({PadIcon::L2}, {"J"}), es ? "atr\xC3\xA1s" : "rewind"},
++            {keys({PadIcon::R2}, {"L"}), es ? "adelante (x2, x4)" : "fast-forward (x2, x4)"},
++            {keys({PadIcon::Select}, {"K"}), es ? "pausa" : "pause"},
++            {keys({PadIcon::Triangle}, {"V"}), es ? "c\xC3\xA1mara" : "camera"},
++            {keys({PadIcon::DpadLeft, PadIcon::DpadRight}, {"A", "D"}), es ? "coche" : "car"},
++            {keys({PadIcon::DpadUp, PadIcon::DpadDown}, {"W", "S"}), es ? "delante/detr\xC3\xA1s" : "ahead/behind"},
+         };
++        if (pad)
++        {
++            bar.right = {
++                {{padKey(PadIcon::L3)}, es ? "ayuda" : "help"},
++                {{padKey(PadIcon::R3)}, es ? "modo foto" : "photo mode"},
++            };
++        }
++        else if (!modeKey.empty() && modeKey != "no" && modeKey != photoKey)
++        {
++            std::string name = modeKey;
++            std::transform(name.begin(), name.end(), name.begin(),
++                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++            bar.right = {{{keyboardKey(name)}, es ? "modo foto" : "photo mode"}};
++        }
+         return bar;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 98b5ec2..b6ed5a6 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -773,6 +773,7 @@ namespace
+     std::atomic<int> g_helpBarRequest{static_cast<int>(HelpBarKind::None)};
+     ps2x::HelpInputMemory g_helpInput; // the window's thread only
+     bool g_helpInputChanged = false;
++    bool g_helpBarToggle = false; // Foto y repeticion T3: L3 pressed (the window's thread only)
+ 
+     void ShowHelpBar(HelpBarKind kind)
+     {
+@@ -899,6 +900,12 @@ namespace ps2x
+         return g_photoModeOn.load(std::memory_order_relaxed);
+     }
+ 
++    bool photoModeReady()
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        return g_photoModeSwitch.ready(PhotoModeClock());
++    }
++
+     void photoModeCameraFrame()
+     {
+         std::lock_guard<std::mutex> lock(g_photoModeMutex);
+@@ -918,6 +925,36 @@ namespace ps2x
+     }
+ }
+ 
++// Foto y repeticion T3 (main thread, once per frame): the pad's R3 alone turns the photo mode on and off as
++// tecla_modo_foto, where it can (photoModeReady: elsewhere R3 is the game's, ps2_pad.cpp), and L3 alone shows or hides
++// the help bar of the photo mode and of the replay. Both act when let go, never together (L3+R3 held opens the options
++// menu) nor with the options menu open.
++static void UpdateStickButtons(bool optionsMenuOpen)
++{
++    static ps2x::StickButtonClick s_l3, s_r3;
++    const uint16_t pressed = ps2x::readPhotoModePad().pressed;
++    const bool l3 = (pressed & ps2x::kPhotoPadL3) != 0u, r3 = (pressed & ps2x::kPhotoPadR3) != 0u;
++    const bool r3Click = s_r3.update(r3, l3);
++    const bool l3Click = s_l3.update(l3, r3);
++    if (optionsMenuOpen)
++    {
++        s_l3.cancel();
++        s_r3.cancel();
++        return;
++    }
++    if (r3Click && ps2x::photoModeReady())
++    {
++        NoteHelpInput(false, true);
++        std::cout << "[modo-foto] R3" << std::endl;
++        ps2x::togglePhotoMode();
++    }
++    if (l3Click && (ps2x::photoModeActive() || ps2x::replayScrubActive()))
++    {
++        NoteHelpInput(false, true);
++        g_helpBarToggle = true;
++    }
++}
++
+ // The window's part, once per frame (main thread): the key, going off by itself when the race camera stops, and the
+ // held keys and pad for the free camera (none while the options menu is open). Nativizacion T10: the pad's circle
+ // takes a photo and START leaves (photoModePadActions).
+@@ -1092,7 +1129,9 @@ static void UpdateReplayScrub(bool optionsMenuOpen)
+     }
+     if (!s_wasActive)
+     {
+-        std::cout << "[repeticion] controles: J atras, L adelante (x2, x4), K pausa; mando L2, R2, SELECT" << std::endl;
++        std::cout << "[repeticion] controles: J atras, L adelante (x2, x4), K pausa; mando L2, R2, SELECT; L3 ayuda, R3 "
++                     "modo foto"
++                  << std::endl;
+         ShowHelpBar(HelpBarKind::Replay); // Aspecto T4: the help bar, with the game's buttons
+     }
+     s_wasActive = true;
+@@ -1107,8 +1146,13 @@ static void UpdateReplayScrub(bool optionsMenuOpen)
+         fastForward = !rewind && (IsKeyDown(KEY_L) || (pad.pressed & kR2) != 0u);
+         pause = IsKeyPressed(KEY_K) || (select && !s_selectHeld);
+         s_selectHeld = select;
+-        NoteHelpInput(IsKeyDown(KEY_J) || IsKeyDown(KEY_L) || IsKeyPressed(KEY_K),
+-                      (pad.pressed & (kL2 | kR2 | kSelect)) != 0u);
++        // Foto y repeticion T4: the game's own replay controls too (triangle, the d-pad; V, W A S D, the arrows).
++        constexpr uint16_t kTriangle = 1u << 12, kDpad = 0xF0u;
++        NoteHelpInput(IsKeyDown(KEY_J) || IsKeyDown(KEY_L) || IsKeyPressed(KEY_K) || IsKeyPressed(KEY_V) ||
++                          IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) || IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D) ||
++                          IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_LEFT) ||
++                          IsKeyPressed(KEY_RIGHT),
++                      (pad.pressed & (kL2 | kR2 | kSelect | kTriangle | kDpad)) != 0u);
+     }
+     ps2x::setReplayScrubControls(rewind, fastForward, pause);
+ 
+@@ -1242,25 +1286,25 @@ static void DrawPhotoMessage()
+ 
+ // Aspecto T4: the help bar (main thread, before the bottom line, which goes above it): for kPhotoModeHelpSeconds or
+ // kReplayHelpSeconds, fading in and out; again from the start when the controls shown change (pad or keyboard); gone
+-// with the photo mode or the replay.
++// with the photo mode or the replay. Foto y repeticion T3: L3 hides it, or brings it back to stay (HelpBarShow).
+ static void DrawHelpBar()
+ {
+     static HelpBarKind s_kind = HelpBarKind::None;
+-    static double s_start = -1.0;
++    static ps2x::HelpBarShow s_show;
++    const double now = GetTime();
+     const auto seconds = [](HelpBarKind kind)
+     { return kind == HelpBarKind::PhotoMode ? ps2x::kPhotoModeHelpSeconds : ps2x::kReplayHelpSeconds; };
+     const HelpBarKind asked =
+         static_cast<HelpBarKind>(g_helpBarRequest.exchange(static_cast<int>(HelpBarKind::None), std::memory_order_relaxed));
+     if (asked != HelpBarKind::None)
+     {
+-        s_start = ps2x::hostNoticeStart(GetTime(), s_kind == asked ? s_start : -1.0, seconds(asked));
++        s_show.start(now, seconds(asked));
+         s_kind = asked;
+     }
+     if (g_helpInputChanged)
+     {
+         g_helpInputChanged = false;
+-        if (s_kind != HelpBarKind::None)
+-            s_start = ps2x::hostNoticeStart(GetTime(), s_start, seconds(s_kind));
++        s_show.controlsChanged(now);
+     }
+     const bool on = s_kind == HelpBarKind::PhotoMode ? ps2x::photoModeActive()
+                     : s_kind == HelpBarKind::Replay  ? ps2x::replayScrubActive() && !ps2x::photoModeActive()
+@@ -1268,16 +1312,25 @@ static void DrawHelpBar()
+     if (!on)
+     {
+         s_kind = HelpBarKind::None;
++        s_show.stop();
++        g_helpBarToggle = false;
+         return;
+     }
+-    const float alpha = ps2x::hostNoticeAlpha(GetTime() - s_start, seconds(s_kind));
++    if (g_helpBarToggle)
++    {
++        g_helpBarToggle = false;
++        s_show.toggle(now);
++        std::cout << "[ayuda] L3: barra " << (s_show.alpha(now + ps2x::kHostNoticeFadeIn) > 0.0f ? "a la vista" : "oculta")
++                  << std::endl;
++    }
++    const float alpha = s_show.alpha(now);
+     if (!(alpha > 0.0f))
+         return;
+     const ps2x::HostLanguage language = ps2x::hostLanguage();
+     const ps2x::HelpInput input = ShownHelpInput();
+-    ps2x::drawHostHelpBar(s_kind == HelpBarKind::PhotoMode
+-                              ? ps2x::photoModeHelp(language, input, ps2x::photoKeyOption(), ps2x::photoModeKeyOption())
+-                              : ps2x::replayHelp(language, input),
++    const std::string photoKey = ps2x::photoKeyOption(), modeKey = ps2x::photoModeKeyOption();
++    ps2x::drawHostHelpBar(s_kind == HelpBarKind::PhotoMode ? ps2x::photoModeHelp(language, input, photoKey, modeKey)
++                                                           : ps2x::replayHelp(language, input, photoKey, modeKey),
+                           alpha);
+ }
+ 
+@@ -3759,6 +3812,7 @@ void PS2Runtime::run()
+         if (const int photoKey = PhotoKeyCode(ps2x::photoKeyOption());
+             !optionsMenuOpen && photoKey != KEY_NULL && IsKeyPressed(photoKey))
+             ps2x::requestPhoto();
++        UpdateStickButtons(optionsMenuOpen);
+         UpdatePhotoMode(optionsMenuOpen);
+         UpdateReplayScrub(optionsMenuOpen);
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+diff --git a/ps2xTest/src/ps2_game_graphics_tests.cpp b/ps2xTest/src/ps2_game_graphics_tests.cpp
+index d4b1cc9..effd1d3 100644
+--- a/ps2xTest/src/ps2_game_graphics_tests.cpp
++++ b/ps2xTest/src/ps2_game_graphics_tests.cpp
+@@ -395,6 +395,10 @@ void register_ps2_game_graphics_tests()
+                      "START and SELECT: the sheet's L1 box without its name (the bar writes theirs on it)");
+             t.IsTrue(source(I::LeftStick).origin == O::Drawn && source(I::LeftStick).file == ps2x::kPadSheetFile,
+                      "the sticks: drawn from a d-pad button");
++            t.IsTrue(source(I::L3).origin == O::Drawn && source(I::R3).origin == O::Drawn &&
++                         source(I::L3).file == source(I::LeftStick).file &&
++                         source(I::R3).rect.y == source(I::RightStick).rect.y,
++                     "L3 and R3: the sticks' button (the bar writes their names on it)");
+             for (size_t i = 0; i < ps2x::kPadIconCount; ++i)
+             {
+                 const ps2x::PadIconSource s = source(static_cast<I>(i));
+@@ -571,6 +575,8 @@ void register_ps2_game_graphics_tests()
+                      std::string("stick izquierdo"), "the left stick");
+             t.Equals(ps2x::helpKeyName(ps2x::padKey(ps2x::PadIcon::DpadUp), L::English), std::string("up"), "d-pad");
+             t.Equals(ps2x::helpKeyName(ps2x::padKey(ps2x::PadIcon::R2), L::Spanish), std::string("R2"), "R2");
++            t.Equals(ps2x::helpKeyName(ps2x::padKey(ps2x::PadIcon::L3), L::Spanish), std::string("L3"), "L3");
++            t.Equals(ps2x::helpKeyName(ps2x::padKey(ps2x::PadIcon::R3), L::English), std::string("R3"), "R3");
+             t.Equals(ps2x::helpKeyName(ps2x::keyboardKey("F12"), L::Spanish), std::string("F12"), "a key: its name");
+ 
+             ps2x::HelpBar bar;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 9c287ca..cb5229f 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1265,19 +1265,21 @@ void register_ps2_options_menu_tests()
+             t.Equals(ps2x::helpBarText(es, L::Spanish),
+                      std::string("Modo foto: stick izquierdo mover, stick derecho mirar, L2 R2 bajar/subir, L1 R1 inclinar, "
+                                  "arriba abajo zoom, cruz r\xC3\xA1pido, cuadrado lento, tri\xC3\xA1ngulo restablecer, "
+-                                 "c\xC3\xADrculo foto, START salir."),
++                                 "L3 ayuda, c\xC3\xADrculo foto, START R3 salir."),
+                      "Spanish, with its accents");
+             t.Equals(es.left.size(), size_t(8), "the camera's eight controls on the left");
+-            t.Equals(es.right.size(), size_t(2), "photo and exit on the right, as the game's ACEPTA");
++            t.Equals(es.right.size(), size_t(3), "help, photo and exit on the right, as the game's ACEPTA");
+             t.IsTrue(es.left.size() == 8u && es.left[0].keys.size() == 1u && es.left[0].keys[0].icon == I::LeftStick &&
+                          es.left[0].keys[0].key.empty(),
+                      "a pad button, not a key");
+-            t.IsTrue(es.right.size() == 2u && es.right[0].keys[0].icon == I::Circle && es.right[1].keys[0].icon == I::Start,
+-                     "circle takes the photo, START leaves");
++            t.IsTrue(es.right.size() == 3u && es.right[0].keys.size() == 1u && es.right[0].keys[0].icon == I::L3 &&
++                         es.right[1].keys[0].icon == I::Circle && es.right[2].keys.size() == 2u &&
++                         es.right[2].keys[0].icon == I::Start && es.right[2].keys[1].icon == I::R3,
++                     "L3 shows or hides the bar, circle takes the photo, START or R3 leave");
+             const ps2x::HelpBar en = ps2x::photoModeHelp(L::English, ps2x::HelpInput::Pad, "f12", "f8");
+             t.Equals(ps2x::helpBarText(en, L::English),
+                      std::string("Photo mode: left stick move, right stick look, L2 R2 down/up, L1 R1 tilt, up down zoom, "
+-                                 "cross fast, square slow, triangle reset, circle photo, START exit."),
++                                 "cross fast, square slow, triangle reset, L3 help, circle photo, START R3 exit."),
+                      "English");
+             t.Equals(ps2x::helpBarText(ps2x::photoModeHelp(L::Spanish, ps2x::HelpInput::Pad, "no", "no"), L::Spanish),
+                      ps2x::helpBarText(es, L::Spanish), "the pad's bar does not depend on the keys");
+@@ -1328,22 +1330,161 @@ void register_ps2_options_menu_tests()
+                      "the help bar stays long enough to read");
+         });
+ 
+-        tc.Run("the replay's help bar: rewind, forward and its speeds, pause", [](TestCase &t)
++        tc.Run("the replay's help bar: rewind, forward and its speeds, pause and the game's own controls", [](TestCase &t)
+         {
++            using I = ps2x::PadIcon;
+             using L = ps2x::HostLanguage;
+-            const ps2x::HelpBar es = ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Pad);
++            const ps2x::HelpBar es = ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Pad, "f12", "f8");
+             t.Equals(ps2x::helpBarText(es, L::Spanish),
+-                     std::string("Repetici\xC3\xB3n: L2 atr\xC3\xA1s, R2 adelante (x2, x4), SELECT pausa."), "Spanish");
+-            t.IsTrue(es.left.size() == 3u && es.left[0].keys[0].icon == ps2x::PadIcon::L2 &&
+-                         es.left[2].keys[0].icon == ps2x::PadIcon::Select && es.right.empty(),
+-                     "the pad's buttons, on the left");
+-            t.Equals(ps2x::helpBarText(ps2x::replayHelp(L::English, ps2x::HelpInput::Pad), L::English),
+-                     std::string("Replay: L2 rewind, R2 fast-forward (x2, x4), SELECT pause."), "English");
+-            t.Equals(ps2x::helpBarText(ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Keyboard), L::Spanish),
+-                     std::string("Repetici\xC3\xB3n: J atr\xC3\xA1s, L adelante (x2, x4), K pausa."), "keyboard");
++                     std::string("Repetici\xC3\xB3n: L2 atr\xC3\xA1s, R2 adelante (x2, x4), SELECT pausa, "
++                                 "tri\xC3\xA1ngulo c\xC3\xA1mara, izquierda derecha coche, arriba abajo delante/detr\xC3\xA1s, "
++                                 "L3 ayuda, R3 modo foto."),
++                     "Spanish");
++            t.IsTrue(es.left.size() == 6u && es.left[0].keys[0].icon == I::L2 && es.left[2].keys[0].icon == I::Select &&
++                         es.left[3].keys[0].icon == I::Triangle && es.left[4].keys.size() == 2u &&
++                         es.left[4].keys[0].icon == I::DpadLeft && es.left[4].keys[1].icon == I::DpadRight &&
++                         es.left[5].keys[0].icon == I::DpadUp && es.left[5].keys[1].icon == I::DpadDown,
++                     "the port's controls and then the game's, on the left");
++            t.IsTrue(es.right.size() == 2u && es.right[0].keys[0].icon == I::L3 && es.right[1].keys[0].icon == I::R3 &&
++                         es.right[0].keys[0].key.empty() && es.right[1].keys[0].key.empty(),
++                     "help and the photo mode on the right");
++            t.Equals(ps2x::helpBarText(ps2x::replayHelp(L::English, ps2x::HelpInput::Pad, "f12", "f8"), L::English),
++                     std::string("Replay: L2 rewind, R2 fast-forward (x2, x4), SELECT pause, triangle camera, left right car, "
++                                 "up down ahead/behind, L3 help, R3 photo mode."),
++                     "English");
++            t.Equals(ps2x::helpBarText(ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Pad, "no", "no"), L::Spanish),
++                     ps2x::helpBarText(es, L::Spanish), "the pad's bar does not depend on the keys");
+             t.IsTrue(ps2x::kReplayHelpSeconds >= 4.0 && ps2x::kReplayHelpSeconds <= 10.0, "long enough to read");
+         });
+ 
++        tc.Run("the replay's help bar with the keyboard's keys: controles.ini's defaults and the photo mode's key",
++               [](TestCase &t)
++        {
++            using L = ps2x::HostLanguage;
++            const ps2x::HelpBar es = ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Keyboard, "f12", "f8");
++            t.Equals(ps2x::helpBarText(es, L::Spanish),
++                     std::string("Repetici\xC3\xB3n: J atr\xC3\xA1s, L adelante (x2, x4), K pausa, V c\xC3\xA1mara, A D coche, "
++                                 "W S delante/detr\xC3\xA1s, F8 modo foto."),
++                     "Spanish");
++            t.IsTrue(es.left.size() == 6u && es.left[0].keys[0].key == "J" && es.right.size() == 1u &&
++                         es.right[0].keys[0].key == "F8",
++                     "keys, not pad buttons; no key shows or hides the bar");
++            t.Equals(ps2x::helpBarText(ps2x::replayHelp(L::English, ps2x::HelpInput::Keyboard, "f12", "p"), L::English),
++                     std::string("Replay: J rewind, L fast-forward (x2, x4), K pause, V camera, A D car, W S ahead/behind, "
++                                 "P photo mode."),
++                     "English, with the photo mode's key P");
++            t.IsTrue(ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Keyboard, "f12", "no").right.empty(),
++                     "no photo mode key: nothing on the right");
++            t.IsTrue(ps2x::replayHelp(L::Spanish, ps2x::HelpInput::Keyboard, "f8", "f8").right.empty(),
++                     "the photo mode's key is the photo's: the photo mode has no key");
++        });
++
++        tc.Run("a help bar comes for a while when its mode starts; the help button hides it or brings it back to stay",
++               [](TestCase &t)
++        {
++            ps2x::HelpBarShow bar;
++            t.Equals(bar.alpha(1.0), 0.0f, "no mode: nothing");
++            bar.toggle(1.0);
++            t.Equals(bar.alpha(2.0), 0.0f, "the button without a mode: nothing");
++            bar.start(10.0, 6.0);
++            t.Equals(bar.alpha(10.0 + ps2x::kHostNoticeFadeIn), 1.0f, "its mode starts: on screen");
++            t.Equals(bar.alpha(15.0), 1.0f, "for a while");
++            t.Equals(bar.alpha(16.0), 0.0f, "and gone after its seconds");
++            bar.toggle(17.0);
++            t.Equals(bar.alpha(17.0 + ps2x::kHostNoticeFadeIn), 1.0f, "the button brings it back");
++            t.Equals(bar.alpha(100.0), 1.0f, "to stay");
++            bar.controlsChanged(100.0);
++            t.Equals(bar.alpha(200.0), 1.0f, "pad or keyboard: it still stays");
++            bar.toggle(200.0);
++            t.Equals(bar.alpha(200.0), 0.0f, "the button again: hidden at once");
++            bar.controlsChanged(201.0);
++            t.Equals(bar.alpha(201.5), 0.0f, "hidden by the player: pad or keyboard do not bring it back");
++            bar.toggle(300.0);
++            t.Equals(bar.alpha(300.0 + ps2x::kHostNoticeFadeIn), 1.0f, "and back again");
++
++            bar.start(400.0, 6.0);
++            bar.toggle(402.0);
++            t.Equals(bar.alpha(402.0), 0.0f, "on screen when its mode started: the button hides it");
++            t.Equals(bar.alpha(404.0), 0.0f, "and it stays hidden");
++
++            bar.start(500.0, 6.0);
++            bar.controlsChanged(505.0);
++            t.Equals(bar.alpha(510.0), 1.0f, "the controls shown change: its seconds again");
++            t.Equals(bar.alpha(511.2), 0.0f, "then gone");
++
++            bar.toggle(600.0);
++            bar.stop();
++            t.Equals(bar.alpha(600.5), 0.0f, "its mode ended: gone");
++        });
++
++        tc.Run("a stick button alone acts when let go; with the other one it is the menu's L3+R3", [](TestCase &t)
++        {
++            ps2x::StickButtonClick r3;
++            t.IsFalse(r3.update(false, false), "nothing held");
++            t.IsFalse(r3.update(true, false), "pressed: not yet");
++            t.IsFalse(r3.update(true, false), "held: not yet");
++            t.IsTrue(r3.update(false, false), "let go: it acts");
++            t.IsFalse(r3.update(false, false), "once");
++
++            t.IsFalse(r3.update(true, false), "pressed alone");
++            t.IsFalse(r3.update(true, true), "the other one too: the menu's combo");
++            t.IsFalse(r3.update(true, false), "the other one let go");
++            t.IsFalse(r3.update(false, false), "let go: nothing");
++
++            t.IsFalse(r3.update(false, true), "the other one first");
++            t.IsFalse(r3.update(true, true), "then this one");
++            t.IsFalse(r3.update(false, true), "let go while the other one is held: nothing");
++
++            t.IsFalse(r3.update(true, false), "pressed alone");
++            r3.cancel();
++            t.IsFalse(r3.update(false, false), "cancelled (the options menu opened): nothing when let go");
++            t.IsFalse(r3.update(true, false), "pressed again");
++            t.IsTrue(r3.update(false, false), "acts again");
++        });
++
++        tc.Run("the game does not see R3 where it turns the photo mode on or off, nor L3 in the replay", [](TestCase &t)
++        {
++            constexpr uint16_t l3 = 1u << 1, r3 = 1u << 2, cross = 1u << 14, select = 1u << 0;
++            t.IsTrue(ps2x::kPhotoPadL3 == l3 && ps2x::kPhotoPadR3 == r3, "the PS2's bits");
++            using ps2x::hidePhotoModeStickButtons;
++            t.Equals(static_cast<int>(hidePhotoModeStickButtons(r3 | l3 | cross, true, false)),
++                     static_cast<int>(l3 | cross), "a race camera drawing: R3 hidden, L3 passes");
++            t.Equals(static_cast<int>(hidePhotoModeStickButtons(r3 | l3 | select, true, true)), static_cast<int>(select),
++                     "the replay: R3 and L3 hidden, SELECT is the replay's own (ps2_pad.cpp)");
++            t.Equals(static_cast<int>(hidePhotoModeStickButtons(r3 | l3 | cross, false, false)),
++                     static_cast<int>(r3 | l3 | cross), "the menus: both pass, as before");
++
++            ps2x::PhotoModeSwitch photoMode;
++            t.IsFalse(photoMode.ready(5.0), "no race camera yet: R3 would not turn it on");
++            photoMode.cameraFrame(10.0);
++            t.IsTrue(photoMode.ready(10.2), "a race camera drawing: it would");
++            t.IsFalse(photoMode.ready(10.0 + ps2x::PhotoModeSwitch::kEnterWindow + 0.01), "not after it stopped");
++            t.IsTrue(photoMode.toggle(10.2), "on");
++            t.IsTrue(photoMode.ready(20.0), "on: R3 turns it off");
++            t.IsFalse(photoMode.active() && !photoMode.ready(20.0), "on is always ready");
++        });
++
++        tc.Run("parseHeldPadButtons reads PS2X_MENU_PETICION's mando=<buttons>[:seconds]", [](TestCase &t)
++        {
++            uint16_t bits = 0u;
++            double seconds = 0.0;
++            t.IsTrue(ps2x::parseHeldPadButtons("r3:0.4", bits, seconds), "one button and its time");
++            t.IsTrue(bits == (1u << 2) && seconds == 0.4, "R3 for 0.4 s");
++            t.IsTrue(ps2x::parseHeldPadButtons("l3+r3:0.8", bits, seconds), "two together");
++            t.IsTrue(bits == ((1u << 1) | (1u << 2)) && seconds == 0.8, "L3 and R3 for 0.8 s");
++            t.IsTrue(ps2x::parseHeldPadButtons("triangulo", bits, seconds), "no time");
++            t.IsTrue(bits == (1u << 12) && seconds == 0.2, "a short press");
++            t.IsTrue(ps2x::parseHeldPadButtons("select+arriba+cuadrado:1", bits, seconds), "controles.ini's names");
++            t.IsTrue(bits == ((1u << 0) | (1u << 4) | (1u << 15)) && seconds == 1.0, "their PS2 bits");
++            bits = 7u;
++            seconds = 3.0;
++            t.IsFalse(ps2x::parseHeldPadButtons("r4:0.4", bits, seconds), "an unknown button");
++            t.IsFalse(ps2x::parseHeldPadButtons("r3:-1", bits, seconds), "a negative time");
++            t.IsFalse(ps2x::parseHeldPadButtons("r3:x", bits, seconds), "not a number");
++            t.IsFalse(ps2x::parseHeldPadButtons("", bits, seconds), "nothing");
++            t.IsTrue(bits == 7u && seconds == 3.0, "refused: left as they were");
++        });
++
+         tc.Run("the replay's state line in the game's language", [](TestCase &t)
+         {
+             using L = ps2x::HostLanguage;
+@@ -1537,6 +1678,8 @@ void register_ps2_options_menu_tests()
+             t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | r3 | cross)), static_cast<int>(cross), "both: hidden");
+             t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | cross)), static_cast<int>(l3 | cross), "L3 alone stays");
+             t.Equals(static_cast<int>(ps2x::maskMenuCombo(r3)), static_cast<int>(r3), "R3 alone stays");
++            t.Equals(static_cast<int>(ps2x::hidePhotoModeStickButtons(ps2x::maskMenuCombo(l3 | r3 | cross), false, false)),
++                     static_cast<int>(cross), "both, out of a race: still hidden");
+         });
+ 
+         tc.Run("the guest gets no input while the menu is open, nor until everything is released", [](TestCase &t)

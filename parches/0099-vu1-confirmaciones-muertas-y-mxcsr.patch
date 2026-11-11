@@ -1,0 +1,232 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index d9d0a3c..346b78d 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -68,7 +68,9 @@
+ // 0081-0084 off at once (73, 75, 77 and 79; kept by runBlocks), 79 the PATH1 GIF packets queued and copied by the
+ // arbiter (before patch 0084), 99 the VU1 schedules with the MAC and status flags worked out even when nothing
+ // reads them (before patch 0097), 101 the VU1 and VU0 schedules that jump on to themselves normalizing the FMAC
+-// operands they never write on every entry (before patch 0098).
++// operands they never write on every entry (before patch 0098), 102 the VU1 schedules without MAC and status flags
++// still working out the FMAC entries committed after them and committing those of unknown kind through a call, and
++// the VU run setting its rounding mode through the CRT (before patch 0099).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index e455a90..26b47ce 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -2009,7 +2009,15 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            if (abMode == 0 && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
++            if (abModeAll == 102 && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
++                (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, kJitNoFlagsPlain))))
++            {
++                // A/B mode 102: without patch 0099's dead flag commits (the second compile slot).
++                reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host);
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
++                ++engine.stats.jitBlocks;
++            }
++            else if (abMode == 0 && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
+                 (s->jitNoFlags != nullptr || (!s->jitNoFlagsTried && jitCompile<Host>(engine, *s, host, kJitNoFlags))))
+             {
+                 // Patch 0097: compiled without the dead flag work (it chains to its own kind).
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 891c5eb..7b9edd9 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3137,8 +3137,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+ 
+-    const int previousRoundingMode = std::fegetround();
+-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++    // Patch 0099: the rounding mode straight in MXCSR (bits 13-14, toward zero), as std::fesetround leaves it on x64;
++    // the CRT's fegetround/fesetround cost ~1 % of the EE thread. A/B mode 102: through them, as before.
++    const bool crtRounding = g_ps2AbMode.load(std::memory_order_relaxed) == 102;
++    const unsigned int previousCsr = _mm_getcsr();
++    const int previousRoundingMode = crtRounding ? std::fegetround() : 0;
++    bool useVuRounding = true;
++    if (crtRounding)
++        useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++    else
++        _mm_setcsr(previousCsr | 0x6000u);
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+     const uint64_t cicloInicioTraza = m_cycle;
+@@ -4176,6 +4184,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+     }
+     m_state.cycles = m_cycle;
+-    if (useVuRounding && previousRoundingMode != -1)
++    if (!crtRounding)
++        _mm_setcsr(previousCsr);
++    else if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 866b5e1..f541154 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -26,6 +26,8 @@
+ 
+     // Patch 0097: jitCompile's alternative for Schedule::jitNoFlags (BlockEngine::macStatusDead).
+     constexpr int kJitNoFlags = 1000;
++    // Patch 0099: the same without jitEmitDeadFlagCommit and kindOnly, in Schedule::jitCalls (A/B mode 102).
++    constexpr int kJitNoFlagsPlain = 1001;
+ 
+     // Patch 0083: PS2X_VU1_JIT_PEGAJOSAS=0: every FMAC flag entry worked out and committed whole (as before).
+     const bool s_jitStickyFlags = []()
+@@ -318,6 +320,30 @@
+         e.modrm(1, B::Vu, static_cast<uint32_t>(offsetof(VU1State, status)));
+     }
+ 
++    // Patch 0099: a flag commit of unknown kind when nothing reads MAC or status: only the CLIP of the entry, inline;
++    // an entry with sticky bits (FSSET: they may be D or I) through jitCommitFlag, whole.
++    template <typename Host>
++    void jitEmitDeadFlagCommit(JitEmitter &e, const BlockCommit &c)
++    {
++        using B = JitEmitter;
++        jitEmitFlagRow(e, c.due);
++        const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags) + c.reg * sizeof(FlagSlot));
++        e.bytes({0x0F, 0xB6, 0x88}); // movzx ecx, byte [rax + slot + kind]
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, kind)));
++        e.bytes({0xF6, 0xC1, kFlagSticky}); // test cl, sticky
++        const size_t whole = e.jne32();
++        e.bytes({0xF6, 0xC1, kFlagClip}); // test cl, clip
++        const size_t none = e.je32();
++        e.bytes({0x8B, 0x88}); // mov ecx, [rax + slot + clip]
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, clip)));
++        e.store32(B::Vu, offsetof(VU1State, clip), 1);
++        const size_t done = e.jmp32();
++        e.bind(whole);
++        e.call(reinterpret_cast<const void *>(&jitCommitFlag<Host>), &c);
++        e.bind(done);
++        e.bind(none);
++    }
++
+     template <typename Host>
+     void jitEmitCommit(JitEmitter &e, const BlockCommit &c, uint8_t knownFlagKind = 0u, bool stickyOnly = false)
+     {
+@@ -500,9 +526,11 @@
+     // is zero, S if one is negative; the same bits as current | sticky) and a zero sticky, for jitEmitStickyCommit.
+     // shadow (patch 0087; nullptr: off): the operands through JitNormShadow and st.jitNorm.
+     // noEntry (patch 0097): no flag entry at all (nothing reads MAC or status, and its commit is left out too).
++    // kindOnly (patch 0099): nothing reads MAC or status, but the entry is committed after the schedule: only its
++    // kind, with status and sticky zero (so its commit adds nothing to the D and I bits).
+     inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
+                             const void *lateSlow = nullptr, bool stickyOnly = false, JitNormShadow *shadow = nullptr,
+-                            bool noEntry = false)
++                            bool noEntry = false, bool kindOnly = false)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -665,7 +693,21 @@
+         e.imm32(op.components);
+         const size_t toSlow = e.jne32();
+ 
+-        if (p.upperFlags != 0u && !noEntry && stickyOnly)
++        if (p.upperFlags != 0u && !noEntry && kindOnly)
++        {
++            jitEmitFlagRow(e, p.issue + 4u);
++            const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
++            e.bytes({0xC7, 0x80}); // mov dword [rax + slot + status], 0
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, status)));
++            e.imm32(0u);
++            e.bytes({0xC7, 0x80}); // mov dword [rax + slot + sticky], 0
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, sticky)));
++            e.imm32(0u);
++            e.bytes({0xC6, 0x80}); // mov byte [rax + slot + kind], upperFlags
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, kind)));
++            e.bytes({p.upperFlags});
++        }
++        else if (p.upperFlags != 0u && !noEntry && stickyOnly)
+         {
+             jitEmitFlagRow(e, p.issue + 4u);
+             const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
+@@ -1658,8 +1700,8 @@
+             host.workingClipOffset(),
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.codeGeneration) - hostBase),
+             host.xgkickActiveOffset()};
+-        const bool noFlags = alternative == kJitNoFlags;
+-        (alternative == 0 ? s.jitTried : noFlags ? s.jitNoFlagsTried : s.jitCallsTried) = true;
++        const bool noFlags = alternative == kJitNoFlags || alternative == kJitNoFlagsPlain;
++        (alternative == 0 ? s.jitTried : alternative == kJitNoFlags ? s.jitNoFlagsTried : s.jitCallsTried) = true;
+         if (noFlags && !s_jitSse41)
+             return false; // its commits would go through s.jitRanges, which the other compiles point into
+         if (!noFlags)
+@@ -1739,6 +1781,18 @@
+                         flagCommitDue.resize(c.due + 1u, 0u);
+                     flagCommitDue[c.due] = 1u;
+                 }
++        // Patch 0099 (PS2X_VU1_JIT_MUERTAS=0: not): with noFlags, the other FMAC entries only get their kind, and the
++        // flag commits of unknown kind only apply CLIP (jitEmitDeadFlagCommit).
++        static const bool s_jitDeadCommits = []
++        {
++            const char *value = std::getenv("PS2X_VU1_JIT_MUERTAS");
++            return value == nullptr || value[0] != '0';
++        }();
++        const bool deadCommits = noFlags && s_jitDeadCommits && alternative != kJitNoFlagsPlain;
++        const auto kindOnlyPair = [&](const BlockPair &p)
++        {
++            return deadCommits && p.lowerFlag == 0u;
++        };
+         const auto noEntryPair = [&](const BlockPair &p)
+         {
+             const size_t due = static_cast<size_t>(p.issue) + 4u;
+@@ -1761,6 +1815,12 @@
+                 {
+                     if (noFlags && knownKind(s.commits[nextCommit]) == (kFlagMac | kFlagStatus))
+                         continue; // patch 0097: its entry was left out (noEntryPair)
++                    if (deadCommits && s.commits[nextCommit].kind == CommitFlag &&
++                        knownKind(s.commits[nextCommit]) == 0u)
++                    {
++                        jitEmitDeadFlagCommit<Host>(e, s.commits[nextCommit]); // patch 0099
++                        continue;
++                    }
+                     jitEmitCommit<Host>(e, s.commits[nextCommit], inlineFlags ? knownKind(s.commits[nextCommit]) : 0u,
+                                         stickyOnlyCommit[nextCommit] != 0u);
+                 }
+@@ -1859,7 +1919,7 @@
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+                       jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40,
+-                                  nullptr, stickyOnlyPair(p), shadow, noEntryPair(p))) &&
++                                  nullptr, stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p))) &&
+                     !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+@@ -1868,7 +1928,7 @@
+                 const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
+                 if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
+                                                 reinterpret_cast<const void *>(&jitUpperLate<Host>),
+-                                                stickyOnlyPair(p), shadow, noEntryPair(p))) &&
++                                                stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p))) &&
+                     !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
+                     e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             }
+@@ -1957,9 +2017,9 @@
+             e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
+         // A/B modes 71 and 73: every schedule returns to runBlocks, as before patch 0081.
+         jitEmitChain(e, layout, engine, s,
+-                     alternative == 0 ? offsetof(Schedule, jit)
+-                     : noFlags        ? offsetof(Schedule, jitNoFlags)
+-                                      : offsetof(Schedule, jitCalls),
++                     alternative == 0             ? offsetof(Schedule, jit)
++                     : alternative == kJitNoFlags ? offsetof(Schedule, jitNoFlags)
++                                                  : offsetof(Schedule, jitCalls),
+                      s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78,
+                      invariant != 0u);
+         e.epilogue();
+@@ -1968,7 +2028,7 @@
+         if (code == nullptr)
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+-        (alternative == 0 ? s.jit : noFlags ? s.jitNoFlags : s.jitCalls) = code;
++        (alternative == 0 ? s.jit : alternative == kJitNoFlags ? s.jitNoFlags : s.jitCalls) = code;
+         if (mapFile != nullptr)
+         {
+             static std::mutex s_mapMutex; // the VU0 and VU1 engines may compile on different threads

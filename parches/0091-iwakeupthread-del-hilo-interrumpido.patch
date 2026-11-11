@@ -1,0 +1,38 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 96fe167..c6164ca 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -980,7 +980,18 @@ void EeScheduler::sleepCurrent()
+ int EeScheduler::wakeupThread(int id, bool interruptSafe)
+ {
+     assertExecutor();
+-    if (id == 0 || id == m_currentThreadId)
++    // Patch 0091: iWakeupThread runs from a handler (an alarm) on top of the thread it interrupted, which is then the
++    // current thread; waking it is legal and only adds a wakeup, so its next SleepThread returns at once. The
++    // DelayThread pattern (SetAlarm, then SleepThread; F1 06 at 0x25F1C8, ps2sdk's DelayThread) relies on it when the
++    // alarm comes due before the thread sleeps: before this, the wakeup was refused with KE_ILLEGAL_THID and the
++    // thread slept for ever (the intermittent hang at "Checking status of the Memory Card", more likely with the PC
++    // busy because the alarm deadline is also host time). PS2X_EE_IWAKEUP_PROPIO=0: refused, as before.
++    static const bool s_interruptWakesCurrent = []()
++    {
++        const char *value = std::getenv("PS2X_EE_IWAKEUP_PROPIO");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (id == 0 || (id == m_currentThreadId && !(interruptSafe && s_interruptWakesCurrent)))
+     {
+         return KE_ILLEGAL_THID;
+     }
+@@ -993,6 +1004,13 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
+     {
+         return KE_DORMANT;
+     }
++    if (id == m_currentThreadId)
++    {
++        static std::atomic<uint32_t> s_traza{0u};
++        if (s_traza.fetch_add(1u, std::memory_order_relaxed) < 8u)
++            std::fprintf(stderr, "[ee:iwakeup] despertar del hilo interrumpido %d contado (wakeupCount=%u)\n", id,
++                         target->wakeupCount + 1u);
++    }
+     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
+         target->wait.reason == EeWaitReason::Sleep)
+     {

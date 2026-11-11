@@ -1,0 +1,907 @@
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index fc7cfd8..163feb0 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -192,6 +192,11 @@ namespace ps2x
+              {{"0", "0"}, {"5", "5"}, {"10", "10"}, {"15", "15"}, {"20", "20"}, {"25", "25"}, {"30", "30"}}, 0, 0,
+              "Campo de vision de las camaras de la carrera (cabina, morro, persecucion...): 0 = el del juego; 5, 10,\n"
+              "15, 20, 25 o 30 = ese tanto por ciento mas abierto. El HUD y los menus no cambian."},
++            // Fase 5 (T13): also a row of AJUSTES PC; the window reads the key (ps2_runtime.cpp, ps2_photo_mode.h).
++            {"tecla_modo_foto", "PS2X_TECLA_MODO_FOTO", "f8", {{"f8", "f8"}, {"f5", "f5"}, {"p", "p"}, {"no", "no"}}, 0, 0,
++             "Tecla del modo foto (f8, f5, p o no): en carrera congela el juego, quita el HUD y deja mover la camara\n"
++             "(W S A D, R F, flechas, Q E, Z X; con el mando, los sticks). La tecla de foto la saca; la misma tecla\n"
++             "vuelve a la carrera."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index e989f17..e6c7a35 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_options.h"
+ #include "ps2_pad_players.h"
+ #include "ps2_photo.h"
++#include "ps2_photo_mode.h"
+ #include "ps2_runtime.h"
+ #include "ps2x/iop/iop_spu2_audio.h"
+ #include "runtime/gs/gs_gpu_bridge.h"
+@@ -122,7 +123,11 @@ namespace
+                {{"0", "Normal"}, {"5", "+5 %"}, {"10", "+10 %"}, {"15", "+15 %"}, {"20", "+20 %"}, {"25", "+25 %"},
+                 {"30", "+30 %"}},
+                "Las cámaras de la carrera (cabina, morro, persecución...) más abiertas: se ve más a los lados. El HUD y "
+-               "los menús no cambian."}}},
++               "los menús no cambian."},
++              // Fase 5 (T13).
++              {"tecla_modo_foto", "Tecla del modo foto", {{"f8", "F8"}, {"f5", "F5"}, {"p", "P"}, {"no", "Ninguna"}},
++               "En carrera: congela el juego, quita el HUD y deja mover la cámara (W S A D, R F, flechas, Q E, Z X o "
++               "los sticks). La tecla de foto la saca; la misma tecla vuelve a la carrera."}}},
+         };
+         return list;
+     }
+@@ -374,6 +379,8 @@ namespace
+         }
+         if (changed("tecla_foto"))
+             ps2x::setPhotoKeyOption(valueOf(model.current, "tecla_foto"));
++        if (changed("tecla_modo_foto"))
++            ps2x::setPhotoModeKeyOption(valueOf(model.current, "tecla_modo_foto"));
+         for (const auto &[key, value] : model.current)
+             if (key != "gs") // gs stays as the game started
+                 applied[key] = value;
+@@ -447,6 +454,8 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+             ps2x::resetMenuToDefaults(s.model);
+         else if (action == "foto")
+             ps2x::requestPhoto();
++        else if (action == "modo_foto")
++            ps2x::togglePhotoMode();
+         else if (action.rfind("seccion=", 0) == 0)
+         {
+             const std::string name = action.substr(8);
+@@ -502,8 +511,8 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     }
+ 
+     // Fase 5 (T9): tecla_hud moves the HUD to its next mode (not saved; CONFIRM or Guardar save it), not while this menu
+-    // is open. The game reads the mode in its next frame.
+-    if (!s.open)
++    // is open nor in the photo mode (it hides the HUD itself). The game reads the mode in its next frame.
++    if (!s.open && !ps2x::photoModeActive())
+     {
+         ensureModel(s);
+         if (const int key = hudKeyCode(valueOf(s.model.current, "tecla_hud")); key != KEY_NULL && IsKeyPressed(key))
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index c8b71fa..2fea16e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_pad_win.h"
+ #include "ps2_pad_players.h"
+ #include "ps2_options_menu.h"
++#include "ps2_photo_mode.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+@@ -788,7 +789,7 @@ namespace
+         f.gamepad = cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad);
+         float value[kTargetCount] = {};
+         readValues(cfg, f, value);
+-        if (g_optionsMenuOpen.load(std::memory_order_relaxed))
++        if (g_optionsMenuOpen.load(std::memory_order_relaxed) || ps2x::photoModeActive())
+             return;
+         writeReport(data, pressedButtons(value, cfg), value, cfg);
+         debugReport(1, data, f);
+@@ -916,6 +917,34 @@ namespace ps2x
+         state.leftY = std::clamp(value[kLsDown] - value[kLsUp], -1.0f, 1.0f);
+         return state;
+     }
++
++    // Fase 5 (T13): as readMenuPad, with both sticks and the triggers' travel.
++    PhotoModePad readPhotoModePad()
++    {
++        const Config &cfg = config();
++        Frame f;
++        f.pad = cfg.gamepad;
++        f.dualSense = cfg.gamepad >= 0 && ps2_pad_win::readDualSenseBluetooth(f.ds);
++        f.gamepad = f.dualSense || (cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad));
++        {
++            std::lock_guard<std::mutex> lock(g_lastWheelMutex);
++            f.wheel = g_lastWheel;
++        }
++        float value[kTargetCount] = {};
++        for (int t = 0; t < kTargetCount; ++t)
++            for (const Source &s : cfg.map[static_cast<size_t>(t)])
++                if (s.kind != SourceKind::Key) // the photo mode reads its own keys
++                    value[t] = std::max(value[t], sourceValue(s, cfg, f));
++        PhotoModePad pad;
++        pad.pressed = pressedButtons(value, cfg);
++        pad.leftX = std::clamp(value[kLsRight] - value[kLsLeft], -1.0f, 1.0f);
++        pad.leftY = std::clamp(value[kLsDown] - value[kLsUp], -1.0f, 1.0f);
++        pad.rightX = std::clamp(value[kRsRight] - value[kRsLeft], -1.0f, 1.0f);
++        pad.rightY = std::clamp(value[kRsDown] - value[kRsUp], -1.0f, 1.0f);
++        pad.l2 = std::clamp(value[kL2], 0.0f, 1.0f);
++        pad.r2 = std::clamp(value[kR2], 0.0f, 1.0f);
++        return pad;
++    }
+ }
+ 
+ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+@@ -959,11 +988,13 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     float value[kTargetCount] = {};
+     readValues(cfg, f, value);
+ 
+-    // Phase 3 (T3): the options menu open (or a button still held after closing it): the neutral pad above.
++    // Phase 3 (T3): the options menu open (or a button still held after closing it): the neutral pad above. Fase 5
++    // (T13): the photo mode too (its keys and sticks move the free camera).
+     uint16_t pressed = pressedButtons(value, cfg);
+     {
+         std::lock_guard<std::mutex> lock(g_guestGateMutex);
+-        if (!g_guestGate.passes(g_optionsMenuOpen.load(std::memory_order_relaxed), pressed != 0u))
++        if (!g_guestGate.passes(g_optionsMenuOpen.load(std::memory_order_relaxed) || ps2x::photoModeActive(),
++                                pressed != 0u))
+             return true;
+     }
+     // L3+R3 together open the menu: the game sees neither.
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+new file mode 100644
+index 0000000..09e86df
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -0,0 +1,259 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <string>
++
++// Fase 5 (T13, F1 06): the photo mode (opciones.ini tecla_modo_foto: f8, f5, p or no). The key freezes the race (the
++// game's simulation steps stop; it keeps drawing), hides the HUD, mutes the sound and hands the race camera to a free
++// camera moved with the keyboard and the pad; the photo key (tecla_foto) takes the picture and the same key goes back.
++// The window's thread reads the input (ps2_runtime.cpp); the game's thread moves the camera on each of its frames and
++// gives it to the game (src/f1_overrides.cpp).
++namespace ps2x
++{
++    // The game's camera matrix (as func_2C5948 takes it): 16 floats, rows 0-2 the camera's axes in the world (row 0
++    // across the screen, row 1 up the screen, row 2 where it looks) and row 3 its position. The world's up is +y.
++    // kFreeCameraRightSign: the screen's right is row 0 times this.
++    constexpr float kFreeCameraRightSign = 1.0f;
++    constexpr float kFreeCameraSpeed = 8.0f;       // world units (metres) per second
++    constexpr float kFreeCameraTurnRate = 1.2f;    // radians per second
++    constexpr float kFreeCameraRollRate = 0.8f;    // radians per second
++    constexpr float kFreeCameraZoomRate = 0.9f;    // the half angle changes by e^(rate) per second
++    constexpr float kFreeCameraMaxPitch = 1.45f;   // about 83 degrees up or down
++    constexpr float kFreeCameraMaxRoll = 0.8f;     // about 45 degrees
++    constexpr float kFreeCameraMinHalfAngle = 0.05f;
++    constexpr float kFreeCameraMaxHalfAngle = 1.2f;
++    constexpr float kFreeCameraMaxDistance = 30.0f; // from where it started: the game keeps the scenery around it
++    constexpr float kFreeCameraMaxDrop = 0.6f;      // under where it started (the ground's height is not known)
++    constexpr float kFreeCameraMaxStep = 0.1f;      // seconds: a long frame does not throw the camera away
++
++    struct FreeCamera
++    {
++        float position[3] = {0.0f, 0.0f, 0.0f};
++        float yaw = 0.0f, pitch = 0.0f, roll = 0.0f; // radians
++        float halfAngle = 0.5f;                      // vertical, as the game's (camera + 0x88)
++        float start[3] = {0.0f, 0.0f, 0.0f};
++        float startYaw = 0.0f, startPitch = 0.0f, startRoll = 0.0f, startHalfAngle = 0.5f;
++    };
++
++    // -1 to 1 each (speed: a factor). forward: where it looks, level; right: across the screen, level; up: the world's up
++    // (down to kFreeCameraMaxDrop under where it started); yaw: to the right; pitch: up; roll: clockwise; zoom: in (a
++    // narrower angle).
++    struct FreeCameraInput
++    {
++        float forward = 0.0f, right = 0.0f, up = 0.0f;
++        float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
++        float zoom = 0.0f;
++        float speed = 1.0f;
++        bool reset = false;
++    };
++
++    namespace photo_mode_detail
++    {
++        inline void levelAxes(float yaw, float pitch, float forward[3], float across[3], float up[3])
++        {
++            forward[0] = std::cos(pitch) * std::sin(yaw);
++            forward[1] = std::sin(pitch);
++            forward[2] = std::cos(pitch) * std::cos(yaw);
++            across[0] = std::cos(yaw); // (0, 1, 0) x forward, normalised
++            across[1] = 0.0f;
++            across[2] = -std::sin(yaw);
++            up[0] = forward[1] * across[2] - forward[2] * across[1]; // forward x across
++            up[1] = forward[2] * across[0] - forward[0] * across[2];
++            up[2] = forward[0] * across[1] - forward[1] * across[0];
++        }
++
++        inline float dot(const float *a, const float *b)
++        {
++            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
++        }
++
++        inline float clampUnit(float value)
++        {
++            return std::isfinite(value) ? std::clamp(value, -1.0f, 1.0f) : 0.0f;
++        }
++    }
++
++    // The free camera where the game's is: same place, direction, roll and angle (the matrix it gives back is the
++    // game's). That is also where it goes back with input.reset and the centre of kFreeCameraMaxDistance.
++    inline FreeCamera freeCameraFromMatrix(const float m[16], float halfAngle)
++    {
++        using namespace photo_mode_detail;
++        FreeCamera camera;
++        for (int i = 0; i < 3; ++i)
++            camera.position[i] = camera.start[i] = std::isfinite(m[12 + i]) ? m[12 + i] : 0.0f;
++        camera.pitch = std::clamp(std::asin(clampUnit(m[9])), -kFreeCameraMaxPitch, kFreeCameraMaxPitch);
++        camera.yaw = (m[8] == 0.0f && m[10] == 0.0f) ? 0.0f : std::atan2(m[8], m[10]);
++        if (!std::isfinite(camera.yaw))
++            camera.yaw = 0.0f;
++        float forward[3], across[3], up[3];
++        levelAxes(camera.yaw, camera.pitch, forward, across, up);
++        const float roll = std::atan2(dot(m, up), dot(m, across));
++        camera.roll = std::isfinite(roll) ? std::clamp(roll, -kFreeCameraMaxRoll, kFreeCameraMaxRoll) : 0.0f;
++        camera.halfAngle = std::isfinite(halfAngle) && halfAngle > 0.0f
++                               ? std::clamp(halfAngle, kFreeCameraMinHalfAngle, kFreeCameraMaxHalfAngle)
++                               : 0.5f;
++        camera.startYaw = camera.yaw;
++        camera.startPitch = camera.pitch;
++        camera.startRoll = camera.roll;
++        camera.startHalfAngle = camera.halfAngle;
++        return camera;
++    }
++
++    // The camera's matrix for the game (the layout above; w = 0, 0, 0, 1).
++    inline void freeCameraMatrix(const FreeCamera &camera, float m[16])
++    {
++        float forward[3], across[3], up[3];
++        photo_mode_detail::levelAxes(camera.yaw, camera.pitch, forward, across, up);
++        const float c = std::cos(camera.roll), s = std::sin(camera.roll);
++        for (int i = 0; i < 3; ++i)
++        {
++            m[i] = across[i] * c + up[i] * s;
++            m[4 + i] = up[i] * c - across[i] * s;
++            m[8 + i] = forward[i];
++            m[12 + i] = camera.position[i];
++        }
++        m[3] = m[7] = m[11] = 0.0f;
++        m[15] = 1.0f;
++    }
++
++    // One step of seconds (at most kFreeCameraMaxStep): moves, turns and zooms, within the limits.
++    inline void moveFreeCamera(FreeCamera &camera, const FreeCameraInput &input, float seconds)
++    {
++        using photo_mode_detail::clampUnit;
++        if (input.reset)
++        {
++            for (int i = 0; i < 3; ++i)
++                camera.position[i] = camera.start[i];
++            camera.yaw = camera.startYaw;
++            camera.pitch = camera.startPitch;
++            camera.roll = camera.startRoll;
++            camera.halfAngle = camera.startHalfAngle;
++            return;
++        }
++        if (!std::isfinite(seconds) || seconds <= 0.0f)
++            return;
++        const float dt = std::min(seconds, kFreeCameraMaxStep);
++        const float speed = std::isfinite(input.speed) ? std::clamp(input.speed, 0.0f, 10.0f) : 1.0f;
++
++        camera.yaw += clampUnit(input.yaw) * kFreeCameraRightSign * kFreeCameraTurnRate * dt;
++        camera.yaw = std::remainder(camera.yaw, 6.28318530718f);
++        camera.pitch = std::clamp(camera.pitch + clampUnit(input.pitch) * kFreeCameraTurnRate * dt,
++                                  -kFreeCameraMaxPitch, kFreeCameraMaxPitch);
++        camera.roll = std::clamp(camera.roll - clampUnit(input.roll) * kFreeCameraRightSign * kFreeCameraRollRate * dt,
++                                 -kFreeCameraMaxRoll, kFreeCameraMaxRoll);
++        camera.halfAngle = std::clamp(camera.halfAngle * std::exp(-clampUnit(input.zoom) * kFreeCameraZoomRate * dt),
++                                      kFreeCameraMinHalfAngle, kFreeCameraMaxHalfAngle);
++
++        float forward[3], across[3], up[3];
++        photo_mode_detail::levelAxes(camera.yaw, camera.pitch, forward, across, up);
++        const float step = kFreeCameraSpeed * speed * dt;
++        const float f = clampUnit(input.forward) * step, r = clampUnit(input.right) * kFreeCameraRightSign * step,
++                    u = clampUnit(input.up) * step;
++        // Forward and back stay level (looking down does not sink it into the track); up and down are the world's.
++        const float level = std::sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
++        camera.position[0] += (level > 0.0f ? forward[0] / level : 0.0f) * f + across[0] * r;
++        camera.position[1] = std::max(camera.position[1] + u, camera.start[1] - kFreeCameraMaxDrop);
++        camera.position[2] += (level > 0.0f ? forward[2] / level : 0.0f) * f + across[2] * r;
++        float offset[3];
++        for (int i = 0; i < 3; ++i)
++            offset[i] = camera.position[i] - camera.start[i];
++        const float distance = std::sqrt(photo_mode_detail::dot(offset, offset));
++        if (distance > kFreeCameraMaxDistance)
++            for (int i = 0; i < 3; ++i)
++                camera.position[i] = camera.start[i] + offset[i] * (kFreeCameraMaxDistance / distance);
++    }
++
++    // The controls (fixed): what is held on the keyboard and the pad, read by the window.
++    struct PhotoModeKeys
++    {
++        bool forward = false, back = false, left = false, right = false, up = false, down = false; // W S A D R F
++        bool turnLeft = false, turnRight = false, lookUp = false, lookDown = false;               // arrows
++        bool rollLeft = false, rollRight = false;                                                 // Q E
++        bool zoomIn = false, zoomOut = false;                                                     // Z X
++        bool fast = false, slow = false;                                                          // Shift, Ctrl
++        bool reset = false;                                                                       // Backspace
++    };
++
++    // The pad: sticks -1 to 1 (up = -1, as the PS2's), triggers 0 to 1 and the PS2 button bits (1 = pressed).
++    struct PhotoModePad
++    {
++        float leftX = 0.0f, leftY = 0.0f, rightX = 0.0f, rightY = 0.0f;
++        float l2 = 0.0f, r2 = 0.0f;
++        uint16_t pressed = 0u;
++    };
++
++    // PS2 pad bits (libpad order, as ps2_options_menu.h's).
++    constexpr uint16_t kPhotoPadUp = 1u << 4, kPhotoPadDown = 1u << 6, kPhotoPadL1 = 1u << 10,
++                       kPhotoPadR1 = 1u << 11, kPhotoPadTriangle = 1u << 12, kPhotoPadCross = 1u << 14,
++                       kPhotoPadSquare = 1u << 15;
++
++    // Keyboard: W S A D move, R F up and down, arrows turn, Q E roll, Z X zoom, Shift fast (x4), Ctrl slow (x0.25),
++    // Backspace back to the start. Pad: left stick moves, right stick turns, R2 L2 up and down, L1 R1 roll, the d-pad's
++    // up and down zoom, cross fast, square slow, triangle back to the start.
++    inline FreeCameraInput freeCameraInput(const PhotoModeKeys &keys, const PhotoModePad &pad)
++    {
++        using photo_mode_detail::clampUnit;
++        const auto axis = [](bool negative, bool positive) { return (positive ? 1.0f : 0.0f) - (negative ? 1.0f : 0.0f); };
++        const auto held = [&pad](uint16_t bit) { return (pad.pressed & bit) != 0u; };
++        FreeCameraInput input;
++        input.forward = clampUnit(axis(keys.back, keys.forward) - pad.leftY);
++        input.right = clampUnit(axis(keys.left, keys.right) + pad.leftX);
++        input.up = clampUnit(axis(keys.down, keys.up) + pad.r2 - pad.l2);
++        input.yaw = clampUnit(axis(keys.turnLeft, keys.turnRight) + pad.rightX);
++        input.pitch = clampUnit(axis(keys.lookDown, keys.lookUp) - pad.rightY);
++        input.roll = clampUnit(axis(keys.rollLeft || held(kPhotoPadL1), keys.rollRight || held(kPhotoPadR1)));
++        input.zoom = clampUnit(axis(keys.zoomOut || held(kPhotoPadDown), keys.zoomIn || held(kPhotoPadUp)));
++        const bool fast = keys.fast || held(kPhotoPadCross), slow = keys.slow || held(kPhotoPadSquare);
++        input.speed = fast && !slow ? 4.0f : slow && !fast ? 0.25f : 1.0f;
++        input.reset = keys.reset || held(kPhotoPadTriangle);
++        return input;
++    }
++
++    // On and off: the key turns it on only while a race camera is drawing (cameraFrame in the last kEnterWindow
++    // seconds) and it goes off by itself when no race camera has drawn for kLeaveAfter seconds (the race ended).
++    class PhotoModeSwitch
++    {
++    public:
++        static constexpr double kEnterWindow = 0.5;
++        static constexpr double kLeaveAfter = 2.0;
++
++        bool active() const { return m_active; }
++        void cameraFrame(double now) { m_lastCamera = now; }
++        // The key: the new state (off -> on refused outside a race).
++        bool toggle(double now)
++        {
++            if (m_active)
++                m_active = false;
++            else if (m_lastCamera >= 0.0 && now - m_lastCamera <= kEnterWindow)
++                m_active = true;
++            return m_active;
++        }
++        // Every frame of the window: false when it went off by itself now.
++        bool stillActive(double now)
++        {
++            if (m_active && (m_lastCamera < 0.0 || now - m_lastCamera > kLeaveAfter))
++                m_active = false;
++            return m_active;
++        }
++
++    private:
++        bool m_active = false;
++        double m_lastCamera = -1.0;
++    };
++
++    // The shared state (ps2_runtime.cpp; any thread). The window: setPhotoModeKeyOption from the menus,
++    // togglePhotoMode with the key or PS2X_MENU_GUION's "modo_foto", setPhotoModeInput on each of its frames. The game:
++    // photoModeCameraFrame when a race camera draws, photoModeActive and photoModeInput.
++    void setPhotoModeKeyOption(const std::string &option);
++    std::string photoModeKeyOption();
++    bool togglePhotoMode();
++    bool photoModeActive();
++    void photoModeCameraFrame();
++    void setPhotoModeInput(const FreeCameraInput &input);
++    FreeCameraInput photoModeInput();
++
++    // ps2_pad.cpp (the window's thread): the pad of controles.ini for the free camera (not its keys, as readMenuPad).
++    PhotoModePad readPhotoModePad();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 91f4695..88948e2 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -21,6 +21,7 @@
+ #include "ps2_user_paths.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_photo.h"
++#include "ps2_photo_mode.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -728,6 +729,149 @@ namespace ps2x
+     }
+ }
+ 
++// Fase 5 (T13): the photo mode (tecla_modo_foto, F8 by default; ps2_photo_mode.h). The window turns it on and off and
++// hands the held keys and pad to the game's thread, which moves the free camera (src/f1_overrides.cpp); while it is on
++// the sound is muted and the guest's pad is neutral (ps2_pad.cpp).
++namespace
++{
++    std::mutex g_photoModeMutex;
++    std::string g_photoModeKey;
++    bool g_photoModeKeyRead = false;
++    ps2x::PhotoModeSwitch g_photoModeSwitch;
++    ps2x::FreeCameraInput g_photoModeInput;
++    std::atomic<bool> g_photoModeOn{false};
++    std::chrono::steady_clock::time_point g_photoModeClockStart = std::chrono::steady_clock::now();
++
++    double PhotoModeClock()
++    {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_photoModeClockStart).count();
++    }
++
++    int PhotoModeKeyCode(const std::string &option)
++    {
++        return option == "f8" ? KEY_F8 : option == "f5" ? KEY_F5 : option == "p" ? KEY_P : KEY_NULL;
++    }
++}
++
++static void SetPhotoMessage(const std::string &message);
++
++namespace ps2x
++{
++    void setPhotoModeKeyOption(const std::string &option)
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        g_photoModeKey = option;
++        g_photoModeKeyRead = true;
++    }
++
++    std::string photoModeKeyOption()
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        if (!g_photoModeKeyRead)
++        {
++            const char *value = std::getenv("PS2X_TECLA_MODO_FOTO");
++            g_photoModeKey = value != nullptr ? value : "f8";
++            g_photoModeKeyRead = true;
++        }
++        return g_photoModeKey;
++    }
++
++    bool togglePhotoMode()
++    {
++        bool was = false, on = false;
++        {
++            std::lock_guard<std::mutex> lock(g_photoModeMutex);
++            was = g_photoModeSwitch.active();
++            on = g_photoModeSwitch.toggle(PhotoModeClock());
++            g_photoModeInput = {};
++            g_photoModeOn.store(on, std::memory_order_relaxed);
++        }
++        if (!was && !on)
++        {
++            std::cout << "[modo-foto] solo en carrera (no hay camara de carrera dibujando)" << std::endl;
++            SetPhotoMessage("Modo foto: solo en carrera o en la repeticion.");
++            return on;
++        }
++        std::cout << "[modo-foto] " << (on ? "entra" : "sale") << std::endl;
++        SetPhotoMessage(on ? "Modo foto: WASD, R F, flechas, Q E, Z X (o los sticks). Foto con su tecla; sale con la misma."
++                           : "Modo foto: fuera.");
++        return on;
++    }
++
++    bool photoModeActive()
++    {
++        return g_photoModeOn.load(std::memory_order_relaxed);
++    }
++
++    void photoModeCameraFrame()
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        g_photoModeSwitch.cameraFrame(PhotoModeClock());
++    }
++
++    void setPhotoModeInput(const FreeCameraInput &input)
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        g_photoModeInput = input;
++    }
++
++    FreeCameraInput photoModeInput()
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        return g_photoModeInput;
++    }
++}
++
++// The window's part, once per frame (main thread): the key, going off by itself when the race camera stops, and the
++// held keys and pad for the free camera (none while the options menu is open).
++static void UpdatePhotoMode(bool optionsMenuOpen)
++{
++    // The same key as the photos' (F8 in both): the photo goes first and the photo mode has no key.
++    const int key = PhotoModeKeyCode(ps2x::photoModeKeyOption());
++    const bool sharedKey = key != KEY_NULL && key == PhotoKeyCode(ps2x::photoKeyOption());
++    static bool s_sharedKeyLogged = false;
++    if (sharedKey && !s_sharedKeyLogged)
++        std::cerr << "[modo-foto] tecla_modo_foto es la tecla de foto: el modo foto no tiene tecla" << std::endl;
++    s_sharedKeyLogged = sharedKey;
++    if (!optionsMenuOpen && key != KEY_NULL && !sharedKey && IsKeyPressed(key))
++        ps2x::togglePhotoMode();
++    bool wentOff = false;
++    {
++        std::lock_guard<std::mutex> lock(g_photoModeMutex);
++        const bool was = g_photoModeSwitch.active();
++        wentOff = was && !g_photoModeSwitch.stillActive(PhotoModeClock());
++        g_photoModeOn.store(g_photoModeSwitch.active(), std::memory_order_relaxed);
++    }
++    if (wentOff)
++        std::cout << "[modo-foto] sale (la camara de carrera ya no dibuja)" << std::endl;
++    if (!ps2x::photoModeActive())
++        return;
++    ps2x::PhotoModeKeys keys;
++    ps2x::PhotoModePad pad;
++    if (!optionsMenuOpen)
++    {
++        keys.forward = IsKeyDown(KEY_W);
++        keys.back = IsKeyDown(KEY_S);
++        keys.left = IsKeyDown(KEY_A);
++        keys.right = IsKeyDown(KEY_D);
++        keys.up = IsKeyDown(KEY_R);
++        keys.down = IsKeyDown(KEY_F);
++        keys.turnLeft = IsKeyDown(KEY_LEFT);
++        keys.turnRight = IsKeyDown(KEY_RIGHT);
++        keys.lookUp = IsKeyDown(KEY_UP);
++        keys.lookDown = IsKeyDown(KEY_DOWN);
++        keys.rollLeft = IsKeyDown(KEY_Q);
++        keys.rollRight = IsKeyDown(KEY_E);
++        keys.zoomIn = IsKeyDown(KEY_Z);
++        keys.zoomOut = IsKeyDown(KEY_X);
++        keys.fast = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
++        keys.slow = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
++        keys.reset = IsKeyDown(KEY_BACKSPACE);
++        pad = ps2x::readPhotoModePad();
++    }
++    ps2x::setPhotoModeInput(ps2x::freeCameraInput(keys, pad));
++}
++
+ static void SetPhotoMessage(const std::string &message)
+ {
+     std::lock_guard<std::mutex> lock(g_photoMutex);
+@@ -1402,7 +1546,10 @@ bool PS2Runtime::initialize(const char *title)
+                                        const size_t got = ps2x::iop::readSpu2Audio(out, frames);
+                                        if (got < frames)
+                                            std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
+-                                       const float scale = g_outputVolumeScale.load(std::memory_order_relaxed);
++                                       // Fase 5 (T13): silent in the photo mode.
++                                       const float scale = ps2x::photoModeActive()
++                                                               ? 0.0f
++                                                               : g_outputVolumeScale.load(std::memory_order_relaxed);
+                                        if (scale != 1.0f)
+                                            for (size_t i = 0; i < got * 2u; ++i)
+                                                out[i] = static_cast<int16_t>(std::clamp(
+@@ -3306,6 +3453,7 @@ void PS2Runtime::run()
+         if (const int photoKey = PhotoKeyCode(ps2x::photoKeyOption());
+             !optionsMenuOpen && photoKey != KEY_NULL && IsKeyPressed(photoKey))
+             ps2x::requestPhoto();
++        UpdatePhotoMode(optionsMenuOpen);
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+                                     : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
+                                                                                : srcWidth / srcHeight;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 829c85f..e1d4b61 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_options.h"
+ #include "ps2_camera_fov.h"
+ #include "ps2_hud.h"
++#include "ps2_photo_mode.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_race_laps.h"
+ #include "ps2_user_paths.h"
+@@ -25,6 +26,18 @@ namespace
+     namespace fs = std::filesystem;
+     using Environment = std::map<std::string, std::string>;
+ 
++    // Fase 5 (T13): a camera of the race (Silverstone's cockpit, as the game gives it) and how far two vectors are.
++    const float kCockpitCamera[16] = {0.972576f, -0.0115481f, 0.231972f, 0.0f, -0.00940208f, 0.995911f, 0.0889981f, 0.0f,
++                                      -0.232069f, -0.0887451f, 0.968564f, 0.0f, -778.155f, 0.93049f, -188.148f, 1.0f};
++
++    bool nearlyEqual(const float *a, const float *b, int n, float tolerance)
++    {
++        for (int i = 0; i < n; ++i)
++            if (!(std::fabs(a[i] - b[i]) <= tolerance))
++                return false;
++        return true;
++    }
++
+     struct TempDir
+     {
+         fs::path path;
+@@ -515,6 +528,273 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(std::isnan(ps2x::widenedCameraFov(std::nanf(""), 30)), "not a number: as it was");
+         });
+ 
++        // Fase 5 (T13): the photo mode's key (tecla_modo_foto), its free camera, its controls and its switch.
++        tc.Run("the tecla_modo_foto option has its default, variable, checks and number", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("tecla_modo_foto"), std::string("f8"), "F8 by default");
++            t.Equals(fileValue("", "tecla_modo_foto", true), std::string("f8"), "also in development");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "tecla_modo_foto = f8\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "fov = 0\n"), "and keeps fov");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("tecla_modo_foto = P\n");
++            t.IsTrue(file.warnings.empty(), "a valid value gives no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            std::string variable = "<none>";
++            for (const ps2x::EnvironmentSetting &setting : settings)
++                if (setting.variable == "PS2X_TECLA_MODO_FOTO")
++                    variable = setting.value;
++            t.Equals(variable, std::string("p"), "tecla_modo_foto -> PS2X_TECLA_MODO_FOTO");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("tecla_modo_foto = f12\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "the photo key is not a photo mode key");
++            t.Equals(bad.values.at("tecla_modo_foto"), std::string("f8"), "and takes the default");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "tecla_modo_foto", value), "a number for the game's row");
++            t.Equals(value, 0.0f, "f8: the first choice");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "tecla_modo_foto", 2.0f), "choice 2");
++            t.Equals(model.current.at("tecla_modo_foto"), std::string("p"), "is p");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "tecla_modo_foto", 3.0f), "choice 3");
++            t.Equals(model.current.at("tecla_modo_foto"), std::string("no"), "no key");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "tecla_modo_foto", 4.0f), "past the last");
++            t.Equals(model.current.at("tecla_modo_foto"), std::string("no"), "stays no");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "tecla_modo_foto"), std::string("no"), "CONFIRM writes it");
++            t.Equals(fileValue(saved, "tecla_foto"), std::string("f12"), "the photo key keeps its value");
++        });
++
++        tc.Run("the free camera starts where the game's camera is and gives its matrix back", [](TestCase &t)
++        {
++            const ps2x::FreeCamera camera = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.477614f);
++            float m[16] = {};
++            ps2x::freeCameraMatrix(camera, m);
++            t.IsTrue(nearlyEqual(m, kCockpitCamera, 16, 1e-4f), "the same matrix: place, direction and roll");
++            t.IsTrue(std::fabs(camera.halfAngle - 0.477614f) < 1e-6f, "the same angle");
++            t.IsTrue(nearlyEqual(camera.start, kCockpitCamera + 12, 3, 0.0f), "it starts at the game's place");
++
++            const float level[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 5, 6, 7, 1};
++            const ps2x::FreeCamera straight = ps2x::freeCameraFromMatrix(level, 0.5f);
++            t.IsTrue(std::fabs(straight.yaw) < 1e-6f && std::fabs(straight.pitch) < 1e-6f &&
++                         std::fabs(straight.roll) < 1e-6f, "looking along +z, level: no yaw, pitch or roll");
++            ps2x::freeCameraMatrix(straight, m);
++            t.IsTrue(nearlyEqual(m, level, 16, 1e-6f), "and its matrix is the identity at its place");
++
++            const float broken[16] = {std::nanf(""), 0, 0, 0, 0, std::nanf(""), 0, 0, 0, 0, std::nanf(""), 0,
++                                      std::nanf(""), 1, 2, 1};
++            const ps2x::FreeCamera safe = ps2x::freeCameraFromMatrix(broken, std::nanf(""));
++            ps2x::freeCameraMatrix(safe, m);
++            bool finite = true;
++            for (float v : m)
++                finite = finite && std::isfinite(v);
++            t.IsTrue(finite, "a broken matrix gives a usable camera");
++            t.Equals(safe.halfAngle, 0.5f, "and a usable angle");
++            t.Equals(ps2x::freeCameraFromMatrix(level, 3.0f).halfAngle, ps2x::kFreeCameraMaxHalfAngle,
++                     "a wider angle than the limit starts at the limit");
++        });
++
++        tc.Run("the free camera moves level where it looks, across the screen and up the world", [](TestCase &t)
++        {
++            ps2x::FreeCamera camera = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.5f);
++            camera.roll = 0.0f;
++            float m[16] = {};
++            ps2x::freeCameraMatrix(camera, m);
++            ps2x::FreeCameraInput input;
++            input.forward = 1.0f;
++            ps2x::moveFreeCamera(camera, input, 0.05f);
++            const float step = ps2x::kFreeCameraSpeed * 0.05f;
++            const float level = std::sqrt(m[8] * m[8] + m[10] * m[10]);
++            const float expected[3] = {kCockpitCamera[12] + m[8] / level * step, kCockpitCamera[13],
++                                       kCockpitCamera[14] + m[10] / level * step};
++            t.IsTrue(nearlyEqual(camera.position, expected, 3, 1e-4f),
++                     "forward: where it looks, level (looking down does not sink it)");
++
++            ps2x::FreeCamera across = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.5f);
++            ps2x::FreeCameraInput right;
++            right.right = 1.0f;
++            right.speed = 4.0f;
++            ps2x::moveFreeCamera(across, right, 0.05f);
++            const float moved[3] = {across.position[0] - kCockpitCamera[12], across.position[1] - kCockpitCamera[13],
++                                    across.position[2] - kCockpitCamera[14]};
++            t.IsTrue(std::fabs(moved[1]) < 1e-5f, "right: level, the height does not change");
++            const float length = std::sqrt(moved[0] * moved[0] + moved[2] * moved[2]);
++            t.IsTrue(std::fabs(length - 4.0f * step) < 1e-3f, "four times as far with speed 4");
++            t.IsTrue((moved[0] * m[0] + moved[2] * m[2]) * ps2x::kFreeCameraRightSign > 0.0f,
++                     "towards the screen's right");
++
++            ps2x::FreeCamera rising = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.5f);
++            ps2x::FreeCameraInput up;
++            up.up = -1.0f;
++            up.speed = 0.25f;
++            ps2x::moveFreeCamera(rising, up, 0.05f);
++            t.IsTrue(std::fabs(rising.position[1] - (kCockpitCamera[13] - 0.25f * step)) < 1e-5f, "down: the world's -y");
++            t.IsTrue(std::fabs(rising.position[0] - kCockpitCamera[12]) < 1e-5f, "only the height changes");
++            up.speed = 4.0f;
++            for (int i = 0; i < 20; ++i)
++                ps2x::moveFreeCamera(rising, up, 0.1f);
++            t.IsTrue(std::fabs(rising.position[1] - (kCockpitCamera[13] - ps2x::kFreeCameraMaxDrop)) < 1e-5f,
++                     "down to kFreeCameraMaxDrop under where it started (the ground is not known)");
++            up.up = 1.0f;
++            ps2x::moveFreeCamera(rising, up, 0.1f);
++            t.IsTrue(rising.position[1] > kCockpitCamera[13] - ps2x::kFreeCameraMaxDrop, "and up again from there");
++
++            ps2x::FreeCamera still = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.5f);
++            ps2x::moveFreeCamera(still, input, 0.0f);
++            ps2x::moveFreeCamera(still, input, -1.0f);
++            ps2x::moveFreeCamera(still, input, std::nanf(""));
++            t.IsTrue(nearlyEqual(still.position, kCockpitCamera + 12, 3, 0.0f), "no time, a negative or broken time: no move");
++            ps2x::moveFreeCamera(still, input, 5.0f);
++            const float longest = ps2x::kFreeCameraSpeed * ps2x::kFreeCameraMaxStep;
++            const float went[3] = {still.position[0] - kCockpitCamera[12], still.position[1] - kCockpitCamera[13],
++                                   still.position[2] - kCockpitCamera[14]};
++            t.IsTrue(std::fabs(std::sqrt(went[0] * went[0] + went[1] * went[1] + went[2] * went[2]) - longest) < 1e-3f,
++                     "a long frame moves as much as the longest step");
++        });
++
++        tc.Run("the free camera turns, rolls and zooms within its limits", [](TestCase &t)
++        {
++            const float level[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++            ps2x::FreeCamera camera = ps2x::freeCameraFromMatrix(level, 0.5f);
++            ps2x::FreeCameraInput turn;
++            turn.yaw = 1.0f;
++            ps2x::moveFreeCamera(camera, turn, 0.1f);
++            float m[16] = {};
++            ps2x::freeCameraMatrix(camera, m);
++            t.IsTrue(m[8] * ps2x::kFreeCameraRightSign > 0.0f && std::fabs(m[9]) < 1e-6f,
++                     "yaw right: it looks towards the screen's right, level");
++            t.IsTrue(std::fabs(std::fabs(camera.yaw) - ps2x::kFreeCameraTurnRate * 0.1f) < 1e-5f, "at its rate");
++
++            ps2x::FreeCameraInput look;
++            look.pitch = 1.0f;
++            for (int i = 0; i < 40; ++i)
++                ps2x::moveFreeCamera(camera, look, 0.1f);
++            t.Equals(camera.pitch, ps2x::kFreeCameraMaxPitch, "looking up stops at the limit");
++            ps2x::freeCameraMatrix(camera, m);
++            t.IsTrue(m[5] > 0.0f, "and the screen's up still points up the world");
++            look.pitch = -1.0f;
++            for (int i = 0; i < 80; ++i)
++                ps2x::moveFreeCamera(camera, look, 0.1f);
++            t.Equals(camera.pitch, -ps2x::kFreeCameraMaxPitch, "looking down too");
++
++            ps2x::FreeCameraInput roll;
++            roll.roll = 1.0f;
++            for (int i = 0; i < 40; ++i)
++                ps2x::moveFreeCamera(camera, roll, 0.1f);
++            t.Equals(std::fabs(camera.roll), ps2x::kFreeCameraMaxRoll, "the roll stops at its limit");
++            ps2x::freeCameraMatrix(camera, m);
++            const float across = m[0] * m[4] + m[1] * m[5] + m[2] * m[6];
++            const float side = m[0] * m[8] + m[1] * m[9] + m[2] * m[10];
++            t.IsTrue(std::fabs(across) < 1e-5f && std::fabs(side) < 1e-5f, "the axes stay square");
++            const float cross[3] = {m[1] * m[6] - m[2] * m[5], m[2] * m[4] - m[0] * m[6], m[0] * m[5] - m[1] * m[4]};
++            t.IsTrue(nearlyEqual(cross, m + 8, 3, 1e-5f), "and the same hand as the game's (row 0 x row 1 = row 2)");
++
++            ps2x::FreeCameraInput zoom;
++            zoom.zoom = 1.0f;
++            ps2x::moveFreeCamera(camera, zoom, 0.1f);
++            t.IsTrue(std::fabs(camera.halfAngle - 0.5f * std::exp(-ps2x::kFreeCameraZoomRate * 0.1f)) < 1e-6f,
++                     "zoom in: a narrower angle");
++            for (int i = 0; i < 400; ++i)
++                ps2x::moveFreeCamera(camera, zoom, 0.1f);
++            t.Equals(camera.halfAngle, ps2x::kFreeCameraMinHalfAngle, "down to the narrowest");
++            zoom.zoom = -1.0f;
++            for (int i = 0; i < 400; ++i)
++                ps2x::moveFreeCamera(camera, zoom, 0.1f);
++            t.Equals(camera.halfAngle, ps2x::kFreeCameraMaxHalfAngle, "up to the widest");
++        });
++
++        tc.Run("the free camera stays near where it started and goes back with reset", [](TestCase &t)
++        {
++            ps2x::FreeCamera camera = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.477614f);
++            ps2x::FreeCameraInput input;
++            input.forward = 1.0f;
++            input.up = 1.0f;
++            input.yaw = 0.5f;
++            input.zoom = 1.0f;
++            input.speed = 4.0f;
++            for (int i = 0; i < 200; ++i)
++                ps2x::moveFreeCamera(camera, input, 0.1f);
++            const float offset[3] = {camera.position[0] - kCockpitCamera[12], camera.position[1] - kCockpitCamera[13],
++                                     camera.position[2] - kCockpitCamera[14]};
++            const float distance = std::sqrt(offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]);
++            t.IsTrue(std::fabs(distance - ps2x::kFreeCameraMaxDistance) < 1e-3f, "held at the most distance");
++
++            ps2x::FreeCameraInput reset;
++            reset.reset = true;
++            reset.forward = 1.0f;
++            ps2x::moveFreeCamera(camera, reset, 0.1f);
++            float m[16] = {};
++            ps2x::freeCameraMatrix(camera, m);
++            t.IsTrue(nearlyEqual(m, kCockpitCamera, 16, 1e-4f), "reset: the game's camera again, without moving");
++            t.IsTrue(std::fabs(camera.halfAngle - 0.477614f) < 1e-6f, "and its angle");
++        });
++
++        tc.Run("the photo mode controls turn keys and the pad into the camera's input", [](TestCase &t)
++        {
++            const ps2x::FreeCameraInput none = ps2x::freeCameraInput({}, {});
++            t.IsTrue(none.forward == 0.0f && none.right == 0.0f && none.up == 0.0f && none.yaw == 0.0f &&
++                         none.pitch == 0.0f && none.roll == 0.0f && none.zoom == 0.0f && none.speed == 1.0f &&
++                         !none.reset, "nothing held: still, normal speed");
++
++            ps2x::PhotoModeKeys keys;
++            keys.forward = keys.right = keys.up = keys.turnLeft = keys.lookUp = keys.rollRight = keys.zoomOut = true;
++            keys.fast = true;
++            const ps2x::FreeCameraInput held = ps2x::freeCameraInput(keys, {});
++            t.IsTrue(held.forward == 1.0f && held.right == 1.0f && held.up == 1.0f, "W, D and R: forward, right, up");
++            t.IsTrue(held.yaw == -1.0f && held.pitch == 1.0f, "left and up arrows: turn left, look up");
++            t.IsTrue(held.roll == 1.0f && held.zoom == -1.0f, "E rolls right, X zooms out");
++            t.Equals(held.speed, 4.0f, "Shift: four times as fast");
++
++            ps2x::PhotoModeKeys both;
++            both.forward = both.back = both.fast = both.slow = true;
++            const ps2x::FreeCameraInput cancel = ps2x::freeCameraInput(both, {});
++            t.IsTrue(cancel.forward == 0.0f && cancel.speed == 1.0f, "opposite keys cancel out");
++            ps2x::PhotoModeKeys slow;
++            slow.slow = slow.reset = slow.down = true;
++            const ps2x::FreeCameraInput gentle = ps2x::freeCameraInput(slow, {});
++            t.IsTrue(gentle.speed == 0.25f && gentle.reset && gentle.up == -1.0f, "Ctrl slow, Backspace reset, F down");
++
++            ps2x::PhotoModePad pad;
++            pad.leftX = -0.5f;
++            pad.leftY = -1.0f; // up
++            pad.rightX = 0.25f;
++            pad.rightY = 0.5f; // down
++            pad.r2 = 0.75f;
++            pad.l2 = 0.25f;
++            pad.pressed = ps2x::kPhotoPadL1 | ps2x::kPhotoPadUp | ps2x::kPhotoPadSquare | ps2x::kPhotoPadTriangle;
++            const ps2x::FreeCameraInput stick = ps2x::freeCameraInput({}, pad);
++            t.IsTrue(stick.forward == 1.0f && stick.right == -0.5f, "left stick up and half left");
++            t.IsTrue(stick.yaw == 0.25f && stick.pitch == -0.5f, "right stick: turn right, look down");
++            t.IsTrue(std::fabs(stick.up - 0.5f) < 1e-6f, "R2 up minus L2 down");
++            t.IsTrue(stick.roll == -1.0f && stick.zoom == 1.0f, "L1 rolls left, the d-pad's up zooms in");
++            t.IsTrue(stick.speed == 0.25f && stick.reset, "square slow, triangle reset");
++
++            ps2x::PhotoModeKeys forward;
++            forward.forward = true;
++            const ps2x::FreeCameraInput together = ps2x::freeCameraInput(forward, pad);
++            t.Equals(together.forward, 1.0f, "key and stick together stay within 1");
++        });
++
++        tc.Run("the photo mode switch turns on only during a race camera and off when it ends", [](TestCase &t)
++        {
++            ps2x::PhotoModeSwitch photoMode;
++            t.IsFalse(photoMode.toggle(10.0), "no race camera yet: the key does nothing");
++            photoMode.cameraFrame(20.0);
++            t.IsFalse(photoMode.toggle(20.0 + ps2x::PhotoModeSwitch::kEnterWindow + 0.01),
++                      "the race camera stopped (a menu): nothing");
++            photoMode.cameraFrame(30.0);
++            t.IsTrue(photoMode.toggle(30.2), "during a race: on");
++            t.IsTrue(photoMode.active(), "and stays on");
++            photoMode.cameraFrame(31.0);
++            t.IsTrue(photoMode.stillActive(31.0 + ps2x::PhotoModeSwitch::kLeaveAfter), "while the camera draws");
++            t.IsFalse(photoMode.toggle(33.0), "the key again: off");
++            t.IsFalse(photoMode.active(), "off");
++            photoMode.cameraFrame(40.0);
++            t.IsTrue(photoMode.toggle(40.0), "on again");
++            t.IsFalse(photoMode.stillActive(40.0 + ps2x::PhotoModeSwitch::kLeaveAfter + 0.01),
++                      "no race camera for a while (the race ended): off by itself");
++            t.IsFalse(photoMode.active(), "and stays off");
++        });
++
+         tc.Run("the HUD modes: their names, their numbers and the key's cycle", [](TestCase &t)
+         {
+             ps2x::HudMode mode = ps2x::HudMode::Hidden;
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index d986a06..2d0fbf7 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{21}, "twenty-one options (fase 5: ten more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{22}, "twenty-two options (fase 5: eleven more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

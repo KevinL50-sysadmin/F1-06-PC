@@ -1,0 +1,629 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 164a60c..e4a90eb 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -48,7 +48,10 @@
+ // worker, 52 the GS coordinator spinning 1000 instead of 4000 (patch 0071: none of the three changed anything), 53 and
+ // 54 GS bands of 16 and 4 rows instead of 8 (16 before patch 0071), 55 the VU0 microprograms run by the
+ // interpreter alone, without blocks (before patch 0072), 58 the GS untextured sprites through writePixelTyped for each
+-// pixel (before patch 0074). Since patch 0069 the modes of
++// pixel (before patch 0074), 59 the GS
++// perspective-textured triangles without rasterTriangleSpan4Tex and CT16 textures through the sampler pointer, 60 the
++// GS textured sprites without spriteTexRows (both before
++// patch 0075). Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 296c8b3..cd1e0da 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1753,11 +1753,17 @@ namespace
+         return pp;
+     }
+ 
+-    template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z>
+-    PS2_GS_INLINE void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog)
++    // writePixelTyped's body. kChecks false (patch 0075) leaves out the scissor test and the depth test: the caller
++    // knows the pixel is inside the scissor and has done the depth test itself (it passed). Neither has a side effect,
++    // and every other test before the writes only returns, so doing the depth test first does not change the result.
++    template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z, bool kChecks>
++    PS2_GS_INLINE void writePixelBody(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog)
+     {
+-        if (x < pp.scissorX0 || x > pp.scissorX1 || y < pp.scissorY0 || y > pp.scissorY1)
+-            return;
++        if constexpr (kChecks)
++        {
++            if (x < pp.scissorX0 || x > pp.scissorX1 || y < pp.scissorY0 || y > pp.scissorY1)
++                return;
++        }
+ 
+         uint8_t *const vram = pp.vram;
+         uint8_t r = static_cast<uint8_t>(rgba);
+@@ -1801,27 +1807,30 @@ namespace
+         if (!passesDestinationAlphaTest(pp.test, static_cast<uint8_t>(pp.fpsm), rawFramebufferPixel))
+             return;
+ 
+-        bool zpass = false;
+-        uint32_t storedZ = 0u;
+-        switch (pp.ztestMethod)
++        if constexpr (kChecks)
+         {
+-        case 0:
+-            zpass = false;
+-            break;
+-        case 1:
+-            zpass = true;
+-            break;
+-        case 2:
+-            storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x, y);
+-            zpass = static_cast<uint32_t>(z) >= storedZ;
+-            break;
+-        case 3:
+-            storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x, y);
+-            zpass = static_cast<uint32_t>(z) > storedZ;
+-            break;
++            bool zpass = false;
++            uint32_t storedZ = 0u;
++            switch (pp.ztestMethod)
++            {
++            case 0:
++                zpass = false;
++                break;
++            case 1:
++                zpass = true;
++                break;
++            case 2:
++                storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x, y);
++                zpass = static_cast<uint32_t>(z) >= storedZ;
++                break;
++            case 3:
++                storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x, y);
++                zpass = static_cast<uint32_t>(z) > storedZ;
++                break;
++            }
++            if (!zpass)
++                return;
+         }
+-        if (!zpass)
+-            return;
+ 
+         if (writeMask.writesFramebuffer())
+         {
+@@ -1863,6 +1872,12 @@ namespace
+             pipelineWrite<Z>(pp.writeZ, vram, pp.zbp, pp.fbw, x, y, static_cast<uint32_t>(z));
+     }
+ 
++    template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z>
++    PS2_GS_INLINE void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog)
++    {
++        writePixelBody<F, Z, true>(pp, x, y, z, rgba, fog);
++    }
++
+     // SampleTexture prepared once per primitive: the texture registers decoded, the CLUT lookup as a palette
+     // (PreparePalette: LookupCLUT of every index) and the texel read specialized by format, inlining the same
+     // PixelStorageTraits read with the same page table as GSMem::ReadTexture. Same arithmetic as SampleTexture.
+@@ -2146,6 +2161,10 @@ namespace
+         // Patch 0067: a copy of local memory for the presentation (BandState::uploads of its slot: copyTo,
+         // copyBytes), each worker its share once every worker is past the jobs before it.
+         bool isCopy = false;
++        // Patch 0075: its texture, frame and Z pages are apart (SubmitBandJob checked it), so its pixels do not depend
++        // on the order they are drawn in and rasterTriangleSpan4Tex may test the depth and sample the texture of four
++        // pixels before writing any of them. False for jobs drawn alone or without the bands.
++        bool unordered = false;
+         // Patch 0063: before running it, a worker waits until every worker has finished the jobs below this (what the
+         // coordinator used to wait for before queueing it). 0: nothing.
+         uint64_t waitAll = 0u;
+@@ -2434,10 +2453,270 @@ namespace
+         }
+     }
+ 
++    // Patch 0075: SSE2 helpers of rasterTriangleSpan4Tex (signed 32-bit min and max, a 32-bit multiply modulo 2^32).
++    PS2_GS_INLINE __m128i maxEpi32(__m128i a, __m128i b)
++    {
++        const __m128i gt = _mm_cmpgt_epi32(a, b);
++        return _mm_or_si128(_mm_and_si128(gt, a), _mm_andnot_si128(gt, b));
++    }
++
++    PS2_GS_INLINE __m128i minEpi32(__m128i a, __m128i b)
++    {
++        const __m128i gt = _mm_cmpgt_epi32(a, b);
++        return _mm_or_si128(_mm_and_si128(gt, b), _mm_andnot_si128(gt, a));
++    }
++
++    PS2_GS_INLINE __m128i mulloEpi32(__m128i a, __m128i b)
++    {
++        const __m128i even = _mm_mul_epu32(a, b);
++        const __m128i odd = _mm_mul_epu32(_mm_srli_epi64(a, 32), _mm_srli_epi64(b, 32));
++        return _mm_unpacklo_epi32(_mm_shuffle_epi32(even, _MM_SHUFFLE(0, 0, 2, 0)),
++                                  _mm_shuffle_epi32(odd, _MM_SHUFFLE(0, 0, 2, 0)));
++    }
++
++    // fastFloorToInt on four lanes: the truncating conversion (INT_MIN out of range, as cvttss2si), minus one where the
++    // truncated value converted back is above the input.
++    PS2_GS_INLINE __m128i floorLanes(__m128 v)
++    {
++        const __m128i truncated = _mm_cvttps_epi32(v);
++        return _mm_add_epi32(truncated, _mm_castps_si128(_mm_cmpgt_ps(_mm_cvtepi32_ps(truncated), v)));
++    }
++
++    // wrapTextureCoordinate on four lanes (size >= 1: textureWidth/Height are 1 << n).
++    PS2_GS_INLINE __m128i wrapLanes(__m128i c, int size, uint8_t mode, uint16_t regionMin, uint16_t regionMax)
++    {
++        switch (mode & 0x3u)
++        {
++        case 0: // REPEAT
++            return _mm_and_si128(c, _mm_set1_epi32(size - 1));
++        case 1: // CLAMP: clampInt(c, 0, size - 1)
++            return minEpi32(maxEpi32(c, _mm_setzero_si128()), _mm_set1_epi32(size - 1));
++        case 2: // REGION_CLAMP
++            return minEpi32(maxEpi32(c, _mm_set1_epi32(regionMin)), _mm_set1_epi32(regionMax));
++        default: // REGION_REPEAT
++            return _mm_or_si128(_mm_and_si128(c, _mm_set1_epi32(regionMin)), _mm_set1_epi32(regionMax));
++        }
++    }
++
++    // PixelStorageTraits<P>::Address and Read's bit address, split for the texels (x, y) of four lanes (wrapped, so
++    // never negative): `pre` is the page part times the bit width plus the bit offset and `idx` the index into the
++    // block table of the texture base, so a texel's bit address is pre + table[idx] * width (modulo 2^32, as Read).
++    template <GSMem::PixelStorageMode P>
++    PS2_GS_INLINE void texelLanes(__m128i x, __m128i y, __m128i basePage, __m128i rowPages, uint32_t *pre, uint32_t *idx)
++    {
++        using Traits = GSMem::PixelStorageTraits<P>;
++        constexpr GSMem::Extent2D extent = Traits::PageExtent();
++        constexpr uint32_t kPageBits = static_cast<uint32_t>(Traits::PixelsPerPage() * GSMem::UnpackedBitWidth(P));
++        static_assert(std::has_single_bit(static_cast<uint32_t>(extent.x)) &&
++                          std::has_single_bit(static_cast<uint32_t>(extent.y)) && std::has_single_bit(kPageBits),
++                      "power-of-two page sizes");
++        constexpr int kShiftX = std::countr_zero(static_cast<uint32_t>(extent.x));
++        constexpr int kShiftY = std::countr_zero(static_cast<uint32_t>(extent.y));
++        constexpr int kShiftPage = std::countr_zero(kPageBits);
++        const __m128i page = _mm_add_epi32(_mm_add_epi32(basePage, mulloEpi32(_mm_srli_epi32(y, kShiftY), rowPages)),
++                                           _mm_srli_epi32(x, kShiftX));
++        _mm_store_si128(reinterpret_cast<__m128i *>(pre),
++                        _mm_add_epi32(_mm_slli_epi32(page, kShiftPage),
++                                      _mm_set1_epi32(static_cast<int>(Traits::BitOffset()))));
++        const __m128i yIn = _mm_and_si128(y, _mm_set1_epi32(static_cast<int>(extent.y - 1)));
++        const __m128i xIn = _mm_and_si128(x, _mm_set1_epi32(static_cast<int>(extent.x - 1)));
++        _mm_store_si128(reinterpret_cast<__m128i *>(idx), _mm_add_epi32(_mm_slli_epi32(yIn, kShiftX), xIn));
++    }
++
++    // One texel from texelLanes' parts, read and converted as samplerBilinear's `read` (and samplerTexel).
++    template <GSMem::PixelStorageMode P>
++    PS2_GS_INLINE uint32_t fetchTexel(const TextureSampler &ts, const uint16_t *blockTable, uint32_t pre, uint32_t idx)
++    {
++        using Traits = GSMem::PixelStorageTraits<P>;
++        using Packed = typename Traits::PackedT;
++        const uint32_t bits = pre + static_cast<uint32_t>(blockTable[idx]) * static_cast<uint32_t>(GSMem::UnpackedBitWidth(P));
++        const uint32_t byteAddr = (bits / 8u) & static_cast<uint32_t>(GSMem::MEMORY_SIZE - sizeof(Packed));
++        Packed value;
++        std::memcpy(&value, ts.vram + byteAddr, sizeof(Packed));
++        uint32_t raw;
++        if constexpr (P == GSMem::C24 || P == GSMem::Z24)
++            raw = static_cast<uint32_t>(value & 0x00FFFFFFu);
++        else if constexpr (P == GSMem::P4 || P == GSMem::P4HL || P == GSMem::P4HH)
++            raw = static_cast<uint32_t>((value >> (bits % 8u)) & 0x0Fu);
++        else
++            raw = static_cast<uint32_t>(value);
++        if constexpr (P == GSMem::C32 || P == GSMem::C24 || P == GSMem::Z32 || P == GSMem::Z24)
++            return applyTexa(ts.texa, ts.psm, raw);
++        else if constexpr (P == GSMem::C16 || P == GSMem::C16S || P == GSMem::Z16 || P == GSMem::Z16S)
++            return applyTexa(ts.texa, ts.psm, Rgba5551ToRgba8888(static_cast<u16>(raw)));
++        else
++            return ts.palette[static_cast<uint8_t>(raw)];
++    }
++
++    // Patch 0075: rasterTriangleSpan4 for a perspective-textured triangle (the race's P8/P4/CT32/CT16 triangles, ~half of
++    // a band worker's time) of a job whose pixels may be drawn in any order (BandJob::unordered), written by
++    // writePixelTyped<F, Z>. For each four pixels: the depth test first, for the covered pixels (it has no side effect
++    // and a failing pixel writes nothing, whatever the other tests say); then, for the four lanes at once, samplerSample's
++    // 1 / q, the texel coordinates, floor, fractions, wrapping and the address parts, with the same operations per lane
++    // (IEEE single-precision products, sums and the division rounded one by one, truncating conversions); then, per
++    // passing pixel in x order, the texel reads, bilinearRgba, the combiner and writePixelBody without the depth test and
++    // the scissor test (prepareTriangle clamps the box to the scissor). The values are the same bit for bit; only the
++    // order of the depth reads against the other pixels' writes changes, which the separate pages make irrelevant.
++    template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z, GSMem::PixelStorageMode P>
++    PS2_GS_INLINE void rasterTriangleSpan4Tex(const BandJob &job, const TriangleSetup &t, int y, int spanX0, int spanX1,
++                                              float row0, float row1)
++    {
++        using Traits = GSMem::PixelStorageTraits<P>;
++        constexpr GSMem::Extent2D extent = Traits::PageExtent();
++        const PixelPipeline &pp = job.pp;
++        const TextureSampler &ts = job.sampler;
++        uint8_t *const vram = pp.vram;
++        const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3 (the caller leaves 0 to rasterTriangleSpan4)
++        const __m128 eps = _mm_set1_ps(-1.0e-4f);
++        const __m128 one = _mm_set1_ps(1.0f);
++        const __m128 half = _mm_set1_ps(0.5f);
++        const __m128 fx2 = _mm_set1_ps(t.fx2);
++        const __m128 e0 = _mm_set1_ps(t.e0), e1 = _mm_set1_ps(t.e1);
++        const __m128 r0v = _mm_set1_ps(row0), r1v = _mm_set1_ps(row1);
++        const __m128 winding = _mm_set1_ps(t.winding), inv = _mm_set1_ps(t.invAbsDenom);
++        const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
++        const __m128 qMin = _mm_set1_ps(1.0e-8f);
++        const __m128 texW = _mm_set1_ps(static_cast<float>(ts.texW)), texH = _mm_set1_ps(static_cast<float>(ts.texH));
++        const __m128i oneI = _mm_set1_epi32(1);
++        const __m128i lanes = _mm_setr_epi32(0, 1, 2, 3);
++        const auto &table = *static_cast<const typename Traits::PageLookupTableT *>(ts.pageTable);
++        const uint16_t *const blockTable = reinterpret_cast<const uint16_t *>(&table[ts.tbp0 % Traits::BlocksPerPage()]);
++        const __m128i basePage = _mm_set1_epi32(static_cast<int>(static_cast<uint32_t>(ts.tbp0 / Traits::BlocksPerPage())));
++        const __m128i rowPages = _mm_set1_epi32(static_cast<int>((ts.tbw * 64u) / static_cast<uint32_t>(extent.x)));
++        auto lerp = [](float a0, float a1, float a2, __m128 w0, __m128 w1, __m128 w2)
++        {
++            return _mm_add_ps(_mm_add_ps(_mm_mul_ps(_mm_set1_ps(a0), w0), _mm_mul_ps(_mm_set1_ps(a1), w1)),
++                              _mm_mul_ps(_mm_set1_ps(a2), w2));
++        };
++        auto lerpD = [](double a0, double a1, double a2, __m128d w0, __m128d w1, __m128d w2)
++        {
++            return _mm_add_pd(_mm_add_pd(_mm_mul_pd(_mm_set1_pd(a0), w0), _mm_mul_pd(_mm_set1_pd(a1), w1)),
++                              _mm_mul_pd(_mm_set1_pd(a2), w2));
++        };
++        alignas(16) uint32_t rgbaL[4];
++        alignas(16) uint32_t fogL[4];
++        alignas(16) double zL[4];
++        alignas(16) float fxL[4], fyL[4];
++        alignas(16) uint32_t pre[4][4], idx[4][4]; // [texel 00, 10, 01, 11][lane]
++        uint32_t zi[4];
++        for (int x = spanX0; x <= spanX1; x += 4)
++        {
++            const __m128i xs = _mm_add_epi32(_mm_set1_epi32(x), lanes);
++            const __m128 px = _mm_add_ps(_mm_cvtepi32_ps(xs), half);
++            const __m128 dx = _mm_sub_ps(px, fx2);
++            const __m128 w0 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e0, dx), r0v), winding), inv);
++            const __m128 w1 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e1, dx), r1v), winding), inv);
++            const __m128 w2 = _mm_sub_ps(_mm_sub_ps(one, w0), w1);
++            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps), _mm_cmplt_ps(w1, eps)), _mm_cmplt_ps(w2, eps));
++            const int count = std::min(4, spanX1 - x + 1);
++            unsigned live = ~static_cast<unsigned>(_mm_movemask_ps(out)) & ((1u << count) - 1u);
++            if (live == 0u)
++                continue;
++
++            const __m128d w0lo = _mm_cvtps_pd(w0), w0hi = _mm_cvtps_pd(_mm_movehl_ps(w0, w0));
++            const __m128d w1lo = _mm_cvtps_pd(w1), w1hi = _mm_cvtps_pd(_mm_movehl_ps(w1, w1));
++            const __m128d w2lo = _mm_cvtps_pd(w2), w2hi = _mm_cvtps_pd(_mm_movehl_ps(w2, w2));
++            _mm_store_pd(zL, lerpD(t.z0, t.z1, t.z2, w0lo, w1lo, w2lo));
++            _mm_store_pd(zL + 2, lerpD(t.z0, t.z1, t.z2, w0hi, w1hi, w2hi));
++
++            // The depth test of the covered pixels, as writePixelTyped's.
++            {
++                unsigned pass = 0u;
++                for (unsigned m = live; m != 0u; m &= m - 1u)
++                {
++                    const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                    zi[i] = static_cast<u32>(zL[i] + 0.5);
++                    if (ztest == 1u)
++                        pass |= 1u << i;
++                    else
++                    {
++                        const uint32_t storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x + static_cast<int>(i), y);
++                        if (ztest == 2u ? zi[i] >= storedZ : zi[i] > storedZ)
++                            pass |= 1u << i;
++                    }
++                }
++                live = pass;
++                if (live == 0u)
++                    continue;
++            }
++
++            if (t.iip)
++            {
++                const __m128i r = _mm_cvttps_epi32(lerp(t.r0, t.r1, t.r2, w0, w1, w2));
++                const __m128i g = _mm_cvttps_epi32(lerp(t.g0, t.g1, t.g2, w0, w1, w2));
++                const __m128i b = _mm_cvttps_epi32(lerp(t.b0, t.b1, t.b2, w0, w1, w2));
++                const __m128i a = _mm_cvttps_epi32(lerp(t.a0, t.a1, t.a2, w0, w1, w2));
++                const __m128i bytes = _mm_packus_epi16(_mm_packs_epi32(r, g), _mm_packs_epi32(b, a));
++                const __m128i rg = _mm_unpacklo_epi8(bytes, _mm_srli_si128(bytes, 4));
++                const __m128i ba = _mm_unpacklo_epi8(_mm_srli_si128(bytes, 8), _mm_srli_si128(bytes, 12));
++                _mm_store_si128(reinterpret_cast<__m128i *>(rgbaL), _mm_unpacklo_epi16(rg, ba));
++            }
++            {
++                const __m128i f = _mm_cvttps_epi32(lerp(t.fog0, t.fog1, t.fog2, w0, w1, w2));
++                const __m128i f16 = _mm_packs_epi32(f, f);
++                const __m128i f8 = _mm_packus_epi16(f16, f16);
++                _mm_store_si128(reinterpret_cast<__m128i *>(fogL),
++                                _mm_unpacklo_epi16(_mm_unpacklo_epi8(f8, _mm_setzero_si128()), _mm_setzero_si128()));
++            }
++
++            // samplerSample: invQ = 1 / fabsQ(q), texUf = s * invQ * texW, texVf = t * invQ * texH.
++            const __m128 sv = lerp(t.s0, t.s1, t.s2, w0, w1, w2);
++            const __m128 tv = lerp(t.tq0, t.tq1, t.tq2, w0, w1, w2);
++            const __m128 qv = lerp(t.q0, t.q1, t.q2, w0, w1, w2);
++            const __m128 qBig = _mm_cmpgt_ps(_mm_and_ps(qv, absMask), qMin);
++            const __m128 invQ = _mm_div_ps(one, _mm_or_ps(_mm_and_ps(qBig, qv), _mm_andnot_ps(qBig, one)));
++            const __m128 texUf = _mm_mul_ps(_mm_mul_ps(sv, invQ), texW);
++            const __m128 texVf = _mm_mul_ps(_mm_mul_ps(tv, invQ), texH);
++            const bool linear = ts.linear;
++            if (linear)
++            {
++                const __m128 sampleU = _mm_sub_ps(texUf, half);
++                const __m128 sampleV = _mm_sub_ps(texVf, half);
++                const __m128i u0 = floorLanes(sampleU);
++                const __m128i v0 = floorLanes(sampleV);
++                _mm_store_ps(fxL, _mm_sub_ps(sampleU, _mm_cvtepi32_ps(u0)));
++                _mm_store_ps(fyL, _mm_sub_ps(sampleV, _mm_cvtepi32_ps(v0)));
++                const __m128i wu0 = wrapLanes(u0, ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                const __m128i wu1 = wrapLanes(_mm_add_epi32(u0, oneI), ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                const __m128i wv0 = wrapLanes(v0, ts.texH, ts.wrapV, ts.minV, ts.maxV);
++                const __m128i wv1 = wrapLanes(_mm_add_epi32(v0, oneI), ts.texH, ts.wrapV, ts.minV, ts.maxV);
++                texelLanes<P>(wu0, wv0, basePage, rowPages, pre[0], idx[0]);
++                texelLanes<P>(wu1, wv0, basePage, rowPages, pre[1], idx[1]);
++                texelLanes<P>(wu0, wv1, basePage, rowPages, pre[2], idx[2]);
++                texelLanes<P>(wu1, wv1, basePage, rowPages, pre[3], idx[3]);
++            }
++            else
++            {
++                // samplerPoint(static_cast<int>(texUf), static_cast<int>(texVf)).
++                const __m128i wu = wrapLanes(_mm_cvttps_epi32(texUf), ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                const __m128i wv = wrapLanes(_mm_cvttps_epi32(texVf), ts.texH, ts.wrapV, ts.minV, ts.maxV);
++                texelLanes<P>(wu, wv, basePage, rowPages, pre[0], idx[0]);
++            }
++
++            do
++            {
++                const unsigned i = static_cast<unsigned>(std::countr_zero(live));
++                live &= live - 1u;
++                uint32_t texel;
++                if (linear)
++                    texel = bilinearRgba(fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]),
++                                         fetchTexel<P>(ts, blockTable, pre[1][i], idx[1][i]),
++                                         fetchTexel<P>(ts, blockTable, pre[2][i], idx[2][i]),
++                                         fetchTexel<P>(ts, blockTable, pre[3][i], idx[3][i]), fxL[i], fyL[i]);
++                else
++                    texel = fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]);
++                const uint32_t rgba = combineTexturePacked(job.combiner, t.iip ? rgbaL[i] : t.flatRgba, texel);
++                writePixelBody<F, Z, false>(pp, x + static_cast<int>(i), y, static_cast<int>(zi[i]), rgba,
++                                            static_cast<uint8_t>(fogL[i]));
++            } while (live != 0u);
++        }
++    }
++
+     // The rows of the triangle in the band set. W and S, when not null, are the job's pixel writer and texture sampler
+     // known at compile time, so they inline into the pixel loop (patch 0044; the calls through the job's pointers were
+-    // two indirect calls per pixel). Same arithmetic either way.
+-    template <WritePixelFn W, SampleFn S>
++    // two indirect calls per pixel). Same arithmetic either way. TP, when not PixelStorageMode::Max, is the format of S:
++    // the job may take rasterTriangleSpan4Tex (patch 0075; W is then writePixelTyped<C32, Z24>).
++    template <WritePixelFn W, SampleFn S, GSMem::PixelStorageMode TP = GSMem::PixelStorageMode::Max>
+     void rasterTriangleRowsWith(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         const TriangleSetup t = job.tri;
+@@ -2458,6 +2737,12 @@ namespace
+         // Patch 0066: four pixels at a time (A/B modes 41 and 44: one by one, as before).
+         const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
+         const bool simd = abMode != 41 && abMode != 44;
++        // Patch 0075 (A/B mode 59: not; nor in modes 38 and 40, which sample as before patch 0064).
++        bool fastTex = false;
++        if constexpr (TP != GSMem::PixelStorageMode::Max)
++            fastTex = simd && abMode != 59 && abMode != 38 && abMode != 40 && job.unordered && t.tme && !t.fst &&
++                      pp.ztestMethod != 0u && job.sampler.pageTable != nullptr && pp.scissorX0 <= pp.scissorX1 &&
++                      pp.scissorY0 <= pp.scissorY1;
+         const int skip = static_cast<int>(count - 1u) << shift;
+         for (int y = firstBandRow(t.minY, shift, count, index); y <= t.maxY; y = nextBandRow(y, shift, skip))
+         {
+@@ -2478,6 +2763,14 @@ namespace
+             }
+             const float row0 = (t.fx2 - t.fx1) * (py - t.fy2);
+             const float row1 = (t.fx0 - t.fx2) * (py - t.fy2);
++            if constexpr (TP != GSMem::PixelStorageMode::Max)
++            {
++                if (fastTex)
++                {
++                    rasterTriangleSpan4Tex<GSMem::C32, GSMem::Z24, TP>(job, t, y, spanX0, spanX1, row0, row1);
++                    continue;
++                }
++            }
+             if (simd)
+             {
+                 rasterTriangleSpan4<W, S>(job, t, y, spanX0, spanX1, row0, row1);
+@@ -2542,22 +2835,26 @@ namespace
+         }
+     }
+ 
+-    // The frame/depth formats of the race (CT32 with Z24) with the samplers it uses most (8 and 4 bit indexed, CT32)
+-    // get their own loop; anything else, and A/B mode 13, goes through the pointers.
++    // The frame/depth formats of the race (CT32 with Z24) with the samplers it uses most (8 and 4 bit indexed, CT32 and,
++    // since patch 0075, CT16) get their own loop; anything else, and A/B mode 13, goes through the pointers (CT16 too
++    // in A/B mode 59).
+     void rasterTriangleRows(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         constexpr WritePixelFn kCt32Z24 = &writePixelTyped<GSMem::C32, GSMem::Z24>;
+-        if (job.pp.writePixel == kCt32Z24 && g_ps2AbMode.load(std::memory_order_relaxed) != 13)
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        if (job.pp.writePixel == kCt32Z24 && abMode != 13)
+         {
+             const SampleFn sample = job.tri.tme ? job.sampler.sample : nullptr;
+             if (sample == nullptr)
+                 return rasterTriangleRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
+             if (sample == &samplerSample<GSMem::P8>)
+-                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P8>>(job, shift, count, index);
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P8>, GSMem::P8>(job, shift, count, index);
+             if (sample == &samplerSample<GSMem::P4>)
+-                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P4>>(job, shift, count, index);
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P4>, GSMem::P4>(job, shift, count, index);
+             if (sample == &samplerSample<GSMem::C32>)
+-                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::C32>>(job, shift, count, index);
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::C32>, GSMem::C32>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::C16> && abMode != 59)
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::C16>, GSMem::C16>(job, shift, count, index);
+             return rasterTriangleRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
+         }
+         rasterTriangleRowsWith<nullptr, nullptr>(job, shift, count, index);
+@@ -2622,6 +2919,136 @@ namespace
+         }
+     }
+ 
++    // Patch 0075: rasterSpriteRowsWith for a textured sprite of a job whose pixels may be drawn in any order
++    // (BandJob::unordered), written by writePixelTyped<F, Z>; like rasterTriangleSpan4Tex. The texel row (DrawSprite's ty
++    // and texVf, then samplerSample's v, floor, fraction and wrapping) is worked out once per row; for each four pixels,
++    // the depth test first (the sprite's depth is the same everywhere), then tx, texUf, the fixed-point coordinate (fst)
++    // or s (and samplerSample's u), floor, fractions, wrapping and the address parts for the four lanes at once, with the
++    // same operations per lane; then, per passing pixel in x order, the texel reads, bilinearRgba, the combiner and
++    // writePixelBody without the depth test and the scissor test (prepareSprite clips to the scissor).
++    template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z, GSMem::PixelStorageMode P>
++    void spriteTexRows(const BandJob &job, int shift, unsigned count, unsigned index)
++    {
++        using Traits = GSMem::PixelStorageTraits<P>;
++        constexpr GSMem::Extent2D extent = Traits::PageExtent();
++        const SpriteSetup s = job.sprite;
++        const PixelPipeline &pp = job.pp;
++        const TextureSampler &ts = job.sampler;
++        uint8_t *const vram = pp.vram;
++        const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3
++        const uint32_t z = static_cast<uint32_t>(s.z);
++        const __m128 half = _mm_set1_ps(0.5f);
++        const __m128 one = _mm_set1_ps(1.0f);
++        const __m128 sixteen = _mm_set1_ps(16.0f);
++        const __m128 texW = _mm_set1_ps(static_cast<float>(ts.texW));
++        const __m128 u0f = _mm_set1_ps(s.u0f), uSpan = _mm_set1_ps(s.u1f - s.u0f);
++        const __m128 spriteW = _mm_set1_ps(s.spriteW), texWf = _mm_set1_ps(s.texWf);
++        const __m128i oneI = _mm_set1_epi32(1);
++        const __m128i lanes = _mm_setr_epi32(0, 1, 2, 3);
++        const __m128i unclippedX0 = _mm_set1_epi32(s.unclippedX0);
++        const auto &table = *static_cast<const typename Traits::PageLookupTableT *>(ts.pageTable);
++        const uint16_t *const blockTable = reinterpret_cast<const uint16_t *>(&table[ts.tbp0 % Traits::BlocksPerPage()]);
++        const __m128i basePage = _mm_set1_epi32(static_cast<int>(static_cast<uint32_t>(ts.tbp0 / Traits::BlocksPerPage())));
++        const __m128i rowPages = _mm_set1_epi32(static_cast<int>((ts.tbw * 64u) / static_cast<uint32_t>(extent.x)));
++        const bool linear = ts.linear;
++        alignas(16) float fxL[4];
++        alignas(16) uint32_t pre[4][4], idx[4][4]; // [texel 00, 10, 01, 11][lane]
++        const int skip = static_cast<int>(count - 1u) << shift;
++        for (int y = firstBandRow(s.drawY0, shift, count, index); y <= s.drawY1; y = nextBandRow(y, shift, skip))
++        {
++            // The row's v, as rasterSpriteRowsWith and samplerSample work it out.
++            const float ty = (static_cast<float>(y - s.unclippedY0) + 0.5f) / s.spriteH;
++            const float texVf = s.v0f + (s.v1f - s.v0f) * ty;
++            float texV;
++            if (s.fst)
++            {
++                const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
++                texV = static_cast<float>(static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF))) / 16.0f;
++            }
++            else
++                texV = texVf / s.texHf * (1.0f / fabsQ(1.0f)) * static_cast<float>(ts.texH);
++            __m128i wv0, wv1;
++            float fy = 0.0f;
++            if (linear)
++            {
++                const float sampleV = texV - 0.5f;
++                const int v0 = fastFloorToInt(sampleV);
++                fy = sampleV - static_cast<float>(v0);
++                wv0 = _mm_set1_epi32(wrapTextureCoordinate(v0, ts.texH, ts.wrapV, ts.minV, ts.maxV));
++                wv1 = _mm_set1_epi32(wrapTextureCoordinate(v0 + 1, ts.texH, ts.wrapV, ts.minV, ts.maxV));
++            }
++            else
++                wv0 = wv1 = _mm_set1_epi32(wrapTextureCoordinate(static_cast<int>(texV), ts.texH, ts.wrapV, ts.minV, ts.maxV));
++
++            for (int x = s.drawX0; x <= s.drawX1; x += 4)
++            {
++                const int lanesLeft = std::min(4, s.drawX1 - x + 1);
++                unsigned live = (1u << lanesLeft) - 1u;
++                if (ztest != 1u)
++                {
++                    unsigned pass = 0u;
++                    for (unsigned m = live; m != 0u; m &= m - 1u)
++                    {
++                        const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                        const uint32_t storedZ = pipelineRead<Z>(pp.readZ, vram, pp.zbp, pp.fbw, x + static_cast<int>(i), y);
++                        if (ztest == 2u ? z >= storedZ : z > storedZ)
++                            pass |= 1u << i;
++                    }
++                    live = pass;
++                    if (live == 0u)
++                        continue;
++                }
++
++                const __m128i xs = _mm_add_epi32(_mm_set1_epi32(x), lanes);
++                const __m128 tx = _mm_div_ps(_mm_add_ps(_mm_cvtepi32_ps(_mm_sub_epi32(xs, unclippedX0)), half), spriteW);
++                const __m128 texUf = _mm_add_ps(u0f, _mm_mul_ps(uSpan, tx));
++                __m128 texU;
++                if (s.fst)
++                {
++                    // static_cast<int>(texUf * 16 + 0.5), clampInt to 0..0xFFFF, then samplerSample's u / 16.
++                    const __m128i fixedU = _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(texUf, sixteen), half));
++                    const __m128i clamped = minEpi32(maxEpi32(fixedU, _mm_setzero_si128()), _mm_set1_epi32(0xFFFF));
++                    texU = _mm_div_ps(_mm_cvtepi32_ps(clamped), sixteen);
++                }
++                else
++                    texU = _mm_mul_ps(_mm_mul_ps(_mm_div_ps(texUf, texWf), one), texW); // q = 1: invQ = 1
++                if (linear)
++                {
++                    const __m128 sampleU = _mm_sub_ps(texU, half);
++                    const __m128i u0 = floorLanes(sampleU);
++                    _mm_store_ps(fxL, _mm_sub_ps(sampleU, _mm_cvtepi32_ps(u0)));
++                    const __m128i wu0 = wrapLanes(u0, ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                    const __m128i wu1 = wrapLanes(_mm_add_epi32(u0, oneI), ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                    texelLanes<P>(wu0, wv0, basePage, rowPages, pre[0], idx[0]);
++                    texelLanes<P>(wu1, wv0, basePage, rowPages, pre[1], idx[1]);
++                    texelLanes<P>(wu0, wv1, basePage, rowPages, pre[2], idx[2]);
++                    texelLanes<P>(wu1, wv1, basePage, rowPages, pre[3], idx[3]);
++                }
++                else
++                {
++                    const __m128i wu = wrapLanes(_mm_cvttps_epi32(texU), ts.texW, ts.wrapU, ts.minU, ts.maxU);
++                    texelLanes<P>(wu, wv0, basePage, rowPages, pre[0], idx[0]);
++                }
++
++                do
++                {
++                    const unsigned i = static_cast<unsigned>(std::countr_zero(live));
++                    live &= live - 1u;
++                    uint32_t texel;
++                    if (linear)
++                        texel = bilinearRgba(fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]),
++                                             fetchTexel<P>(ts, blockTable, pre[1][i], idx[1][i]),
++                                             fetchTexel<P>(ts, blockTable, pre[2][i], idx[2][i]),
++                                             fetchTexel<P>(ts, blockTable, pre[3][i], idx[3][i]), fxL[i], fy);
++                    else
++                        texel = fetchTexel<P>(ts, blockTable, pre[0][i], idx[0][i]);
++                    const uint32_t rgba = combineTexturePacked(job.combiner, s.vertexRgba, texel);
++                    writePixelBody<F, Z, false>(pp, x + static_cast<int>(i), y, s.z, rgba, s.fog);
++                } while (live != 0u);
++            }
++        }
++    }
++
+     // Patch 0074: an untextured sprite has the same colour, depth and fog in every pixel, so what writePixelTyped works
+     // out from them alone (the fog, the alpha test, the blend decision, the colour written without blending) is done
+     // once per sprite; the rest is the same per pixel, with the same expressions. Its pixels are inside the scissor
+@@ -2737,9 +3164,24 @@ namespace
+         constexpr WritePixelFn kCt32Z24 = &writePixelTyped<GSMem::C32, GSMem::Z24>;
+         if (job.pp.writePixel == kCt32Z24 && g_ps2AbMode.load(std::memory_order_relaxed) != 13)
+         {
+-            if (!job.sprite.tme && g_ps2AbMode.load(std::memory_order_relaxed) != 58)
++            const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++            if (!job.sprite.tme && abMode != 58)
+                 return spriteFillRows<GSMem::C32, GSMem::Z24>(job, shift, count, index);
+             const SampleFn sample = job.sprite.tme ? job.sampler.sample : nullptr;
++            // Patch 0075 (A/B mode 60: not; nor in modes 38 and 40).
++            if (sample != nullptr && job.unordered && abMode != 60 && abMode != 38 && abMode != 40 &&
++                job.pp.ztestMethod != 0u && job.sampler.pageTable != nullptr && job.pp.scissorX0 <= job.pp.scissorX1 &&
++                job.pp.scissorY0 <= job.pp.scissorY1)
++            {
++                if (sample == &samplerSample<GSMem::C32>)
++                    return spriteTexRows<GSMem::C32, GSMem::Z24, GSMem::C32>(job, shift, count, index);
++                if (sample == &samplerSample<GSMem::P8>)
++                    return spriteTexRows<GSMem::C32, GSMem::Z24, GSMem::P8>(job, shift, count, index);
++                if (sample == &samplerSample<GSMem::P4>)
++                    return spriteTexRows<GSMem::C32, GSMem::Z24, GSMem::P4>(job, shift, count, index);
++                if (sample == &samplerSample<GSMem::C16>)
++                    return spriteTexRows<GSMem::C32, GSMem::Z24, GSMem::C16>(job, shift, count, index);
++            }
+             if (sample == nullptr)
+                 return rasterSpriteRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
+             if (sample == &samplerSample<GSMem::P8>)
+@@ -3934,6 +4376,7 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     job.isSprite = sprite;
+     job.isUpload = false;
+     job.isCopy = false;
++    job.unordered = false;
+     job.waitAll = 0u;
+     job.waitFirst = 0u;
+     // A/B modes 53 and 54: bands of twice and half the height (16 and 4 rows). A job with another band height than the
+@@ -3995,6 +4438,7 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+         rasterJobRows(job, 0, 1u, 0u);
+         return;
+     }
++    job.unordered = true;
+ 
+     // Wait for the pending jobs it conflicts with. Reading what a pending job writes, and writing what a pending job
+     // reads as a texture, by the last jobs of the blocks (A/B mode 19: the unions of the pending blocks; 15: by

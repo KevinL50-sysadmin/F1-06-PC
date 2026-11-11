@@ -1,0 +1,97 @@
+diff --git a/ps2xRuntime/include/ps2_heap_reserve.h b/ps2xRuntime/include/ps2_heap_reserve.h
+new file mode 100644
+index 0000000..800a9f4
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_heap_reserve.h
+@@ -0,0 +1,16 @@
++#ifndef PS2_HEAP_RESERVE_H
++#define PS2_HEAP_RESERVE_H
++
++#include <cstdint>
++
++namespace ps2_syscalls
++{
++    // Games that manage the heap with their own sbrk/malloc (instead of the runtime's HLE malloc) can
++    // reserve the top of the heap for runtime-internal allocations (SIF command packets, HLE buffers).
++    // SetupHeap then places the runtime heap in that reserve and EndOfHeap reports the start of the
++    // reserve as the end of the game heap, so both allocators never hand out the same memory.
++    // Call it from a game override (before the game runs SetupHeap). 0 keeps the default behaviour.
++    void setGuestHeapTopReserve(uint32_t bytes);
++}
++
++#endif // PS2_HEAP_RESERVE_H
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..4f7cc70 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "System.h"
++#include "ps2_heap_reserve.h"
+ 
+ namespace ps2_syscalls
+ {
+@@ -534,6 +535,17 @@ namespace ps2_syscalls
+         setReturnU32(ctx, sp);
+     }
+ 
++    namespace
++    {
++        uint32_t g_guestHeapTopReserve = 0u;
++        bool g_guestHeapReserveActive = false; // SetupHeap placed the runtime heap in the reserve
++    }
++
++    void setGuestHeapTopReserve(uint32_t bytes)
++    {
++        g_guestHeapTopReserve = bytes & ~0xFu;
++    }
++
+     // 0x3D SetupHeap: returns heap base/start pointer
+     void SetupHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+@@ -557,9 +569,15 @@ namespace ps2_syscalls
+             heapLimit = kDefaultGuestHeapEnd;
+         }
+ 
++        // With a top reserve the runtime heap lives above the game heap (see ps2_heap_reserve.h).
++        const bool reserveTop = g_guestHeapTopReserve != 0u &&
++                                static_cast<uint64_t>(heapBase) + g_guestHeapTopReserve < heapLimit;
++        const uint32_t runtimeHeapBase = reserveTop ? heapLimit - g_guestHeapTopReserve : heapBase;
++
+         if (runtime)
+         {
+-            runtime->configureGuestHeap(heapBase, heapLimit);
++            runtime->configureGuestHeap(runtimeHeapBase, heapLimit);
++            g_guestHeapReserveActive = reserveTop;
+ 
+             PS2_IF_AGRESSIVE_LOGS({
+                 std::cerr << "[SetupHeap]"
+@@ -571,7 +589,8 @@ namespace ps2_syscalls
+                           << std::dec << std::endl;
+             });
+ 
+-            setReturnU32(ctx, runtime->guestHeapBase());
++            // The game heap still starts at heapBase; only the runtime heap moved to the reserve.
++            setReturnU32(ctx, reserveTop ? heapBase : runtime->guestHeapBase());
+             return;
+         }
+ 
+@@ -585,9 +604,15 @@ namespace ps2_syscalls
+ 
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+ 
+-        const uint32_t ret = runtime
+-                                 ? runtime->guestHeapLimit()
+-                                 : kDefaultGuestHeapEnd;
++        uint32_t ret = runtime
++                           ? runtime->guestHeapLimit()
++                           : kDefaultGuestHeapEnd;
++
++        // With a top reserve the game heap ends where the runtime heap begins.
++        if (runtime && g_guestHeapReserveActive && runtime->guestHeapBase() < ret)
++        {
++            ret = runtime->guestHeapBase();
++        }
+ 
+         setReturnU32(ctx, ret);
+     }

@@ -1,0 +1,347 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index f5a0253..5f989eb 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -140,4 +140,13 @@ namespace ps2x
+     bool highResolutionAvailable(const OptionsMenuModel &model);
+     // rewriteOptionsText over the file's current text and writeTextFileAtomically; on success saved follows.
+     bool saveOptionsMenu(OptionsMenuModel &model, const std::filesystem::path &file, std::string &error);
++
++    // Phase 3 (T6): the options as numbers, for the game's own OPTIONS screens (Lua numbers are floats). An option
++    // whose choices are all integers (supersampling, vsync...) or without choices (volumen) is its value; one with
++    // named choices (filtro, pantalla) is the position of its value among them, from 0. False (number unchanged) for
++    // an unknown key or a value of another form (tamano_ventana).
++    bool menuOptionNumber(const OptionsMenuModel &model, const std::string &key, float &number);
++    // The value a number stands for (rounded to the nearest integer), through setMenuOption. alta_resolucion = 1 also
++    // needs highResolutionAvailable, as the F2 menu's row.
++    bool setMenuOptionNumber(OptionsMenuModel &model, const std::string &key, float number);
+ }
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index 0c76c2d..1dfbb3d 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -138,6 +138,15 @@ public:
+     void draw(PS2Runtime &runtime);
+     void endFrame();
+ 
++    // Phase 3 (T6): the game's own OPTIONS screens (Lua, the EE thread: src/f1_overrides.cpp) work on this menu's
++    // values, as numbers (ps2x::menuOptionNumber): a change is applied by update() in the next frame and Guardar
++    // writes the same opciones.ini. False when no menu is configured or for an option that is not a number.
++    static bool gameOptionNumber(const std::string &key, float &number);
++    static bool setGameOptionNumber(const std::string &key, float number);
++    // A screen opens: the values F11 and F10 may have changed, as when this menu opens.
++    static void syncGameOptions(PS2Runtime &runtime);
++    static bool saveGameOptions();
++
+ private:
+     struct State;
+     std::unique_ptr<State> m_state;
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index fb0c273..5053c57 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -4,6 +4,7 @@
+ #include "ps2_user_paths.h"
+ 
+ #include <cctype>
++#include <cmath>
+ #include <cstdlib>
+ #include <fstream>
+ #include <set>
+@@ -537,6 +538,56 @@ namespace ps2x
+         return true;
+     }
+ 
++    namespace
++    {
++        bool integerChoices(const OptionSpec &spec)
++        {
++            for (const OptionChoice &choice : spec.choices)
++                for (const char *c = choice.value; *c != '\0'; ++c)
++                    if (!std::isdigit(static_cast<unsigned char>(*c)))
++                        return false;
++            return true;
++        }
++    }
++
++    bool menuOptionNumber(const OptionsMenuModel &model, const std::string &key, float &number)
++    {
++        const OptionSpec *spec = findSpec(key);
++        const auto found = model.current.find(key);
++        if (spec == nullptr || spec->isValid != nullptr || found == model.current.end())
++            return false;
++        if (integerChoices(*spec))
++        {
++            number = static_cast<float>(std::atoi(found->second.c_str()));
++            return true;
++        }
++        for (size_t i = 0; i < spec->choices.size(); ++i)
++            if (found->second == spec->choices[i].value)
++            {
++                number = static_cast<float>(i);
++                return true;
++            }
++        return false;
++    }
++
++    bool setMenuOptionNumber(OptionsMenuModel &model, const std::string &key, float number)
++    {
++        const OptionSpec *spec = findSpec(key);
++        if (spec == nullptr || spec->isValid != nullptr || !(number > -1e6f && number < 1e6f))
++            return false;
++        const long rounded = std::lround(number);
++        std::string value;
++        if (integerChoices(*spec))
++            value = std::to_string(rounded);
++        else if (rounded >= 0 && static_cast<size_t>(rounded) < spec->choices.size())
++            value = spec->choices[static_cast<size_t>(rounded)].value;
++        else
++            return false;
++        if (key == "alta_resolucion" && value != "0" && !highResolutionAvailable(model))
++            return false;
++        return setMenuOption(model, key, value);
++    }
++
+     std::vector<MenuScriptStep> parseMenuScript(std::string_view text)
+     {
+         std::vector<MenuScriptStep> steps;
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index fa0b9d2..9bc51e1 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -14,6 +14,7 @@
+ #include <fstream>
+ #include <iostream>
+ #include <map>
++#include <mutex>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -185,11 +186,44 @@ struct PS2OptionsMenu::State
+     ImGuiStyle style;
+ };
+ 
++namespace
++{
++    // Phase 3 (T6): the menu whose values the game's OPTIONS screens use (gameOptionNumber...), and the lock of its
++    // model: update() and draw() run on the main thread, the game's screens on the EE thread.
++    std::mutex g_modelMutex;
++    PS2OptionsMenu *g_gameMenu = nullptr;
++
++    std::string readFile(const std::filesystem::path &file);
++
++    template <typename MenuState>
++    void ensureModel(MenuState &s)
++    {
++        if (s.modelReady)
++            return;
++        const ps2x::StartupOptions &startup = ps2x::startupOptions();
++        s.model = ps2x::makeOptionsMenuModel(readFile(s.file), s.mode == ps2x::UserPathsMode::Development,
++                                             startup.forced,
++                                             [](const char *name) { return static_cast<const char *>(std::getenv(name)); });
++        s.applied = s.model.current;
++        s.runningGs = ps2GsActiveGpuBackend() != nullptr ? "gpu" : "cpu";
++        s.applied["gs"] = s.runningGs;
++        s.modelReady = true;
++    }
++}
++
+ PS2OptionsMenu::PS2OptionsMenu() : m_state(std::make_unique<State>()) {}
+-PS2OptionsMenu::~PS2OptionsMenu() = default;
++
++PS2OptionsMenu::~PS2OptionsMenu()
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == this)
++        g_gameMenu = nullptr;
++}
+ 
+ void PS2OptionsMenu::configure(const std::filesystem::path &file, ps2x::UserPathsMode mode)
+ {
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    g_gameMenu = this;
+     m_state->file = file;
+     m_state->mode = mode;
+     if (const char *script = std::getenv("PS2X_MENU_GUION"))
+@@ -305,23 +339,11 @@ namespace
+ void PS2OptionsMenu::update(PS2Runtime &runtime)
+ {
+     State &s = *m_state;
++    std::lock_guard<std::mutex> lock(g_modelMutex);
+     if (!s.initialized)
+         return;
+     const double now = GetTime();
+ 
+-    const auto ensureModel = [&]()
+-    {
+-        if (s.modelReady)
+-            return;
+-        const ps2x::StartupOptions &startup = ps2x::startupOptions();
+-        s.model = ps2x::makeOptionsMenuModel(readFile(s.file), s.mode == ps2x::UserPathsMode::Development,
+-                                             startup.forced,
+-                                             [](const char *name) { return static_cast<const char *>(std::getenv(name)); });
+-        s.applied = s.model.current;
+-        s.runningGs = ps2GsActiveGpuBackend() != nullptr ? "gpu" : "cpu";
+-        s.applied["gs"] = s.runningGs;
+-        s.modelReady = true;
+-    };
+     const auto setOpen = [&](bool open)
+     {
+         if (open == s.open)
+@@ -329,7 +351,7 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+         s.open = open;
+         if (open)
+         {
+-            ensureModel();
++            ensureModel(s);
+             syncFromRuntime(s.model, s.applied, runtime);
+             s.focusFirstRow = true;
+             s.status.clear();
+@@ -347,7 +369,7 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     const auto runAction = [&](const std::string &action)
+     {
+         bool done = true;
+-        ensureModel();
++        ensureModel(s);
+         if (action == "abrir")
+             setOpen(true);
+         else if (action == "cerrar")
+@@ -486,6 +508,7 @@ void PS2OptionsMenu::endFrame()
+ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+ {
+     State &s = *m_state;
++    std::lock_guard<std::mutex> lock(g_modelMutex);
+     if (!s.initialized || !s.open)
+         return;
+ 
+@@ -757,3 +780,44 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+     applyLive(s.model, s.applied, runtime);
+     ps2x::setOptionsMenuOpen(s.open);
+ }
++
++bool PS2OptionsMenu::gameOptionNumber(const std::string &key, float &number)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    return ps2x::menuOptionNumber(s.model, key, number);
++}
++
++bool PS2OptionsMenu::setGameOptionNumber(const std::string &key, float number)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    return ps2x::setMenuOptionNumber(s.model, key, number);
++}
++
++void PS2OptionsMenu::syncGameOptions(PS2Runtime &runtime)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    syncFromRuntime(s.model, s.applied, runtime);
++}
++
++bool PS2OptionsMenu::saveGameOptions()
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    saveAndReport(s.model, s.file, s.status, s.statusError);
++    return !s.statusError;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f6ab4c4..0148ffc 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -533,6 +533,13 @@ namespace
+                                             ps2x::pathForLog(mod.hostPath) + " (" + std::to_string(mod.size) +
+                                             " bytes)");
+             }
++            else if (mod.relativePath.extension() == ".lua" || mod.relativePath.extension() == ".LUA")
++            {
++                // Phase 3 (T6): a Lua chunk of the game's scripts (inside its .luc files, not on the disc): the game's
++                // lua_load hook (f1_overrides.cpp, "[mods-lua]") loads it by its chunk name.
++                shared.modsReport.push_back("[mods] " + ps2x::pathForLog(mod.relativePath) +
++                                            ": trozo de Lua (lo carga el gancho de lua_load, no es un archivo del disco)");
++            }
+             else
+             {
+                 shared.modsReport.push_back("[mods] " + ps2x::pathForLog(mod.relativePath) +
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 875a168..9ee3ce9 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -254,6 +254,63 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(!fs::exists(dir.path / "opciones.ini.tmp"), "no temporary file left");
+         });
+ 
++        tc.Run("the game's OPTIONS screens read the options as numbers", [](TestCase &t)
++        {
++            const ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            const auto number = [&model](const char *key)
++            {
++                float value = -99.0f;
++                return ps2x::menuOptionNumber(model, key, value) ? value : -99.0f;
++            };
++            t.Equals(number("filtro"), 3.0f, "fsr: the fourth choice");
++            t.Equals(number("pantalla"), 0.0f, "ventana: the first");
++            t.Equals(number("supersampling"), 4.0f, "integer choices are their value");
++            t.Equals(number("alta_resolucion"), 1.0f, "alta_resolucion 1");
++            t.Equals(number("vsync"), 1.0f, "vsync 1");
++            t.Equals(number("mostrar_fps"), 0.0f, "mostrar_fps 0");
++            t.Equals(number("volumen"), 100.0f, "no choices: the value");
++            float value = -99.0f;
++            t.IsFalse(ps2x::menuOptionNumber(model, "tamano_ventana", value), "a window size is not a number");
++            t.IsFalse(ps2x::menuOptionNumber(model, "no_existe", value), "an unknown key");
++            t.Equals(value, -99.0f, "leaves the number alone");
++        });
++
++        tc.Run("setMenuOptionNumber sets the value a number stands for, with the F2 menu's rules", [](TestCase &t)
++        {
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "filtro", 4.0f), "filtro 4");
++            t.Equals(model.current.at("filtro"), std::string("crt"), "is crt");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "filtro", 5.0f), "past the last choice");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "filtro", -1.0f), "before the first");
++            t.Equals(model.current.at("filtro"), std::string("crt"), "unchanged");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "pantalla", 2.0f), "pantalla 2");
++            t.Equals(model.current.at("pantalla"), std::string("completa"), "is completa");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "supersampling", 3.0f), "x3 is not a choice");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "supersampling", 16.0f), "x16");
++            t.Equals(model.current.at("supersampling"), std::string("16"), "is 16");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "supersampling", 2.0f), "x2");
++            t.Equals(model.current.at("alta_resolucion"), std::string("0"), "double resolution goes off under x4");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "alta_resolucion", 1.0f), "and cannot be chosen under x4");
++            t.Equals(model.current.at("alta_resolucion"), std::string("0"), "still off");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "alta_resolucion", 0.0f), "off is always allowed");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "supersampling", 8.0f), "x8");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "alta_resolucion", 1.0f), "double resolution with x8");
++            t.Equals(model.current.at("alta_resolucion"), std::string("1"), "on");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "volumen", 37.6f), "a volume");
++            t.Equals(model.current.at("volumen"), std::string("38"), "rounded to the nearest integer");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "volumen", 101.0f), "over 100");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "tamano_ventana", 1.0f), "not a number option");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "no_existe", 1.0f), "an unknown key");
++
++            const Environment environment = {{"PS2X_VSYNC", "0"}};
++            ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            t.IsFalse(ps2x::setMenuOptionNumber(forced, "vsync", 1.0f), "a forced option does not change");
++            t.Equals(forced.current.at("vsync"), std::string("0"), "it keeps its variable's value");
++            t.IsTrue(ps2x::setMenuOption(forced, "gs", "cpu"), "the CPU GS");
++            t.IsFalse(ps2x::setMenuOptionNumber(forced, "alta_resolucion", 1.0f), "no double resolution with gs = cpu");
++        });
++
+         tc.Run("the pad combo fires once after being held for its time", [](TestCase &t)
+         {
+             ps2x::HoldComboDetector combo(0.5);

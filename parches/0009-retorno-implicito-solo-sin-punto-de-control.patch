@@ -1,0 +1,69 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..5eedb39 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1342,6 +1343,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++namespace
++{
++    // Executor-thread counters used by dispatchGuestBranch to tell a callee that really returned from one that
++    // yielded (checkpoint) or transferred control (jump) while its PC happened to equal its entry address.
++    // File statics instead of PS2Runtime members so ps2_runtime.h (and every generated file) stays untouched.
++    uint64_t g_eeCheckpointSerial = 0u;
++    uint64_t g_eeJumpSerial = 0u;
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1358,11 +1368,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        ++g_eeCheckpointSerial;
+         return false;
+     }
+ 
+     if (!isCall)
+     {
++        ++g_eeJumpSerial;
+         if (!hasFunction(targetPc))
+         {
+             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+@@ -1396,6 +1408,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    const uint64_t checkpointSerial = g_eeCheckpointSerial;
++    const uint64_t jumpSerial = g_eeJumpSerial;
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1403,7 +1417,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc)
++    // A callee that leaves ctx->pc untouched (HLE stubs) has returned. But a callee that yielded at a checkpoint
++    // or jumped back to its own entry also leaves ctx->pc == entryPc: treating that as a return skipped the rest of
++    // the callee with its stack frame still allocated, and a later epilogue read a wrong saved $ra (F1 06 crashed in
++    // its Lua front end). Only take the implicit return when neither happened during the call.
++    if (ctx->pc == entryPc && g_eeCheckpointSerial == checkpointSerial && g_eeJumpSerial == jumpSerial)
+     {
+         ctx->pc = fallthroughPc;
+     }
+@@ -2211,7 +2234,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++    if (due)
++        ++g_eeCheckpointSerial;
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+

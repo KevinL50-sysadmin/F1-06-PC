@@ -1,0 +1,66 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 76fc5e4..e190f9c 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -16,6 +16,9 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++// ps2_runtime.cpp: changes whenever a dispatch yielded at a checkpoint or jumped (see dispatchGuestBranch).
++uint64_t ps2EeControlTransferSerial() noexcept;
++
+ namespace
+ {
+     // PS2X_EE_DESPACHOS=1: see EeScheduler::run.
+@@ -417,9 +420,33 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            const uint32_t dispatchedPc = context.pc;
++            const int dispatchedThread = running->id;
++            const size_t dispatchedInvocations = running->invocations.size();
++            const uint64_t transferSerial = ps2EeControlTransferSerial();
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
++            // Implicit return, as in dispatchGuestBranch: a function that leaves ctx->pc untouched without yielding
++            // or jumping is an HLE stub or override (they do not set pc = $ra) that has returned. This happens when a
++            // checkpoint fell due right at the call boundary: dispatchGuestBranch gave the thread back with pc = the
++            // callee's entry and this loop resumed it here. Without this the loop called the stub again forever
++            // (F1 06 hang in the menus: sceMpegIsEnd, replaced by videoTerminado, ~13 M times/s for minutes).
++            // A guest function that ended with "jr $ra" already has pc == $ra, so this changes nothing for it (it
++            // happens with self-recursive functions, whose inner call the recompiler turns into a goto: F1 06's
++            // func_2F8D48 comes back here with pc == $ra == 0x2F8EF8 or 0x2F8F08).
++            if (context.pc == dispatchedPc && ps2EeControlTransferSerial() == transferSerial)
++            {
++                const uint32_t returnPc = getRegU32(&context, 31);
++                static uint32_t s_implicitReturnLogs = 0u;
++                if (returnPc != dispatchedPc && s_implicitReturnLogs < 32u)
++                {
++                    ++s_implicitReturnLogs;
++                    std::fprintf(stderr, "[ee:vuelta-implicita] pc=0x%x ra=0x%x hilo=%d invocaciones=%zu\n",
++                                 dispatchedPc, returnPc, dispatchedThread, dispatchedInvocations);
++                }
++                context.pc = returnPc;
++            }
+             if (countDispatch)
+                 eeDispatchCount(1, context.pc, 0u, 0);
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c3d1e9f..0ffcc24 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1464,6 +1464,13 @@ namespace
+     uint64_t g_eeJumpSerial = 0u;
+ }
+ 
++// For EeScheduler::run (declared there, so ps2_runtime.h stays untouched): changes whenever a dispatch yielded at a
++// checkpoint or jumped, so the scheduler can apply the same implicit-return rule as dispatchGuestBranch.
++uint64_t ps2EeControlTransferSerial() noexcept
++{
++    return g_eeCheckpointSerial + g_eeJumpSerial;
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,

@@ -1,0 +1,1881 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index a46e547..46bd147 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -409,6 +409,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_netplay_crypto.cpp
+     src/lib/ps2_netplay_guest.cpp
+     src/lib/ps2_netplay_protocol.cpp
++    src/lib/ps2_netplay_session.cpp
+     src/lib/ps2_netplay_video.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+@@ -600,6 +601,10 @@ if(WIN32)
+     target_link_libraries(ps2_runtime PRIVATE shell32 ole32)
+     target_link_libraries(ps2_runtime PUBLIC ws2_32 bcrypt)
+ endif()
++# Fase 5 (T15, N4): the guest's form has Spanish texts in UTF-8 (accents), drawn with a Windows font.
++if(MSVC)
++    set_source_files_properties(src/lib/ps2_netplay_guest.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index 0986f29..018ad49 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -319,6 +319,38 @@ namespace ps2x::netplay
+ #endif
+     }
+ 
++#if defined(_WIN32)
++    std::vector<std::string> localIpv4Addresses()
++    {
++        std::vector<std::string> out;
++        if (!ensureWinsock())
++            return out;
++        char name[256] = {};
++        if (gethostname(name, sizeof(name)) != 0)
++            return out;
++        addrinfo hints{};
++        hints.ai_family = AF_INET;
++        hints.ai_socktype = SOCK_STREAM;
++        addrinfo *list = nullptr;
++        if (getaddrinfo(name, nullptr, &hints, &list) != 0)
++            return out;
++        for (addrinfo *a = list; a != nullptr; a = a->ai_next)
++        {
++            const std::string text = addressText(a->ai_addr, static_cast<int>(a->ai_addrlen), false);
++            if (text != "?" && text.rfind("127.", 0) != 0 && text.rfind("169.254.", 0) != 0 &&
++                std::find(out.begin(), out.end(), text) == out.end())
++                out.push_back(text);
++        }
++        freeaddrinfo(list);
++        return out;
++    }
++#else
++    std::vector<std::string> localIpv4Addresses()
++    {
++        return {};
++    }
++#endif
++
+     bool hostPictureWanted()
+     {
+         return g_pictureWanted.load(std::memory_order_relaxed);
+@@ -413,6 +445,8 @@ namespace ps2x::netplay
+         };
+         SOCKET client = INVALID_SOCKET;
+         std::string clientAddress;
++        mutable std::mutex guestAddressMutex;
++        std::string guestAddress; // N4: clientAddress while it is the guest (any thread)
+         Phase phase = Phase::None;
+         MessageAuth auth;
+         FrameReader reader{auth};
+@@ -640,6 +674,10 @@ namespace ps2x::netplay
+         {
+             clearRemote(this);
+             connected = false;
++            {
++                std::lock_guard<std::mutex> lock(guestAddressMutex);
++                guestAddress.clear();
++            }
+             logLine("invitado %s desconectado (%s); el puerto 2 vuelve a [jugador2] de controles.ini o queda sin mando",
+                     clientAddress.c_str(), why.c_str());
+         }
+@@ -1140,6 +1178,10 @@ namespace ps2x::netplay
+             {
+                 phase = Phase::Session;
+                 handshake.reset();
++                {
++                    std::lock_guard<std::mutex> lock(guestAddressMutex);
++                    guestAddress = clientAddress;
++                }
+                 connected = true;
+                 lastPing = statsStart = Clock::now();
+                 statsPads = 0;
+@@ -1326,7 +1368,7 @@ namespace ps2x::netplay
+             lingerTick();
+         }
+         if (client != INVALID_SOCKET)
+-            drop("el anfitrion se cierra", true, ByeReason::Shutdown);
++            drop("el anfitrion para", true, ByeReason::Shutdown);
+         for (Lingering &l : lingering)
+             closesocket(l.socket);
+         lingering.clear();
+@@ -1378,6 +1420,12 @@ namespace ps2x::netplay
+         return m_impl->connected;
+     }
+ 
++    std::string Host::guestAddress() const
++    {
++        std::lock_guard<std::mutex> lock(m_impl->guestAddressMutex);
++        return m_impl->guestAddress;
++    }
++
+     uint64_t Host::padMessages() const
+     {
+         return m_impl->padMessages;
+@@ -2114,6 +2162,7 @@ namespace ps2x::netplay
+     void Host::stop() {}
+     uint16_t Host::port() const { return 0; }
+     bool Host::guestConnected() const { return false; }
++    std::string Host::guestAddress() const { return {}; }
+     uint64_t Host::padMessages() const { return 0; }
+     uint64_t Host::rejectedLogins() const { return 0; }
+     HostVideoStats Host::videoStats() const { return {}; }
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.h b/ps2xRuntime/src/lib/ps2_netplay.h
+index 0f8e506..bc0acc4 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.h
++++ b/ps2xRuntime/src/lib/ps2_netplay.h
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ // Fase 5 (T15, netplay N1): own netplay inside F1-06.exe, by IP (LAN or a VPN like Tailscale/ZeroTier, no router
+ // ports). The host runs the game and listens on one TCP port for one guest; the guest (no game, a small window) sends
+@@ -70,6 +71,7 @@ namespace ps2x::netplay
+         void stop();
+         uint16_t port() const;
+         bool guestConnected() const;
++        std::string guestAddress() const; // N4: "1.2.3.4:5" while a guest is connected, else empty
+         uint64_t padMessages() const;
+         uint64_t rejectedLogins() const;
+         HostVideoStats videoStats() const;
+@@ -83,6 +85,9 @@ namespace ps2x::netplay
+     // The host's picture (N2), from the window's thread: whether a guest wants it now (cheap) and the latched frame
+     // (RGBA). The copy is the only work done in the caller's thread; a picture offered while the encoder is busy
+     // replaces the one waiting.
++    // N4: this PC's IPv4 addresses (no loopback nor link-local), to tell the guest where to connect.
++    std::vector<std::string> localIpv4Addresses();
++
+     bool hostPictureWanted();
+     void offerHostPicture(const uint8_t *rgba, uint32_t width, uint32_t height, size_t stride);
+     // The aspect the host's window shows the picture at (width / height): 4:3, 16:9 or the frame's own.
+@@ -174,6 +179,8 @@ namespace ps2x::netplay
+     bool readRemotePad(PadWire &pad);
+ 
+     // Guest mode of F1-06.exe: its window (state of the connection) and the local pad (player 1 of the guest's own
+-    // controles.ini) sent to the host. Returns the process exit code.
+-    int runGuestWindow(const GuestSettings &settings);
++    // controles.ini) sent to the host. Returns the process exit code. N4: askFirst (--invitado without an address or a
++    // password) shows a form first (address, port, password; the last address and port from configed.ini), and
++    // again after a session ends.
++    int runGuestWindow(const GuestSettings &settings, bool askFirst = false);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index ab71893..2682c94 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_netplay.h"
++#include "ps2_netplay_session.h"
+ #include "ps2_host_backend.h"
+ #include "runtime/ps2_pad.h"
+ 
+@@ -10,6 +11,8 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <memory>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -23,13 +26,16 @@ extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hW
+ // pad (player 1 of this PC's controles.ini: keys, gamepad, wheel) to the host ~60 times per second. N2: the host's
+ // picture fills the window (its aspect kept, black bars), with a line of figures (size, pictures per second, bit rate,
+ // round trip, latency; F3 hides it). N3: the host's sound through this PC's audio device (M silences it, Re Pag / Av Pag
+-// or + / - on the keypad change the volume), with its figures on a second line.
++// or + / - on the keypad change the volume), with its figures on a second line. N4: without an address or a password
++// (--invitado alone, the "Jugar en red - Invitado" shortcut) a form asks for them first and comes back when a session
++// ends; the address and port that connect are remembered in config\red.ini (never the password).
+ namespace ps2x::netplay
+ {
+     namespace
+     {
+         // N3: the guest whose sound the audio device's thread plays, and PS2X_INVITADO_WAV.
+         std::atomic<Guest *> g_audioGuest{nullptr};
++        std::mutex g_audioGuestMutex; // N4: held while the device pulls, so the form can replace the guest safely
+         FILE *g_guestWav = nullptr;
+ 
+         // The audio device's thread: what the jitter buffer gives (silence without a guest). PS2X_INVITADO_WAV=<path>
+@@ -38,10 +44,13 @@ namespace ps2x::netplay
+         void guestAudioCallback(void *buffer, unsigned int frames)
+         {
+             int16_t *out = static_cast<int16_t *>(buffer);
+-            if (Guest *guest = g_audioGuest.load(std::memory_order_acquire))
+-                guest->pullAudio(out, frames);
+-            else
+-                std::memset(out, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
++            {
++                std::lock_guard<std::mutex> lock(g_audioGuestMutex);
++                if (Guest *guest = g_audioGuest.load(std::memory_order_acquire))
++                    guest->pullAudio(out, frames);
++                else
++                    std::memset(out, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
++            }
+             if (g_guestWav)
+                 std::fwrite(out, sizeof(int16_t) * 2u, frames, g_guestWav);
+         }
+@@ -73,8 +82,8 @@ namespace ps2x::netplay
+             return out.empty() ? "-" : out;
+         }
+ 
+-        // The connection screen (before the first picture, or when the session ends).
+-        void drawStatus(const GuestStatus &status, const PadWire &wire, int screenHeight)
++        // The connection screen (before the first picture, or when the session ends). canReturn: the form is there.
++        void drawStatus(const GuestStatus &status, const PadWire &wire, int screenHeight, bool canReturn)
+         {
+             ClearBackground(Color{18, 22, 30, 255});
+             DrawText("FORMULA ONE 06 - JUEGO EN RED", 24, 20, 24, RAYWHITE);
+@@ -95,9 +104,137 @@ namespace ps2x::netplay
+                          236, 18, LIGHTGRAY);
+                 DrawText("Esperando la imagen del anfitrion...", 24, 270, 18, YELLOW);
+             }
++            const bool ended = status.state == GuestState::Rejected || status.state == GuestState::Disconnected ||
++                               status.state == GuestState::Failed;
++            if (canReturn && ended)
++                DrawText("Pulsa Intro para volver a la conexion (direccion, puerto y contrasena).", 24, 186, 18, YELLOW);
+             DrawText("Cierra la ventana para salir.", 24, screenHeight - 30, 14, GRAY);
+         }
+ 
++        // N4: the form. Its texts carry accents: Segoe UI from the Windows fonts folder with the Spanish letters
++        // (raylib's own font when it is missing).
++        struct GuestFormScreen
++        {
++            GuestForm fields;
++            int focus = 0; // 0 address, 1 port, 2 password
++            bool showPassword = false;
++            std::string error;
++            Font font{};
++            bool ownFont = false;
++        };
++
++        Font loadFormFont()
++        {
++            const char *windows = std::getenv("WINDIR");
++            if (windows != nullptr)
++            {
++                const std::filesystem::path path = std::filesystem::path(windows) / "Fonts" / "segoeui.ttf";
++                std::error_code error;
++                if (std::filesystem::exists(path, error))
++                {
++                    std::vector<int> codepoints;
++                    for (int c = 32; c < 127; ++c)
++                        codepoints.push_back(c);
++                    for (int c : {0xE1, 0xE9, 0xED, 0xF3, 0xFA, 0xFC, 0xF1, 0xC1, 0xC9, 0xCD, 0xD3, 0xDA, 0xDC, 0xD1, 0xBF,
++                                  0xA1, 0xAB, 0xBB, 0xB7})
++                        codepoints.push_back(c);
++                    Font font = LoadFontEx(path.string().c_str(), 40, codepoints.data(), static_cast<int>(codepoints.size()));
++                    if (font.texture.id != 0)
++                    {
++                        SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
++                        return font;
++                    }
++                }
++            }
++            return GetFontDefault();
++        }
++
++        // Typed characters, Backspace, Ctrl+V, Tab and the arrows, Enter or a click on Conectar. True: connect.
++        bool updateForm(GuestFormScreen &form, const Rectangle (&boxes)[3], const Rectangle &button)
++        {
++            std::string *fields[3] = {&form.fields.address, &form.fields.port, &form.fields.password};
++            const size_t limits[3] = {253, 5, kMaxPasswordSize};
++            const auto accept = [&](int c) -> bool
++            {
++                if (c < 32 || c > 126)
++                    return false;
++                if (form.focus == 1)
++                    return c >= '0' && c <= '9';
++                if (form.focus == 0)
++                    return c != ' ';
++                return true;
++            };
++            const auto add = [&](int c)
++            {
++                std::string &field = *fields[form.focus];
++                if (accept(c) && field.size() < limits[form.focus])
++                    field += static_cast<char>(c);
++            };
++            for (int c = GetCharPressed(); c != 0; c = GetCharPressed())
++                add(c);
++            const bool control = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
++            if (control && IsKeyPressed(KEY_V))
++                if (const char *clip = GetClipboardText())
++                    for (const char *p = clip; *p != '\0'; ++p)
++                        add(static_cast<unsigned char>(*p));
++            if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && !fields[form.focus]->empty())
++                fields[form.focus]->pop_back();
++            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
++            if ((IsKeyPressed(KEY_TAB) && !shift) || IsKeyPressed(KEY_DOWN))
++                form.focus = (form.focus + 1) % 3;
++            if ((IsKeyPressed(KEY_TAB) && shift) || IsKeyPressed(KEY_UP))
++                form.focus = (form.focus + 2) % 3;
++            if (IsKeyPressed(KEY_F4))
++                form.showPassword = !form.showPassword;
++            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++            {
++                const Vector2 mouse = GetMousePosition();
++                for (int i = 0; i < 3; ++i)
++                    if (CheckCollisionPointRec(mouse, boxes[i]))
++                        form.focus = i;
++                if (CheckCollisionPointRec(mouse, button))
++                    return true;
++            }
++            return IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
++        }
++
++        void drawForm(const GuestFormScreen &form, const Rectangle (&boxes)[3], const Rectangle &button, int screenHeight)
++        {
++            const Font &font = form.font;
++            const auto text = [&](const char *s, float x, float y, float size, Color color)
++            { DrawTextEx(font, s, Vector2{x, y}, size, 1.0f, color); };
++            ClearBackground(Color{18, 22, 30, 255});
++            text("FORMULA ONE 06 - JUEGO EN RED", 24, 16, 30, RAYWHITE);
++            text("Invitado: juegas como jugador 2 en el PC del anfitrión, a pantalla partida. Ves y oyes su juego.", 24,
++                 56, 19, LIGHTGRAY);
++            static const char *const kLabels[3] = {"Dirección IP del anfitrión", "Puerto", "Contraseña"};
++            const std::string *values[3] = {&form.fields.address, &form.fields.port, &form.fields.password};
++            const bool blink = static_cast<int>(GetTime() * 2.0) % 2 == 0;
++            for (int i = 0; i < 3; ++i)
++            {
++                const Rectangle &box = boxes[i];
++                text(kLabels[i], 24, box.y + 8, 22, RAYWHITE);
++                DrawRectangleRec(box, form.focus == i ? Color{38, 56, 96, 255} : Color{30, 36, 50, 255});
++                DrawRectangleLinesEx(box, 2, form.focus == i ? Color{120, 160, 240, 255} : Color{70, 80, 100, 255});
++                std::string shown = i == 2 && !form.showPassword ? std::string(values[i]->size(), '*') : *values[i];
++                if (form.focus == i && blink)
++                    shown += "_";
++                text(shown.c_str(), box.x + 10, box.y + 8, 24, RAYWHITE);
++            }
++            DrawRectangleRec(button, Color{26, 64, 148, 255});
++            DrawRectangleLinesEx(button, 2, Color{120, 160, 240, 255});
++            const Vector2 size = MeasureTextEx(font, "Conectar", 24, 1.0f);
++            text("Conectar", button.x + (button.width - size.x) * 0.5f, button.y + (button.height - size.y) * 0.5f, 24,
++                 RAYWHITE);
++            if (!form.error.empty())
++                text(form.error.c_str(), 24, button.y + button.height + 18, 20, Color{255, 110, 110, 255});
++            text("Tab o flechas: cambiar de campo  ·  Intro: conectar  ·  Ctrl+V: pegar  ·  F4: ver la contraseña", 24,
++                 static_cast<float>(screenHeight) - 92, 18, LIGHTGRAY);
++            text("El anfitrión ve su dirección, su puerto y la contraseña en su menú F2 > Juego en red.", 24,
++                 static_cast<float>(screenHeight) - 66, 18, LIGHTGRAY);
++            text("Cierra la ventana para salir.", 24, static_cast<float>(screenHeight) - 36, 16, GRAY);
++        }
++
+         // PS2X_CAPTURA_PETICION=<file>, as in the game's window (ps2_runtime.cpp): when the file exists, the window as
+         // drawn is saved as a PNG at the path written in it, and the file is deleted.
+         void saveRequestedCapture(const RenderTexture2D &canvas)
+@@ -132,7 +269,7 @@ namespace ps2x::netplay
+         }
+     }
+ 
+-    int runGuestWindow(const GuestSettings &settings)
++    int runGuestWindow(const GuestSettings &settings, bool askFirst)
+     {
+         // PS2X_BACKGROUND_WINDOW=1 (automated runs), as the game's window: never takes the focus, off-screen.
+         const char *background = std::getenv("PS2X_BACKGROUND_WINDOW");
+@@ -151,15 +288,34 @@ namespace ps2x::netplay
+         SetExitKey(KEY_NULL); // ESC may be one of the player's controls
+         SetTargetFPS(120);    // a new picture shows at most ~8 ms after it was decoded
+ 
+-        Guest guest;
+-        guest.start(settings);
++        // N4: the form first when something is missing; the address and port of red.ini fill what the command line
++        // did not give.
++        GuestFormScreen form;
++        bool inForm = askFirst;
++        if (askFirst)
++        {
++            const GuestMemory memory = loadGuestMemory(guestMemoryFile());
++            form.fields.address = settings.host.empty() ? memory.address : settings.host;
++            const uint16_t port = settings.host.empty() ? memory.port : settings.port;
++            form.fields.port = std::to_string(port);
++            form.fields.password = settings.password;
++            form.focus = !form.fields.address.empty() && form.fields.password.empty() ? 2 : 0;
++            form.font = loadFormFont();
++            form.ownFont = form.font.texture.id != GetFontDefault().texture.id;
++            std::fprintf(stderr, "[red] invitado: formulario de conexion%s\n",
++                         memory.address.empty() ? "" : " (direccion y puerto de red.ini)");
++            std::fflush(stderr);
++        }
++        std::unique_ptr<Guest> guest = std::make_unique<Guest>();
++        if (!inForm)
++            guest->start(settings);
+         // N3: the host's sound. The automated runs (background window) keep it silent so they do not play over the
+         // user's sound, as the game's window does; PS2X_SONIDO=1 makes them audible. PS2X_VOLUMEN (0-100) starts it.
+         InitAudioDevice();
+         AudioStream sound{};
+         const bool soundReady = IsAudioDeviceReady();
+         if (const char *volume = std::getenv("PS2X_VOLUMEN"))
+-            guest.setAudioVolume(static_cast<float>(std::clamp(std::atoi(volume), 0, 100)) / 100.0f);
++            guest->setAudioVolume(static_cast<float>(std::clamp(std::atoi(volume), 0, 100)) / 100.0f);
+         if (soundReady)
+         {
+             if (const char *path = std::getenv("PS2X_INVITADO_WAV"))
+@@ -173,7 +329,7 @@ namespace ps2x::netplay
+             }
+             SetAudioStreamBufferSizeDefault(1024);
+             sound = LoadAudioStream(kAudioSampleRate, 16, kAudioChannels);
+-            g_audioGuest.store(&guest, std::memory_order_release);
++            g_audioGuest.store(guest.get(), std::memory_order_release);
+             SetAudioStreamCallback(sound, guestAudioCallback);
+             const char *soundEnv = std::getenv("PS2X_SONIDO");
+             if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
+@@ -192,10 +348,90 @@ namespace ps2x::netplay
+         bool showFigures = true;
+         while (!WindowShouldClose())
+         {
++            const int screenWidth = std::max(1, GetScreenWidth()), screenHeight = std::max(1, GetScreenHeight());
++            if (canvas.id == 0 || canvas.texture.width != screenWidth || canvas.texture.height != screenHeight)
++            {
++                if (canvas.id != 0)
++                    UnloadRenderTexture(canvas);
++                canvas = LoadRenderTexture(screenWidth, screenHeight);
++            }
++
++            // A session that ended: Enter goes back to the form, the fields as they were and what went wrong under them.
++            // That Enter must not also send the form: raylib only sees it released after the next drawn frame.
++            bool returning = false;
++            if (askFirst && !inForm && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)))
++            {
++                const GuestStatus ended = guest->status();
++                if (ended.state == GuestState::Rejected || ended.state == GuestState::Disconnected ||
++                    ended.state == GuestState::Failed)
++                {
++                    form.error = ended.text;
++                    inForm = true;
++                    returning = true;
++                    while (GetCharPressed() != 0)
++                    {
++                    }
++                }
++            }
++
++            if (inForm)
++            {
++                const Rectangle boxes[3] = {{330, 100, 400, 44}, {330, 156, 160, 44}, {330, 212, 400, 44}};
++                const Rectangle button{330, 276, 200, 48};
++                if (updateForm(form, boxes, button) && !returning)
++                {
++                    GuestSettings chosen;
++                    if (validateGuestForm(form.fields, chosen, form.error))
++                    {
++                        form.error.clear();
++                        std::string error;
++                        if (!saveGuestMemory(guestMemoryFile(), rememberedFrom(chosen), error))
++                            std::fprintf(stderr, "[red] no se pudo guardar red.ini: %s\n", error.c_str());
++                        // A new guest for each try: the audio device's thread lets go of the old one first.
++                        const float volume = guest->audioVolume();
++                        const bool muted = guest->audioMuted();
++                        {
++                            std::lock_guard<std::mutex> lock(g_audioGuestMutex);
++                            g_audioGuest.store(nullptr, std::memory_order_release);
++                        }
++                        guest = std::make_unique<Guest>();
++                        guest->setAudioVolume(volume);
++                        guest->setAudioMuted(muted);
++                        guest->start(chosen);
++                        if (soundReady)
++                            g_audioGuest.store(guest.get(), std::memory_order_release);
++                        lastState = GuestState::Idle;
++                        inForm = false;
++                        std::fprintf(stderr, "[red] invitado: conectando a %s puerto %u\n", chosen.host.c_str(),
++                                     static_cast<unsigned>(chosen.port));
++                        std::fflush(stderr);
++                    }
++                    else
++                    {
++                        std::fprintf(stderr, "[red] invitado: formulario no valido\n");
++                        std::fflush(stderr);
++                    }
++                }
++                if (inForm)
++                {
++                    BeginTextureMode(canvas);
++                    drawForm(form, boxes, button, screenHeight);
++                    EndTextureMode();
++                    saveRequestedCapture(canvas);
++                    BeginDrawing();
++                    ClearBackground(BLACK);
++                    DrawTextureRec(canvas.texture,
++                                   Rectangle{0, 0, static_cast<float>(screenWidth), -static_cast<float>(screenHeight)},
++                                   Vector2{0, 0}, WHITE);
++                    EndDrawing();
++                    continue;
++                }
++            }
++
+             pad.readState(0, 0, report, sizeof(report));
+             const PadWire wire = padWireFromReport(report);
+-            guest.setPad(wire);
+-            const GuestStatus status = guest.status();
++            guest->setPad(wire);
++            const GuestStatus status = guest->status();
+             if (status.state != lastState)
+             {
+                 lastState = status.state;
+@@ -204,7 +440,7 @@ namespace ps2x::netplay
+             }
+ 
+             uint16_t width = 0, height = 0;
+-            if (guest.takePicture(rgba, width, height) && width > 0 && height > 0 &&
++            if (guest->takePicture(rgba, width, height) && width > 0 && height > 0 &&
+                 rgba.size() == static_cast<size_t>(width) * height * 4u)
+             {
+                 if (picture.id == 0 || picture.width != width || picture.height != height)
+@@ -222,7 +458,7 @@ namespace ps2x::netplay
+                 showFigures = !showFigures;
+             if (IsKeyPressed(KEY_M))
+             {
+-                guest.setAudioMuted(!guest.audioMuted());
++                guest->setAudioMuted(!guest->audioMuted());
+                 soundMessageUntil = GetTime() + 2.0;
+             }
+             const bool louder = IsKeyPressed(KEY_PAGE_UP) || IsKeyPressed(KEY_KP_ADD);
+@@ -230,20 +466,13 @@ namespace ps2x::netplay
+             if (louder || quieter)
+             {
+                 const float step = louder ? 0.1f : -0.1f;
+-                guest.setAudioVolume(std::round((guest.audioVolume() + step) * 10.0f) / 10.0f);
+-                guest.setAudioMuted(false);
++                guest->setAudioVolume(std::round((guest->audioVolume() + step) * 10.0f) / 10.0f);
++                guest->setAudioMuted(false);
+                 soundMessageUntil = GetTime() + 2.0;
+             }
+ 
+             // Drawn into a texture first: the capture asked for by PS2X_CAPTURA_PETICION reads it back even with the
+             // window hidden (automated runs).
+-            const int screenWidth = std::max(1, GetScreenWidth()), screenHeight = std::max(1, GetScreenHeight());
+-            if (canvas.id == 0 || canvas.texture.width != screenWidth || canvas.texture.height != screenHeight)
+-            {
+-                if (canvas.id != 0)
+-                    UnloadRenderTexture(canvas);
+-                canvas = LoadRenderTexture(screenWidth, screenHeight);
+-            }
+             BeginTextureMode(canvas);
+             if (status.state == GuestState::Connected && picture.id != 0)
+             {
+@@ -276,20 +505,20 @@ namespace ps2x::netplay
+                             status.audioCodec.c_str(), static_cast<double>(status.audioKbps),
+                             static_cast<unsigned>(status.audioBufferMs),
+                             static_cast<unsigned long long>(status.audioUnderruns), syncText.c_str(),
+-                            static_cast<int>(std::lround(guest.audioVolume() * 100.0f)),
+-                            guest.audioMuted() ? "  SILENCIO" : "");
++                            static_cast<int>(std::lround(guest->audioVolume() * 100.0f)),
++                            guest->audioMuted() ? "  SILENCIO" : "");
+                         DrawRectangle(0, 24, MeasureText(audioLine, 16) + 16, 22, Color{0, 0, 0, 160});
+                         DrawText(audioLine, 8, 27, 16, RAYWHITE);
+                     }
+                 }
+             }
+             else
+-                drawStatus(status, wire, screenHeight);
++                drawStatus(status, wire, screenHeight, askFirst);
+             if (GetTime() < soundMessageUntil)
+             {
+-                const char *message = guest.audioMuted()
++                const char *message = guest->audioMuted()
+                                           ? "Sonido: silencio (M)"
+-                                          : TextFormat("Sonido: %d %%", static_cast<int>(std::lround(guest.audioVolume() * 100.0f)));
++                                          : TextFormat("Sonido: %d %%", static_cast<int>(std::lround(guest->audioVolume() * 100.0f)));
+                 const int width = MeasureText(message, 24) + 24;
+                 DrawRectangle((screenWidth - width) / 2, screenHeight - 64, width, 36, Color{0, 0, 0, 180});
+                 DrawText(message, (screenWidth - width) / 2 + 12, screenHeight - 58, 24, RAYWHITE);
+@@ -314,13 +543,15 @@ namespace ps2x::netplay
+             UnloadAudioStream(sound);
+         }
+         CloseAudioDevice();
++        if (form.ownFont)
++            UnloadFont(form.font);
+         if (g_guestWav)
+         {
+             std::fclose(g_guestWav);
+             g_guestWav = nullptr;
+         }
+-        guest.stop();
+-        const GuestStatus last = guest.status();
++        guest->stop();
++        const GuestStatus last = guest->status();
+         std::fprintf(stderr, "[red] invitado cerrado: %s - %s\n", stateName(last.state), last.text.c_str());
+         CloseWindow();
+         return last.state == GuestState::Rejected || last.state == GuestState::Failed ? 2 : 0;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+index c74333c..5fe83ce 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+@@ -132,7 +132,7 @@ namespace ps2x::netplay
+         case ByeReason::Quit: return "salio";
+         case ByeReason::Timeout: return "tiempo agotado";
+         case ByeReason::Protocol: return "mensaje no valido";
+-        case ByeReason::Shutdown: return "cierre del programa";
++        case ByeReason::Shutdown: return "dejo de ser anfitrion o cerro el juego"; // N4: also the in-game host stopping
+         }
+         return "motivo desconocido";
+     }
+@@ -1039,9 +1039,10 @@ namespace ps2x::netplay
+                 host = true;
+             else if (a == "--invitado")
+             {
++                // N4: without an address (nothing after it, or another option) the guest's window asks for it.
+                 guest = true;
+-                if (!value(guestAddress))
+-                    return false;
++                if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0)
++                    guestAddress = args[++i];
+             }
+             else if (a == "--puerto")
+             {
+@@ -1179,7 +1180,7 @@ namespace ps2x::netplay
+             if (!splitHostPort("x:" + portText, ignored, options.port, hasPort, error))
+                 return false;
+         }
+-        if (guest)
++        if (guest && !guestAddress.empty())
+         {
+             std::string address;
+             uint16_t port = options.port;
+@@ -1191,7 +1192,11 @@ namespace ps2x::netplay
+         }
+         if (!passwordGiven && environmentPassword != nullptr)
+             options.password = environmentPassword;
+-        if (options.password.size() < kMinPasswordSize || options.password.size() > kMaxPasswordSize)
++        // N4: a guest without an address or a password fills the form (a password given must still be valid).
++        options.guestForm = guest && (guestAddress.empty() || options.password.empty());
++        const bool passwordMissing = options.guestForm && options.password.empty();
++        if (!passwordMissing &&
++            (options.password.size() < kMinPasswordSize || options.password.size() > kMaxPasswordSize))
+         {
+             error = "la contrasena (--clave o PS2X_RED_CLAVE) debe tener entre " + std::to_string(kMinPasswordSize) +
+                     " y " + std::to_string(kMaxPasswordSize) + " caracteres";
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.h b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+index 56fbd57..0c427a9 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+@@ -500,6 +500,8 @@ namespace ps2x::netplay
+     // Command line of the netplay (the game's other arguments stay in args, in order):
+     //   --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
+     //   --invitado <address>[:port] [--puerto N] --clave <password>
++    // N4: --invitado without an address or without a password (none in PS2X_RED_CLAVE either) is guestForm: the
++    // guest's window asks for what is missing.
+     // The host's picture (N2): [--imagen-alto N] (144..1080, even; default 540) [--imagen-kbps N] (500..50000; default
+     // 8000) [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no] (default auto: the first that opens,
+     // in that order; no = no picture).
+@@ -521,6 +523,7 @@ namespace ps2x::netplay
+         std::string hostAddress;   // guest
+         uint16_t port = kDefaultPort;
+         std::string password;
++        bool guestForm = false; // N4: --invitado without an address or a password: the guest's window asks first
+         uint16_t videoHeight = 540;
+         uint32_t videoKbps = 8000;
+         std::string videoCodec = "auto";
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+new file mode 100644
+index 0000000..6b84299
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -0,0 +1,328 @@
++#include "ps2_netplay_session.h"
++#include "ps2_options.h"
++#include "ps2_user_paths.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++
++// Fase 5 (T15, netplay N4): see ps2_netplay_session.h.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        std::string trimmed(std::string_view text)
++        {
++            size_t begin = 0, end = text.size();
++            while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
++                ++begin;
++            while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])))
++                --end;
++            return std::string(text.substr(begin, end - begin));
++        }
++
++        std::string lowered(std::string text)
++        {
++            std::transform(text.begin(), text.end(), text.begin(),
++                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++            return text;
++        }
++
++        // A port typed as text: 1-65535, digits only.
++        bool parsePort(const std::string &text, uint16_t &port, std::string &error)
++        {
++            std::string ignored;
++            bool hasPort = false;
++            return splitHostPort("x:" + text, ignored, port, hasPort, error);
++        }
++
++        // Windows' socket errors come in the system's code page (accents in Spanish): plain ASCII for the window's
++        // default font and for ImGui (UTF-8).
++        std::string asciiOnly(const std::string &text)
++        {
++            static const std::pair<unsigned char, char> kFolds[] = {
++                {0xE1, 'a'}, {0xE9, 'e'}, {0xED, 'i'}, {0xF3, 'o'}, {0xFA, 'u'}, {0xFC, 'u'}, {0xF1, 'n'},
++                {0xC1, 'A'}, {0xC9, 'E'}, {0xCD, 'I'}, {0xD3, 'O'}, {0xDA, 'U'}, {0xDC, 'U'}, {0xD1, 'N'}};
++            std::string out;
++            for (const char c : text)
++            {
++                const unsigned char u = static_cast<unsigned char>(c);
++                if (u < 0x80)
++                {
++                    out += u < 0x20 ? ' ' : c;
++                    continue;
++                }
++                char folded = '?';
++                for (const auto &[from, to] : kFolds)
++                    if (u == from)
++                        folded = to;
++                out += folded;
++            }
++            return out;
++        }
++    }
++
++    std::string generatePassword(const RandomSource &random)
++    {
++        constexpr size_t kAlphabetSize = sizeof(kPasswordAlphabet) - 1;
++        constexpr unsigned kLimit = 256u - 256u % kAlphabetSize; // 248: bytes at or above it are skipped
++        std::string out;
++        uint8_t bytes[16];
++        for (int batch = 0; batch < 64 && out.size() < kGeneratedPasswordSize; ++batch)
++        {
++            if (!random || !random(bytes, sizeof(bytes)))
++                return {};
++            for (const uint8_t b : bytes)
++                if (b < kLimit && out.size() < kGeneratedPasswordSize)
++                    out += kPasswordAlphabet[b % kAlphabetSize];
++        }
++        return out.size() == kGeneratedPasswordSize ? out : std::string();
++    }
++
++    bool parsePictureQuality(std::string_view text, PictureQuality &quality)
++    {
++        const std::string value = lowered(trimmed(text));
++        if (value == "baja")
++            quality = PictureQuality::Low;
++        else if (value == "media")
++            quality = PictureQuality::Medium;
++        else if (value == "alta")
++            quality = PictureQuality::High;
++        else
++            return false;
++        return true;
++    }
++
++    const char *pictureQualityOption(PictureQuality quality)
++    {
++        switch (quality)
++        {
++        case PictureQuality::Low: return "baja";
++        case PictureQuality::High: return "alta";
++        case PictureQuality::Medium: break;
++        }
++        return "media";
++    }
++
++    HostVideoSettings videoSettingsFor(PictureQuality quality)
++    {
++        HostVideoSettings video;
++        switch (quality)
++        {
++        case PictureQuality::Low:
++            video.height = 360;
++            video.kbps = 4000;
++            break;
++        case PictureQuality::Medium:
++            video.height = 540;
++            video.kbps = 8000;
++            break;
++        case PictureQuality::High:
++            video.height = 720;
++            video.kbps = 15000;
++            break;
++        }
++        return video;
++    }
++
++    bool validateGuestForm(const GuestForm &form, GuestSettings &settings, std::string &error)
++    {
++        const std::string address = trimmed(form.address);
++        if (address.empty())
++        {
++            error = "Escribe la direcci\xC3\xB3n IP del anfitri\xC3\xB3n.";
++            return false;
++        }
++        GuestSettings out;
++        const std::string portText = trimmed(form.port);
++        std::string why;
++        if (!portText.empty() && !parsePort(portText, out.port, why))
++        {
++            error = "Puerto no v\xC3\xA1lido (de 1 a 65535): " + portText;
++            return false;
++        }
++        bool hasPort = false;
++        if (!splitHostPort(address, out.host, out.port, hasPort, why))
++        {
++            error = "Direcci\xC3\xB3n no v\xC3\xA1lida: " + address;
++            return false;
++        }
++        if (form.password.size() < kMinPasswordSize || form.password.size() > kMaxPasswordSize)
++        {
++            error = "La contrase\xC3\xB1" "a debe tener entre " + std::to_string(kMinPasswordSize) + " y " +
++                    std::to_string(kMaxPasswordSize) + " caracteres.";
++            return false;
++        }
++        out.password = form.password;
++        settings = out;
++        return true;
++    }
++
++    GuestMemory rememberedFrom(const GuestSettings &settings)
++    {
++        return {settings.host, settings.port};
++    }
++
++    std::string guestMemoryText(const GuestMemory &memory)
++    {
++        std::ostringstream out;
++        out << "# Juego en red (F1-06.exe --invitado): la ultima direccion y el puerto del anfitrion a los que se\n"
++               "# conecto este PC. La contrasena no se guarda nunca.\n"
++            << "direccion = " << memory.address << "\n"
++            << "puerto = " << memory.port << "\n";
++        return out.str();
++    }
++
++    GuestMemory parseGuestMemory(std::string_view text)
++    {
++        GuestMemory memory;
++        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
++            static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF)
++            text.remove_prefix(3);
++        std::istringstream lines{std::string(text)};
++        std::string line;
++        while (std::getline(lines, line))
++        {
++            const size_t equals = line.find('=');
++            if (line.empty() || line[0] == '#' || equals == std::string::npos)
++                continue;
++            const std::string key = lowered(trimmed(std::string_view(line).substr(0, equals)));
++            const std::string value = trimmed(std::string_view(line).substr(equals + 1));
++            std::string why;
++            if (key == "direccion")
++            {
++                std::string host;
++                uint16_t port = kDefaultPort;
++                bool hasPort = false;
++                if (splitHostPort(value, host, port, hasPort, why) && !hasPort)
++                    memory.address = host;
++            }
++            else if (key == "puerto")
++            {
++                uint16_t port = kDefaultPort;
++                if (parsePort(value, port, why))
++                    memory.port = port;
++            }
++        }
++        return memory;
++    }
++
++    GuestMemory loadGuestMemory(const std::filesystem::path &file)
++    {
++        std::ifstream in(file, std::ios::binary);
++        if (!in)
++            return {};
++        std::stringstream text;
++        text << in.rdbuf();
++        return parseGuestMemory(text.str());
++    }
++
++    bool saveGuestMemory(const std::filesystem::path &file, const GuestMemory &memory, std::string &error)
++    {
++        return ps2x::writeTextFileAtomically(file, guestMemoryText(memory), error);
++    }
++
++    std::filesystem::path guestMemoryFile()
++    {
++        const std::filesystem::path folder = ps2x::userConfigDirectory();
++        return (folder.empty() ? std::filesystem::path("config") : folder) / "red.ini";
++    }
++
++    std::string listenAddressOverride()
++    {
++        const char *value = std::getenv("PS2X_RED_ESCUCHAR");
++        return value != nullptr ? trimmed(value) : std::string();
++    }
++
++    std::string hostStatusText(const HostSessionStatus &status)
++    {
++        if (!status.hosting)
++            return status.error.empty() ? std::string("Juego en red apagado")
++                                        : "Juego en red: no se puede ser anfitrion (" + status.error + ")";
++        if (status.guestConnected)
++            return "Juego en red: invitado conectado desde " + status.guestAddress + " (jugador 2)";
++        const std::string port = std::to_string(status.port);
++        std::string where;
++        for (const std::string &address : status.addresses)
++            where += (where.empty() ? "" : " o ") + address + ":" + port;
++        if (where.empty())
++            where = "el puerto " + port;
++        return "Juego en red: esperando invitado en " + where + " - clave " + status.password;
++    }
++
++    struct HostSession::Impl
++    {
++        mutable std::mutex mutex;
++        Host host;
++        HostSessionStatus status; // the parts that change only with start and stop
++    };
++
++    HostSession::HostSession() : m_impl(std::make_unique<Impl>()) {}
++
++    HostSession::~HostSession()
++    {
++        stop();
++    }
++
++    bool HostSession::start(const HostSessionSettings &settings, std::string &error)
++    {
++        std::lock_guard<std::mutex> lock(m_impl->mutex);
++        m_impl->host.stop();
++        HostSessionStatus status;
++        status.port = settings.port;
++        status.listenAddress = settings.listenAddress;
++        status.password = settings.password.empty() ? generatePassword() : settings.password;
++        if (status.password.empty())
++            error = "no hay numeros aleatorios para la contrasena";
++        else
++        {
++            HostSettings host{settings.listenAddress, settings.port, status.password};
++            host.video = settings.video;
++            host.audio = settings.audio;
++            status.hosting = m_impl->host.start(host, error);
++        }
++        if (!status.hosting)
++        {
++            error = asciiOnly(error);
++            status.error = error;
++            status.password.clear();
++            m_impl->status = status;
++            return false;
++        }
++        status.port = m_impl->host.port();
++        status.addresses = settings.listenAddress.empty() ? localIpv4Addresses()
++                                                          : std::vector<std::string>{settings.listenAddress};
++        m_impl->status = status;
++        return true;
++    }
++
++    void HostSession::stop()
++    {
++        std::lock_guard<std::mutex> lock(m_impl->mutex);
++        m_impl->host.stop();
++        m_impl->status.hosting = false;
++        m_impl->status.password.clear();
++        m_impl->status.error.clear();
++    }
++
++    HostSessionStatus HostSession::status() const
++    {
++        std::lock_guard<std::mutex> lock(m_impl->mutex);
++        HostSessionStatus status = m_impl->status;
++        if (status.hosting)
++        {
++            status.guestConnected = m_impl->host.guestConnected();
++            status.guestAddress = status.guestConnected ? m_impl->host.guestAddress() : std::string();
++        }
++        return status;
++    }
++
++    HostSession &hostSession()
++    {
++        static HostSession s_session;
++        return s_session;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+new file mode 100644
+index 0000000..49ea057
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -0,0 +1,107 @@
++#pragma once
++
++#include "ps2_netplay.h"
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// Fase 5 (T15, netplay N4): the netplay without the command line. The host starts and stops from the game (AJUSTES PC
++// row JUEGO EN RED, F2 menu section "Juego en red") while the game runs; the guest fills a small form in its window
++// (F1-06.exe --invitado with no address), which remembers the last address and port in config\red.ini (never the
++// password).
++namespace ps2x::netplay
++{
++    // A session password a player can read out or type: no 0/O, 1/I/L (ambiguous), uppercase and digits only.
++    constexpr const char kPasswordAlphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
++    constexpr size_t kGeneratedPasswordSize = 8;
++    // Empty when the random source fails. Each character is uniform over kPasswordAlphabet (rejection sampling).
++    std::string generatePassword(const RandomSource &random = randomBytes);
++
++    // The picture quality presets of the F2 menu and opciones.ini red_calidad.
++    enum class PictureQuality
++    {
++        Low,    // baja: 4 Mbit/s, 360 lines
++        Medium, // media: 8 Mbit/s, 540 lines (the N2 default)
++        High,   // alta: 15 Mbit/s, 720 lines
++    };
++    bool parsePictureQuality(std::string_view text, PictureQuality &quality);
++    const char *pictureQualityOption(PictureQuality quality); // baja, media, alta
++    HostVideoSettings videoSettingsFor(PictureQuality quality);
++
++    // The guest's form, as typed. True with settings filled (address trimmed, port 1-65535, password 4-256
++    // characters); false with a Spanish message in error. An empty port is the default one; "host:port" in the address
++    // wins over the port field.
++    struct GuestForm
++    {
++        std::string address;
++        std::string port;
++        std::string password;
++    };
++    bool validateGuestForm(const GuestForm &form, GuestSettings &settings, std::string &error);
++
++    // config\red.ini of the guest: the last address and port that connected. Never the password.
++    struct GuestMemory
++    {
++        std::string address;
++        uint16_t port = kDefaultPort;
++    };
++    GuestMemory rememberedFrom(const GuestSettings &settings); // the address and port, without the password
++    std::string guestMemoryText(const GuestMemory &memory);
++    GuestMemory parseGuestMemory(std::string_view text); // bad or missing lines keep the defaults
++    GuestMemory loadGuestMemory(const std::filesystem::path &file);
++    bool saveGuestMemory(const std::filesystem::path &file, const GuestMemory &memory, std::string &error);
++    std::filesystem::path guestMemoryFile(); // <config folder>\red.ini
++
++    // PS2X_RED_ESCUCHAR=<numeric address> (tests, advanced): the address the in-game host listens on instead of every
++    // interface (127.0.0.1: no other PC can connect, and Windows does not ask about its firewall).
++    std::string listenAddressOverride();
++
++    struct HostSessionSettings
++    {
++        std::string listenAddress; // empty: every interface
++        uint16_t port = kDefaultPort;
++        std::string password; // empty: generatePassword()
++        HostVideoSettings video;
++        HostAudioSettings audio;
++    };
++
++    struct HostSessionStatus
++    {
++        bool hosting = false;
++        bool guestConnected = false;
++        uint16_t port = 0;
++        std::string listenAddress; // as asked (empty: every interface)
++        std::vector<std::string> addresses; // where a guest can connect: this PC's IPv4 addresses, or listenAddress
++        std::string password;
++        std::string guestAddress;
++        std::string error; // the last start that failed (empty after a good one)
++    };
++
++    // One line for the host's overlay and log (ASCII: the window's default font has no accents).
++    std::string hostStatusText(const HostSessionStatus &status);
++
++    // The host that can start and stop while the game runs (one per process: hostSession()). Starting again first
++    // stops the running one (its guest gets a goodbye, port 2 goes back to controles.ini).
++    class HostSession
++    {
++    public:
++        HostSession();
++        ~HostSession();
++        HostSession(const HostSession &) = delete;
++        HostSession &operator=(const HostSession &) = delete;
++
++        bool start(const HostSessionSettings &settings, std::string &error);
++        void stop();
++        HostSessionStatus status() const;
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++
++    HostSession &hostSession();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 580e6c8..a4d7c61 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -203,6 +203,14 @@ namespace ps2x
+              "Dificultad de los rivales mas fina: 0 = la del juego (FACIL, MEDIA o DIFICIL en DIFFICULTY > OPPONENT AI);\n"
+              "de 1 a 100, un punto entre ellas (0 FACIL, 50 MEDIA, 100 DIFICIL). Solo cuenta mientras la del juego sea\n"
+              "la mas cercana (la fila del juego pone las dos)."},
++            // Fase 5 (T15, netplay N4): the host started from the game (F2 > Juego en red, AJUSTES PC > JUEGO EN RED;
++            // ps2_netplay_session.h). Its password is never saved: each session has a new one.
++            {"red_puerto", "PS2X_RED_PUERTO", "50650", {}, 1024, 65535,
++             "Juego en red: puerto TCP en el que el juego espera al invitado al ser anfitrion (de 1024 a 65535). El\n"
++             "invitado escribe el mismo."},
++            {"red_calidad", "PS2X_RED_CALIDAD", "media", {{"baja", "baja"}, {"media", "media"}, {"alta", "alta"}}, 0, 0,
++             "Juego en red: calidad de la imagen que recibe el invitado: baja (4 Mbit/s, 360 lineas), media (8 Mbit/s,\n"
++             "540 lineas) o alta (15 Mbit/s, 720 lineas). Si la imagen va a saltos, baja la calidad."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 4618f57..4f6a89c 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_color_vision.h"
+ #include "ps2_display.h"
+ #include "ps2_hud.h"
++#include "ps2_netplay_session.h"
+ #include "ps2_options.h"
+ #include "ps2_pad_players.h"
+ #include "ps2_photo.h"
+@@ -15,6 +16,7 @@
+ #include "raylib.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdlib>
+ #include <fstream>
+@@ -134,10 +136,45 @@ namespace
+                 {"60", "60"}, {"70", "70"}, {"80", "80"}, {"90", "90"}, {"100", "100 (difícil)"}},
+                "0: la del juego (DIFFICULTY > OPPONENT AI). De 1 a 100, un punto entre fácil (0), media (50) y difícil "
+                "(100); solo cuenta mientras la del juego sea la más cercana."}}},
++            // Fase 5 (T15, netplay N4): the host from the game (ps2_netplay_session.h). red_anfitrion is not an option
++            // of opciones.ini: it shows and changes the host's state (netplayHostingWanted, g_netplayRequest).
++            {"Juego en red",
++             {{"red_anfitrion", "Juego en red", {{"0", "Apagado"}, {"1", "Anfitrión"}},
++               "Anfitrión: este PC juega y otro PC se une como jugador 2 a pantalla partida (SPLIT SCREEN): ve y oye "
++               "el juego y manda su mando. El otro abre «Jugar en red - Invitado» y escribe la dirección, el puerto y "
++               "la contraseña de abajo."},
++              {"red_puerto", "Puerto",
++               {{"50650", "50650"}, {"50651", "50651"}, {"50652", "50652"}, {"50653", "50653"}, {"50654", "50654"},
++                {"50655", "50655"}},
++               "El puerto TCP en el que este PC espera al invitado; el invitado escribe el mismo. Cámbialo solo si "
++               "otro programa usa el 50650."},
++              {"red_calidad", "Calidad de la imagen",
++               {{"baja", "Baja (4 Mbit/s, 360)"}, {"media", "Media (8 Mbit/s, 540)"}, {"alta", "Alta (15 Mbit/s, 720)"}},
++               "La imagen que recibe el invitado. Si le va a saltos o con retraso, baja la calidad. Alta necesita una "
++               "red local buena."}}},
+         };
+         return list;
+     }
+ 
++    // Fase 5 (T15, netplay N4): the in-game host. The AJUSTES PC row asks from the EE thread and the menu from the
++    // main thread; update() starts or stops the host on the main thread. -1: nothing asked, 0: stop, 1: start.
++    constexpr const char *kNetplayKey = "red_anfitrion";
++    constexpr int kNetplaySection = 4;
++    std::atomic<int> g_netplayRequest{-1};
++
++    bool netplayHostingWanted()
++    {
++        const int request = g_netplayRequest.load();
++        return request >= 0 ? request == 1 : ps2x::netplay::hostSession().status().hosting;
++    }
++
++    // Port and quality are fixed while hosting (they apply when the host starts).
++    bool netplayRowLocked(const char *key)
++    {
++        const std::string name = key;
++        return (name == "red_puerto" || name == "red_calidad") && netplayHostingWanted();
++    }
++
+     // Fase 5 (T9): the key of tecla_hud.
+     int hudKeyCode(const std::string &option)
+     {
+@@ -241,6 +278,13 @@ struct PS2OptionsMenu::State
+     ImFont *bold = nullptr;
+     float styleFontSize = 0.0f;
+     ImGuiStyle style;
++
++    // Fase 5 (T15, N4): the in-game host's password (empty: a new random one when it starts; then it stays for the
++    // next start) and the overlay that shows what changed.
++    char netplayPassword[ps2x::netplay::kMaxPasswordSize + 1] = {};
++    bool netplayPasswordReady = false;
++    std::string netplayOverlayText;
++    double netplayOverlayUntil = 0.0;
+ };
+ 
+ namespace
+@@ -414,6 +458,124 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Fase 5 (T15, N4): PS2X_RED_CLAVE fills the password the first time (tests, players who want a fixed one).
++    template <typename MenuState>
++    void ensureNetplayPassword(MenuState &s)
++    {
++        if (s.netplayPasswordReady)
++            return;
++        s.netplayPasswordReady = true;
++        if (const char *password = std::getenv("PS2X_RED_CLAVE"))
++            std::snprintf(s.netplayPassword, sizeof(s.netplayPassword), "%s", password);
++    }
++
++    // Starts (or restarts) the host with the menu's port, quality and password; PS2X_RED_ESCUCHAR fixes the address.
++    template <typename MenuState>
++    void startNetplayHost(MenuState &s)
++    {
++        ensureNetplayPassword(s);
++        ps2x::netplay::HostSessionSettings settings;
++        settings.listenAddress = ps2x::netplay::listenAddressOverride();
++        settings.port = static_cast<uint16_t>(
++            std::clamp(std::atoi(valueOf(s.model.current, "red_puerto").c_str()), 1024, 65535));
++        ps2x::netplay::PictureQuality quality = ps2x::netplay::PictureQuality::Medium;
++        ps2x::netplay::parsePictureQuality(valueOf(s.model.current, "red_calidad"), quality);
++        settings.video = ps2x::netplay::videoSettingsFor(quality);
++        settings.password = s.netplayPassword;
++        std::string error;
++        if (ps2x::netplay::hostSession().start(settings, error))
++        {
++            const ps2x::netplay::HostSessionStatus status = ps2x::netplay::hostSession().status();
++            std::snprintf(s.netplayPassword, sizeof(s.netplayPassword), "%s", status.password.c_str());
++            std::cout << "[red] anfitrion desde el juego: puerto " << status.port << ", calidad "
++                      << ps2x::netplay::pictureQualityOption(quality)
++                      << (settings.listenAddress.empty() ? "" : ", solo en " + settings.listenAddress)
++                      << (settings.password.empty() ? ", contrasena nueva" : "") << std::endl;
++        }
++        else
++            std::cerr << "[red] no se puede ser anfitrion: " << error << std::endl;
++    }
++
++    // What changed, for 8 seconds at the top of the game's window (not while the menu, which shows it, is open).
++    template <typename MenuState>
++    void drawNetplayOverlay(MenuState &s, double now)
++    {
++        const ps2x::netplay::HostSessionStatus status = ps2x::netplay::hostSession().status();
++        const std::string text =
++            status.hosting || !status.error.empty() ? ps2x::netplay::hostStatusText(status) : std::string();
++        if (text != s.netplayOverlayText)
++        {
++            const bool wasShown = !s.netplayOverlayText.empty();
++            s.netplayOverlayText = text;
++            s.netplayOverlayUntil = now + 8.0;
++            if (text.empty() && wasShown)
++            {
++                s.netplayOverlayText = "Juego en red apagado: el puerto 2 vuelve a controles.ini";
++                s.netplayOverlayUntil = now + 4.0;
++            }
++        }
++        if (s.open || s.netplayOverlayText.empty() || now >= s.netplayOverlayUntil)
++            return;
++        const int fontSize = std::max(10, GetScreenHeight() / 40);
++        const int padding = fontSize / 3;
++        const int width = MeasureText(s.netplayOverlayText.c_str(), fontSize) + 2 * padding;
++        DrawRectangle(2 * padding, 2 * padding, width, fontSize + 2 * padding, Fade(BLACK, 0.65f));
++        DrawText(s.netplayOverlayText.c_str(), 3 * padding, 3 * padding, fontSize,
++                 status.guestConnected ? GREEN : status.hosting ? RAYWHITE : ORANGE);
++    }
++
++    // The section's own part, under its rows: the state, the password and what to tell the guest.
++    template <typename MenuState>
++    void drawNetplaySection(MenuState &s, float fontSize)
++    {
++        ensureNetplayPassword(s);
++        const ps2x::netplay::HostSessionStatus status = ps2x::netplay::hostSession().status();
++        ImGui::Spacing();
++        if (status.hosting)
++        {
++            const std::string port = std::to_string(status.port);
++            if (status.guestConnected)
++                ImGui::TextColored(ImVec4(0.55f, 1.0f, 0.6f, 1.0f), "Invitado conectado desde %s: es el jugador 2.",
++                                   status.guestAddress.c_str());
++            else
++                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Esperando al invitado...");
++            std::string where;
++            for (const std::string &address : status.addresses)
++                where += (where.empty() ? "" : "  o  ") + address;
++            ImGui::Text("Dirección: %s    Puerto: %s", where.empty() ? "(la IP de este PC)" : where.c_str(),
++                        port.c_str());
++            ImGui::PushFont(s.bold, fontSize * 1.15f);
++            ImGui::Text("Contraseña: %s", status.password.c_str());
++            ImGui::PopFont();
++        }
++        else
++        {
++            if (!status.error.empty())
++                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "No se pudo empezar: %s", status.error.c_str());
++            else
++                ImGui::TextDisabled("Apagado: el puerto 2 es el de controles.ini.");
++            ImGui::AlignTextToFramePadding();
++            ImGui::TextUnformatted("Contraseña");
++            ImGui::SameLine();
++            const float button = ImGui::CalcTextSize("Nueva").x + ImGui::GetStyle().FramePadding.x * 2.0f;
++            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x);
++            ImGui::InputTextWithHint("##clave", "vacía: una al azar", s.netplayPassword, sizeof(s.netplayPassword));
++            ImGui::SameLine();
++            if (ImGui::Button("Nueva"))
++                std::snprintf(s.netplayPassword, sizeof(s.netplayPassword), "%s",
++                              ps2x::netplay::generatePassword().c_str());
++        }
++        ImGui::PushFont(nullptr, fontSize * 0.85f);
++        ImGui::PushTextWrapPos(0.0f);
++        ImGui::TextDisabled("Misma red local, o los dos en Tailscale o ZeroTier. La primera vez Windows pregunta por "
++                            "el cortafuegos: permite las redes privadas.");
++        ImGui::PopTextWrapPos();
++        ImGui::PopFont();
++    }
++}
++
+ void PS2OptionsMenu::update(PS2Runtime &runtime)
+ {
+     State &s = *m_state;
+@@ -465,7 +627,11 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+         else if (action.rfind("seccion=", 0) == 0)
+         {
+             const std::string name = action.substr(8);
+-            s.section = name == "graficos" ? 1 : name == "sonido" ? 2 : name == "juego" ? 3 : 0;
++            s.section = name == "graficos"  ? 1
++                        : name == "sonido" ? 2
++                        : name == "juego"  ? 3
++                        : name == "red"    ? kNetplaySection
++                                           : 0;
+         }
+         else if (action.rfind("tecla=", 0) == 0)
+         {
+@@ -483,6 +649,8 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+                 ImGui::GetIO().AddKeyEvent(key, false);
+             }
+         }
++        else if (action == std::string(kNetplayKey) + "=0" || action == std::string(kNetplayKey) + "=1")
++            g_netplayRequest = action.back() == '1' ? 1 : 0;
+         else if (const size_t equals = action.find('='); equals != std::string::npos)
+             done = ps2x::setMenuOption(s.model, action.substr(0, equals), action.substr(equals + 1u));
+         else
+@@ -592,6 +760,20 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     ps2x::setOptionsMenuOpen(s.open);
+     if (s.modelReady)
+         applyLive(s.model, s.applied, runtime);
++
++    // Fase 5 (T15, N4): the host asked for by the AJUSTES PC row, the menu or PS2X_MENU_GUION.
++    if (const int request = g_netplayRequest.exchange(-1); request >= 0)
++    {
++        ensureModel(s);
++        if (request == 1)
++            startNetplayHost(s);
++        else if (ps2x::netplay::hostSession().status().hosting)
++        {
++            ps2x::netplay::hostSession().stop();
++            std::cout << "[red] anfitrion parado desde el juego" << std::endl;
++        }
++    }
++    drawNetplayOverlay(s, now);
+ }
+ 
+ void PS2OptionsMenu::beginFrame()
+@@ -679,16 +861,21 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+                     const auto forced = model.forced.find(row.key);
+                     const bool isForced = forced != model.forced.end();
+                     const bool highResolution = std::string(row.key) == "alta_resolucion";
+-                    const bool disabled = isForced || (highResolution && !ps2x::highResolutionAvailable(model));
+-                    const std::string value = valueOf(model.current, row.key);
++                    const bool netplayRow = std::string(row.key) == kNetplayKey;
++                    const bool netplayLocked = netplayRowLocked(row.key);
++                    const bool disabled =
++                        isForced || netplayLocked || (highResolution && !ps2x::highResolutionAvailable(model));
++                    const std::string value = netplayRow ? std::string(netplayHostingWanted() ? "1" : "0")
++                                                         : valueOf(model.current, row.key);
+ 
+                     // The value as shown, and its position among the choices.
+                     std::vector<Choice> choices = row.choices;
+                     std::string sizeText;
+-                    if (std::string(row.key) == "tamano_ventana" &&
++                    const bool customValue = std::string(row.key) == "tamano_ventana" || std::string(row.key) == "red_puerto";
++                    if (customValue &&
+                         std::none_of(choices.begin(), choices.end(), [&](const Choice &c) { return value == c.value; }))
+                     {
+-                        sizeText = sizeLabel(value);
++                        sizeText = std::string(row.key) == "red_puerto" ? value : sizeLabel(value);
+                         choices.insert(choices.begin(), Choice{value.c_str(), sizeText.c_str()});
+                     }
+                     int index = 0;
+@@ -720,6 +907,8 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+                                          ": el menú no la cambia.";
+                         else if (highResolution && disabled)
+                             s.hintNote = "Necesita supersampling x4 o más y gráficos por GPU.";
++                        else if (netplayLocked)
++                            s.hintNote = "Para cambiarlo, deja de ser anfitrión (Juego en red: Apagado).";
+                     }
+                     int step = activated ? (choices.empty() ? 1 : 2) : 0; // 2: the next value, wrapping
+                     if (focused && !disabled)
+@@ -785,11 +974,16 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+                             const int to = step == 2 ? (index + 1) % count : std::clamp(index + step, 0, count - 1);
+                             next = choices[to].value;
+                         }
+-                        ps2x::setMenuOption(model, row.key, next);
++                        if (netplayRow)
++                            g_netplayRequest = next == "1" ? 1 : 0;
++                        else
++                            ps2x::setMenuOption(model, row.key, next);
+                     }
+                 }
+                 ImGui::EndTable();
+             }
++            if (s.section == kNetplaySection)
++                drawNetplaySection(s, fontSize);
+             // Room for the longest section, so the window keeps its height.
+             ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(),
+                                           tableTop + rowHeight * static_cast<float>(mostRows) +
+@@ -882,6 +1076,12 @@ void PS2OptionsMenu::draw(PS2Runtime &runtime)
+ 
+ bool PS2OptionsMenu::gameOptionNumber(const std::string &key, float &number)
+ {
++    // Fase 5 (T15, N4): AJUSTES PC > JUEGO EN RED shows the host's state (or what was just asked for).
++    if (key == kNetplayKey)
++    {
++        number = netplayHostingWanted() ? 1.0f : 0.0f;
++        return true;
++    }
+     std::lock_guard<std::mutex> lock(g_modelMutex);
+     if (g_gameMenu == nullptr)
+         return false;
+@@ -892,6 +1092,13 @@ bool PS2OptionsMenu::gameOptionNumber(const std::string &key, float &number)
+ 
+ bool PS2OptionsMenu::setGameOptionNumber(const std::string &key, float number)
+ {
++    if (key == kNetplayKey)
++    {
++        const bool host = std::lround(number) == 1;
++        if (host != netplayHostingWanted())
++            g_netplayRequest = host ? 1 : 0;
++        return true;
++    }
+     std::lock_guard<std::mutex> lock(g_modelMutex);
+     if (g_gameMenu == nullptr)
+         return false;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index b4174d8..f3afb9d 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -2,6 +2,7 @@
+ #include "games_database.h"
+ #include "ps2_options.h"
+ #include "lib/ps2_netplay.h" // Fase 5 (T15): private to the runtime, next to this file
++#include "lib/ps2_netplay_session.h"
+ #include "ps2_user_paths.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+@@ -395,7 +396,8 @@ namespace
+ //       runs the game and waits for one guest on TCP port N (50650 by default, every interface unless --escuchar).
+ //   F1-06.exe --invitado <address>[:port] [--puerto N] --clave <password>
+ //       does not run the game: a window that sends this PC's pad (player 1 of controles.ini) as the host's player 2.
+-// Without --clave the password comes from PS2X_RED_CLAVE.
++// Without --clave the password comes from PS2X_RED_CLAVE. N4: --invitado without an address or a password opens the
++// guest's form; the host can also start from the game (F2 > Juego en red, OPCIONES > AJUSTES PC > JUEGO EN RED).
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+@@ -448,14 +450,15 @@ int main(int argc, char *argv[])
+                       << "[red]      [--imagen-alto 144-1080] [--imagen-kbps 500-50000]" << std::endl
+                       << "[red]      [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no]" << std::endl
+                       << "[red]      [--sonido-codec auto|opus|pcm|no] [--sonido-kbps 32-256]" << std::endl
+-                      << "[red]      --invitado <direccion>[:puerto] [--puerto N] --clave <contrasena>" << std::endl;
++                      << "[red]      --invitado [<direccion>[:puerto]] [--puerto N] [--clave <contrasena>]" << std::endl;
+             std::cout.flush();
+             std::cerr.flush();
+             std::_Exit(1);
+         }
+         if (guestMode)
+         {
+-            const int code = ps2x::netplay::runGuestWindow({netplay.hostAddress, netplay.port, netplay.password});
++            const int code = ps2x::netplay::runGuestWindow({netplay.hostAddress, netplay.port, netplay.password},
++                                                           netplay.guestForm);
+             std::cout.flush();
+             std::cerr.flush();
+             std::_Exit(code);
+@@ -570,15 +573,18 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
+-        // Fase 5 (T15): the host waits for its guest while the game runs (the game reads it on port 2).
+-        static ps2x::netplay::Host s_netplayHost;
++        // Fase 5 (T15): the host waits for its guest while the game runs (the game reads it on port 2). N4: the same
++        // host the game's menus start and stop (ps2x::netplay::hostSession()).
+         if (netplay.mode == ps2x::netplay::NetplayMode::Host)
+         {
+             std::string error;
+-            ps2x::netplay::HostSettings hostSettings{netplay.listenAddress, netplay.port, netplay.password};
++            ps2x::netplay::HostSessionSettings hostSettings;
++            hostSettings.listenAddress = netplay.listenAddress;
++            hostSettings.port = netplay.port;
++            hostSettings.password = netplay.password;
+             hostSettings.video = {netplay.videoHeight, netplay.videoKbps, netplay.videoCodec};
+             hostSettings.audio = {netplay.audioCodec, netplay.audioKbps};
+-            if (!s_netplayHost.start(hostSettings, error))
++            if (!ps2x::netplay::hostSession().start(hostSettings, error))
+                 std::cerr << "[red] no se puede escuchar en el puerto " << netplay.port << ": " << error
+                           << " (el juego sigue sin red)" << std::endl;
+         }
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 7d612df..308954d 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_netplay.h"
+ #include "ps2_netplay_crypto.h"
+ #include "ps2_netplay_protocol.h"
++#include "ps2_netplay_session.h"
+ #include "ps2_netplay_video.h"
+ 
+ #include <algorithm>
+@@ -15,6 +16,8 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <functional>
+ #include <memory>
+ #include <string>
+@@ -673,7 +676,7 @@ void register_ps2_netplay_tests()
+                 {"--anfitrion", "--puerto", "0", "--clave", "abcd"},
+                 {"--anfitrion", "--puerto", "70000", "--clave", "abcd"},
+                 {"--anfitrion", "--puerto", "12x", "--clave", "abcd"},
+-                {"--invitado", "--clave", "abcd"},                         // no address
++                {"--invitado", "--clave", "abc"},                          // the form, but a short password
+                 {"--invitado", "1.2.3.4:99999", "--clave", "abcd"},
+                 {"--anfitrion", "--clave"},                                // missing value
+                 {"--invitado", "1.2.3.4", "--escuchar", "0.0.0.0", "--clave", "abcd"},
+@@ -1254,4 +1257,260 @@ void register_ps2_netplay_tests()
+             guest.stop();
+             host.stop();
+         }); });
++
++    // Fase 5 (T15, netplay N4): hosting from the game and the guest's form.
++    MiniTest::Case("NetplaySession", [](TestCase &tc)
++                   {
++        tc.Run("generated passwords: 8 characters of the unambiguous alphabet", [](TestCase &t)
++        {
++            const std::string alphabet = kPasswordAlphabet;
++            t.Equals(alphabet.size(), static_cast<size_t>(31), "31 characters");
++            for (char c : std::string("0O1IL"))
++                t.IsTrue(alphabet.find(c) == std::string::npos, std::string("no ambiguous ") + c);
++            for (char c : alphabet)
++                t.IsTrue((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '9'), "uppercase and digits only");
++            t.Equals(generatePassword(counting(0)), std::string("ABCDEFGH"), "bytes 0-7: the first letters");
++            t.Equals(generatePassword(counting(31)), std::string("ABCDEFGH"), "31 wraps to the first letter");
++            t.Equals(generatePassword(counting(250)), std::string("ABCDEFGH"),
++                     "bytes 248-255 are skipped (no bias towards the first letters)");
++            t.Equals(generatePassword([](void *, size_t) { return false; }), std::string(), "a failed source: none");
++            std::vector<std::string> seen;
++            for (int i = 0; i < 50; ++i)
++            {
++                const std::string p = generatePassword();
++                t.Equals(p.size(), kGeneratedPasswordSize, "length 8");
++                t.IsTrue(p.find_first_not_of(alphabet) == std::string::npos, "alphabet only: " + p);
++                t.IsTrue(std::find(seen.begin(), seen.end(), p) == seen.end(), "no repeats: " + p);
++                seen.push_back(p);
++            }
++        });
++
++        tc.Run("quality presets: baja 4 Mbit/s 360, media 8 Mbit/s 540, alta 15 Mbit/s 720", [](TestCase &t)
++        {
++            struct Preset
++            {
++                const char *name;
++                PictureQuality quality;
++                uint16_t height;
++                uint32_t kbps;
++            };
++            const Preset presets[] = {{"baja", PictureQuality::Low, 360, 4000},
++                                      {"media", PictureQuality::Medium, 540, 8000},
++                                      {"alta", PictureQuality::High, 720, 15000}};
++            for (const Preset &p : presets)
++            {
++                PictureQuality q = PictureQuality::Low;
++                t.IsTrue(parsePictureQuality(p.name, q) && q == p.quality, std::string("parses ") + p.name);
++                t.Equals(std::string(pictureQualityOption(p.quality)), std::string(p.name), "its option");
++                const HostVideoSettings v = videoSettingsFor(p.quality);
++                t.Equals(v.height, p.height, std::string("lines of ") + p.name);
++                t.Equals(v.kbps, p.kbps, std::string("bit rate of ") + p.name);
++                t.Equals(v.codec, std::string("auto"), "any encoder");
++            }
++            PictureQuality q = PictureQuality::High;
++            t.IsTrue(parsePictureQuality("MEDIA", q) && q == PictureQuality::Medium, "case-insensitive");
++            q = PictureQuality::High;
++            t.IsFalse(parsePictureQuality("ultra", q), "unknown preset");
++            t.IsFalse(parsePictureQuality("", q), "empty");
++            t.IsTrue(q == PictureQuality::High, "unchanged when refused");
++            const HostVideoSettings defaults;
++            const HostVideoSettings medium = videoSettingsFor(PictureQuality::Medium);
++            t.IsTrue(medium.height == defaults.height && medium.kbps == defaults.kbps, "media is the N2 default");
++        });
++
++        tc.Run("guest form: address, port and password are checked", [](TestCase &t)
++        {
++            GuestSettings s;
++            std::string error;
++            t.IsTrue(validateGuestForm({"192.168.1.5", "50650", "ABCD2345"}, s, error), "valid: " + error);
++            t.Equals(s.host, std::string("192.168.1.5"), "address");
++            t.Equals(s.port, static_cast<uint16_t>(50650), "port");
++            t.Equals(s.password, std::string("ABCD2345"), "password");
++            t.IsTrue(validateGuestForm({"  100.64.0.7 ", " 40000 ", "clave"}, s, error), "spaces around");
++            t.Equals(s.host, std::string("100.64.0.7"), "address trimmed");
++            t.Equals(s.port, static_cast<uint16_t>(40000), "port trimmed");
++            t.IsTrue(validateGuestForm({"10.0.0.2", "", "clave"}, s, error), "empty port");
++            t.Equals(s.port, kDefaultPort, "the default port");
++            t.IsTrue(validateGuestForm({"10.0.0.2:5000", "50650", "clave"}, s, error), "address with a port");
++            t.IsTrue(s.host == "10.0.0.2" && s.port == 5000, "the address's port wins");
++            t.IsTrue(validateGuestForm({"[fd7a::1]:4000", "", "clave"}, s, error), "IPv6 with a port");
++            t.IsTrue(s.host == "fd7a::1" && s.port == 4000, "IPv6 address and port");
++            t.IsTrue(validateGuestForm({"mi-pc.tailnet", "50650", "clave"}, s, error), "a name");
++
++            const std::vector<GuestForm> bad = {
++                {"", "50650", "clave"},
++                {"   ", "50650", "clave"},
++                {"192.168 .1.5", "50650", "clave"},
++                {"1.2.3.4", "0", "clave"},
++                {"1.2.3.4", "65536", "clave"},
++                {"1.2.3.4", "12x", "clave"},
++                {"1.2.3.4:99999", "", "clave"},
++                {"1.2.3.4", "50650", ""},
++                {"1.2.3.4", "50650", "abc"},
++                {"1.2.3.4", "50650", std::string(257, 'k')},
++            };
++            for (const GuestForm &f : bad)
++            {
++                GuestSettings before{"sin-tocar", 1, "sin-tocar"};
++                GuestSettings out = before;
++                std::string e;
++                const std::string name = "refused: '" + f.address + "' '" + f.port + "' (" +
++                                         std::to_string(f.password.size()) + " characters)";
++                t.IsFalse(validateGuestForm(f, out, e), name);
++                t.IsFalse(e.empty(), "with a message: " + name);
++                t.IsTrue(out.host == before.host && out.port == before.port && out.password == before.password,
++                         "settings unchanged: " + name);
++            }
++        });
++
++        tc.Run("red.ini keeps the last address and port, never the password", [](TestCase &t)
++        {
++            const GuestSettings settings{"192.168.1.40", 50700, "SECRETO99"};
++            const GuestMemory memory = rememberedFrom(settings);
++            t.IsTrue(memory.address == "192.168.1.40" && memory.port == 50700, "address and port");
++            const std::string text = guestMemoryText(memory);
++            t.IsTrue(text.find("SECRETO99") == std::string::npos, "no password in the text");
++            t.IsTrue(text.find("192.168.1.40") != std::string::npos && text.find("50700") != std::string::npos,
++                     "address and port in the text");
++
++            const std::filesystem::path folder =
++                std::filesystem::temp_directory_path() / "ps2x-netplay-tests-red-ini";
++            std::error_code ec;
++            std::filesystem::remove_all(folder, ec);
++            const std::filesystem::path file = folder / "red.ini";
++            const GuestMemory missing = loadGuestMemory(file);
++            t.IsTrue(missing.address.empty() && missing.port == kDefaultPort, "no file: the defaults");
++            std::string error;
++            t.IsTrue(saveGuestMemory(file, memory, error), "saved: " + error);
++            const GuestMemory back = loadGuestMemory(file);
++            t.IsTrue(back.address == memory.address && back.port == memory.port, "read back");
++            std::ifstream in(file, std::ios::binary);
++            const std::string saved((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++            in.close();
++            t.IsTrue(saved.find("SECRETO99") == std::string::npos, "no password in the file");
++            std::filesystem::remove_all(folder, ec);
++
++            const GuestMemory odd = parseGuestMemory("\xEF\xBB\xBF# comentario\r\nDIRECCION = 10.1.2.3\r\npuerto=70000\r\n"
++                                                     "clave = algo\r\n");
++            t.Equals(odd.address, std::string("10.1.2.3"), "BOM, CRLF, case and spaces");
++            t.Equals(odd.port, kDefaultPort, "a bad port keeps the default");
++            const GuestMemory weird = parseGuestMemory("direccion = 1.2.3.4 ; rm -rf\npuerto = 50651\n");
++            t.IsTrue(weird.address.empty(), "an address that is not one is dropped");
++            t.Equals(weird.port, static_cast<uint16_t>(50651), "the port still read");
++        });
++
++        tc.Run("command line: --invitado without an address or password opens the form", [](TestCase &t)
++        {
++            std::vector<std::string> args = {"--invitado"};
++            NetplayOptions o;
++            std::string error;
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "--invitado alone: " + error);
++            t.Equals(o.mode, NetplayMode::Guest, "guest");
++            t.IsTrue(o.guestForm, "the form");
++            t.IsTrue(o.hostAddress.empty() && o.password.empty(), "nothing filled");
++
++            args = {"--invitado", "--clave", "abcd"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "a password only: " + error);
++            t.IsTrue(o.guestForm && o.password == "abcd", "the form, with the password filled");
++
++            args = {"--invitado", "10.0.0.9:50700"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "an address only: " + error);
++            t.IsTrue(o.guestForm && o.hostAddress == "10.0.0.9" && o.port == 50700, "the form, with the address");
++
++            args = {"--invitado", "10.0.0.9", "--clave", "abcd"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "both: " + error);
++            t.IsFalse(o.guestForm, "no form: it connects at once");
++
++            args = {"--invitado"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, "de-la-variable", o, error), "PS2X_RED_CLAVE");
++            t.IsTrue(o.guestForm && o.password == "de-la-variable", "the form, with the variable's password");
++
++            args = {"--anfitrion"};
++            o = {};
++            t.IsFalse(parseNetplayArguments(args, nullptr, o, error), "the host still needs --clave");
++        });
++
++        tc.Run("host session: start, guest, stop frees the port and port 2, restart", [](TestCase &t)
++        {
++            isolatePads();
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++            R5900Context ctx;
++            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
++            setRegU32(ctx, 4, 1u);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 0x1200u);
++            ps2_stubs::scePadPortOpen(rdram.data(), &ctx, nullptr);
++            const uint32_t port2Before = padPortState(rdram, 1);
++
++            HostSession session;
++            t.IsFalse(session.status().hosting, "not hosting at first");
++            t.Equals(hostStatusText(session.status()), std::string("Juego en red apagado"), "text when off");
++            HostSessionSettings settings;
++            settings.listenAddress = "127.0.0.1";
++            settings.port = 0;
++            settings.video.codec = "no";
++            settings.audio.codec = "no";
++            std::string error;
++            t.IsTrue(session.start(settings, error), "starts: " + error);
++            HostSessionStatus s = session.status();
++            t.IsTrue(s.hosting && !s.guestConnected, "hosting, no guest");
++            t.IsTrue(s.port != 0, "a port");
++            t.Equals(s.password.size(), kGeneratedPasswordSize, "a generated password");
++            t.IsTrue(s.password.find_first_not_of(kPasswordAlphabet) == std::string::npos, "of the alphabet");
++            t.Equals(s.addresses, std::vector<std::string>{"127.0.0.1"}, "the address it listens on");
++            const std::string port = std::to_string(s.port);
++            t.Equals(hostStatusText(s), "Juego en red: esperando invitado en 127.0.0.1:" + port + " - clave " + s.password,
++                     "text while waiting");
++
++            Guest guest;
++            guest.start({"127.0.0.1", s.port, s.password});
++            t.IsTrue(waitFor([&] { return session.status().guestConnected; }), "the guest gets in");
++            s = session.status();
++            t.IsTrue(s.guestAddress.rfind("127.0.0.1:", 0) == 0, "the guest's address: " + s.guestAddress);
++            t.Equals(hostStatusText(s), "Juego en red: invitado conectado desde " + s.guestAddress + " (jugador 2)",
++                     "text with a guest");
++            t.Equals(padPortState(rdram, 1), 6u, "port 2 has the guest's pad");
++
++            const uint16_t used = s.port;
++            session.stop();
++            t.IsFalse(session.status().hosting, "stopped");
++            t.IsFalse(remotePadActive(), "no remote pad");
++            t.Equals(padPortState(rdram, 1), port2Before, "port 2 as before hosting");
++            t.IsTrue(waitFor([&] { return guest.status().state == GuestState::Disconnected; }),
++                     "the guest is told the session ended");
++            guest.stop();
++
++            settings.port = used;
++            settings.password = "clave-fija";
++            t.IsTrue(session.start(settings, error), "the same port again at once: " + error);
++            s = session.status();
++            t.IsTrue(s.hosting && s.port == used, "hosting on the same port");
++            t.Equals(s.password, std::string("clave-fija"), "the given password");
++            Guest again;
++            again.start({"127.0.0.1", used, "clave-fija"});
++            t.IsTrue(waitFor([&] { return session.status().guestConnected; }), "a guest again");
++
++            HostSession other;
++            HostSessionSettings busy = settings;
++            t.IsFalse(other.start(busy, error), "a port in use cannot be taken");
++            t.IsFalse(error.empty(), "with the reason");
++            const HostSessionStatus failed = other.status();
++            t.IsTrue(!failed.hosting && !failed.error.empty(), "the failure in the status");
++            t.IsTrue(hostStatusText(failed).rfind("Juego en red: no se puede ser anfitrion", 0) == 0,
++                     "text after a failure: " + hostStatusText(failed));
++
++            settings.password = "otra-clave";
++            t.IsTrue(session.start(settings, error), "start while running restarts: " + error);
++            t.IsTrue(waitFor([&] { return again.status().state == GuestState::Disconnected; }),
++                     "the old session's guest is let go");
++            t.Equals(session.status().password, std::string("otra-clave"), "the new password");
++            again.stop();
++            session.stop();
++            t.IsFalse(remotePadActive(), "nothing left");
++            t.Equals(padPortState(rdram, 1), port2Before, "port 2 as before, at the end");
++        }); });
+ }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 172b1c2..b11b910 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -552,6 +552,40 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "fov"), std::string("0"), "the other options keep their values");
+         });
+ 
++        // Fase 5 (T15, netplay N4): the in-game host's port and picture quality (never its password).
++        tc.Run("the red_puerto and red_calidad options have their defaults, variables and checks", [](TestCase &t)
++        {
++            const ps2x::OptionsFile none = ps2x::parseOptions("");
++            t.Equals(none.values.at("red_puerto"), std::string("50650"), "port 50650 by default");
++            t.Equals(none.values.at("red_calidad"), std::string("media"), "media by default");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "red_puerto = 50650\n"), "the template has the port");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "red_calidad = media\n"), "and the quality");
++            t.IsFalse(contains(ps2x::defaultOptionsText(false), "red_clave"), "no password in opciones.ini");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("red_puerto = 50700\nred_calidad = alta\n");
++            t.IsTrue(file.warnings.empty(), "valid values give no warning");
++            std::map<std::string, std::string> variables;
++            for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(file, environmentOf({})))
++                variables[setting.variable] = setting.value;
++            t.Equals(variables["PS2X_RED_PUERTO"], std::string("50700"), "red_puerto -> PS2X_RED_PUERTO");
++            t.Equals(variables["PS2X_RED_CALIDAD"], std::string("alta"), "red_calidad -> PS2X_RED_CALIDAD");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("red_puerto = 80\nred_calidad = ultra\n");
++            t.Equals(bad.warnings.size(), size_t{2u}, "a low port and an unknown quality warn");
++            t.Equals(bad.values.at("red_puerto"), std::string("50650"), "the default port");
++            t.Equals(bad.values.at("red_calidad"), std::string("media"), "the default quality");
++            t.Equals(ps2x::parseOptions("red_puerto = 65536\n").values.at("red_puerto"), std::string("50650"),
++                     "past 65535 too");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.IsTrue(ps2x::setMenuOption(model, "red_calidad", "baja"), "the menu sets the quality");
++            t.IsTrue(ps2x::setMenuOption(model, "red_puerto", "50651"), "and the port");
++            t.IsFalse(ps2x::setMenuOption(model, "red_puerto", "1023"), "not a reserved port");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "red_calidad"), std::string("baja"), "saving writes the quality");
++            t.Equals(fileValue(saved, "red_puerto"), std::string("50651"), "and the port");
++        });
++
+         tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)
+         {
+             t.Equals(ps2x::aiDifficultyNearestLevel(0), 0, "0: EASY");
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 0896c28..e53846a 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{23}, "twenty-three options (fase 5: twelve more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{25}, "twenty-five options (fase 5: fourteen more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

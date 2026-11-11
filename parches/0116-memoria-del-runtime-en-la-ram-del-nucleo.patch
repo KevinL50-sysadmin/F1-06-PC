@@ -1,0 +1,210 @@
+diff --git a/ps2xRuntime/include/ps2_heap_reserve.h b/ps2xRuntime/include/ps2_heap_reserve.h
+index 800a9f4..0afee77 100644
+--- a/ps2xRuntime/include/ps2_heap_reserve.h
++++ b/ps2xRuntime/include/ps2_heap_reserve.h
+@@ -11,6 +11,19 @@ namespace ps2_syscalls
+     // reserve as the end of the game heap, so both allocators never hand out the same memory.
+     // Call it from a game override (before the game runs SetupHeap). 0 keeps the default behaviour.
+     void setGuestHeapTopReserve(uint32_t bytes);
++
++    // F1 06 (phase 5): memory below the game's ELF (kernel RAM on the console, which a game does not use) for the
++    // runtime's own needs, so the game keeps all of its RAM as on the console. With a low heap set, SetupHeap puts the
++    // runtime heap there and a heap of "rest of RAM" ends where the main thread's stack begins (EndOfHeap reports it),
++    // instead of at 0x1F00000 minus the top reserve. Low stack areas hold the EE invocation stacks (interrupt
++    // handlers and callbacks run on them; on the console they use the kernel's stack), which otherwise are carved from
++    // the end of RAM. Call them from a game override before the game runs SetupThread/SetupHeap.
++    void setRuntimeLowHeap(uint32_t base, uint32_t end);
++    void addRuntimeLowStackArea(uint32_t base, uint32_t end);
++    // A stack of `size` bytes from the low areas: returns its top (16-byte aligned, minus 0x10 like
++    // PS2Runtime::reserveAsyncCallbackStack) or 0 when they are exhausted or not set.
++    uint32_t reserveRuntimeLowStack(uint32_t size);
++    [[nodiscard]] bool runtimeLowStacksActive();
+ }
+ 
+ #endif // PS2_HEAP_RESERVE_H
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 8cbecf0..e6ca247 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ee_scheduler.h"
++#include "ps2_heap_reserve.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -1561,7 +1562,15 @@ uint32_t EeScheduler::invocationStackTop()
+         return existing->second;
+     }
+     constexpr uint32_t kInvocationStackSize = 0x4000u;
+-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
++    // Low memory first (ps2_heap_reserve.h): the end of RAM then stays the game's, as on the console.
++    uint32_t top = ps2_syscalls::reserveRuntimeLowStack(kInvocationStackSize);
++    if (top == 0u)
++    {
++        if (ps2_syscalls::runtimeLowStacksActive())
++            std::fprintf(stderr, "[ee:pilas] AVISO: sin sitio en la memoria baja para otra pila de invocacion; "
++                                 "se toma del final de la RAM (puede pisar el monton del juego)\n");
++        top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
++    }
+     if (top == 0u)
+     {
+         throw std::runtime_error("EE invocation stack space exhausted");
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index e4bbe4e..6c18115 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -2,6 +2,11 @@
+ #include "System.h"
+ #include "ps2_heap_reserve.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
+ namespace ps2_syscalls
+ {
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -471,6 +476,61 @@ namespace ps2_syscalls
+ 
+     // 0x3C SetupThread
+     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
++    namespace
++    {
++        // Low memory for the runtime (ps2_heap_reserve.h, F1 06 phase 5).
++        uint32_t g_lowHeapBase = 0u, g_lowHeapEnd = 0u;
++        struct LowStackArea
++        {
++            uint32_t base;
++            uint32_t top; // next stack ends here; areas fill downwards
++        };
++        std::vector<LowStackArea> g_lowStackAreas;
++        std::mutex g_lowStackMutex;
++        uint32_t g_mainStackBottom = 0u; // SetupThread with stack -1: the main thread's stack starts here
++        bool g_lowHeapActive = false;    // SetupHeap placed the runtime heap in low memory
++        uint32_t g_gameHeapEnd = 0u;     // what EndOfHeap reports then
++    }
++
++    void setRuntimeLowHeap(uint32_t base, uint32_t end)
++    {
++        g_lowHeapBase = (base + 0xFu) & ~0xFu;
++        g_lowHeapEnd = end & ~0xFu;
++        if (g_lowHeapEnd <= g_lowHeapBase)
++            g_lowHeapBase = g_lowHeapEnd = 0u;
++    }
++
++    void addRuntimeLowStackArea(uint32_t base, uint32_t end)
++    {
++        std::lock_guard<std::mutex> lock(g_lowStackMutex);
++        if (end > base)
++            g_lowStackAreas.push_back({(base + 0xFu) & ~0xFu, end & ~0xFu});
++    }
++
++    bool runtimeLowStacksActive()
++    {
++        std::lock_guard<std::mutex> lock(g_lowStackMutex);
++        return !g_lowStackAreas.empty();
++    }
++
++    uint32_t reserveRuntimeLowStack(uint32_t size)
++    {
++        const uint32_t allocSize = (size + 0xFu) & ~0xFu;
++        std::lock_guard<std::mutex> lock(g_lowStackMutex);
++        for (LowStackArea &area : g_lowStackAreas)
++        {
++            if (area.top - area.base < allocSize)
++                continue;
++            const uint32_t top = area.top;
++            area.top -= allocSize;
++            static const bool s_trace = std::getenv("PS2X_MEMORIA_TRAZA") != nullptr;
++            if (s_trace)
++                std::fprintf(stderr, "[memoria] pila baja de 0x%x en 0x%x-0x%x\n", allocSize, area.top, top);
++            return top - 0x10u;
++        }
++        return 0u;
++    }
++
+     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t gp = getRegU32(ctx, 4);
+@@ -530,6 +590,7 @@ namespace ps2_syscalls
+         if (stack == 0xFFFFFFFFu)
+         {
+             initialStack = (stackSize != 0u && stackSize <= sp) ? sp - stackSize : sp;
++            g_mainStackBottom = initialStack & ~0xFu;
+         }
+         else if (stack != 0u)
+         {
+@@ -574,6 +635,24 @@ namespace ps2_syscalls
+             heapLimit = kDefaultGuestHeapEnd;
+         }
+ 
++        // Runtime heap in low memory (ps2_heap_reserve.h): the game heap keeps the rest of RAM, up to the main thread's
++        // stack as on the console when the game asks for "rest of RAM".
++        if (runtime && g_lowHeapEnd != 0u)
++        {
++            uint32_t gameEnd = heapLimit;
++            if ((heapSize == 0u || heapSize == 0xFFFFFFFFu) && g_mainStackBottom > heapBase)
++                gameEnd = g_mainStackBottom;
++            runtime->configureGuestHeap(g_lowHeapBase, g_lowHeapEnd);
++            g_lowHeapActive = true;
++            g_gameHeapEnd = gameEnd;
++            static const bool s_trace = std::getenv("PS2X_MEMORIA_TRAZA") != nullptr;
++            if (s_trace)
++                std::fprintf(stderr, "[memoria] SetupHeap: juego 0x%x-0x%x, runtime 0x%x-0x%x\n", heapBase, gameEnd,
++                             g_lowHeapBase, g_lowHeapEnd);
++            setReturnU32(ctx, heapBase);
++            return;
++        }
++
+         // With a top reserve the runtime heap lives above the game heap (see ps2_heap_reserve.h).
+         const bool reserveTop = g_guestHeapTopReserve != 0u &&
+                                 static_cast<uint64_t>(heapBase) + g_guestHeapTopReserve < heapLimit;
+@@ -613,6 +692,12 @@ namespace ps2_syscalls
+                            ? runtime->guestHeapLimit()
+                            : kDefaultGuestHeapEnd;
+ 
++        if (g_lowHeapActive) // runtime heap in low memory: the game heap ends where SetupHeap said
++        {
++            setReturnU32(ctx, g_gameHeapEnd);
++            return;
++        }
++
+         // With a top reserve the game heap ends where the runtime heap begins.
+         if (runtime && g_guestHeapReserveActive && runtime->guestHeapBase() < ret)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 378ab5b..9f52fd1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2024,7 +2024,17 @@ uint32_t PS2Runtime::guestMalloc(uint32_t size, uint32_t alignment)
+ {
+     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+     ensureGuestHeapInitializedLocked();
+-    return allocateGuestBlockLocked(size, alignment);
++    const uint32_t address = allocateGuestBlockLocked(size, alignment);
++    // F1 06 (fase 5): PS2X_MEMORIA_TRAZA=1 registra cada nuevo maximo del monton del runtime.
++    static const bool s_traza = std::getenv("PS2X_MEMORIA_TRAZA") != nullptr;
++    static uint32_t s_maximo = 0u;
++    if (s_traza && address != 0u && address + size > s_maximo)
++    {
++        s_maximo = address + size;
++        std::fprintf(stderr, "[memoria] monton del runtime: bloque de 0x%x en 0x%x (hasta 0x%x; base 0x%x, fin 0x%x)\n", size,
++                     address, s_maximo, m_guestHeapBase, m_guestHeapEnd);
++    }
++    return address;
+ }
+ 
+ uint32_t PS2Runtime::guestCalloc(uint32_t count, uint32_t size, uint32_t alignment)
+@@ -2214,6 +2224,11 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     }
+ 
+     m_asyncCallbackStackTop = base;
++    // F1 06 (fase 5): PS2X_MEMORIA_TRAZA=1 registra cada pila reservada al final de la RAM.
++    static const bool s_traza = std::getenv("PS2X_MEMORIA_TRAZA") != nullptr;
++    if (s_traza)
++        std::fprintf(stderr, "[memoria] pila de 0x%x en 0x%x-0x%x (usado al final de la RAM: 0x%x)\n", allocSize, base, top,
++                     PS2_RAM_SIZE - base);
+     return top - 0x10u;
+ }
+ 

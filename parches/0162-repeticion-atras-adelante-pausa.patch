@@ -1,0 +1,521 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 2fea16e..7558b6a 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -4,6 +4,7 @@
+ #include "ps2_pad_players.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_photo_mode.h"
++#include "ps2_replay_scrub.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+@@ -1003,6 +1004,13 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+         value[kL3] = 0.0f;
+     if ((pressed & ps2x::kPadR3) == 0u)
+         value[kR3] = 0.0f;
++    // Fase 5 (T14): in the replay L2, R2 and SELECT rewind, fast-forward and pause it (ps2_runtime.cpp): the game sees
++    // none of them.
++    if (ps2x::replayScrubActive())
++    {
++        pressed = static_cast<uint16_t>(pressed & ~((1u << kL2) | (1u << kR2) | (1u << kSelect)));
++        value[kL2] = value[kR2] = value[kSelect] = 0.0f;
++    }
+ 
+     writeReport(data, pressed, value, cfg);
+     debugReport(0, data, f);
+diff --git a/ps2xRuntime/src/lib/ps2_replay_scrub.h b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+new file mode 100644
+index 0000000..2bfbfd1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_replay_scrub.h
+@@ -0,0 +1,168 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++// Fase 5 (T14, F1 06): rewind, fast-forward and pause in the game's own replay. The game does not keep the cars'
++// positions: it keeps the pad inputs of the last 1920 steps and two snapshots of the whole race state, and its replay
++// restores the oldest snapshot and simulates again from the inputs, looping at the end (src/f1_overrides.cpp). So:
++// pause = no steps; fast-forward = more steps per frame; rewind = start the replay again (the game's own loop) and run
++// the steps up to the earlier position within one frame, without drawing them. A step costs the PC about 3 ms, so
++// rewind held only moves the target (the picture stays still) and the replay goes there once, when it is let go.
++// The window reads the keys and the pad (ps2_runtime.cpp); the game's thread plans each frame's steps (ReplayScrubber).
++namespace ps2x
++{
++    constexpr double kReplayRewindJump = 2.0;     // seconds of replay back at once and each kReplayRewindRepeat held
++    constexpr double kReplayRewindRepeat = 0.25;
++    constexpr double kReplayFasterAfter = 1.0;    // fast-forward held this long goes from x2 to x4
++    constexpr double kReplayMuteAfterSeek = 0.3;  // the sound stays off this long after the jump back
++    constexpr double kReplayActiveWindow = 1.0;   // the replay counts as on while the game saw it this recently
++
++    // What the player holds (pausePresses counts the pause key's presses, so none is lost between two game frames).
++    struct ReplayScrubControls
++    {
++        bool rewind = false;
++        bool fastForward = false;
++        uint32_t pausePresses = 0u;
++    };
++
++    // The game's replay cursor, in steps: position from 0 (the replay's start) to length - 1.
++    struct ReplayPosition
++    {
++        int32_t position = 0;
++        int32_t length = 0;
++    };
++
++    // One frame: run steps simulation steps; with restart, first put the cursor on the replay's last step, so the
++    // first step makes the game start the replay again (cursor 0) and the rest bring it to target. While rewind is
++    // held, target is where it will go.
++    struct ReplayStepPlan
++    {
++        uint32_t steps = 0u;
++        bool restart = false;
++        int32_t target = -1;
++        int speed = 1; // 0 paused, 1, 2 or 4; -1 rewinding
++    };
++
++    inline bool validReplayPosition(const ReplayPosition &p)
++    {
++        return p.length > 0 && p.position >= 0 && p.position < p.length;
++    }
++
++    // Steps for a number of replay seconds (at least one).
++    inline int32_t replaySteps(double seconds, double stepsPerSecond)
++    {
++        const double sps = std::isfinite(stepsPerSecond) && stepsPerSecond > 0.0 ? stepsPerSecond : 50.0;
++        return std::max<int32_t>(1, static_cast<int32_t>(std::lround(seconds * sps)));
++    }
++
++    class ReplayScrubber
++    {
++    public:
++        // n: the steps the game would run this frame (the VBLANKs since its last one); now: seconds, any clock.
++        ReplayStepPlan plan(const ReplayScrubControls &c, const ReplayPosition &p, uint32_t n, double stepsPerSecond,
++                            double now)
++        {
++            ReplayStepPlan out;
++            out.steps = n;
++            if (!m_synced)
++            {
++                m_synced = true;
++                m_presses = c.pausePresses;
++            }
++            if (((c.pausePresses - m_presses) & 1u) != 0u)
++                m_paused = !m_paused;
++            m_presses = c.pausePresses;
++            if (!validReplayPosition(p))
++                return out;
++
++            if (c.rewind)
++            {
++                const int32_t jump = replaySteps(kReplayRewindJump, stepsPerSecond);
++                if (!m_rewinding)
++                {
++                    m_rewinding = true;
++                    m_lastJump = now;
++                    m_target = std::max<int32_t>(0, p.position - jump);
++                }
++                else if (now - m_lastJump >= kReplayRewindRepeat)
++                {
++                    m_lastJump = now;
++                    m_target = std::max<int32_t>(0, m_target - jump);
++                }
++                out.steps = 0u;
++                out.target = m_target;
++                out.speed = -1;
++                return out;
++            }
++            if (m_rewinding)
++            {
++                m_rewinding = false;
++                m_seeking = true;
++                out.restart = true;
++                out.target = std::min(m_target, p.length - 1);
++                out.steps = static_cast<uint32_t>(out.target) + 1u;
++                out.speed = -1;
++                return out;
++            }
++
++            // The frame after the jump took long: the game would make up for it with as many steps.
++            uint32_t own = n;
++            if (m_seeking)
++            {
++                m_seeking = false;
++                m_mutedUntil = now + kReplayMuteAfterSeek;
++                own = std::min<uint32_t>(n, 1u);
++            }
++            if (c.fastForward)
++            {
++                if (m_fastSince < 0.0)
++                    m_fastSince = now;
++                out.speed = now - m_fastSince >= kReplayFasterAfter ? 4 : 2;
++                out.steps = own * static_cast<uint32_t>(out.speed);
++                return out;
++            }
++            m_fastSince = -1.0;
++            out.speed = m_paused ? 0 : 1;
++            out.steps = m_paused ? 0u : own;
++            return out;
++        }
++
++        bool paused() const { return m_paused; }
++        // The sound: off while paused, rewinding, going there and a moment after.
++        bool muted(double now) const
++        {
++            return m_paused || m_rewinding || m_seeking || now < m_mutedUntil;
++        }
++        // Out of the replay: it starts again playing.
++        void reset()
++        {
++            *this = ReplayScrubber();
++        }
++
++    private:
++        bool m_synced = false;
++        uint32_t m_presses = 0u;
++        bool m_paused = false;
++        bool m_rewinding = false;
++        bool m_seeking = false;
++        int32_t m_target = 0;
++        double m_lastJump = 0.0;
++        double m_mutedUntil = -1.0;
++        double m_fastSince = -1.0;
++    };
++
++    // The shared state (ps2_runtime.cpp; any thread). The game's thread: replayScrubSeen on each frame of a replay
++    // (with its position, or where rewind goes, in steps, and the steps per second), replayScrubControls,
++    // setReplayScrubState and setReplayScrubSeeking around the long frame of the jump back. The window:
++    // replayScrubActive (also during that frame), setReplayScrubControls. The pad (ps2_pad.cpp) hides L2, R2 and SELECT
++    // from the game while it is on, and the sound is off while replayScrubMuted.
++    void replayScrubSeen(const ReplayPosition &position, double stepsPerSecond);
++    bool replayScrubActive();
++    void setReplayScrubControls(bool rewind, bool fastForward, bool pausePressed);
++    ReplayScrubControls replayScrubControls();
++    void setReplayScrubState(int speed, bool muted);
++    void setReplayScrubSeeking(bool seeking);
++    bool replayScrubMuted();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 88948e2..9db428a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -22,6 +22,7 @@
+ #include "ps2_options_menu.h"
+ #include "ps2_photo.h"
+ #include "ps2_photo_mode.h"
++#include "ps2_replay_scrub.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -872,6 +873,140 @@ static void UpdatePhotoMode(bool optionsMenuOpen)
+     ps2x::setPhotoModeInput(ps2x::freeCameraInput(keys, pad));
+ }
+ 
++// Fase 5 (T14): rewind, fast-forward and pause in the game's replay (ps2_replay_scrub.h). The game's thread says when a
++// replay is playing and where (src/f1_overrides.cpp); the window reads J (rewind), L (fast-forward) and K (pause), or
++// the pad's L2, R2 and SELECT, only then and never with the options menu open, and shows a line when the speed changes.
++namespace
++{
++    std::mutex g_replayScrubMutex;
++    ps2x::ReplayScrubControls g_replayScrubControls;
++    ps2x::ReplayPosition g_replayScrubPosition;
++    double g_replayScrubStepsPerSecond = 50.0;
++    double g_replayScrubSeen = -1.0;
++    int g_replayScrubSpeed = 1;
++    std::atomic<bool> g_replayScrubMuted{false};
++    std::atomic<bool> g_replayScrubSeeking{false};
++}
++
++namespace ps2x
++{
++    void replayScrubSeen(const ReplayPosition &position, double stepsPerSecond)
++    {
++        std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++        g_replayScrubPosition = position;
++        g_replayScrubStepsPerSecond = stepsPerSecond;
++        g_replayScrubSeen = PhotoModeClock();
++    }
++
++    bool replayScrubActive()
++    {
++        if (g_replayScrubSeeking.load(std::memory_order_relaxed))
++            return true;
++        std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++        return g_replayScrubSeen >= 0.0 && PhotoModeClock() - g_replayScrubSeen <= kReplayActiveWindow;
++    }
++
++    void setReplayScrubControls(bool rewind, bool fastForward, bool pausePressed)
++    {
++        std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++        g_replayScrubControls.rewind = rewind;
++        g_replayScrubControls.fastForward = fastForward;
++        if (pausePressed)
++            ++g_replayScrubControls.pausePresses;
++    }
++
++    ReplayScrubControls replayScrubControls()
++    {
++        std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++        return g_replayScrubControls;
++    }
++
++    void setReplayScrubState(int speed, bool muted)
++    {
++        {
++            std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++            g_replayScrubSpeed = speed;
++        }
++        g_replayScrubMuted.store(muted, std::memory_order_relaxed);
++    }
++
++    void setReplayScrubSeeking(bool seeking)
++    {
++        if (!seeking && g_replayScrubSeeking.load(std::memory_order_relaxed))
++        {
++            // Seen now: the long frame does not count against kReplayActiveWindow.
++            std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++            g_replayScrubSeen = PhotoModeClock();
++        }
++        g_replayScrubSeeking.store(seeking, std::memory_order_relaxed);
++    }
++
++    bool replayScrubMuted()
++    {
++        return g_replayScrubMuted.load(std::memory_order_relaxed) || g_replayScrubSeeking.load(std::memory_order_relaxed);
++    }
++}
++
++// The window's part, once per frame (main thread).
++static void UpdateReplayScrub(bool optionsMenuOpen)
++{
++    static int s_shownSpeed = 1;
++    static int32_t s_shownTarget = -1;
++    static bool s_wasActive = false;
++    const bool active = ps2x::replayScrubActive() && !ps2x::photoModeActive();
++    if (!active)
++    {
++        if (s_wasActive)
++            ps2x::setReplayScrubControls(false, false, false);
++        s_wasActive = false;
++        s_shownSpeed = 1;
++        s_shownTarget = -1;
++        g_replayScrubMuted.store(false, std::memory_order_relaxed);
++        return;
++    }
++    if (!s_wasActive)
++        std::cout << "[repeticion] controles: J atras, L adelante (x2, x4), K pausa; mando L2, R2, SELECT" << std::endl;
++    s_wasActive = true;
++    bool rewind = false, fastForward = false, pause = false;
++    if (!optionsMenuOpen)
++    {
++        const ps2x::PhotoModePad pad = ps2x::readPhotoModePad();
++        constexpr uint16_t kSelect = 1u << 0, kL2 = 1u << 8, kR2 = 1u << 9;
++        static bool s_selectHeld = false;
++        const bool select = (pad.pressed & kSelect) != 0u;
++        rewind = IsKeyDown(KEY_J) || (pad.pressed & kL2) != 0u;
++        fastForward = !rewind && (IsKeyDown(KEY_L) || (pad.pressed & kR2) != 0u);
++        pause = IsKeyPressed(KEY_K) || (select && !s_selectHeld);
++        s_selectHeld = select;
++    }
++    ps2x::setReplayScrubControls(rewind, fastForward, pause);
++
++    int speed = 1;
++    ps2x::ReplayPosition position;
++    double stepsPerSecond = 50.0;
++    {
++        std::lock_guard<std::mutex> lock(g_replayScrubMutex);
++        speed = g_replayScrubSpeed;
++        position = g_replayScrubPosition;
++        stepsPerSecond = g_replayScrubStepsPerSecond > 0.0 ? g_replayScrubStepsPerSecond : 50.0;
++    }
++    // Rewind held: a line each time the target moves.
++    if (speed == s_shownSpeed && (speed != -1 || position.position == s_shownTarget))
++        return;
++    s_shownSpeed = speed;
++    s_shownTarget = position.position;
++    char line[160];
++    const char *what = speed == 0    ? "pausa (K o SELECT sigue)"
++                       : speed == -1 ? "atras, hasta"
++                       : speed == 2  ? "adelante x2"
++                       : speed == 4  ? "adelante x4"
++                                     : "normal";
++    std::snprintf(line, sizeof(line), "Repeticion: %s  %.1f / %.1f s", what, position.position / stepsPerSecond,
++                  position.length / stepsPerSecond);
++    std::cout << "[repeticion] " << line << std::endl;
++    SetPhotoMessage(line);
++}
++
+ static void SetPhotoMessage(const std::string &message)
+ {
+     std::lock_guard<std::mutex> lock(g_photoMutex);
+@@ -1546,8 +1681,8 @@ bool PS2Runtime::initialize(const char *title)
+                                        const size_t got = ps2x::iop::readSpu2Audio(out, frames);
+                                        if (got < frames)
+                                            std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
+-                                       // Fase 5 (T13): silent in the photo mode.
+-                                       const float scale = ps2x::photoModeActive()
++                                       // Fase 5 (T13, T14): silent in the photo mode and while the replay is paused or rewinds.
++                                       const float scale = ps2x::photoModeActive() || ps2x::replayScrubMuted()
+                                                                ? 0.0f
+                                                                : g_outputVolumeScale.load(std::memory_order_relaxed);
+                                        if (scale != 1.0f)
+@@ -3454,6 +3589,7 @@ void PS2Runtime::run()
+             !optionsMenuOpen && photoKey != KEY_NULL && IsKeyPressed(photoKey))
+             ps2x::requestPhoto();
+         UpdatePhotoMode(optionsMenuOpen);
++        UpdateReplayScrub(optionsMenuOpen);
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+                                     : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
+                                                                                : srcWidth / srcHeight;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index e1d4b61..eedc045 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_photo_mode.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_race_laps.h"
++#include "ps2_replay_scrub.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <chrono>
+@@ -795,6 +796,136 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(photoMode.active(), "and stays off");
+         });
+ 
++        tc.Run("the replay plays as the game does with nothing held and pauses with the pause key", [](TestCase &t)
++        {
++            ps2x::ReplayScrubber scrub;
++            const ps2x::ReplayPosition at{500, 1920};
++            ps2x::ReplayScrubControls c;
++            c.pausePresses = 7u; // presses before the replay do not count
++            ps2x::ReplayStepPlan p = scrub.plan(c, at, 1u, 50.0, 10.0);
++            t.Equals(p.steps, 1u, "nothing held: the game's own steps");
++            t.IsFalse(p.restart, "no restart");
++            t.Equals(p.speed, 1, "normal speed");
++            p = scrub.plan(c, at, 3u, 50.0, 10.02);
++            t.Equals(p.steps, 3u, "a slow frame: as many steps as the game asks");
++            c.pausePresses = 8u;
++            p = scrub.plan(c, at, 1u, 50.0, 10.04);
++            t.Equals(p.steps, 0u, "the pause key: no steps");
++            t.Equals(p.speed, 0, "paused");
++            t.IsTrue(scrub.paused() && scrub.muted(10.04), "paused and silent");
++            p = scrub.plan(c, at, 1u, 50.0, 20.0);
++            t.Equals(p.steps, 0u, "stays paused");
++            c.pausePresses = 10u;
++            p = scrub.plan(c, at, 1u, 50.0, 20.02);
++            t.Equals(p.steps, 0u, "two presses between frames: still paused");
++            c.pausePresses = 11u;
++            p = scrub.plan(c, at, 1u, 50.0, 20.04);
++            t.Equals(p.steps, 1u, "pressed again: plays");
++            t.IsFalse(scrub.paused() || scrub.muted(20.04), "playing, with sound");
++            const ps2x::ReplayPosition bad{1920, 1920};
++            c.rewind = true;
++            p = scrub.plan(c, bad, 2u, 50.0, 21.0);
++            t.IsTrue(p.steps == 2u && !p.restart, "a cursor out of the replay: the game's steps, untouched");
++        });
++
++        tc.Run("fast-forward runs two steps per step, four after a second held", [](TestCase &t)
++        {
++            ps2x::ReplayScrubber scrub;
++            const ps2x::ReplayPosition at{500, 1920};
++            ps2x::ReplayScrubControls c;
++            c.fastForward = true;
++            ps2x::ReplayStepPlan p = scrub.plan(c, at, 1u, 50.0, 5.0);
++            t.IsTrue(p.steps == 2u && p.speed == 2 && !p.restart, "held: x2");
++            p = scrub.plan(c, at, 2u, 50.0, 5.0 + ps2x::kReplayFasterAfter - 0.01);
++            t.IsTrue(p.steps == 4u && p.speed == 2, "x2 of the game's steps");
++            p = scrub.plan(c, at, 1u, 50.0, 5.0 + ps2x::kReplayFasterAfter);
++            t.IsTrue(p.steps == 4u && p.speed == 4, "a second held: x4");
++            c.fastForward = false;
++            p = scrub.plan(c, at, 1u, 50.0, 7.0);
++            t.IsTrue(p.steps == 1u && p.speed == 1, "let go: normal");
++            c.fastForward = true;
++            p = scrub.plan(c, at, 1u, 50.0, 8.0);
++            t.IsTrue(p.steps == 2u && p.speed == 2, "held again: x2 again");
++            c.fastForward = false;
++            c.pausePresses = 1u;
++            p = scrub.plan(c, at, 1u, 50.0, 9.0);
++            t.Equals(p.steps, 0u, "paused");
++            c.fastForward = true;
++            p = scrub.plan(c, at, 1u, 50.0, 9.02);
++            t.IsTrue(p.steps == 2u && p.speed == 2, "fast-forward plays while paused");
++            c.fastForward = false;
++            p = scrub.plan(c, at, 1u, 50.0, 9.04);
++            t.Equals(p.steps, 0u, "and lets go back to the pause");
++        });
++
++        tc.Run("rewind held goes two seconds back every quarter second, still, and jumps there when let go", [](TestCase &t)
++        {
++            ps2x::ReplayScrubber scrub;
++            ps2x::ReplayScrubControls c;
++            c.rewind = true;
++            ps2x::ReplayStepPlan p = scrub.plan(c, {500, 1920}, 1u, 50.0, 30.0);
++            t.IsTrue(p.steps == 0u && !p.restart, "held: still");
++            t.Equals(p.target, 400, "two seconds of 50 steps back at once");
++            t.Equals(p.speed, -1, "rewinding");
++            t.IsTrue(scrub.muted(30.0), "silent while rewinding");
++            p = scrub.plan(c, {500, 1920}, 20u, 50.0, 30.0 + ps2x::kReplayRewindRepeat - 0.01);
++            t.IsTrue(p.steps == 0u && p.target == 400, "before a quarter second: the same");
++            p = scrub.plan(c, {500, 1920}, 1u, 50.0, 30.0 + ps2x::kReplayRewindRepeat);
++            t.IsTrue(p.steps == 0u && p.target == 300, "a quarter second later: two seconds more");
++            c.rewind = false;
++            p = scrub.plan(c, {500, 1920}, 1u, 50.0, 30.5);
++            t.IsTrue(p.restart, "let go: restart first");
++            t.Equals(p.target, 300, "to where it got");
++            t.Equals(p.steps, 301u, "one step to restart and 300 up to there");
++            t.IsTrue(scrub.muted(30.5), "silent while it gets there");
++            p = scrub.plan(c, {300, 1920}, 40u, 50.0, 35.0);
++            t.IsTrue(p.steps == 1u && !p.restart && p.speed == 1, "the long frame is not made up for");
++            t.IsTrue(scrub.muted(35.0 + ps2x::kReplayMuteAfterSeek - 0.01), "silent a moment after");
++            t.IsFalse(scrub.muted(35.0 + ps2x::kReplayMuteAfterSeek), "and then the sound again");
++            p = scrub.plan(c, {301, 1920}, 2u, 50.0, 35.02);
++            t.Equals(p.steps, 2u, "then the game's steps again");
++
++            c.rewind = true;
++            p = scrub.plan(c, {60, 1920}, 1u, 60.0, 40.0);
++            t.IsTrue(p.steps == 0u && p.target == 0, "no further back than the replay's start (60 steps/s)");
++            c.rewind = false;
++            p = scrub.plan(c, {60, 1920}, 1u, 60.0, 40.1);
++            t.IsTrue(p.restart && p.target == 0 && p.steps == 1u, "a tap: back to the start");
++        });
++
++        tc.Run("rewind while paused stays paused where it lands", [](TestCase &t)
++        {
++            ps2x::ReplayScrubber scrub;
++            ps2x::ReplayScrubControls c;
++            scrub.plan(c, {800, 1920}, 1u, 50.0, 1.0);
++            c.pausePresses = 1u;
++            scrub.plan(c, {800, 1920}, 1u, 50.0, 1.02);
++            c.rewind = true;
++            ps2x::ReplayStepPlan p = scrub.plan(c, {800, 1920}, 1u, 50.0, 1.04);
++            t.IsTrue(p.steps == 0u && p.target == 700, "held while paused");
++            c.rewind = false;
++            p = scrub.plan(c, {800, 1920}, 1u, 50.0, 1.1);
++            t.IsTrue(p.restart && p.steps == 701u, "let go: the jump");
++            p = scrub.plan(c, {700, 1920}, 1u, 50.0, 3.0);
++            t.IsTrue(p.steps == 0u && p.speed == 0 && scrub.paused(), "and still paused");
++        });
++
++        tc.Run("the replay scrubber starts playing again out of the replay", [](TestCase &t)
++        {
++            ps2x::ReplayScrubber scrub;
++            ps2x::ReplayScrubControls c;
++            scrub.plan(c, {10, 100}, 1u, 50.0, 1.0);
++            c.pausePresses = 1u;
++            scrub.plan(c, {10, 100}, 1u, 50.0, 1.02);
++            t.IsTrue(scrub.paused(), "paused");
++            scrub.reset();
++            t.IsFalse(scrub.paused() || scrub.muted(1.04), "reset: playing, with sound");
++            const ps2x::ReplayStepPlan p = scrub.plan(c, {10, 100}, 1u, 50.0, 2.0);
++            t.Equals(p.steps, 1u, "the presses before do not pause it again");
++            t.Equals(ps2x::replaySteps(2.0, 0.0), 100, "steps per second unknown: 50");
++            t.Equals(ps2x::replaySteps(0.001, 50.0), 1, "at least one step");
++        });
++
+         tc.Run("the HUD modes: their names, their numbers and the key's cycle", [](TestCase &t)
+         {
+             ps2x::HudMode mode = ps2x::HudMode::Hidden;

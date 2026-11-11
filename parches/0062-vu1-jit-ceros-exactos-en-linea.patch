@@ -1,0 +1,228 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 02b13ae..8eda224 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -29,7 +29,8 @@
+ // compiled schedules with the upper FMAC through calls instead of inline (before patch 0058), 31 the compiled schedules with LQ,
+ // SQ, the pc and the block end through calls (before patch 0059), 32 the compiled
+ // schedules with every flag commit through a call (before patch 0060), 34 the
+-// compiled schedules normalizing every FMAC operand, without JitKnownNormal (before patch 0061). A
++// compiled schedules normalizing every FMAC operand, without JitKnownNormal (before patch 0061), 35 the compiled
++// schedules with the exact zeros of the inline FMAC through calls (before patch 0062). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index c162109..51b4a51 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1967,13 +1967,13 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35) && s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34)
++            else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 6e45d31..2c9994d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -373,11 +373,13 @@
+         JcTop,     // 254
+         JcOne,     // 1
+         JcBinades, // 23
++        JcSign,    // 0x80000000
+     };
+-    alignas(16) const uint32_t kJitConst[8][4] = {
++    alignas(16) const uint32_t kJitConst[9][4] = {
+         {0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u}, {0u, 0u, 0u, 0u},
+         {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu}, {0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu},
+-        {0xFFu, 0xFFu, 0xFFu, 0xFFu}, {254u, 254u, 254u, 254u}, {1u, 1u, 1u, 1u}, {23u, 23u, 23u, 23u}};
++        {0xFFu, 0xFFu, 0xFFu, 0xFFu}, {254u, 254u, 254u, 254u}, {1u, 1u, 1u, 1u}, {23u, 23u, 23u, 23u},
++        {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u}};
+ 
+     // normalize4 on xmm x (rax = kJitConst), with xmm3-xmm5 as scratch: bits & ~(D & 0x7FFFFFFF) | (maxE & 0x7F7FFFFF)
+     // with D = zero exponent | maximum exponent. The same as normalize4: a zero exponent keeps the sign alone, the
+@@ -411,7 +413,16 @@
+     // current MXCSR mode, the range test of fmacSse2, the flag entry (sign flags alone) and the result in its lanes.
+     // Outside that range: a call to p.upperEarly, which does all of it from the registers, still untouched.
+     // False: not one of these (the caller calls p.upperEarly).
+-    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known)
++    // zeros (patch 0062; A/B mode 35: without): also the lanes whose exact result is zero, and for MADD/MSUB the lanes
++    // whose product is exactly zero, which fmacSse2 sends to its slow path (in a race, the zeros of the transform
++    // matrices: MULA/MADDA with a zero entry were about 7 % of the EE thread through upperEarly calls). Operands are
++    // normalized, so a lane is zero only when it is a signed zero, and the exact result of a lane is zero when an
++    // operand of MUL is zero, when a = -b in ADD (a = b in SUB) and, for MADD/MSUB, when a or b and c are zero; the
++    // product is exact zero when a or b is. In those lanes the rounded value is the same signed zero as the exact one
++    // (the IEEE sign rules do not depend on the precision), so the slow path keeps it and adds Z (and S if negative)
++    // to MAC and status; a zero product of MADD/MSUB adds Z (and its S) to the sticky flags, and c +- 0 is c, whose
++    // own range test still applies.
++    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -465,6 +476,43 @@
+             e.rr({0x0F, 0x59}, 4, 1); // mulps
+             e.movaps(3, 2);
+             e.rr({0x0F, static_cast<uint8_t>(op.kind == FmacMadd ? 0x58 : 0x5C)}, 3, 4); // addps / subps
++            if (zeros)
++            {
++                // Per lane: (value in range and (product in range, at most 22 binades above the value, or exactly
++                // zero)) or (product and c exactly zero).
++                e.cst({0x0F, 0xC2}, 0, JcZero);          // cmpeqps: a == 0
++                e.bytes({0x00});
++                e.cst({0x0F, 0xC2}, 1, JcZero);          // b == 0
++                e.bytes({0x00});
++                e.rr({0x0F, 0x56}, 0, 1);                // orps: the product is exactly zero
++                e.cst({0x0F, 0xC2}, 2, JcZero);          // c == 0
++                e.bytes({0x00});
++                e.rr({0x0F, 0x54}, 2, 0);                // andps: and c too
++                e.movmskps(1, 0);                        // ecx: zero product
++                e.movmskps(2, 2);                        // edx: zero product and c
++                jitExponent(e, 0, 3);                    // ve
++                jitExponent(e, 1, 4);                    // pe
++                e.cst({0x0F, 0x28}, 2, JcTop);
++                e.rr({0x66, 0x0F, 0x66}, 2, 0);          // 254 > ve
++                e.movaps(5, 0);
++                e.cst({0x66, 0x0F, 0x66}, 5, JcOne);     // ve > 1
++                e.rr({0x66, 0x0F, 0xDB}, 2, 5);          // xmm2: value in range
++                e.cst({0x66, 0x0F, 0xFE}, 0, JcBinades); // paddd: ve + 23
++                e.rr({0x66, 0x0F, 0x66}, 0, 1);          // ve + 23 > pe
++                e.cst({0x0F, 0x28}, 5, JcTop);
++                e.rr({0x66, 0x0F, 0x66}, 5, 1);          // 254 > pe
++                e.rr({0x66, 0x0F, 0xDB}, 0, 5);
++                e.movaps(5, 1);
++                e.cst({0x66, 0x0F, 0x66}, 5, JcOne);     // pe > 1
++                e.rr({0x66, 0x0F, 0xDB}, 0, 5);          // xmm0: product in range
++                e.movmskps(0, 0);
++                e.orEaxEcx();
++                e.movmskps(1, 2);
++                e.bytes({0x21, 0xC8});                   // and eax, ecx
++                e.bytes({0x09, 0xD0});                   // or eax, edx
++            }
++            else
++            {
+             // Value and product exponents between 2 and 253, the value at most 22 binades below the product.
+             jitExponent(e, 0, 3);                    // ve
+             jitExponent(e, 1, 4);                    // pe
+@@ -483,6 +531,7 @@
+             e.rr({0x66, 0x0F, 0x66}, 0, 1);          // ve + 23 > pe
+             e.rr({0x66, 0x0F, 0xDB}, 2, 0);
+             e.movmskps(0, 2);
++            }
+         }
+         else
+         {
+@@ -494,7 +543,29 @@
+             e.rr({0x66, 0x0F, 0x66}, 5, 4);          // 254 > exponent
+             e.cst({0x66, 0x0F, 0x66}, 4, JcOne);     // exponent > 1
+             e.rr({0x66, 0x0F, 0xDB}, 4, 5);
++            if (zeros)
++            {
++                // Or an exact zero: MUL a == 0 or b == 0; ADD a == -b; SUB a == b (before eax, which is rax).
++                if (op.kind == FmacMul)
++                {
++                    e.cst({0x0F, 0xC2}, 0, JcZero); // cmpeqps
++                    e.bytes({0x00});
++                    e.cst({0x0F, 0xC2}, 1, JcZero);
++                    e.bytes({0x00});
++                    e.rr({0x0F, 0x56}, 0, 1);       // orps
++                }
++                else
++                {
++                    if (op.kind == FmacAdd)
++                        e.cst({0x0F, 0x57}, 1, JcSign); // xorps: -b
++                    e.rr({0x0F, 0xC2}, 0, 1);       // cmpeqps
++                    e.bytes({0x00});
++                }
++                e.movmskps(1, 0);
++            }
+             e.movmskps(0, 4);
++            if (zeros)
++                e.orEaxEcx();
+         }
+         e.andEax(op.components);
+         e.bytes({0x3D}); // cmp eax, components
+@@ -521,6 +592,27 @@
+                                                           ((op.components & 4u) >> 1) | ((op.components & 8u) >> 3));
+             e.movaps(5, 3);
+             e.shufps(5, 5, 0x1B);
++            if (zeros)
++            {
++                // A zero lane here is an exact zero: Z in MAC (bits 0-3) and status (bit 0).
++                e.rr({0x0F, 0x57}, 0, 0);  // xorps xmm0, xmm0
++                e.rr({0x0F, 0xC2}, 0, 5);  // cmpeqps xmm0, xmm5
++                e.bytes({0x00});
++                e.movmskps(1, 5);
++                e.andEcx(reversed);
++                e.shlEcx(4);
++                e.movmskps(2, 0);
++                e.bytes({0x81, 0xE2});     // and edx, reversed
++                e.imm32(reversed);
++                e.bytes({0x09, 0xD1});     // or ecx, edx
++                storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, mac)), 1);
++                // edx = (mac & 0xF ? 1 : 0) | (mac & 0xF0 ? 2 : 0)
++                e.bytes({0x31, 0xD2, 0xF6, 0xC1, 0x0F, 0x0F, 0x95, 0xC2, 0xF6, 0xC1, 0xF0, 0x0F, 0x95, 0xC1, 0x0F, 0xB6,
++                         0xC9, 0x8D, 0x14, 0x4A});
++                storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, status)), 2);
++            }
++            else
++            {
+             e.movmskps(1, 5); // ecx
+             e.andEcx(reversed);
+             e.bytes({0x89, 0xCA}); // mov edx, ecx
+@@ -528,7 +620,24 @@
+             storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, mac)), 1);
+             e.bytes({0x85, 0xD2, 0x0F, 0x95, 0xC2, 0x0F, 0xB6, 0xD2, 0x01, 0xD2}); // edx = edx != 0 ? 2 : 0
+             storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, status)), 2);
+-            if (madd)
++            }
++            if (madd && zeros)
++            {
++                // The product: its signs (S) and its exact zeros (Z) to the sticky flags.
++                e.movmskps(1, 4);
++                e.andEcx(op.components);
++                e.rr({0x0F, 0x57}, 0, 0);  // xorps xmm0, xmm0
++                e.rr({0x0F, 0xC2}, 0, 4);  // cmpeqps xmm0, xmm4
++                e.bytes({0x00});
++                e.movmskps(2, 0);
++                e.bytes({0x81, 0xE2});     // and edx, components
++                e.imm32(op.components);
++                // ecx = (ecx != 0 ? 2 : 0) | (edx != 0 ? 1 : 0)
++                e.bytes({0x85, 0xC9, 0x0F, 0x95, 0xC1, 0x0F, 0xB6, 0xC9, 0x01, 0xC9, 0x85, 0xD2, 0x0F, 0x95, 0xC2, 0x0F,
++                         0xB6, 0xD2, 0x09, 0xD1});
++                storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, sticky)), 1);
++            }
++            else if (madd)
+             {
+                 e.movmskps(1, 4); // the product's signs go to the sticky flags
+                 e.andEcx(op.components);
+@@ -857,7 +966,8 @@
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
+     // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls), 31 (LQ, SQ, the pc and the end
+-    // of the block through calls), 32 (flag commits through calls) and 34 (no JitKnownNormal), in s.jitCalls.
++    // of the block through calls), 32 (flag commits through calls), 34 (no JitKnownNormal) and 35 (no exact zeros
++    // in the inline FMAC), in s.jitCalls.
+     template <typename Host>
+     bool jitCompile(BlockEngine &engine, Schedule &s, Host &host, int alternative = 0)
+     {
+@@ -918,7 +1028,8 @@
+             }
+             if (upperDone)
+             {
+-                if (!(inlineFmac && s_jitInlineFmac && jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
++                if (!(inlineFmac && s_jitInlineFmac &&
++                      jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35)))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+             else if (p.upperFn != nullptr)

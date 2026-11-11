@@ -1,0 +1,52 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index e9226f3..348c7a6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4823,9 +4823,33 @@ struct GSCpuBackend::BandState
+                 me.onEfficiency.fetch_add(onEfficiency, std::memory_order_relaxed);
+             }
+             const auto start = std::chrono::steady_clock::now();
++            // Patch 0092: the jobs that do nothing on this band (most of them: every band walks every job) are passed
++            // over without publishing `done` (a seq_cst store, ~5 % of a band's time); what was passed over is
++            // published before the next job that works or waits here and at the end of the batch, so whoever waits
++            // for it sees it at once (passing over takes nanoseconds and never blocks). A/B mode 85: published after
++            // every job, as before.
++            const bool everyJob = g_ps2AbMode.load(std::memory_order_relaxed) == 85;
++            bool passedOver = false;
++            const auto publish = [&](uint64_t upTo)
++            {
++                me.done.store(upTo, std::memory_order_seq_cst);
++                if (coordinatorWaiting.load(std::memory_order_seq_cst) || bandWaiters.load(std::memory_order_seq_cst) != 0u)
++                    me.done.notify_all();
++                passedOver = false;
++            };
+             for (; next < available; ++next)
+             {
+                 const BandJob &job = jobs[next % kJobCapacity];
++                const bool works = job.isUpload ? job.uploadWorker == index
++                                   : job.isCopy ? true
++                                                : job.layoutChange || jobTouchesBand(job, job.shift, count, index);
++                if (!works && !everyJob)
++                {
++                    passedOver = true;
++                    continue;
++                }
++                if (passedOver)
++                    publish(next);
+                 if (job.isUpload)
+                 {
+                     if (job.uploadWorker == index)
+@@ -4855,10 +4879,10 @@ struct GSCpuBackend::BandState
+                     if (!job.layoutChange || jobTouchesBand(job, job.shift, count, index))
+                         rasterJobRows(job, job.shift, count, index);
+                 }
+-                me.done.store(next + 1u, std::memory_order_seq_cst);
+-                if (coordinatorWaiting.load(std::memory_order_seq_cst) || bandWaiters.load(std::memory_order_seq_cst) != 0u)
+-                    me.done.notify_all();
++                publish(next + 1u);
+             }
++            if (passedOver)
++                publish(next);
+             me.busyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                           std::chrono::steady_clock::now() - start)
+                                                           .count()),

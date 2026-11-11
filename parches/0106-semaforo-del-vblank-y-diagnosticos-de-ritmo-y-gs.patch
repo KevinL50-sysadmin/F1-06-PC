@@ -1,0 +1,354 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 346b78d..11b6316 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -92,6 +92,7 @@ extern std::atomic<uint64_t> g_ps2Vu1HostPairs;
+ extern std::atomic<uint64_t> g_ps2GsEeWaitNs;
+ extern std::atomic<uint64_t> g_ps2Vu1GsWaitNs; // ... of it, inside the VU1 runs (XGKICK)
+ extern std::atomic<uint64_t> g_ps2GsWakes; // times the producers woke the GS thread
++extern std::atomic<uint64_t> g_ps2DisplayFlips; // DISPFB1/2 writes that changed the buffer shown (patch 0106)
+ 
+ // Called by the EE thread (patch 0069): own = true keeps it on a performance core of its own (both of its
+ // hyper-threads) and every other thread of the process off that core, with 7 cores or more; false undoes it (the EE
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c6164ca..bcb99e6 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1165,7 +1165,17 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
+ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
+ {
+     assertExecutor();
+-    if (maxCount <= 0 || initCount < 0 || initCount > maxCount)
++    // Patch 0106: like the EE kernel, only a negative initial count is refused. F1 06 creates its VBLANK semaphore
++    // with max_count 0 (its handler signals it only while a thread waits on it); refused, every WaitSema on it
++    // returned at once and the game never waited for the VBLANK (front-end at ~140 frames/s, light race scenes at
++    // 58-68 with the VBLANK at 50 Hz). A signal with no waiter still overflows at max_count.
++    // PS2X_SEMA_ESTRICTA=1: refused as before (for comparisons).
++    static const bool s_strict = []
++    {
++        const char *value = std::getenv("PS2X_SEMA_ESTRICTA");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (initCount < 0 || (s_strict && (maxCount <= 0 || initCount > maxCount)))
+     {
+         return KE_ERROR;
+     }
+@@ -1174,6 +1184,9 @@ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uin
+     {
+         return KE_ERROR;
+     }
++    if (maxCount <= 0 || initCount > maxCount)
++        std::fprintf(stderr, "[ee:sema] id=%d init=%d max=%d aceptado (antes del 0106 se rechazaba)\n", id, initCount,
++                     maxCount);
+     EeSemaphore semaphore{};
+     semaphore.id = id;
+     semaphore.count = initCount;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 21f8389..f047ef5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -904,6 +904,11 @@ namespace
+         uint64_t count = 0;
+         double area = 0.0;
+         std::string example;
++        float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f; // union of the boxes (patch 0106)
++        uint64_t mixedQ = 0; // triangles with Q of both signs (patch 0106)
++        uint64_t coversPixel = 0; // triangles over the F1_GS_PIXEL point (patch 0106)
++        int64_t relMin = INT64_MAX, relMax = INT64_MIN; // draws since the last Z-only clear sprite (patch 0106)
++        std::string pixelExample;
+     };
+ 
+     void resumenAnotar(const GSPrimitiveBatch &batch)
+@@ -932,7 +937,21 @@ namespace
+             std::cerr << "[gs:resumen] " << s_groups.size() << " grupos entre " << s_from << " y " << s_from + 1.0 << " s" << std::endl;
+             for (size_t i = 0; i < sorted.size() && i < 60u; ++i)
+                 std::cerr << "[gs:resumen] n=" << sorted[i].second.count << " area=" << static_cast<uint64_t>(sorted[i].second.area)
+-                          << " " << sorted[i].first << " | " << sorted[i].second.example << std::endl;
++                          << " " << sorted[i].first << " | " << sorted[i].second.example << " todo=[" << sorted[i].second.bx0
++                          << "," << sorted[i].second.by0 << "]-[" << sorted[i].second.bx1 << "," << sorted[i].second.by1
++                          << "] qMixta=" << sorted[i].second.mixedQ << std::endl;
++            for (size_t i = 0; i < sorted.size(); ++i)
++                if (sorted[i].second.coversPixel != 0u)
++                    std::cerr << "[gs:resumen] pixel n=" << sorted[i].second.coversPixel << " orden=[" << sorted[i].second.relMin
++                              << "," << sorted[i].second.relMax << "] " << sorted[i].first << " |"
++                              << sorted[i].second.pixelExample << std::endl;
++            for (size_t i = 0, shown = 0; i < sorted.size() && shown < 30u; ++i)
++                if (sorted[i].second.mixedQ != 0u)
++                {
++                    ++shown;
++                    std::cerr << "[gs:resumen] conQMixta=" << sorted[i].second.mixedQ << " n=" << sorted[i].second.count
++                              << " " << sorted[i].first << " | " << sorted[i].second.example << std::endl;
++                }
+             return;
+         }
+         const uint32_t type = state.prim.type;
+@@ -965,8 +984,94 @@ namespace
+         y1 = std::min(y1, static_cast<float>(ctx.scissor.y1));
+         ResumenGrupo &group = s_groups[key.str()];
+         ++group.count;
++        static int64_t s_seq = 0, s_lastClear = 0;
++        ++s_seq;
++        if (type == GS_PRIM_SPRITE && ((ctx.test >> 12) & 3u) == 2u && (ctx.test & 0xFu) == 1u)
++            s_lastClear = s_seq; // alpha test NEVER, AFAIL ZB_ONLY: a Z-only fill
++        group.relMin = std::min(group.relMin, s_seq - s_lastClear);
++        group.relMax = std::max(group.relMax, s_seq - s_lastClear);
++        // Patch 0106: F1_GS_PIXEL=x,y counts, per group, the triangles over that screen point (and keeps one whole).
++        static const std::pair<float, float> s_pixel = []
++        {
++            const char *value = std::getenv("F1_GS_PIXEL");
++            float px = -1.0f, py = -1.0f;
++            if (value != nullptr)
++                std::sscanf(value, "%f,%f", &px, &py);
++            return std::make_pair(px, py);
++        }();
++        if ((vertices == 3 || type == GS_PRIM_SPRITE) && s_pixel.first >= 0.0f)
++        {
++            float vx[3] = {}, vy[3] = {};
++            for (int i = 0; i < vertices; ++i)
++            {
++                vx[i] = batch.vertices[i].x - ofx;
++                vy[i] = batch.vertices[i].y - ofy;
++            }
++            const float px = s_pixel.first + 0.5f, py = s_pixel.second + 0.5f;
++            bool covers = false;
++            if (vertices == 2)
++                covers = px >= std::min(vx[0], vx[1]) && px < std::max(vx[0], vx[1]) && py >= std::min(vy[0], vy[1]) &&
++                         py < std::max(vy[0], vy[1]);
++            else
++            {
++                const float d0 = (vx[1] - vx[0]) * (py - vy[0]) - (vy[1] - vy[0]) * (px - vx[0]);
++                const float d1 = (vx[2] - vx[1]) * (py - vy[1]) - (vy[2] - vy[1]) * (px - vx[1]);
++                const float d2 = (vx[0] - vx[2]) * (py - vy[2]) - (vy[0] - vy[2]) * (px - vx[2]);
++                const float areaTri = (vx[1] - vx[0]) * (vy[2] - vy[0]) - (vy[1] - vy[0]) * (vx[2] - vx[0]);
++                covers = areaTri != 0.0f &&
++                         ((d0 >= 0.0f && d1 >= 0.0f && d2 >= 0.0f) || (d0 <= 0.0f && d1 <= 0.0f && d2 <= 0.0f));
++            }
++            if (covers)
++            {
++                if (group.coversPixel++ == 0u)
++                {
++                    std::ostringstream t;
++                    for (int i = 0; i < vertices; ++i)
++                    {
++                        const GSVertex &v = batch.vertices[i];
++                        t << " v" << i << "=(" << vx[i] << "," << vy[i] << ",z=" << v.z << ",q=" << v.q << ",s=" << v.s
++                          << ",t=" << v.t << ",uv=" << (v.u >> 4) << "/" << (v.v >> 4) << ",rgba=" << int(v.r) << "/"
++                          << int(v.g) << "/" << int(v.b) << "/" << int(v.a) << ")";
++                    }
++                    t << " of=(" << ofx << "," << ofy << ")";
++                    group.pixelExample = t.str();
++                }
++            }
++        }
++        // Patch 0106: triangles whose vertices have Q of both signs cross the camera plane (in F1 06 the Q of what is
++        // seen is negative); the first 24 are printed whole.
++        if (vertices == 3 && state.prim.tme && !state.prim.fst)
++        {
++            const bool neg0 = batch.vertices[0].q < 0.0f, neg1 = batch.vertices[1].q < 0.0f,
++                       neg2 = batch.vertices[2].q < 0.0f;
++            if (neg0 != neg1 || neg0 != neg2)
++            {
++                ++group.mixedQ;
++                static uint32_t s_printed = 0;
++                if (s_printed < 24u)
++                {
++                    ++s_printed;
++                    std::ostringstream t;
++                    t << "[gs:resumen] qMixta tbp=" << ctx.tex0.tbp0 << " tpsm=" << int(ctx.tex0.psm) << " tw=" << int(ctx.tex0.tw)
++                      << " th=" << int(ctx.tex0.th) << " prim=" << int(type);
++                    for (int i = 0; i < 3; ++i)
++                    {
++                        const GSVertex &v = batch.vertices[i];
++                        t << " v" << i << "=(" << v.x - ofx << "," << v.y - ofy << ",z=" << v.z << ",q=" << v.q << ",s=" << v.s
++                          << ",t=" << v.t << ",rgba=" << int(v.r) << "/" << int(v.g) << "/" << int(v.b) << "/" << int(v.a) << ")";
++                    }
++                    std::cerr << t.str() << std::endl;
++                }
++            }
++        }
+         if (x1 >= x0 && y1 >= y0)
++        {
+             group.area += static_cast<double>(x1 - x0 + 1.0f) * static_cast<double>(y1 - y0 + 1.0f);
++            group.bx0 = std::min(group.bx0, x0);
++            group.by0 = std::min(group.by0, y0);
++            group.bx1 = std::max(group.bx1, x1);
++            group.by1 = std::max(group.by1, y1);
++        }
+         if (group.example.empty())
+         {
+             std::ostringstream ex;
+@@ -984,6 +1089,16 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
+     resumenAnotar(batch);
++    // Debug (patch 0106): F1_GS_OMITIR_TBP=<tbp> skips the textured triangles with that texture base (to find which
++    // draw is a wrong one on screen).
++    static const int64_t s_omitTbp = []
++    {
++        const char *value = std::getenv("F1_GS_OMITIR_TBP");
++        return value != nullptr ? static_cast<int64_t>(std::atoll(value)) : int64_t{-1};
++    }();
++    if (s_omitTbp >= 0 && state.prim.tme && static_cast<int64_t>(ctx.tex0.tbp0) == s_omitTbp &&
++        state.prim.type >= GS_PRIM_TRIANGLE && state.prim.type <= GS_PRIM_TRIFAN)
++        return;
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e1ff3a3..59025f1 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -21,13 +21,19 @@
+ // gs_frontend.cpp (patch 0104): DISPFB1/2 are about to show another buffer.
+ void ps2GsBeforeDisplayChange();
+ 
++// Patch 0106: buffer changes of the display, the frames per second the game really shows (read by the game hook).
++std::atomic<uint64_t> g_ps2DisplayFlips{0u};
++
+ namespace
+ {
+     // Patch 0104: before a write to DISPFB1/2 that changes the buffer shown (FBP), the GS snapshots the one being left.
+     inline void noteDisplayWrite(uint32_t regOff, uint64_t oldValue, uint64_t newValue)
+     {
+         if ((regOff == 0x70u || regOff == 0x90u) && ((oldValue ^ newValue) & 0x1FFull) != 0u)
++        {
++            g_ps2DisplayFlips.fetch_add(1u, std::memory_order_relaxed);
+             ps2GsBeforeDisplayChange();
++        }
+     }
+ 
+     // See advanceEeTimers (patch 0051).
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 7b9edd9..f6c96c0 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -55,6 +55,9 @@ namespace
+     TrazaVu1Par s_trazaVu1[64];
+     uint32_t s_trazaVu1Pos = 0u;
+     uint32_t s_trazaVu1Llamadas = 0u;
++    uint32_t s_vu1RunStartPc = 0u; // patch 0106: start of the VU1 run in progress (F1_VU1_TBP)
++    const uint8_t *s_vu1RunCode = nullptr;
++    uint32_t s_vu1RunCodeSize = 0u;
+     uint32_t s_trazaVu1Volcados = 0u;
+     // F1_VU1_HISTORIAL_VI=1: the history also keeps the VI registers of each pair (a 64-byte copy per pair).
+     const bool s_historialVi = std::getenv("F1_VU1_HISTORIAL_VI") != nullptr;
+@@ -2193,6 +2196,106 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++    // Debug (patch 0106): F1_VU1_TBP=<tbp> follows the TEX0_1/2 set on PATH1 and, while it is that texture, logs the
++    // VU1 program that sends vertices ("[vu1:tbp]") and saves the first 4 packets with the micro and data memory
++    // (logs/vu1-tbp-<n>-paquete.bin, -codigo.bin, -datos.bin) to disassemble them.
++    {
++        static const int64_t s_tbp = []
++        {
++            const char *value = std::getenv("F1_VU1_TBP");
++            return value != nullptr ? static_cast<int64_t>(std::atoll(value)) : int64_t{-1};
++        }();
++        static bool s_active = false;
++        static uint32_t s_saved = 0u, s_logged = 0u;
++        static const auto s_tbpStart = std::chrono::steady_clock::now();
++        static const double s_tbpFrom = []
++        {
++            const char *value = std::getenv("F1_VU1_TBP_DESDE");
++            return value != nullptr ? std::atof(value) : 0.0;
++        }();
++        if (s_tbp == -2)
++            s_active = false;
++        if ((s_tbp >= 0 || s_tbp == -2) && std::chrono::duration<double>(std::chrono::steady_clock::now() - s_tbpStart).count() >= s_tbpFrom)
++        {
++            bool vertices = false;
++            uint32_t offset = 0u;
++            while (offset + 16u <= m_xgkick.totalBytes)
++            {
++                uint64_t tagLo = 0, tagHi = 0;
++                std::memcpy(&tagLo, m_xgkick.packet.data() + offset, 8u);
++                std::memcpy(&tagHi, m_xgkick.packet.data() + offset + 8u, 8u);
++                const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++                const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
++                uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++                if (nreg == 0u)
++                    nreg = 16u;
++                offset += 16u;
++                if (format == 0u)
++                {
++                    for (uint32_t loop = 0; loop < nloop; ++loop)
++                        for (uint32_t r = 0; r < nreg && offset + 16u <= m_xgkick.totalBytes; ++r, offset += 16u)
++                        {
++                            const uint32_t reg = static_cast<uint32_t>((tagHi >> (4u * r)) & 0xFu);
++                            uint64_t lo = 0, hi = 0;
++                            std::memcpy(&lo, m_xgkick.packet.data() + offset, 8u);
++                            std::memcpy(&hi, m_xgkick.packet.data() + offset + 8u, 8u);
++                            if (reg == 0xEu && ((hi & 0xFFu) == 0x06u || (hi & 0xFFu) == 0x07u))
++                                s_active = static_cast<int64_t>(lo & 0x3FFFu) == s_tbp;
++                            else if (reg == 0x4u || reg == 0x5u || reg == 0xCu || reg == 0xDu)
++                            {
++                                vertices = true;
++                                // F1_VU1_TBP=-2: a vertex above y16 < F1_VU1_YMAX (raw 12.4) and z > F1_VU1_ZMIN.
++                                static const uint32_t s_yMax = []
++                                {
++                                    const char *value = std::getenv("F1_VU1_YMAX");
++                                    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 23872u;
++                                }();
++                                static const uint32_t s_zMin = []
++                                {
++                                    const char *value = std::getenv("F1_VU1_ZMIN");
++                                    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 1000000u;
++                                }();
++                                const uint32_t y16 = static_cast<uint32_t>((lo >> 32) & 0xFFFFu);
++                                const uint32_t z = reg == 0x4u || reg == 0xCu ? static_cast<uint32_t>((hi >> 4) & 0xFFFFFFu)
++                                                                               : static_cast<uint32_t>(hi & 0xFFFFFFFFu);
++                                const bool drawKick = ((hi >> 47) & 1u) == 0u && loop >= 2u;
++                                if (s_tbp == -2 && y16 < s_yMax && z > s_zMin && drawKick)
++                                    s_active = true;
++                            }
++                        }
++                }
++                else if (format == 1u)
++                    offset += static_cast<uint32_t>(((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u);
++                else
++                    offset += nloop * 16u;
++                if ((tagLo >> 15) & 1u)
++                    break;
++            }
++            if (s_active && vertices && s_logged < 40u)
++            {
++                ++s_logged;
++                std::fprintf(stderr, "[vu1:tbp] tbp=%lld inicio=0x%04x pc=0x%04x bytes=%u vi=%d,%d,%d,%d,%d,%d,%d,%d\n",
++                             static_cast<long long>(s_tbp), s_vu1RunStartPc, m_state.pc, m_xgkick.totalBytes,
++                             m_state.vi[1], m_state.vi[2], m_state.vi[3], m_state.vi[4], m_state.vi[5], m_state.vi[6],
++                             m_state.vi[7], m_state.vi[8]);
++                if (s_saved < 4u && m_activeVuData)
++                {
++                    char name[96];
++                    std::snprintf(name, sizeof(name), "logs/vu1-tbp-%u-paquete.bin", s_saved);
++                    if (FILE *f = std::fopen(name, "wb")) { std::fwrite(m_xgkick.packet.data(), 1, m_xgkick.totalBytes, f); std::fclose(f); }
++                    std::snprintf(name, sizeof(name), "logs/vu1-tbp-%u-datos.bin", s_saved);
++                    if (FILE *f = std::fopen(name, "wb")) { std::fwrite(m_activeVuData, 1, m_activeVuDataSize, f); std::fclose(f); }
++                    if (s_vu1RunCode)
++                    {
++                        std::snprintf(name, sizeof(name), "logs/vu1-tbp-%u-codigo.bin", s_saved);
++                        if (FILE *f = std::fopen(name, "wb")) { std::fwrite(s_vu1RunCode, 1, s_vu1RunCodeSize, f); std::fclose(f); }
++                    }
++                    ++s_saved;
++                }
++            }
++        }
++    }
++
+     if (s_verifyPackets != nullptr)
+     {
+         // F1_VU1_VERIFICAR: the packets of the run are kept to compare them; the run with blocks does not send them.
+@@ -3151,6 +3254,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     bool programEnded = false;
+     const uint64_t cicloInicioTraza = m_cycle;
+     const uint32_t pcInicioTraza = m_state.pc;
++    if (m_unit == Unit::VU1)
++    {
++        s_vu1RunStartPc = m_state.pc;
++        s_vu1RunCode = vuCode;
++        s_vu1RunCodeSize = codeSize;
++    }
+     const auto inicioRitmo = VuRunClock::now();
+     const uint64_t esperaGsAntes = g_ps2GsEeWaitNs.load(std::memory_order_relaxed);
+     uint64_t paresEjecutados = 0u;

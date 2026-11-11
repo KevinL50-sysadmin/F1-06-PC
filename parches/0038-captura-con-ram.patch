@@ -1,0 +1,42 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a8aebf3..c3d1e9f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -410,7 +410,9 @@ namespace
+ // PNG at the path written in the file, then deletes the file. Unlike PrintWindow it works with the window hidden and
+ // with the session locked (PrintWindow then gets a white image). scripts\medir-carrera.ps1 and capturar-ventana.ps1
+ // use it.
+-static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t width, uint32_t height)
++// With PS2X_CAPTURA_RAM=1 the capture also saves the EE RAM (32 MB) next to the PNG, as <path>.ram, taken at the same
++// moment (to find game variables by what the screen shows).
++static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t width, uint32_t height, const uint8_t *rdram)
+ {
+     static const char *const s_request = std::getenv("PS2X_CAPTURA_PETICION");
+     static uint32_t s_skip = 0u;
+@@ -446,6 +448,17 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t wid
+         Image image{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+         if (!ExportImage(image, path.c_str()))
+             std::cerr << "[captura] no se pudo guardar " << path << std::endl;
++        static const bool s_saveRam = []()
++        {
++            const char *value = std::getenv("PS2X_CAPTURA_RAM");
++            return value != nullptr && value[0] != '0';
++        }();
++        if (s_saveRam && rdram != nullptr)
++            if (FILE *ram = std::fopen((path + ".ram").c_str(), "wb"))
++            {
++                std::fwrite(rdram, 1, PS2_RAM_SIZE, ram);
++                std::fclose(ram);
++            }
+     }
+     std::remove(s_request);
+ }
+@@ -464,7 +477,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+ 
+     if (s_hasUploadedFrame)
+-        SaveRequestedCapture(s_uploadBuffer, s_lastWidth, s_lastHeight);
++        SaveRequestedCapture(s_uploadBuffer, s_lastWidth, s_lastHeight, rt->memory().getRDRAM());
+ 
+     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;

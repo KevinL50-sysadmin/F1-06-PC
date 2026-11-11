@@ -1,0 +1,113 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index e98c9c0..ce43629 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -44,7 +44,9 @@
+ // way round), 48 the GS
+ // band workers, the GS coordinator and the GS thread sleeping at once instead of spinning first, 49 the EE thread
+ // waking the sleeping GS thread as before patch 0069 (again on every command while the pending cost it last saw stays
+-// over the bound). Since patch 0069 the modes of
++// over the bound), 50 and 51 the GS band workers spinning 200 and 1000 pauses instead of 4000 before sleeping on another
++// worker, 52 the GS coordinator spinning 1000 instead of 4000 (patch 0071: none of the three changed anything), 53 and
++// 54 GS bands of 16 and 4 rows instead of 8 (16 before patch 0071). Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 5f8cce4..ab1c0a5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2137,6 +2137,8 @@ namespace
+         TriangleSetup tri;   // when !isSprite
+         SpriteSetup sprite;  // when isSprite
+         int minX = 0, maxX = -1, minY = 0, maxY = -1; // pixels it may touch
++        int shift = 3; // band height of this job, log2 of rows (A/B modes 53 and 54)
++        bool layoutChange = false; // the first job with that height: every worker waits for waitAll
+         bool isSprite = false;
+         // Patch 0063: an image upload (BandState::uploads of its slot), run by worker uploadWorker alone.
+         bool isUpload = false;
+@@ -2975,7 +2977,10 @@ struct GSCpuBackend::BandState
+     static constexpr int kCoordinatorSpin = 4000;
+ 
+     unsigned threads = 0u;
+-    int bandShift = 4;
++    // Bands of 8 rows since patch 0071 (+2,6 % +-0,6 over 16 in a race, A/B mode 53; the 8-row test before patch 0069
++    // looked worse only because its A/B windows ran the VU1 without its JIT).
++    int bandShift = 3;
++    int lastJobShift = -1; // coordinator: band height of the last draw job (A/B mode 53)
+     std::unique_ptr<BandJob[]> jobs;
+     std::vector<std::thread> workers;
+     uint64_t prepared = 0u; // coordinator: jobs [published, prepared) are ready but not published yet
+@@ -3264,7 +3269,8 @@ struct GSCpuBackend::BandState
+         if (std::max(target, first) > published.load(std::memory_order_relaxed))
+             Publish(prepared);
+         const auto start = std::chrono::steady_clock::now();
+-        const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kCoordinatorSpin;
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        const int spin = abMode == 48 ? 0 : abMode == 52 ? 1000 : kCoordinatorSpin; // A/B modes 48 and 52: shorter
+         for (unsigned k = 0; k < threads; ++k)
+         {
+             std::atomic<uint64_t> &done = worker[k].done;
+@@ -3301,7 +3307,8 @@ struct GSCpuBackend::BandState
+     {
+         std::chrono::steady_clock::time_point start{};
+         bool waited = false;
+-        const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kCoordinatorSpin;
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        const int spin = abMode == 48 ? 0 : abMode == 50 ? 200 : abMode == 51 ? 1000 : kCoordinatorSpin; // 48, 50, 51
+         for (unsigned k = 0; k < threads; ++k)
+         {
+             if (k == self)
+@@ -3510,7 +3517,6 @@ struct GSCpuBackend::BandState
+         std::snprintf(name, sizeof(name), "GS banda %u", index);
+         ThreadNaming::SetCurrentThreadName(name);
+         Worker &me = worker[index];
+-        const int shift = bandShift;
+         const unsigned count = threads;
+         uint64_t next = 0u;
+         int coresApplied = 0;
+@@ -3570,11 +3576,13 @@ struct GSCpuBackend::BandState
+                     const size_t end = std::min<size_t>(copy.copyBytes, begin + share);
+                     std::memcpy(copy.copyTo + begin, copy.vram + begin, end - begin);
+                 }
+-                else if (jobTouchesBand(job, shift, count, index))
++                else if (job.layoutChange || jobTouchesBand(job, job.shift, count, index))
+                 {
++                    // A job with a new band height (A/B mode 53): every worker waits, as the rows change hands.
+                     if ((job.waitAll | job.waitFirst) != 0u)
+                         WaitAll(job.waitAll, job.waitFirst, index);
+-                    rasterJobRows(job, shift, count, index);
++                    if (!job.layoutChange || jobTouchesBand(job, job.shift, count, index))
++                        rasterJobRows(job, job.shift, count, index);
+                 }
+                 me.done.store(next + 1u, std::memory_order_seq_cst);
+                 if (coordinatorWaiting.load(std::memory_order_seq_cst) || bandWaiters.load(std::memory_order_seq_cst) != 0u)
+@@ -3816,6 +3824,15 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     job.isCopy = false;
+     job.waitAll = 0u;
+     job.waitFirst = 0u;
++    // A/B modes 53 and 54: bands of twice and half the height (16 and 4 rows). A job with another band height than the
++    // last one waits for every worker to finish the jobs before it (its pixels may belong to another worker now).
++    const int bandMode = g_ps2AbMode.load(std::memory_order_relaxed);
++    job.shift = bandMode == 53 && bs.bandShift < 8 ? bs.bandShift + 1
++                : bandMode == 54 && bs.bandShift > 1 ? bs.bandShift - 1
++                                                   : bs.bandShift;
++    const bool shiftChanged = job.shift != bs.lastJobShift;
++    bs.lastJobShift = job.shift;
++    job.layoutChange = false;
+     if (sprite)
+     {
+         if (!prepareSprite(batch, job.sprite))
+@@ -3973,6 +3990,12 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+         bs.verifyBatches.push_back(batch);
+     }
+ 
++    if (shiftChanged && index > bs.minDone)
++    {
++        job.waitAll = std::max(job.waitAll, index);
++        job.layoutChange = true;
++    }
++
+     // Record what it touches and publish it.
+     const uint64_t tag = index + 1u;
+     colorPages.forEach([&](uint32_t page)

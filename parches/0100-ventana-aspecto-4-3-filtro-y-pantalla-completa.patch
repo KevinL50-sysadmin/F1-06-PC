@@ -1,0 +1,106 @@
+diff --git a/ps2xRuntime/include/ps2_debug_panel.h b/ps2xRuntime/include/ps2_debug_panel.h
+index b9933d5..2de5df6 100644
+--- a/ps2xRuntime/include/ps2_debug_panel.h
++++ b/ps2xRuntime/include/ps2_debug_panel.h
+@@ -16,7 +16,7 @@ public:
+ 
+ private:
+     bool m_initialized = false;
+-    bool m_visible = true;
++    bool m_visible = false; // patch 0100: hidden until F1 (its collapsed title bar sat over the picture)
+     bool m_showRegisters = true;
+     unsigned int m_memoryAddress = 0x00100000u;
+     unsigned int m_memoryBytes = 0x100u;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 134afbb..b02e829 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -80,9 +80,33 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
+ static constexpr int HOST_WINDOW_WIDTH = 960;
+ static constexpr int HOST_WINDOW_HEIGHT = 544;
+ #else
+-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
+-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
++// Patch 0100: the window starts at 960x720, a 4:3 picture 1.5 times the PS2's 640x480 (before, 640x448).
++static constexpr int HOST_WINDOW_WIDTH = 960;
++static constexpr int HOST_WINDOW_HEIGHT = 720;
+ #endif
++
++namespace
++{
++    // Patch 0100: how the PS2 picture fills the window. The PS2 sends its frame (640x448 NTSC, 640x512 PAL...) to a
++    // 4:3 TV whatever its size in pixels, so the picture goes to the largest 4:3 rectangle (16:9 for the games set to
++    // widescreen, which draw anamorphic) instead of keeping square pixels (a 640x512 frame came out at 1.25:1).
++    // PS2X_ASPECTO=4:3 (default), 16:9 or pixel (square pixels, as before); F10 cycles them while running.
++    enum class PresentAspect
++    {
++        Tv4x3,
++        Wide16x9,
++        Pixel
++    };
++    PresentAspect initialPresentAspect()
++    {
++        const char *value = std::getenv("PS2X_ASPECTO");
++        if (value != nullptr && std::strcmp(value, "16:9") == 0)
++            return PresentAspect::Wide16x9;
++        if (value != nullptr && std::strcmp(value, "pixel") == 0)
++            return PresentAspect::Pixel;
++        return PresentAspect::Tv4x3;
++    }
++}
+ struct ElfHeader
+ {
+     uint32_t magic;
+@@ -849,6 +873,15 @@ bool PS2Runtime::initialize(const char *title)
+ #endif
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
++#endif
++        // Patch 0100: PS2X_PANTALLA_COMPLETA=1 starts in borderless full screen (F11 toggles it; not with the background
++        // window of the automated runs).
++#if !defined(PLATFORM_VITA)
++        {
++            const char *fullEnv = std::getenv("PS2X_PANTALLA_COMPLETA");
++            if (!backgroundWindow && fullEnv != nullptr && fullEnv[0] == '1')
++                ToggleBorderlessWindowed();
++        }
+ #endif
+         SetTargetFPS(60);
+         if (m_debugUiInitCallback)
+@@ -2507,6 +2540,13 @@ void PS2Runtime::run()
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+     Texture2D frameTex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
++    // Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest
++    // made uneven pixels). PS2X_FILTRO=0: nearest, as before.
++    {
++        const char *filterEnv = std::getenv("PS2X_FILTRO");
++        SetTextureFilter(frameTex, filterEnv != nullptr && filterEnv[0] == '0' ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
++    }
++    PresentAspect presentAspect = initialPresentAspect();
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -2576,9 +2616,19 @@ void PS2Runtime::run()
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
++        // Patch 0100: F11 full screen (borderless), F10 the next aspect; the picture in the largest rectangle of the
++        // aspect (presentAspect) centred in the window.
++        if (IsKeyPressed(KEY_F11))
++            ToggleBorderlessWindowed();
++        if (IsKeyPressed(KEY_F10))
++            presentAspect = presentAspect == PresentAspect::Tv4x3      ? PresentAspect::Wide16x9
++                            : presentAspect == PresentAspect::Wide16x9 ? PresentAspect::Pixel
++                                                                       : PresentAspect::Tv4x3;
++        const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
++                                    : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
++                                                                               : srcWidth / srcHeight;
++        const float dstWidth = std::min(screenWidth, screenHeight * pictureAspect);
++        const float dstHeight = dstWidth / pictureAspect;
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{
+             (screenWidth - dstWidth) * 0.5f,

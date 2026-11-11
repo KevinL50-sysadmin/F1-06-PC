@@ -1,0 +1,253 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index 6457440..a0bde17 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -60,22 +60,30 @@ namespace ps2x
+     // Foto y repeticion T3: L3 or R3 pressed alone (the photo mode's buttons, ps2_photo_mode.h). It acts when let go, and
+     // only if the other one was not held at any moment of the press: L3+R3 is the menu's combo, which neither must
+     // trigger. cancel: forget the press in progress (the options menu opened).
++    // Camaras y pilotos T4: a press that starts within kChatterSeconds of the last let go is that press going on (the
++    // pad's chatter: a frame without the button while it is held, or a bounce when let go), never a second click: the
++    // player's DualSense turned the photo mode on and, when R3 was let go a second later, off again (logs/usuario/
++    // prueba-cyp). now: seconds, any clock.
+     class StickButtonClick
+     {
+     public:
+-        bool update(bool held, bool otherHeld)
++        static constexpr double kChatterSeconds = 0.25;
++
++        bool update(bool held, bool otherHeld, double now)
+         {
+             if (held)
+             {
+                 if (!m_down)
+                 {
+                     m_down = true;
+-                    m_spoiled = false;
++                    m_spoiled = m_letGo >= 0.0 && now - m_letGo < kChatterSeconds;
+                 }
+                 m_spoiled = m_spoiled || otherHeld;
+                 return false;
+             }
+             const bool click = m_down && !m_spoiled;
++            if (m_down)
++                m_letGo = now;
+             m_down = false;
+             return click;
+         }
+@@ -87,6 +95,7 @@ namespace ps2x
+     private:
+         bool m_down = false;
+         bool m_spoiled = false;
++        double m_letGo = -1.0;
+     };
+ 
+     // The guest's pad: neutral while the menu is open and, after it closes, until no input is held (so the button that
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index 33745fc..f4f9634 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -26,6 +26,10 @@ namespace ps2x
+     constexpr float kFreeCameraRightSign = 1.0f;
+     constexpr float kFreeCameraSpeed = 8.0f;       // world units (metres) per second
+     constexpr float kFreeCameraTurnRate = 1.2f;    // radians per second
++    // Camaras y pilotos T4: from this half angle down (narrower, zoomed in) it turns slower, by its angle: the replay's
++    // TV cameras are as narrow as 0.06 and the full rate threw their car out of the picture at a touch of the stick
++    // (the player's photo was the ground, logs/usuario/prueba-cyp). A driving camera's angle (0.41-0.48) turns as before.
++    constexpr float kFreeCameraFullTurnHalfAngle = 0.45f;
+     constexpr float kFreeCameraRollRate = 0.8f;    // radians per second
+     constexpr float kFreeCameraZoomRate = 0.9f;    // the half angle changes by e^(rate) per second
+     constexpr float kFreeCameraMaxPitch = 1.45f;   // about 83 degrees up or down
+@@ -145,9 +149,10 @@ namespace ps2x
+         const float dt = std::min(seconds, kFreeCameraMaxStep);
+         const float speed = std::isfinite(input.speed) ? std::clamp(input.speed, 0.0f, 10.0f) : 1.0f;
+ 
+-        camera.yaw += clampUnit(input.yaw) * kFreeCameraRightSign * kFreeCameraTurnRate * dt;
++        const float turnRate = kFreeCameraTurnRate * std::min(camera.halfAngle / kFreeCameraFullTurnHalfAngle, 1.0f);
++        camera.yaw += clampUnit(input.yaw) * kFreeCameraRightSign * turnRate * dt;
+         camera.yaw = std::remainder(camera.yaw, 6.28318530718f);
+-        camera.pitch = std::clamp(camera.pitch + clampUnit(input.pitch) * kFreeCameraTurnRate * dt,
++        camera.pitch = std::clamp(camera.pitch + clampUnit(input.pitch) * turnRate * dt,
+                                   -kFreeCameraMaxPitch, kFreeCameraMaxPitch);
+         camera.roll = std::clamp(camera.roll - clampUnit(input.roll) * kFreeCameraRightSign * kFreeCameraRollRate * dt,
+                                  -kFreeCameraMaxRoll, kFreeCameraMaxRoll);
+@@ -428,6 +433,21 @@ namespace ps2x
+         return {};
+     }
+ 
++    // Camaras y pilotos T4: what the replay's triangle leaves in the replay's director (src/f1_overrides.cpp), as the
++    // game's own triangle does after it changes the camera: the TV mode manual (automatic, + 0x510: it would change the
++    // car and the camera by itself) and the director held (hold, + 0x514) on any camera but its trackside TV one; else
++    // its next cut (the car leaving a trackside camera's stretch) puts the trackside camera back.
++    struct ReplayDirectorWrite
++    {
++        uint32_t automatic = 0u;
++        uint32_t hold = 0u;
++    };
++
++    inline ReplayDirectorWrite replayDirectorAfterCamera(RaceCameraKind kind)
++    {
++        return {0u, kind == RaceCameraKind::Tv ? 0u : 1u};
++    }
++
+     // Camaras y pilotos T2: the driver's caption when a car is chosen in the photo mode, as the game's replay shows it
+     // (its HUD's func_203F18: the driver's name as the game keeps it, mixed case, and the team): name and team in the
+     // game's Latin-1, the race position (1 the leader; 0 not known).
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 488d694..d9a1ff2 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -970,8 +970,9 @@ static void UpdateStickButtons(bool optionsMenuOpen)
+     static ps2x::StickButtonClick s_l3, s_r3;
+     const uint16_t pressed = ps2x::readPhotoModePad().pressed;
+     const bool l3 = (pressed & ps2x::kPhotoPadL3) != 0u, r3 = (pressed & ps2x::kPhotoPadR3) != 0u;
+-    const bool r3Click = s_r3.update(r3, l3);
+-    const bool l3Click = s_l3.update(l3, r3);
++    const double now = PhotoModeClock();
++    const bool r3Click = s_r3.update(r3, l3, now);
++    const bool l3Click = s_l3.update(l3, r3, now);
+     if (optionsMenuOpen)
+     {
+         s_l3.cancel();
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 460cc0d..94cd98b 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1089,6 +1089,41 @@ void register_ps2_options_menu_tests()
+             t.Equals(camera.halfAngle, ps2x::kFreeCameraMaxHalfAngle, "up to the widest");
+         });
+ 
++        tc.Run("the free camera turns slower when zoomed in: a TV camera's narrow angle keeps its car in sight",
++               [](TestCase &t)
++        {
++            const float level[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++            const float wide = ps2x::kFreeCameraFullTurnHalfAngle;
++            t.IsTrue(wide >= 0.4f && wide <= 0.5f, "the full rate from a driving camera's angle (0.41-0.48) up");
++            ps2x::FreeCameraInput turn;
++            turn.yaw = 1.0f;
++            turn.pitch = 1.0f;
++            ps2x::FreeCamera tv = ps2x::freeCameraFromMatrix(level, 0.06f); // the replay's TV camera in logs/usuario
++            ps2x::moveFreeCamera(tv, turn, 0.1f);
++            const float rate = ps2x::kFreeCameraTurnRate * 0.06f / wide;
++            t.IsTrue(std::fabs(std::fabs(tv.yaw) - rate * 0.1f) < 1e-6f, "yaw: the rate times its angle over the full one");
++            t.IsTrue(std::fabs(tv.pitch - rate * 0.1f) < 1e-6f, "pitch too");
++            ps2x::FreeCamera touched = ps2x::freeCameraFromMatrix(level, 0.06f);
++            for (int i = 0; i < 3; ++i)
++                ps2x::moveFreeCamera(touched, turn, 0.1f);
++            t.IsTrue(std::fabs(touched.yaw) < 0.06f && std::fabs(touched.pitch) < 0.06f,
++                     "a 0.3 s touch of the stick: still within the picture (it was the ground, logs/usuario)");
++
++            ps2x::FreeCamera driving = ps2x::freeCameraFromMatrix(level, wide);
++            ps2x::moveFreeCamera(driving, turn, 0.1f);
++            t.IsTrue(std::fabs(std::fabs(driving.yaw) - ps2x::kFreeCameraTurnRate * 0.1f) < 1e-6f,
++                     "a driving camera's angle: the full rate, as before");
++            ps2x::FreeCamera widest = ps2x::freeCameraFromMatrix(level, ps2x::kFreeCameraMaxHalfAngle);
++            ps2x::moveFreeCamera(widest, turn, 0.1f);
++            t.IsTrue(std::fabs(std::fabs(widest.yaw) - ps2x::kFreeCameraTurnRate * 0.1f) < 1e-6f,
++                     "wider: never faster");
++            ps2x::FreeCameraInput roll;
++            roll.roll = 1.0f;
++            ps2x::moveFreeCamera(tv, roll, 0.1f);
++            t.IsTrue(std::fabs(std::fabs(tv.roll) - ps2x::kFreeCameraRollRate * 0.1f) < 1e-6f,
++                     "the roll (around the view) at its own rate");
++        });
++
+         tc.Run("the free camera stays near where it started and goes back with reset", [](TestCase &t)
+         {
+             ps2x::FreeCamera camera = ps2x::freeCameraFromMatrix(kCockpitCamera, 0.477614f);
+@@ -1456,6 +1491,24 @@ void register_ps2_options_menu_tests()
+             t.Equals(raceCameraNotice(set, 10, L::English), std::string(), "out of range: nothing");
+         });
+ 
++        tc.Run("the replay's triangle tells its director what the game's triangle does: no TV cuts over the onboard and "
++               "driving cameras",
++               [](TestCase &t)
++        {
++            using K = ps2x::RaceCameraKind;
++            const ps2x::ReplayDirectorWrite tv = ps2x::replayDirectorAfterCamera(K::Tv);
++            t.Equals(static_cast<int>(tv.automatic), 0, "TV mode manual, as the game's triangle (+ 0x510 = 0)");
++            t.Equals(static_cast<int>(tv.hold), 0, "the TV camera: the director goes on cutting between its trackside ones");
++            const ps2x::ReplayDirectorWrite onboard = ps2x::replayDirectorAfterCamera(K::Replay);
++            t.Equals(static_cast<int>(onboard.automatic), 0, "manual");
++            t.Equals(static_cast<int>(onboard.hold), 1,
++                     "the replay's onboard ones (its PlayerCam): held, as the game's triangle (+ 0x514 = 1)");
++            const ps2x::ReplayDirectorWrite driving = ps2x::replayDirectorAfterCamera(K::Driving);
++            t.Equals(static_cast<int>(driving.automatic), 0, "manual");
++            t.Equals(static_cast<int>(driving.hold), 1,
++                     "a driving camera: held too (else its next cut puts the trackside camera back)");
++        });
++
+         tc.Run("the driver's caption in the photo mode: the game's name and team, the race position", [](TestCase &t)
+         {
+             using L = ps2x::HostLanguage;
+@@ -1640,26 +1693,51 @@ void register_ps2_options_menu_tests()
+         tc.Run("a stick button alone acts when let go; with the other one it is the menu's L3+R3", [](TestCase &t)
+         {
+             ps2x::StickButtonClick r3;
+-            t.IsFalse(r3.update(false, false), "nothing held");
+-            t.IsFalse(r3.update(true, false), "pressed: not yet");
+-            t.IsFalse(r3.update(true, false), "held: not yet");
+-            t.IsTrue(r3.update(false, false), "let go: it acts");
+-            t.IsFalse(r3.update(false, false), "once");
+-
+-            t.IsFalse(r3.update(true, false), "pressed alone");
+-            t.IsFalse(r3.update(true, true), "the other one too: the menu's combo");
+-            t.IsFalse(r3.update(true, false), "the other one let go");
+-            t.IsFalse(r3.update(false, false), "let go: nothing");
+-
+-            t.IsFalse(r3.update(false, true), "the other one first");
+-            t.IsFalse(r3.update(true, true), "then this one");
+-            t.IsFalse(r3.update(false, true), "let go while the other one is held: nothing");
+-
+-            t.IsFalse(r3.update(true, false), "pressed alone");
++            double now = 0.0;
++            const auto at = [&now]() { return now += 1.0; }; // a second apart: never the pad's chatter
++            t.IsFalse(r3.update(false, false, at()), "nothing held");
++            t.IsFalse(r3.update(true, false, at()), "pressed: not yet");
++            t.IsFalse(r3.update(true, false, at()), "held: not yet");
++            t.IsTrue(r3.update(false, false, at()), "let go: it acts");
++            t.IsFalse(r3.update(false, false, at()), "once");
++
++            t.IsFalse(r3.update(true, false, at()), "pressed alone");
++            t.IsFalse(r3.update(true, true, at()), "the other one too: the menu's combo");
++            t.IsFalse(r3.update(true, false, at()), "the other one let go");
++            t.IsFalse(r3.update(false, false, at()), "let go: nothing");
++
++            t.IsFalse(r3.update(false, true, at()), "the other one first");
++            t.IsFalse(r3.update(true, true, at()), "then this one");
++            t.IsFalse(r3.update(false, true, at()), "let go while the other one is held: nothing");
++
++            t.IsFalse(r3.update(true, false, at()), "pressed alone");
+             r3.cancel();
+-            t.IsFalse(r3.update(false, false), "cancelled (the options menu opened): nothing when let go");
+-            t.IsFalse(r3.update(true, false), "pressed again");
+-            t.IsTrue(r3.update(false, false), "acts again");
++            t.IsFalse(r3.update(false, false, at()), "cancelled (the options menu opened): nothing when let go");
++            t.IsFalse(r3.update(true, false, at()), "pressed again");
++            t.IsTrue(r3.update(false, false, at()), "acts again");
++        });
++
++        tc.Run("a stick button: a drop while it is held (the pad's chatter) is one click, not two", [](TestCase &t)
++        {
++            const double chatter = ps2x::StickButtonClick::kChatterSeconds;
++            t.IsTrue(chatter >= 0.1 && chatter <= 0.3, "short: a player's second click is slower");
++            ps2x::StickButtonClick r3;
++            t.IsFalse(r3.update(true, false, 10.0), "pressed");
++            t.IsTrue(r3.update(false, false, 10.02), "a frame without it: it acts (the photo mode goes on)");
++            t.IsFalse(r3.update(true, false, 10.04), "back at once: the same press");
++            t.IsFalse(r3.update(true, false, 11.0), "held for a second");
++            t.IsFalse(r3.update(false, false, 11.02), "let go: no second click (the photo mode stays on)");
++            t.IsFalse(r3.update(false, false, 12.0), "nothing later either");
++
++            t.IsFalse(r3.update(true, false, 20.0), "pressed");
++            t.IsTrue(r3.update(false, false, 20.1), "let go: it acts");
++            t.IsFalse(r3.update(true, false, 20.1 + chatter * 0.5), "it bounces when let go");
++            t.IsFalse(r3.update(false, false, 20.1 + chatter * 0.6), "and is let go again: no second click");
++
++            t.IsFalse(r3.update(true, false, 30.0), "pressed");
++            t.IsTrue(r3.update(false, false, 30.1), "let go: it acts (on)");
++            t.IsFalse(r3.update(true, false, 30.1 + chatter + 0.05), "pressed again after the chatter's time");
++            t.IsTrue(r3.update(false, false, 30.3 + chatter), "a second click of the player's: it acts (off)");
+         });
+ 
+         tc.Run("the game does not see R3 where it turns the photo mode on or off, nor L3 in the replay", [](TestCase &t)

@@ -1,0 +1,58 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..cf0d009 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -80,6 +80,10 @@ namespace ps2_stubs
+         {
+             std::string currentDir = "/";
+             bool formatted = true;
++            // sceMcGetDir with a non-zero mode continues the previous listing from the next entry. Games call it in
++            // a loop while it keeps returning entries (F1 06 lists "/*" 16 entries at a time).
++            std::string getDirQuery;
++            size_t getDirOffset = 0u;
+         };
+ 
+         std::mutex g_mcStateMutex;
+@@ -699,6 +703,7 @@ namespace ps2_stubs
+         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
++        const int32_t mode = static_cast<int32_t>(getRegU32(ctx, 7));
+         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
+         const uint32_t tableAddr = getRegU32(ctx, 9);
+ 
+@@ -821,15 +826,20 @@ namespace ps2_stubs
+                             entries.push_back(tableEntry);
+                         }
+ 
+-                        const size_t entryCount =
+-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
++                        const size_t offset = (mode != 0 && state.getDirQuery == guestQuery)
++                                                  ? std::min(state.getDirOffset, entries.size())
++                                                  : 0u;
++                        const size_t entryCount = std::min(entries.size() - offset,
++                                                           maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
++                        state.getDirQuery = guestQuery;
++                        state.getDirOffset = offset + entryCount;
+                         if (entryCount == 0u || tableAddr == 0u)
+                         {
+                             result = static_cast<int32_t>(entryCount);
+                         }
+                         else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
+                         {
+-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
++                            std::memcpy(dst, entries.data() + offset, entryCount * sizeof(SceMcTblGetDir));
+                             result = static_cast<int32_t>(entryCount);
+                         }
+                         else
+@@ -842,8 +852,8 @@ namespace ps2_stubs
+ 
+             setMcCommandResultLocked(kMcCmdGetDir, result);
+         }
+-        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
+-                                        << "' maxent=" << maxEntries << " -> result=" << result);
++        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath << "' mode=" << mode
++                                        << " maxent=" << maxEntries << " -> result=" << result);
+         setReturnS32(ctx, 0);
+     }
+ 

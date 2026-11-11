@@ -1,0 +1,185 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index dde5f02..716f69f 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -101,17 +101,62 @@ namespace ps2x
+     }
+ 
+     // Nativizacion T14: a text of the host for the game's OPTIONS > PC NETPLAY page (the reason a start failed, the
+-    // guest's address), which its Lua reads one character code at a time: printable ASCII (anything else is ?) and at
+-    // most maxSize characters (a longer one ends in ...).
++    // guest's address), which its Lua reads one byte at a time: printable ASCII and whole UTF-8 letters, as the page's
++    // own literals (Pruebas autonomas T3: Windows' reasons are UTF-8 now); any other byte is ?. At most maxSize bytes:
++    // a longer one ends in ..., never in the middle of a letter.
+     constexpr size_t kNetplayPageTextSize = 96;
+     inline std::string netplayPageText(std::string_view text, size_t maxSize)
+     {
+-        std::string out;
+-        for (const char c : text.substr(0, maxSize))
+-            out += c >= 0x20 && c < 0x7F ? c : '?';
+-        if (text.size() > maxSize && maxSize > 3u)
+-            out.replace(maxSize - 3u, 3u, "...");
+-        return out;
++        // The length of the valid UTF-8 sequence at i (2-4 bytes: no overlong forms, surrogates or past U+10FFFF), or 0.
++        const auto letter = [&](size_t i) -> size_t
++        {
++            const auto at = [&](size_t k) { return static_cast<unsigned char>(text[k]); };
++            const unsigned char b = at(i);
++            size_t size = 0;
++            unsigned char low = 0x80, high = 0xBF;
++            if (b >= 0xC2 && b <= 0xDF)
++                size = 2;
++            else if (b >= 0xE0 && b <= 0xEF)
++            {
++                size = 3;
++                low = b == 0xE0 ? 0xA0 : 0x80;
++                high = b == 0xED ? 0x9F : 0xBF;
++            }
++            else if (b >= 0xF0 && b <= 0xF4)
++            {
++                size = 4;
++                low = b == 0xF0 ? 0x90 : 0x80;
++                high = b == 0xF4 ? 0x8F : 0xBF;
++            }
++            if (size == 0 || i + size > text.size() || at(i + 1) < low || at(i + 1) > high)
++                return 0;
++            for (size_t k = 2; k < size; ++k)
++                if (at(i + k) < 0x80 || at(i + k) > 0xBF)
++                    return 0;
++            return size;
++        };
++        std::string clean;
++        for (size_t i = 0; i < text.size();)
++        {
++            const unsigned char b = static_cast<unsigned char>(text[i]);
++            if (const size_t size = b >= 0x80 ? letter(i) : 0; size > 0)
++            {
++                clean.append(text.substr(i, size));
++                i += size;
++                continue;
++            }
++            clean += b >= 0x20 && b < 0x7F ? static_cast<char>(b) : '?';
++            ++i;
++        }
++        if (clean.size() <= maxSize)
++            return clean;
++        size_t cut = maxSize > 3u ? maxSize - 3u : maxSize;
++        while (cut > 0 && (static_cast<unsigned char>(clean[cut]) & 0xC0u) == 0x80u)
++            --cut; // back to the start of the letter the cut falls in
++        clean.resize(cut);
++        if (maxSize > 3u)
++            clean += "...";
++        return clean;
+     }
+ 
+     // Nativizacion T16: the host's password typed on the game's own keyboard (OPTIONS > PC NETPLAY, PASSWORD). The
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+index 985d7dd..29c4e36 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_netplay_session.h"
+ #include "ps2_options.h"
++#include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+@@ -40,29 +41,16 @@ namespace ps2x::netplay
+             return splitHostPort("x:" + text, ignored, port, hasPort, error);
+         }
+ 
+-        // Windows' socket errors come in the system's code page (accents in Spanish): plain ASCII for the window's
+-        // default font and for ImGui (UTF-8).
+-        std::string asciiOnly(const std::string &text)
++        // Windows' socket errors come in UTF-8 (Pruebas autonomas T3, socketError), as the game's page, the overlay
++        // and the guest's window draw them: control characters become spaces, whole UTF-8 letters stay (accents in
++        // Spanish), any other byte is ?.
++        std::string reasonText(const std::string &text)
+         {
+-            static const std::pair<unsigned char, char> kFolds[] = {
+-                {0xE1, 'a'}, {0xE9, 'e'}, {0xED, 'i'}, {0xF3, 'o'}, {0xFA, 'u'}, {0xFC, 'u'}, {0xF1, 'n'},
+-                {0xC1, 'A'}, {0xC9, 'E'}, {0xCD, 'I'}, {0xD3, 'O'}, {0xDA, 'U'}, {0xDC, 'U'}, {0xD1, 'N'}};
+-            std::string out;
+-            for (const char c : text)
+-            {
+-                const unsigned char u = static_cast<unsigned char>(c);
+-                if (u < 0x80)
+-                {
+-                    out += u < 0x20 ? ' ' : c;
+-                    continue;
+-                }
+-                char folded = '?';
+-                for (const auto &[from, to] : kFolds)
+-                    if (u == from)
+-                        folded = to;
+-                out += folded;
+-            }
+-            return out;
++            std::string spaced = text;
++            for (char &c : spaced)
++                if (static_cast<unsigned char>(c) < 0x20)
++                    c = ' ';
++            return ps2x::netplayPageText(spaced, spaced.size());
+         }
+     }
+ 
+@@ -507,7 +495,7 @@ namespace ps2x::netplay
+         }
+         if (!status.hosting)
+         {
+-            error = asciiOnly(error);
++            error = reasonText(error);
+             status.error = error;
+             status.password.clear();
+             m_impl->status = status;
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 362a8b1..1da6c71 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2_netplay_protocol.h"
+ #include "ps2_netplay_session.h"
+ #include "ps2_netplay_video.h"
++#include "ps2_options_menu.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -2042,6 +2043,11 @@ void register_ps2_netplay_tests()
+             t.IsFalse(error.empty(), "with the reason");
+             const HostSessionStatus failed = other.status();
+             t.IsTrue(!failed.hosting && !failed.error.empty(), "the failure in the status");
++            // Pruebas autonomas T3: Windows' reason in UTF-8, its accents whole ("direcci\xC3\xB3n" in Spanish), not
++            // '?' for each byte, in the error and in the status.
++            t.IsTrue(error.find('?') == std::string::npos, "no ? in the reason: " + error);
++            t.Equals(failed.error, error, "the status has the same reason");
++            t.Equals(ps2x::netplayPageText(error, error.size()), error, "valid UTF-8 (the game's page keeps it whole)");
+             t.IsTrue(hostStatusText(failed).rfind("Juego en red: no se puede ser anfitrion", 0) == 0,
+                      "text after a failure: " + hostStatusText(failed));
+ 
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 9700271..4b31ed6 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -786,8 +786,20 @@ void register_ps2_options_menu_tests()
+             t.Equals(ps2x::netplayPageText("192.168.1.20:51234", ps2x::kNetplayPageTextSize),
+                      std::string("192.168.1.20:51234"), "a guest's address as it is");
+             t.Equals(ps2x::netplayPageText("", ps2x::kNetplayPageTextSize), std::string(), "nothing: nothing");
+-            t.Equals(ps2x::netplayPageText("a\tb\n\xC3\xA1~\x7F", 20), std::string("a?b???~?"),
+-                     "control characters and bytes past ASCII become ?");
++            // Pruebas autonomas T3: the page's own literals are UTF-8 (DIRECCI\195\147N), and so are Windows' reasons
++            // now: whole UTF-8 letters pass, anything else past ASCII is ?.
++            t.Equals(ps2x::netplayPageText("a\tb\n\xC3\xA1~\x7F", 20), std::string("a?b?\xC3\xA1~?"),
++                     "control characters become ?, a UTF-8 letter passes");
++            t.Equals(ps2x::netplayPageText("conexi\xC3\xB3n deneg\xC3\xB3 \xE2\x82\xAC \xF0\x9F\x98\x80", 40),
++                     std::string("conexi\xC3\xB3n deneg\xC3\xB3 \xE2\x82\xAC \xF0\x9F\x98\x80"),
++                     "two-, three- and four-byte letters pass");
++            t.Equals(ps2x::netplayPageText("x\xA1y\xC3z\xC0\xAF\xE2\x82\xED\xA0\x80\xF5\x80\x80\x80\xC3", 40),
++                     std::string("x?y?z") + std::string(12, '?'),
++                     "a lone continuation, a cut letter, overlong, surrogate and out-of-range bytes: one ? each");
++            t.Equals(ps2x::netplayPageText(std::string(92, 'x') + "\xC3\xB3yyyy", ps2x::kNetplayPageTextSize),
++                     std::string(92, 'x') + "...", "the cut never splits a letter");
++            t.Equals(ps2x::netplayPageText(std::string(93, 'x') + "\xC3\xB3yyyy", ps2x::kNetplayPageTextSize),
++                     std::string(93, 'x') + "...", "a letter starting at the cut is left out whole");
+             const std::string cut = ps2x::netplayPageText(std::string(200, 'x'), ps2x::kNetplayPageTextSize);
+             t.Equals(cut.size(), ps2x::kNetplayPageTextSize, "cut to its size");
+             t.Equals(cut, std::string(ps2x::kNetplayPageTextSize - 3, 'x') + "...", "with ... at the end");

@@ -1,0 +1,1333 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 71b76ee..493b56d 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -17,6 +17,7 @@ namespace ps2x::iop
+         CdImage = 2,
+         HostRoot = 3,
+         MemoryCardRoot = 4,
++        ModsRoot = 5, // files that replace disc files with the same relative path (empty: no mods)
+     };
+ 
+     enum class LogLevel : uint32_t
+diff --git a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+index 44c61e6..6854052 100644
+--- a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
++++ b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+@@ -7,6 +7,8 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
++#include <map>
++#include <memory>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -25,6 +27,132 @@ namespace ps2x::iop
+         bool isDirectory = false;
+     };
+ 
++    // Upper case, without the ";1" version suffix or a trailing '.' (ISO names without extension).
++    inline std::string normalizeDiscComponent(std::string_view value)
++    {
++        std::string result(value);
++        const size_t semicolon = result.rfind(';');
++        if (semicolon != std::string::npos)
++            result.resize(semicolon);
++        while (!result.empty() && result.back() == '.')
++            result.pop_back();
++        std::transform(result.begin(), result.end(), result.begin(),
++                       [](unsigned char ch)
++                       { return static_cast<char>(std::toupper(ch)); });
++        return result;
++    }
++
++    // The key of a disc path: "\DIR\FILE.BIN;1", "dir/file.bin" and "cdrom0:\Dir\File.Bin" all give "DIR/FILE.BIN".
++    // Other devices and ".." are refused.
++    inline std::optional<std::string> normalizeDiscPath(std::string_view value)
++    {
++        const size_t colon = value.find(':');
++        if (colon != std::string_view::npos)
++        {
++            std::string device(value.substr(0u, colon));
++            std::transform(device.begin(), device.end(), device.begin(),
++                           [](unsigned char ch)
++                           { return static_cast<char>(std::tolower(ch)); });
++            if (device != "cdrom0" && device != "cdrom")
++                return std::nullopt;
++            value.remove_prefix(colon + 1u);
++        }
++
++        std::string result;
++        size_t begin = 0u;
++        while (begin <= value.size())
++        {
++            size_t end = value.find_first_of("/\\", begin);
++            if (end == std::string_view::npos)
++                end = value.size();
++            const std::string_view component = value.substr(begin, end - begin);
++            begin = end + 1u;
++            if (component.empty() || component == ".")
++                continue;
++            if (component == "..")
++                return std::nullopt;
++            if (!result.empty())
++                result += '/';
++            result += normalizeDiscComponent(component);
++        }
++        return result;
++    }
++
++    struct ModFile
++    {
++        std::filesystem::path relativePath; // as stored in the mods folder
++        std::filesystem::path hostPath;
++        uint32_t size = 0u;
++    };
++
++    // Phase 1 (F1 06): a file in the mods folder replaces the whole disc file with the same relative path (any case,
++    // ";1" ignored). Files inside the game's archives (.WAD) are not replaced here: that needs the archive format and
++    // belongs to phase 5.
++    class ModOverlay
++    {
++    public:
++        // Every regular file under `directory` (none if it is empty or missing). Files of 4 GB or more are skipped:
++        // disc files have 32-bit sizes.
++        static ModOverlay scan(const std::filesystem::path &directory)
++        {
++            ModOverlay overlay;
++            std::error_code error;
++            if (directory.empty() || !std::filesystem::is_directory(directory, error))
++                return overlay;
++            for (std::filesystem::recursive_directory_iterator iterator(
++                     directory, std::filesystem::directory_options::skip_permission_denied, error),
++                 end;
++                 !error && iterator != end; iterator.increment(error))
++            {
++                std::error_code entryError;
++                if (!iterator->is_regular_file(entryError) || entryError)
++                    continue;
++                const uint64_t size = iterator->file_size(entryError);
++                if (entryError || size > 0xFFFFFFFFu)
++                    continue;
++                const std::filesystem::path relative = iterator->path().lexically_relative(directory);
++                std::optional<std::string> key;
++                try
++                {
++                    key = normalizeDiscPath(relative.generic_string());
++                }
++                catch (const std::exception &)
++                {
++                    continue; // a name the narrow code page cannot hold
++                }
++                if (!key || key->empty())
++                    continue;
++                overlay.m_files.emplace(*key, ModFile{relative, iterator->path(), static_cast<uint32_t>(size)});
++            }
++            return overlay;
++        }
++
++        [[nodiscard]] bool empty() const { return m_files.empty(); }
++        // By disc path key, in key order.
++        [[nodiscard]] const std::map<std::string, ModFile> &files() const { return m_files; }
++
++        // The mod for a disc path (any IsoImage::lookup() form), or null.
++        [[nodiscard]] const ModFile *find(std::string_view guestPath) const
++        {
++            const std::optional<std::string> key = normalizeDiscPath(guestPath);
++            if (!key)
++                return nullptr;
++            const auto found = m_files.find(*key);
++            return found == m_files.end() ? nullptr : &found->second;
++        }
++
++        // Keeps only the mods for which keep(key) is true.
++        template <typename Predicate>
++        void retain(Predicate keep)
++        {
++            for (auto it = m_files.begin(); it != m_files.end();)
++                it = keep(it->first) ? std::next(it) : m_files.erase(it);
++        }
++
++    private:
++        std::map<std::string, ModFile> m_files;
++    };
++
+     // Read-only ISO 9660 image (a plain .iso, or one stored at a byte offset inside a larger file).
+     // open() indexes every directory once; lookup() and readSectors() may then be called from any thread.
+     // open() and close() must not race with readers.
+@@ -33,6 +161,10 @@ namespace ps2x::iop
+     public:
+         static constexpr uint32_t kSectorSize = 2048u;
+         static constexpr uint32_t kPrimaryVolumeDescriptorLsn = 16u;
++        // Zero sectors after the last mod. On a disc a file is followed by more sectors, and readers fetch whole
++        // blocks past a file's end (CORE.IRX reads 32 sectors at a time): without them that last read is refused
++        // and the game retries it for ever.
++        static constexpr uint32_t kModTailSectors = 1024u;
+ 
+         IsoImage() = default;
+         IsoImage(const IsoImage &) = delete;
+@@ -55,6 +187,7 @@ namespace ps2x::iop
+                 return false;
+             }
+             m_totalSectors = readLe32(pvd.data() + 80u);
++            m_volumeSectors = m_totalSectors;
+             const IsoEntry root{readLe32(pvd.data() + 156u + 2u), readLe32(pvd.data() + 156u + 10u), true};
+             m_index.emplace(std::string{}, root);
+             if (!indexDirectory(std::string{}, root))
+@@ -73,24 +206,69 @@ namespace ps2x::iop
+                 m_stream.close();
+             m_stream.clear();
+             m_index.clear();
++            m_mods.clear();
+             m_path.clear();
+             m_baseOffset = 0u;
+             m_totalSectors = 0u;
++            m_volumeSectors = 0u;
+             m_open = false;
+         }
+ 
+         [[nodiscard]] bool isOpen() const { return m_open; }
+         [[nodiscard]] const std::filesystem::path &path() const { return m_path; }
+         [[nodiscard]] uint64_t baseOffset() const { return m_baseOffset; }
+-        // Volume space size from the PVD (not the file size).
++        // Volume space size from the PVD (not the file size), plus the sectors of the applied mods.
+         [[nodiscard]] uint32_t totalSectors() const { return m_totalSectors; }
+ 
++        // Gives every disc file that has a mod new sectors after the volume end (in key order, so every reader that
++        // applies the same mods gets the same LSNs); lookup() and the reads then serve the mod. Directory records read
++        // as raw sectors still describe the original files. Returns the applied mods. Call it after open(), before
++        // any reader.
++        std::vector<ModFile> applyMods(const ModOverlay &mods)
++        {
++            std::vector<ModFile> applied;
++            if (!m_open || !m_mods.empty())
++                return applied;
++            for (const auto &[key, mod] : mods.files())
++            {
++                const auto found = m_index.find(key);
++                if (found == m_index.end() || found->second.isDirectory)
++                    continue;
++                const uint32_t sectors = std::max<uint32_t>(1u, static_cast<uint32_t>(
++                                                                    (static_cast<uint64_t>(mod.size) + kSectorSize - 1u) / kSectorSize));
++                if (static_cast<uint64_t>(m_totalSectors) + sectors + kModTailSectors > 0xFFFFFFFFu)
++                    break;
++                auto extent = std::make_unique<ModExtent>();
++                extent->path = mod.hostPath;
++                extent->lsn = m_totalSectors;
++                extent->sectors = sectors;
++                extent->size = mod.size;
++                m_mods.push_back(std::move(extent));
++                found->second.lsn = m_totalSectors;
++                found->second.size = mod.size;
++                m_totalSectors += sectors;
++                applied.push_back(mod);
++            }
++            if (!m_mods.empty())
++                m_totalSectors += kModTailSectors;
++            return applied;
++        }
++
++        // The mod file whose sectors hold `lsn` (for traces), or nothing.
++        [[nodiscard]] std::optional<std::filesystem::path> modFileForSector(uint32_t lsn) const
++        {
++            const ModExtent *extent = modExtentFor(lsn);
++            if (!extent)
++                return std::nullopt;
++            return extent->path;
++        }
++
+         // Accepts "\DIR\FILE.BIN;1", "dir/file.bin" or "cdrom0:\DIR\FILE.BIN;1" (case-insensitive).
+         [[nodiscard]] std::optional<IsoEntry> lookup(std::string_view guestPath) const
+         {
+             if (!m_open)
+                 return std::nullopt;
+-            const std::optional<std::string> key = normalizePath(guestPath);
++            const std::optional<std::string> key = normalizeDiscPath(guestPath);
+             if (!key)
+                 return std::nullopt;
+             const auto found = m_index.find(*key);
+@@ -104,8 +282,8 @@ namespace ps2x::iop
+         {
+             if (!m_open || static_cast<uint64_t>(lsn) + count > m_totalSectors)
+                 return false;
+-            return readRaw(static_cast<uint64_t>(lsn) * kSectorSize, destination,
+-                           static_cast<size_t>(count) * kSectorSize);
++            return readVolume(static_cast<uint64_t>(lsn) * kSectorSize, destination,
++                              static_cast<size_t>(count) * kSectorSize);
+         }
+ 
+         // Reads `size` bytes starting `offset` bytes into the extent at `lsn` (any alignment, inside the volume).
+@@ -114,7 +292,7 @@ namespace ps2x::iop
+             const uint64_t start = static_cast<uint64_t>(lsn) * kSectorSize + offset;
+             if (!m_open || start + size > static_cast<uint64_t>(m_totalSectors) * kSectorSize)
+                 return false;
+-            return size == 0u || readRaw(start, destination, size);
++            return size == 0u || readVolume(start, destination, size);
+         }
+ 
+         // Reads a whole file (any lookup() path form) into `bytes`; directories and missing files fail.
+@@ -139,64 +317,86 @@ namespace ps2x::iop
+                    (static_cast<uint32_t>(bytes[2]) << 16u) | (static_cast<uint32_t>(bytes[3]) << 24u);
+         }
+ 
+-        // Upper case, without the ";1" version suffix or a trailing '.' (ISO names without extension).
+-        static std::string normalizeComponent(std::string_view value)
++        bool readRaw(uint64_t offset, void *destination, size_t size) const
+         {
+-            std::string result(value);
+-            const size_t semicolon = result.rfind(';');
+-            if (semicolon != std::string::npos)
+-                result.resize(semicolon);
+-            while (!result.empty() && result.back() == '.')
+-                result.pop_back();
+-            std::transform(result.begin(), result.end(), result.begin(),
+-                           [](unsigned char ch)
+-                           { return static_cast<char>(std::toupper(ch)); });
+-            return result;
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stream.clear();
++            m_stream.seekg(static_cast<std::streamoff>(m_baseOffset + offset), std::ios::beg);
++            if (!m_stream)
++                return false;
++            m_stream.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
++            return static_cast<size_t>(m_stream.gcount()) == size;
+         }
+ 
+-        static std::optional<std::string> normalizePath(std::string_view value)
++        // The sectors of one applied mod: [lsn, lsn + sectors), the file bytes and then zeros.
++        struct ModExtent
+         {
+-            const size_t colon = value.find(':');
+-            if (colon != std::string_view::npos)
+-            {
+-                std::string device(value.substr(0u, colon));
+-                std::transform(device.begin(), device.end(), device.begin(),
+-                               [](unsigned char ch)
+-                               { return static_cast<char>(std::tolower(ch)); });
+-                if (device != "cdrom0" && device != "cdrom")
+-                    return std::nullopt;
+-                value.remove_prefix(colon + 1u);
+-            }
++            std::filesystem::path path;
++            uint32_t lsn = 0u;
++            uint32_t sectors = 0u;
++            uint32_t size = 0u;
++            std::ifstream stream; // opened on the first read, under m_mutex
++        };
+ 
+-            std::string result;
+-            size_t begin = 0u;
+-            while (begin <= value.size())
++        ModExtent *modExtentFor(uint32_t lsn) const
++        {
++            if (lsn < m_volumeSectors)
++                return nullptr;
++            for (const std::unique_ptr<ModExtent> &extent : m_mods)
+             {
+-                size_t end = value.find_first_of("/\\", begin);
+-                if (end == std::string_view::npos)
+-                    end = value.size();
+-                const std::string_view component = value.substr(begin, end - begin);
+-                begin = end + 1u;
+-                if (component.empty() || component == ".")
+-                    continue;
+-                if (component == "..")
+-                    return std::nullopt;
+-                if (!result.empty())
+-                    result += '/';
+-                result += normalizeComponent(component);
++                if (lsn >= extent->lsn && lsn - extent->lsn < extent->sectors)
++                    return extent.get();
+             }
+-            return result;
++            return nullptr;
+         }
+ 
+-        bool readRaw(uint64_t offset, void *destination, size_t size) const
++        // Volume bytes: the image up to its PVD size, then the sectors of the applied mods and the zero tail.
++        bool readVolume(uint64_t offset, void *destination, size_t size) const
+         {
+-            std::lock_guard<std::mutex> lock(m_mutex);
+-            m_stream.clear();
+-            m_stream.seekg(static_cast<std::streamoff>(m_baseOffset + offset), std::ios::beg);
+-            if (!m_stream)
+-                return false;
+-            m_stream.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
+-            return static_cast<size_t>(m_stream.gcount()) == size;
++            uint8_t *out = static_cast<uint8_t *>(destination);
++            const uint64_t imageEnd = static_cast<uint64_t>(m_volumeSectors) * kSectorSize;
++            if (offset < imageEnd)
++            {
++                const size_t count = static_cast<size_t>(std::min<uint64_t>(size, imageEnd - offset));
++                if (!readRaw(offset, out, count))
++                    return false;
++                offset += count;
++                out += count;
++                size -= count;
++            }
++            while (size != 0u)
++            {
++                ModExtent *extent = modExtentFor(static_cast<uint32_t>(offset / kSectorSize));
++                if (!extent)
++                {
++                    // The zero tail after the last mod (callers keep reads inside m_totalSectors).
++                    std::memset(out, 0, size);
++                    return true;
++                }
++                const uint64_t inside = offset - static_cast<uint64_t>(extent->lsn) * kSectorSize;
++                const size_t count = static_cast<size_t>(
++                    std::min<uint64_t>(size, static_cast<uint64_t>(extent->sectors) * kSectorSize - inside));
++                const size_t fileCount =
++                    inside < extent->size ? static_cast<size_t>(std::min<uint64_t>(count, extent->size - inside)) : 0u;
++                std::memset(out, 0, count);
++                if (fileCount != 0u)
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    if (!extent->stream.is_open())
++                        extent->stream.open(extent->path, std::ios::binary);
++                    extent->stream.clear();
++                    extent->stream.seekg(static_cast<std::streamoff>(inside), std::ios::beg);
++                    if (!extent->stream)
++                        return false;
++                    extent->stream.read(reinterpret_cast<char *>(out), static_cast<std::streamsize>(fileCount));
++                    if (static_cast<size_t>(extent->stream.gcount()) != fileCount)
++                        return false;
++                }
++                offset += count;
++                out += count;
++                size -= count;
++            }
++            return true;
+         }
+ 
+         bool indexDirectory(const std::string &prefix, const IsoEntry &directory)
+@@ -237,7 +437,7 @@ namespace ps2x::iop
+                     if (nameLength == 1u && (record[33] == 0u || record[33] == 1u))
+                         continue; // "." and ".."
+ 
+-                    const std::string name = normalizeComponent(
++                    const std::string name = normalizeDiscComponent(
+                         std::string_view(reinterpret_cast<const char *>(record + 33u), nameLength));
+                     const IsoEntry child{readLe32(record + 2u), readLe32(record + 10u), (record[25] & 0x02u) != 0u};
+                     const std::string key = base.empty() ? name : base + '/' + name;
+@@ -256,8 +456,10 @@ namespace ps2x::iop
+         std::filesystem::path m_path;
+         uint64_t m_baseOffset = 0u;
+         uint32_t m_totalSectors = 0u;
++        uint32_t m_volumeSectors = 0u; // the PVD size: the sectors after it belong to mods
+         bool m_open = false;
+         std::unordered_map<std::string, IsoEntry> m_index;
++        std::vector<std::unique_ptr<ModExtent>> m_mods;
+     };
+ 
+     // Appended-ISO format: <original file bytes> <ISO bytes> <32-byte footer>. The footer is the 8-byte magic
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 6fc8e37..9708f29 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -208,6 +208,8 @@ namespace ps2x::iop::detail
+             metadataSectors.clear();
+             image.close();
+             imageChecked = false;
++            mods = {};
++            modsLoaded = false;
+         }
+ 
+         void setClock(const uint64_t *iopCycles) noexcept { clock = iopCycles; }
+@@ -473,6 +475,50 @@ namespace ps2x::iop::detail
+             return true;
+         }
+ 
++        // The files of the mods folder (HostPathKind::ModsRoot), scanned once.
++        const ModOverlay &loadMods()
++        {
++            if (!modsLoaded)
++            {
++                modsLoaded = true;
++                const std::string directory = host.hostPath(HostPathKind::ModsRoot);
++                if (!directory.empty())
++                    mods = ModOverlay::scan(std::filesystem::path(directory));
++            }
++            return mods;
++        }
++
++        // "DIR/FILE.BIN;1" of a virtual ISO node, from its identifiers up to the root.
++        std::string nodeDiscPath(size_t index) const
++        {
++            std::string path;
++            while (index != 0u)
++            {
++                path = path.empty() ? nodes[index].identifier : nodes[index].identifier + '/' + path;
++                index = nodes[index].parent;
++            }
++            return path;
++        }
++
++        // A mod replaces the host file of the node with the same disc path; mods without a disc file are ignored.
++        void applyModsToNodes()
++        {
++            const ModOverlay &overlay = loadMods();
++            if (overlay.empty())
++                return;
++            for (size_t index = 1u; index < nodes.size(); ++index)
++            {
++                IsoNode &node = nodes[index];
++                if (node.directory)
++                    continue;
++                if (const ModFile *mod = overlay.find(nodeDiscPath(index)))
++                {
++                    node.hostPath = mod->hostPath;
++                    node.size = mod->size;
++                }
++            }
++        }
++
+         bool buildVirtualIso()
+         {
+             if (virtualIsoBuilt)
+@@ -496,6 +542,7 @@ namespace ps2x::iop::detail
+             nodes.push_back(std::move(root));
+             if (!addDirectory(0u, rootPath))
+                 return false;
++            applyModsToNodes();
+ 
+             for (IsoNode &node : nodes)
+             {
+@@ -639,8 +686,11 @@ namespace ps2x::iop::detail
+                 {
+                     const uint64_t offset = host.cdImageOffset();
+                     if (image.open(std::filesystem::path(imagePath), offset))
++                    {
+                         std::fprintf(stderr, "[cdvd] imagen %s sectores=%u desplazamiento=%llu\n", imagePath.c_str(),
+                                      image.totalSectors(), static_cast<unsigned long long>(offset));
++                        (void)image.applyMods(loadMods());
++                    }
+                     else
+                         std::fprintf(stderr, "[cdvd] imagen %s no es una ISO 9660: se usa la carpeta\n",
+                                      imagePath.c_str());
+@@ -743,10 +793,12 @@ namespace ps2x::iop::detail
+             if (s_traced)
+             {
+                 const IsoNode *node = !useImage() && buildVirtualIso() ? fileForSector(lsn) : nullptr;
++                const std::optional<std::filesystem::path> modFile = image.modFileForSector(lsn);
++                const std::string imageFile = modFile ? modFile->string() : std::string("imagen");
+                 std::fprintf(stderr, "[cdvd:leer] lsn=%u sectores=%u destino=%x propio=%d archivo=%s desde=%llu\n", lsn,
+                              sectors, destination,
+                              byteCount64 <= IopMemory::RamSize && memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)) ? 1 : 0,
+-                             node ? node->hostPath.string().c_str() : (image.isOpen() ? "imagen" : "?"),
++                             node ? node->hostPath.string().c_str() : (image.isOpen() ? imageFile.c_str() : "?"),
+                              node ? static_cast<unsigned long long>(lsn - node->lsn) * kSectorSize : 0ull);
+             }
+             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
+@@ -798,6 +850,8 @@ namespace ps2x::iop::detail
+         int interruptEventFlagId = 0;
+         IsoImage image;
+         bool imageChecked = false;
++        ModOverlay mods;
++        bool modsLoaded = false;
+         bool virtualIsoBuilt = false;
+         bool virtualIsoValid = false;
+         uint32_t volumeSectors = 0u;
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 7e4a9f3..482df98 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -39,6 +39,7 @@ namespace ps2x::iop
+ {
+     class IopSubsystem;
+     class IsoImage;
++    class ModOverlay;
+ }
+ 
+ class PS2IopHostAdapter;
+@@ -282,6 +283,7 @@ public:
+         std::filesystem::path mcRoot;
+         std::filesystem::path cdImage;
+         uint64_t cdImageOffset = 0; // byte offset of the ISO inside cdImage (0 for a plain .iso)
++        std::filesystem::path modsRoot; // a file here replaces the disc file with the same relative path
+     };
+ 
+     PS2Runtime();
+@@ -362,17 +364,25 @@ public:
+     static const IoPaths &getIoPaths();
+     static void setIoPaths(const IoPaths &paths);
+     // A non-empty cardDirectory puts mc0/mc1 there instead of next to the ELF (PS2X_TARJETAS still wins).
++    // A non-empty modsDirectory is the mods folder (empty keeps the current one; PS2X_MODS still wins).
+     static void configureIoPathsFromElf(const std::string &elfPath,
+-                                        const std::filesystem::path &cardDirectory = {});
++                                        const std::filesystem::path &cardDirectory = {},
++                                        const std::filesystem::path &modsDirectory = {});
+     // Image mode: the disc is the ISO at imageOffset inside imagePath; host: lives in baseDirectory, mc0/mc1 in
+     // cardDirectory (baseDirectory if empty; PS2X_TARJETAS still wins).
+     static void configureIoPathsForImage(const std::filesystem::path &imagePath,
+                                          uint64_t imageOffset,
+                                          const std::filesystem::path &baseDirectory,
+                                          const std::string &elfName,
+-                                         const std::filesystem::path &cardDirectory = {});
++                                         const std::filesystem::path &cardDirectory = {},
++                                         const std::filesystem::path &modsDirectory = {});
+     // The ISO 9660 image of IoPaths::cdImage (opened by setIoPaths), or null without one or if it is not an ISO.
+     static std::shared_ptr<const ps2x::iop::IsoImage> cdIsoImage();
++    // The mods of IoPaths::modsRoot that replace a file of the current disc (null without any). In image mode
++    // cdIsoImage() already serves them; this is for the CD root folder.
++    static std::shared_ptr<const ps2x::iop::ModOverlay> cdMods();
++    // The "[mods] ..." lines of the current disc and mods folder (empty without mods).
++    static std::vector<std::string> cdModsReport();
+ 
+     void SignalException(R5900Context *ctx, PS2Exception exception);
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index a26de0e..1d36832 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -197,8 +197,14 @@ namespace
+     // Search results are cached per disc: switching between the image and the CD root folder drops them.
+     void syncCdFileCache(const std::shared_ptr<const ps2x::iop::IsoImage> &image)
+     {
+-        const std::string source = image ? image->path().string() + "@" + std::to_string(image->baseOffset())
+-                                         : std::string();
++        std::string source = image ? image->path().string() + "@" + std::to_string(image->baseOffset())
++                                   : std::string();
++        // Another mods folder maps other files: the cached results belong to the old one.
++        const std::filesystem::path &mods = PS2Runtime::getIoPaths().modsRoot;
++        if (!mods.empty())
++        {
++            source += "|mods=" + mods.string();
++        }
+         if (source == g_cdFilesSource)
+         {
+             return;
+@@ -401,7 +407,14 @@ namespace
+         const std::filesystem::path root = getCdRootPath();
+         std::filesystem::path path = cdHostPath(ps2Path);
+         std::error_code ec;
+-        if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
++        // A file of the mods folder replaces the disc file with the same path (the image serves its own mods).
++        const std::shared_ptr<const ps2x::iop::ModOverlay> mods = PS2Runtime::cdMods();
++        const ps2x::iop::ModFile *mod = mods ? mods->find(normalizeCdPathNoPrefix(ps2Path)) : nullptr;
++        if (mod)
++        {
++            path = mod->hostPath;
++        }
++        else if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
+         {
+             const std::filesystem::path relative(normalizeCdPathNoPrefix(ps2Path));
+             std::filesystem::path resolvedCasePath;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index e724656..23bb503 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -281,6 +281,8 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
+         return paths.hostRoot.string();
+     case ps2x::iop::HostPathKind::MemoryCardRoot:
+         return paths.mcRoot.string();
++    case ps2x::iop::HostPathKind::ModsRoot:
++        return paths.modsRoot.string();
+     case ps2x::iop::HostPathKind::ElfDirectory:
+     default:
+         return paths.elfDirectory.string();
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a9e3204..c802026 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -17,6 +17,7 @@
+ #include "ps2x/iop/iop_subsystem.h"
+ #include "ps2x/iop/iop_spu2_audio.h"
+ #include "ps2x/iop/ps2_iso_image.h"
++#include "ps2_user_paths.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -404,6 +405,14 @@ namespace
+         std::shared_ptr<const ps2x::iop::IsoImage> image;
+         std::filesystem::path path;
+         uint64_t offset = 0u;
++        std::filesystem::path imageMods; // the mods folder applied to `image`
++        // Mods of the CD root folder and the report, for (modsRoot, cdRoot, image).
++        std::shared_ptr<const ps2x::iop::ModOverlay> mods;
++        std::vector<std::string> modsReport;
++        std::filesystem::path modsRoot;
++        std::filesystem::path modsCdRoot;
++        const ps2x::iop::IsoImage *modsImage = nullptr;
++        bool modsSynced = false;
+     };
+ 
+     SharedCdImage &sharedCdImage()
+@@ -412,26 +421,120 @@ namespace
+         return shared;
+     }
+ 
+-    // Opens the image once per (path, offset); no path, a missing file or a non-ISO file leave no image.
+-    void syncSharedCdImage(const std::filesystem::path &path, uint64_t offset)
++    // The file of the CD root folder with this disc path key (each component compared as the disc does: any case,
++    // ";1" ignored).
++    bool cdRootHasFile(const std::filesystem::path &root, const std::string &key)
++    {
++        std::filesystem::path current = root;
++        size_t begin = 0u;
++        while (begin <= key.size())
++        {
++            size_t end = key.find('/', begin);
++            if (end == std::string::npos)
++            {
++                end = key.size();
++            }
++            const std::string component = key.substr(begin, end - begin);
++            begin = end + 1u;
++            bool matched = false;
++            std::error_code error;
++            for (const auto &entry : std::filesystem::directory_iterator(current, error))
++            {
++                try
++                {
++                    if (ps2x::iop::normalizeDiscComponent(entry.path().filename().string()) == component)
++                    {
++                        current = entry.path();
++                        matched = true;
++                        break;
++                    }
++                }
++                catch (const std::exception &)
++                {
++                }
++            }
++            if (!matched)
++            {
++                return false;
++            }
++        }
++        std::error_code error;
++        return std::filesystem::is_regular_file(current, error);
++    }
++
++    // Opens the image once per (path, offset, mods folder) and gives the disc files with a mod their new sectors; no
++    // path, a missing file or a non-ISO file leave no image. Then the mods of the disc and their "[mods]" lines,
++    // printed once per (mods folder, CD root, image).
++    void syncSharedCdImage(const PS2Runtime::IoPaths &paths)
+     {
+         SharedCdImage &shared = sharedCdImage();
+         std::lock_guard<std::mutex> lock(shared.mutex);
+-        if (shared.path == path && shared.offset == offset)
++        if (shared.path != paths.cdImage || shared.offset != paths.cdImageOffset ||
++            (!paths.cdImage.empty() && shared.imageMods != paths.modsRoot))
++        {
++            shared.path = paths.cdImage;
++            shared.offset = paths.cdImageOffset;
++            shared.imageMods = paths.modsRoot;
++            shared.image.reset();
++            if (!paths.cdImage.empty())
++            {
++                auto image = std::make_shared<ps2x::iop::IsoImage>();
++                if (image->open(paths.cdImage, paths.cdImageOffset))
++                {
++                    (void)image->applyMods(ps2x::iop::ModOverlay::scan(paths.modsRoot));
++                    shared.image = std::move(image);
++                }
++            }
++        }
++
++        if (shared.modsSynced && shared.modsRoot == paths.modsRoot && shared.modsCdRoot == paths.cdRoot &&
++            shared.modsImage == shared.image.get())
+         {
+             return;
+         }
+-        shared.path = path;
+-        shared.offset = offset;
+-        shared.image.reset();
+-        if (path.empty())
++        shared.modsSynced = true;
++        shared.modsRoot = paths.modsRoot;
++        shared.modsCdRoot = paths.cdRoot;
++        shared.modsImage = shared.image.get();
++        shared.mods.reset();
++        shared.modsReport.clear();
++
++        ps2x::iop::ModOverlay overlay = ps2x::iop::ModOverlay::scan(paths.modsRoot);
++        if (overlay.empty())
+         {
+             return;
+         }
+-        auto image = std::make_shared<ps2x::iop::IsoImage>();
+-        if (image->open(path, offset))
++        size_t replaced = 0u;
++        std::vector<std::string> onDisc;
++        for (const auto &[key, mod] : overlay.files())
+         {
+-            shared.image = std::move(image);
++            const std::optional<ps2x::iop::IsoEntry> entry = shared.image ? shared.image->lookup(key) : std::nullopt;
++            const bool found = shared.image ? (entry && !entry->isDirectory) : cdRootHasFile(paths.cdRoot, key);
++            if (found)
++            {
++                ++replaced;
++                onDisc.push_back(key);
++                shared.modsReport.push_back("[mods] " + ps2x::pathForLog(mod.relativePath) + " -> " +
++                                            ps2x::pathForLog(mod.hostPath) + " (" + std::to_string(mod.size) +
++                                            " bytes)");
++            }
++            else
++            {
++                shared.modsReport.push_back("[mods] " + ps2x::pathForLog(mod.relativePath) +
++                                            " no existe en el disco: se ignora");
++            }
++        }
++        shared.modsReport.push_back("[mods] " + std::to_string(replaced) + " archivos sustituidos desde " +
++                                    ps2x::pathForLog(paths.modsRoot));
++        overlay.retain([&](const std::string &key)
++                       { return std::find(onDisc.begin(), onDisc.end(), key) != onDisc.end(); });
++        if (!overlay.empty())
++        {
++            shared.mods = std::make_shared<const ps2x::iop::ModOverlay>(std::move(overlay));
++        }
++        for (const std::string &line : shared.modsReport)
++        {
++            std::cout << line << std::endl;
+         }
+     }
+ 
+@@ -1216,6 +1319,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     normalized.cdRoot = normalizeAbsolutePath(normalized.cdRoot);
+     normalized.mcRoot = normalizeAbsolutePath(normalized.mcRoot);
+     normalized.cdImage = normalizeAbsolutePath(normalized.cdImage);
++    normalized.modsRoot = normalizeAbsolutePath(normalized.modsRoot);
+ 
+     if (normalized.elfDirectory.empty() && !normalized.elfPath.empty())
+     {
+@@ -1236,10 +1340,11 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     }
+ 
+     runtimeIoPaths() = normalized;
+-    syncSharedCdImage(normalized.cdImage, normalized.cdImageOffset);
++    syncSharedCdImage(normalized);
+ }
+ 
+-void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::filesystem::path &cardDirectory)
++void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::filesystem::path &cardDirectory,
++                                         const std::filesystem::path &modsDirectory)
+ {
+     IoPaths paths = runtimeIoPaths();
+     paths.elfPath = normalizeAbsolutePath(std::filesystem::path(elfPath));
+@@ -1273,6 +1378,16 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::
+         paths.cdImageOffset = 0;
+     }
+ 
++    if (!modsDirectory.empty())
++    {
++        paths.modsRoot = modsDirectory;
++    }
++    // PS2X_MODS=<dir>: the mods folder, also in development mode (tests).
++    if (const char *mods = std::getenv("PS2X_MODS"); mods && *mods)
++    {
++        paths.modsRoot = std::filesystem::path(mods);
++    }
++
+     setIoPaths(paths);
+ }
+ 
+@@ -1280,7 +1395,8 @@ void PS2Runtime::configureIoPathsForImage(const std::filesystem::path &imagePath
+                                           uint64_t imageOffset,
+                                           const std::filesystem::path &baseDirectory,
+                                           const std::string &elfName,
+-                                          const std::filesystem::path &cardDirectory)
++                                          const std::filesystem::path &cardDirectory,
++                                          const std::filesystem::path &modsDirectory)
+ {
+     IoPaths paths = runtimeIoPaths();
+     paths.elfDirectory = normalizeAbsolutePath(baseDirectory);
+@@ -1294,9 +1410,31 @@ void PS2Runtime::configureIoPathsForImage(const std::filesystem::path &imagePath
+     }
+     paths.cdImage = imagePath;
+     paths.cdImageOffset = imageOffset;
++    if (!modsDirectory.empty())
++    {
++        paths.modsRoot = modsDirectory;
++    }
++    if (const char *mods = std::getenv("PS2X_MODS"); mods && *mods)
++    {
++        paths.modsRoot = std::filesystem::path(mods);
++    }
+     setIoPaths(paths);
+ }
+ 
++std::shared_ptr<const ps2x::iop::ModOverlay> PS2Runtime::cdMods()
++{
++    SharedCdImage &shared = sharedCdImage();
++    std::lock_guard<std::mutex> lock(shared.mutex);
++    return shared.mods;
++}
++
++std::vector<std::string> PS2Runtime::cdModsReport()
++{
++    SharedCdImage &shared = sharedCdImage();
++    std::lock_guard<std::mutex> lock(shared.mutex);
++    return shared.modsReport;
++}
++
+ std::shared_ptr<const ps2x::iop::IsoImage> PS2Runtime::cdIsoImage()
+ {
+     SharedCdImage &shared = sharedCdImage();
+diff --git a/ps2xRuntime/src/lib/ps2_vfs.cpp b/ps2xRuntime/src/lib/ps2_vfs.cpp
+index a628a82..403556a 100644
+--- a/ps2xRuntime/src/lib/ps2_vfs.cpp
++++ b/ps2xRuntime/src/lib/ps2_vfs.cpp
+@@ -358,6 +358,15 @@ bool PS2Vfs::resolveHostPath(std::string_view path, const PS2VfsMounts &mounts,
+     case ps2x::iop::Ps2PathDevice::Cdrom:
+         if (discImageFor(parsed))
+             return false; // the disc is the image: no host path
++        // A file of the mods folder replaces the disc file with the same path (the image serves its own mods).
++        if (const std::shared_ptr<const ps2x::iop::ModOverlay> mods = PS2Runtime::cdMods())
++        {
++            if (const ps2x::iop::ModFile *mod = mods->find(parsed.path))
++            {
++                result = mod->hostPath.lexically_normal();
++                return true;
++            }
++        }
+         base = mounts.cdRoot;
+         break;
+     case ps2x::iop::Ps2PathDevice::MemoryCard0:
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 9b9d0ac..7777116 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -326,9 +326,11 @@ namespace
+ 
+     // Image mode: the disc is the image, the ELF is BOOT2 of its SYSTEM.CNF, the cards live in cardDirectory.
+     std::vector<uint8_t> prepareImageBoot(const BootSource &boot, const std::filesystem::path &baseDirectory,
+-                                          const std::filesystem::path &cardDirectory, std::string &elfName)
++                                          const std::filesystem::path &cardDirectory,
++                                          const std::filesystem::path &modsDirectory, std::string &elfName)
+     {
+-        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, {}, cardDirectory);
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, {}, cardDirectory,
++                                             modsDirectory);
+         const std::shared_ptr<const ps2x::iop::IsoImage> image = PS2Runtime::cdIsoImage();
+         if (!image)
+         {
+@@ -352,7 +354,8 @@ namespace
+         }
+ 
+         elfName = ps2x::iop::bootElfName(*boot2);
+-        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, elfName, cardDirectory);
++        PS2Runtime::configureIoPathsForImage(boot.imagePath, boot.imageOffset, baseDirectory, elfName, cardDirectory,
++                                             modsDirectory);
+         std::cout << "[arranque] ELF del disco: " << *boot2 << " (" << bytes.size() << " bytes), carpeta base: "
+                   << baseDirectory.string() << std::endl;
+         return bytes;
+@@ -406,12 +409,12 @@ int main(int argc, char *argv[])
+             std::error_code error;
+             const std::filesystem::path baseDirectory =
+                 executable.empty() ? std::filesystem::current_path(error) : executable.parent_path();
+-            elfBytes = prepareImageBoot(boot, baseDirectory, userPaths.savesDirectory, elfName);
++            elfBytes = prepareImageBoot(boot, baseDirectory, userPaths.savesDirectory, userPaths.modsDirectory, elfName);
+             filePathStr = elfName;
+         }
+         else if (!boot.cardDirectory.empty())
+         {
+-            PS2Runtime::configureIoPathsFromElf(filePathStr, userPaths.savesDirectory);
++            PS2Runtime::configureIoPathsFromElf(filePathStr, userPaths.savesDirectory, userPaths.modsDirectory);
+             std::ifstream file(boot.elfPath, std::ios::binary);
+             if (file)
+             {
+diff --git a/ps2xTest/src/ps2_iso_image_tests.cpp b/ps2xTest/src/ps2_iso_image_tests.cpp
+index 3d4f1bc..5b657af 100644
+--- a/ps2xTest/src/ps2_iso_image_tests.cpp
++++ b/ps2xTest/src/ps2_iso_image_tests.cpp
+@@ -182,7 +182,8 @@ namespace
+         ~IoPathsGuard() { PS2Runtime::setIoPaths(saved); }
+     };
+ 
+-    void setCdPaths(const std::filesystem::path &cdRoot, const std::filesystem::path &image, uint64_t offset)
++    void setCdPaths(const std::filesystem::path &cdRoot, const std::filesystem::path &image, uint64_t offset,
++                    const std::filesystem::path &mods = {})
+     {
+         PS2Runtime::IoPaths paths;
+         paths.elfDirectory = cdRoot;
+@@ -191,9 +192,27 @@ namespace
+         paths.mcRoot = cdRoot / "mc0";
+         paths.cdImage = image;
+         paths.cdImageOffset = offset;
++        paths.modsRoot = mods;
+         PS2Runtime::setIoPaths(paths);
+     }
+ 
++    // A mod file: a different size and other bytes than any disc file.
++    constexpr uint32_t kModSize = 7000u;
++
++    std::vector<uint8_t> modBytes(uint32_t size = kModSize, uint8_t seed = 0x31u)
++    {
++        std::vector<uint8_t> bytes(size);
++        for (uint32_t i = 0u; i < size; ++i)
++            bytes[i] = static_cast<uint8_t>((seed + i * 13u + i / kSector) & 0xFFu);
++        return bytes;
++    }
++
++    void writeTree(const std::filesystem::path &path, const std::vector<uint8_t> &bytes)
++    {
++        std::filesystem::create_directories(path.parent_path());
++        writeFile(path, bytes);
++    }
++
+     void setGuestReg(R5900Context &ctx, int reg, uint32_t value)
+     {
+         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
+@@ -271,6 +290,8 @@ namespace
+                 return cdRoot.string();
+             if (kind == ps2x::iop::HostPathKind::CdImage)
+                 return cdImage.empty() ? std::string{} : cdImage.string();
++            if (kind == ps2x::iop::HostPathKind::ModsRoot)
++                return mods.empty() ? std::string{} : mods.string();
+             return {};
+         }
+         uint64_t cdImageOffset() const override { return imageOffset; }
+@@ -311,11 +332,73 @@ namespace
+ 
+         std::filesystem::path cdRoot;
+         std::filesystem::path cdImage;
++        std::filesystem::path mods;
+         uint64_t imageOffset = 0u;
+         std::unordered_map<uint64_t, std::FILE *> files;
+         uint64_t lastHandle = 0u;
+     };
+ 
++    // sceCdSearchFile / sceCdRead on the EE (Support.h) against a scratch RDRAM.
++    struct EeCd
++    {
++        static constexpr uint32_t kFileAddr = 0x3000u;
++        static constexpr uint32_t kPathAddr = 0x3100u;
++        static constexpr uint32_t kBufAddr = 0x10000u;
++
++        int32_t search(const std::string &path)
++        {
++            std::memcpy(rdram.data() + kPathAddr, path.c_str(), path.size() + 1u);
++            std::memset(rdram.data() + kFileAddr, 0, 32u);
++            R5900Context ctx{};
++            setGuestReg(ctx, 4, kFileAddr);
++            setGuestReg(ctx, 5, kPathAddr);
++            ps2_stubs::sceCdSearchFile(rdram.data(), &ctx, nullptr);
++            return guestReturn(ctx);
++        }
++
++        uint32_t lsn() const { return guestU32(rdram, kFileAddr); }
++        uint32_t size() const { return guestU32(rdram, kFileAddr + 4u); }
++
++        int32_t read(uint32_t lsn, uint32_t sectors)
++        {
++            std::memset(rdram.data() + kBufAddr, 0xAA, 8u * kSector);
++            R5900Context ctx{};
++            setGuestReg(ctx, 4, lsn);
++            setGuestReg(ctx, 5, sectors);
++            setGuestReg(ctx, 6, kBufAddr);
++            ps2_stubs::sceCdRead(rdram.data(), &ctx, nullptr);
++            return guestReturn(ctx);
++        }
++
++        std::vector<uint8_t> buffer(size_t size) const
++        {
++            return std::vector<uint8_t>(rdram.begin() + kBufAddr, rdram.begin() + kBufAddr + size);
++        }
++
++        std::vector<uint8_t> rdram = std::vector<uint8_t>(PS2_RAM_SIZE, 0u);
++    };
++
++    // The whole cdrom0: file through PS2Vfs, or nothing if it does not open.
++    std::optional<std::vector<uint8_t>> readVfsFile(PS2Vfs &vfs, const std::string &path, const PS2VfsMounts &mounts,
++                                                    const PS2RomDevice &rom)
++    {
++        const int32_t fd = vfs.open(path, PS2_FIO_O_RDONLY, mounts, rom);
++        if (fd < 0)
++            return std::nullopt;
++        std::vector<uint8_t> bytes(64u * 1024u);
++        const int64_t count = vfs.read(fd, bytes.data(), bytes.size());
++        (void)vfs.close(fd);
++        if (count < 0)
++            return std::nullopt;
++        bytes.resize(static_cast<size_t>(count));
++        return bytes;
++    }
++
++    std::string absoluteText(const std::filesystem::path &path)
++    {
++        return std::filesystem::absolute(path).lexically_normal().string();
++    }
++
+     struct CdvdHarness
+     {
+         explicit CdvdHarness(CdvdHost &host) : kernel(memory), cdvd(host, memory, kernel)
+@@ -883,4 +966,276 @@ void register_ps2_iso_image_tests()
+                      "without a card directory the card stays next to the ELF");
+         });
+     });
++
++    MiniTest::Case("PS2Mods", [](TestCase &tc)
++    {
++        tc.Run("Folder mode: a mod of another size replaces the disc file for CDVD, PS2Vfs, sceCd and IRX", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            const std::filesystem::path disc = dir.path / "disc";
++            const std::filesystem::path mods = dir.path / "mods";
++            const std::vector<uint8_t> keep = modBytes(3000u, 0x77u);
++            const std::vector<uint8_t> mod = modBytes();
++            writeTree(disc / "MODDIR" / "FILE.BIN", fileBytes());
++            writeTree(disc / "MODDIR" / "KEEP.BIN", keep);
++            writeTree(mods / "moddir" / "File.Bin", mod); // other case than on the disc
++            writeTree(mods / "NEW.BIN", modBytes(100u));     // not on the disc: ignored
++
++            CdvdHost host;
++            host.cdRoot = disc;
++            host.mods = mods;
++            CdvdHarness cd(host);
++            t.Equals(cd.searchFile("cdrom0:\\MODDIR\\FILE.BIN;1"), 1u, "IOP: the overridden file is found");
++            const uint32_t lsn = cd.memory.read32(cd.resultAddress);
++            t.Equals(cd.memory.read32(cd.resultAddress + 4u), kModSize, "IOP: sceCdSearchFile returns the mod size");
++            t.Equals(cd.read(lsn, 4u), 1u, "IOP: sceCdRead of the mod sectors succeeds");
++            t.IsTrue(cd.buffer(kModSize) == mod, "IOP: sceCdRead returns the mod bytes");
++            t.Equals(cd.searchFile("cdrom0:\\MODDIR\\KEEP.BIN;1"), 1u, "IOP: a file without mod is found");
++            t.Equals(cd.memory.read32(cd.resultAddress + 4u), uint32_t{3000u}, "IOP: a file without mod keeps its size");
++            t.Equals(cd.read(cd.memory.read32(cd.resultAddress), 2u), 1u, "IOP: a file without mod is read");
++            t.IsTrue(cd.buffer(keep.size()) == keep, "IOP: a file without mod keeps its bytes");
++            t.Equals(cd.searchFile("cdrom0:\\NEW.BIN;1"), 0u, "IOP: a file only in mods is not on the disc");
++
++            setCdPaths(disc, {}, 0u, mods);
++            const PS2VfsMounts mounts{disc, disc, disc / "mc0"};
++            PS2RomDevice rom;
++            PS2Vfs vfs;
++            t.IsTrue(readVfsFile(vfs, "cdrom0:\\MODDIR\\FILE.BIN;1", mounts, rom) == mod, "PS2Vfs: open/read give the mod");
++            t.IsTrue(readVfsFile(vfs, "cdrom0:\\MODDIR\\KEEP.BIN;1", mounts, rom) == keep, "PS2Vfs: other files unchanged");
++            PS2VfsStat status;
++            t.IsTrue(vfs.stat("cdrom0:\\MODDIR\\FILE.BIN;1", mounts, rom, status) && status.size == kModSize,
++                     "PS2Vfs: stat reports the mod size");
++            t.IsFalse(readVfsFile(vfs, "cdrom0:\\NEW.BIN;1", mounts, rom).has_value(), "PS2Vfs: a file only in mods is ignored");
++            t.IsFalse(vfs.stat("cdrom0:\\NEW.BIN;1", mounts, rom, status), "PS2Vfs: stat of a file only in mods fails");
++
++            EeCd ee;
++            t.Equals(ee.search("\\MODDIR\\FILE.BIN;1"), 1, "EE: sceCdSearchFile finds the overridden file");
++            t.Equals(ee.size(), kModSize, "EE: sceCdSearchFile returns the mod size");
++            t.Equals(ee.read(ee.lsn(), 4u), 1, "EE: sceCdRead of the mod succeeds");
++            t.IsTrue(ee.buffer(kModSize) == mod, "EE: sceCdRead returns the mod bytes");
++            t.Equals(ee.search("\\NEW.BIN;1"), 0, "EE: a file only in mods is not on the disc");
++
++            PS2Runtime runtime;
++            PS2IopHostAdapter adapter(runtime);
++            std::vector<uint8_t> module;
++            t.IsTrue(ps2x::iop::detail::IopModuleLoader::readWholeHostFile(adapter, "cdrom0:\\MODDIR\\FILE.BIN;1", module) &&
++                         module == mod,
++                     "IRX: a cdrom0: module is read from the mod");
++
++            const std::vector<std::string> expected = {
++                "[mods] " + (std::filesystem::path("moddir") / "File.Bin").string() + " -> " +
++                    absoluteText(mods / "moddir" / "File.Bin") + " (7000 bytes)",
++                "[mods] NEW.BIN no existe en el disco: se ignora",
++                "[mods] 1 archivos sustituidos desde " + absoluteText(mods),
++            };
++            t.IsTrue(PS2Runtime::cdModsReport() == expected, "one line per mod and the summary");
++        });
++
++        tc.Run("Image mode: a mod gets sectors after the volume, other files keep real LSNs and bytes", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 2u * kSector + 5u;
++            // The whole PVD volume is in the file, so its last sector can be read next to the first mod sector.
++            std::vector<uint8_t> volume = buildIso();
++            volume.resize(static_cast<size_t>(kVolumeSectors) * kSector, 0x5Au);
++            std::vector<uint8_t> bytes(static_cast<size_t>(prefix), 0xEEu);
++            bytes.insert(bytes.end(), volume.begin(), volume.end());
++            const std::filesystem::path iso = dir.path / "game.bin";
++            writeFile(iso, bytes);
++            const std::filesystem::path mods = dir.path / "mods";
++            const std::vector<uint8_t> mod = modBytes();
++            writeTree(mods / "dir" / "file.bin;1", mod); // lower case and the ISO version suffix
++            writeTree(mods / "NOPE.BIN", modBytes(10u));
++
++            CdvdHost host;
++            host.cdRoot = dir.path;
++            host.cdImage = iso;
++            host.imageOffset = prefix;
++            host.mods = mods;
++            CdvdHarness cd(host);
++            t.Equals(cd.searchFile("cdrom0:\\DIR\\FILE.BIN;1"), 1u, "IOP: the overridden file is found");
++            const uint32_t lsn = cd.memory.read32(cd.resultAddress);
++            t.IsTrue(lsn >= kVolumeSectors, "IOP: the mod lives after the image's last sector");
++            t.Equals(cd.memory.read32(cd.resultAddress + 4u), kModSize, "IOP: the mod size");
++            t.Equals(cd.read(lsn, 4u), 1u, "IOP: sceCdRead of the mod sectors succeeds");
++            t.IsTrue(cd.buffer(kModSize) == mod, "IOP: sceCdRead returns the mod bytes");
++            t.Equals(cd.searchFile("cdrom0:\\README.TXT;1"), 1u, "IOP: a file without mod is found");
++            t.Equals(cd.memory.read32(cd.resultAddress), kReadmeLsn, "IOP: a file without mod keeps its real LSN");
++            t.Equals(cd.read(kReadmeLsn, 1u), 1u, "IOP: the real sectors are read");
++            const std::vector<uint8_t> readme = cd.buffer(kReadme.size());
++            t.IsTrue(std::string(readme.begin(), readme.end()) == kReadme, "IOP: a file without mod keeps its bytes");
++            t.Equals(cd.searchFile("cdrom0:\\NOPE.BIN;1"), 0u, "IOP: a file only in mods is not on the disc");
++
++            setCdPaths(dir.path, iso, prefix, mods);
++            const std::shared_ptr<const IsoImage> image = PS2Runtime::cdIsoImage();
++            t.IsTrue(image != nullptr, "the shared image opens");
++            if (image)
++            {
++                const std::optional<IsoEntry> entry = image->lookup("dir/file.bin");
++                t.IsTrue(entry && entry->lsn == lsn && entry->size == kModSize,
++                         "the shared image maps the mod to the same LSN as the IOP");
++                std::vector<uint8_t> bytes;
++                t.IsTrue(image->readFile("\\DIR\\FILE.BIN;1", bytes) && bytes == mod, "readFile returns the mod");
++                std::vector<uint8_t> two(2u * kSector, 0xAAu);
++                t.Equals(lsn, kVolumeSectors, "the first mod starts right after the volume");
++                t.IsTrue(image->readSectors(lsn - 1u, 2u, two.data()), "a read across the image end succeeds");
++                t.IsTrue(two[0] == 0x5Au && two[kSector - 1u] == 0x5Au, "the last image sector has its bytes");
++                t.IsTrue(std::equal(mod.begin(), mod.begin() + kSector, two.begin() + kSector),
++                         "the sector after the image end is the mod's first sector");
++                std::vector<uint8_t> tail(kSector, 0xAAu);
++                t.IsTrue(image->readSectors(lsn + 3u, 1u, tail.data()), "the mod's last sector is read");
++                t.IsTrue(std::equal(mod.begin() + 3u * kSector, mod.end(), tail.begin()) &&
++                             std::all_of(tail.begin() + (kModSize - 3u * kSector), tail.end(), [](uint8_t b) { return b == 0u; }),
++                         "the mod's last sector is its bytes and then zeros");
++                std::vector<uint8_t> block(32u * kSector, 0xAAu);
++                t.IsTrue(image->readSectors(lsn + 2u, 32u, block.data()),
++                         "a block read past the end of the last mod succeeds, as on a disc");
++                t.IsTrue(std::equal(mod.begin() + 2u * kSector, mod.end(), block.begin()) &&
++                             std::all_of(block.begin() + (kModSize - 2u * kSector), block.end(), [](uint8_t b) { return b == 0u; }),
++                         "the mod's tail and the sectors after the last mod are zeros");
++                t.Equals(image->totalSectors(), kVolumeSectors + 4u + IsoImage::kModTailSectors,
++                         "the volume grows by the mod sectors and the zero tail");
++                t.IsFalse(image->readSectors(image->totalSectors() - 1u, 2u, tail.data()), "a read past the tail is refused");
++                t.IsTrue(image->lookup("\\README.TXT").has_value() && image->lookup("\\README.TXT")->lsn == kReadmeLsn,
++                         "a file without mod keeps its real LSN");
++            }
++
++            const PS2VfsMounts mounts{dir.path, dir.path, dir.path / "mc0"};
++            PS2RomDevice rom;
++            PS2Vfs vfs;
++            t.IsTrue(readVfsFile(vfs, "cdrom0:\\DIR\\FILE.BIN;1", mounts, rom) == mod, "PS2Vfs: open/read give the mod");
++            const std::optional<std::vector<uint8_t>> text = readVfsFile(vfs, "cdrom0:\\README.TXT;1", mounts, rom);
++            t.IsTrue(text && std::string(text->begin(), text->end()) == kReadme, "PS2Vfs: other files unchanged");
++            PS2VfsStat status;
++            t.IsTrue(vfs.stat("cdrom0:\\DIR\\FILE.BIN;1", mounts, rom, status) && status.size == kModSize,
++                     "PS2Vfs: stat reports the mod size");
++            t.IsFalse(readVfsFile(vfs, "cdrom0:\\NOPE.BIN", mounts, rom).has_value(), "PS2Vfs: a file only in mods is ignored");
++
++            EeCd ee;
++            t.Equals(ee.search("cdrom0:\\DIR\\FILE.BIN;1"), 1, "EE: sceCdSearchFile finds the overridden file");
++            t.IsTrue(ee.lsn() == lsn && ee.size() == kModSize, "EE: the same LSN and the mod size");
++            t.Equals(ee.read(lsn, 4u), 1, "EE: sceCdRead of the mod succeeds");
++            t.IsTrue(ee.buffer(kModSize) == mod, "EE: sceCdRead returns the mod bytes");
++            t.Equals(ee.search("\\README.TXT;1"), 1, "EE: a file without mod is found");
++            t.Equals(ee.lsn(), kReadmeLsn, "EE: a file without mod keeps its real LSN");
++
++            PS2Runtime runtime;
++            PS2IopHostAdapter adapter(runtime);
++            std::vector<uint8_t> module;
++            t.IsTrue(ps2x::iop::detail::IopModuleLoader::readWholeHostFile(adapter, "cdrom0:\\DIR\\FILE.BIN;1", module) &&
++                         module == mod,
++                     "IRX: a cdrom0: module is read from the mod");
++
++            const std::vector<std::string> report = PS2Runtime::cdModsReport();
++            t.Equals(report.size(), size_t{3u}, "one line per mod and the summary");
++            if (report.size() == 3u)
++            {
++                t.Equals(report[0], "[mods] " + (std::filesystem::path("dir") / "file.bin;1").string() + " -> " +
++                                        absoluteText(mods / "dir" / "file.bin;1") + " (7000 bytes)",
++                         "the overridden file line");
++                t.Equals(report[1], std::string("[mods] NOPE.BIN no existe en el disco: se ignora"), "the ignored line");
++                t.Equals(report[2], "[mods] 1 archivos sustituidos desde " + absoluteText(mods), "the summary");
++            }
++        });
++
++        tc.Run("Without mods (none, missing or empty folder) every read is the same as before", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            constexpr uint64_t prefix = 3u * kSector + 1u;
++            const std::filesystem::path iso = writeIso(dir, "game.bin", prefix);
++            const std::filesystem::path disc = dir.path / "disc";
++            writeTree(disc / "MODDIR" / "FILE.BIN", fileBytes());
++            std::filesystem::create_directories(dir.path / "empty");
++
++            // sceCdSearchFile + sceCdRead on the IOP, the shared image and PS2Vfs, as one comparable record.
++            const auto snapshot = [&](const std::filesystem::path &mods, bool imageMode)
++            {
++                std::vector<uint32_t> values;
++                std::vector<uint8_t> bytes;
++                CdvdHost host;
++                host.cdRoot = imageMode ? dir.path : disc;
++                host.cdImage = imageMode ? iso : std::filesystem::path{};
++                host.imageOffset = imageMode ? prefix : 0u;
++                host.mods = mods;
++                CdvdHarness cd(host);
++                const std::string file = imageMode ? "cdrom0:\\DIR\\FILE.BIN;1" : "cdrom0:\\MODDIR\\FILE.BIN;1";
++                values.push_back(cd.searchFile(file));
++                values.push_back(cd.memory.read32(cd.resultAddress));
++                values.push_back(cd.memory.read32(cd.resultAddress + 4u));
++                values.push_back(cd.read(cd.memory.read32(cd.resultAddress), 3u));
++                const std::vector<uint8_t> read = cd.buffer(3u * kSector);
++                bytes.insert(bytes.end(), read.begin(), read.end());
++                values.push_back(cd.read(16u, 1u));
++                const std::vector<uint8_t> pvd = cd.buffer(kSector);
++                bytes.insert(bytes.end(), pvd.begin(), pvd.end());
++
++                setCdPaths(imageMode ? dir.path : disc, imageMode ? iso : std::filesystem::path{}, imageMode ? prefix : 0u,
++                           mods);
++                if (const std::shared_ptr<const IsoImage> image = PS2Runtime::cdIsoImage())
++                {
++                    values.push_back(image->totalSectors());
++                    values.push_back(image->lookup(file)->lsn);
++                }
++                const PS2VfsMounts mounts{host.cdRoot, host.cdRoot, host.cdRoot / "mc0"};
++                PS2RomDevice rom;
++                PS2Vfs vfs;
++                const std::optional<std::vector<uint8_t>> whole = readVfsFile(vfs, file, mounts, rom);
++                values.push_back(whole ? static_cast<uint32_t>(whole->size()) : 0xFFFFFFFFu);
++                if (whole)
++                    bytes.insert(bytes.end(), whole->begin(), whole->end());
++                values.push_back(static_cast<uint32_t>(PS2Runtime::cdModsReport().size()));
++                return std::make_pair(values, bytes);
++            };
++
++            for (const bool imageMode : {false, true})
++            {
++                const std::string mode = imageMode ? "image" : "folder";
++                const auto base = snapshot({}, imageMode);
++                t.Equals(base.first.front(), 1u, mode + ": the file is found without mods");
++                t.IsTrue(snapshot(dir.path / "missing", imageMode) == base, mode + ": a missing mods folder changes nothing");
++                t.IsTrue(snapshot(dir.path / "empty", imageMode) == base, mode + ": an empty mods folder changes nothing");
++                t.Equals(base.first.back(), 0u, mode + ": no [mods] lines without mods");
++            }
++            const auto image = snapshot(dir.path / "empty", true);
++            t.IsTrue(std::find(image.first.begin(), image.first.end(), kVolumeSectors) != image.first.end(),
++                     "image: the volume keeps its PVD size");
++        });
++
++        tc.Run("The mods folder: none in development, the given one, PS2X_MODS above both", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            const std::string elf = (dir.path / "GAME.ELF").string();
++            const std::filesystem::path given = dir.path / "mods";
++            const std::filesystem::path forced = dir.path / "forced";
++            const std::filesystem::path iso = writeIso(dir, "game.iso", 0u);
++            _putenv_s("PS2X_MODS", "");
++            _putenv_s("PS2X_ISO", "");
++            _putenv_s("PS2X_TARJETAS", "");
++
++            setCdPaths(dir.path, {}, 0u);
++            PS2Runtime::configureIoPathsFromElf(elf);
++            t.IsTrue(PS2Runtime::getIoPaths().modsRoot.empty(), "development mode has no mods folder");
++            PS2Runtime::configureIoPathsFromElf(elf, {}, given);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(given), "the given mods folder is used");
++            PS2Runtime::configureIoPathsFromElf(elf);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(given),
++                     "loading the ELF again keeps the mods folder");
++
++            _putenv_s("PS2X_MODS", forced.string().c_str());
++            setCdPaths(dir.path, {}, 0u);
++            PS2Runtime::configureIoPathsFromElf(elf);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(forced), "PS2X_MODS in development mode");
++            PS2Runtime::configureIoPathsFromElf(elf, {}, given);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(forced), "PS2X_MODS wins over the folder");
++            PS2Runtime::configureIoPathsForImage(iso, 0u, dir.path, "GAME.ELF", {}, given);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(forced), "PS2X_MODS wins in image mode");
++            _putenv_s("PS2X_MODS", "");
++            PS2Runtime::configureIoPathsForImage(iso, 0u, dir.path, "GAME.ELF", {}, given);
++            t.Equals(PS2Runtime::getIoPaths().modsRoot.string(), absoluteText(given), "image mode uses the given folder");
++        });
++    });
+ }

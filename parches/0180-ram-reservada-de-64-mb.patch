@@ -1,0 +1,417 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4887a98..9987a19 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -418,7 +418,7 @@ public:
+     void handleTLBWR(uint8_t *rdram, R5900Context *ctx);
+     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
+     void clearLLBit(R5900Context *ctx);
+-    void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
++    void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_GUEST_RAM_SIZE);
+     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
+     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
+     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
+@@ -553,11 +553,11 @@ private:
+     std::vector<GuestHeapBlock> m_guestHeapBlocks;
+     uint32_t m_guestHeapBase = 0x00100000u;
+     uint32_t m_guestHeapEnd = 0x00100000u;
+-    uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
++    uint32_t m_guestHeapLimit = PS2_GUEST_RAM_SIZE;
+     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
+     bool m_guestHeapConfigured = false;
+     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
+-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    uint32_t m_asyncCallbackStackTop = PS2_GUEST_RAM_SIZE;
+ 
+     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
+     std::atomic<bool> m_missingFunctionReported{false};
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index bade304..8bf503f 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -23,8 +23,12 @@
+ 
+ class GS;
+ 
+-constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
+-constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
++// F1 06 port, patch 0180: the runtime reserves 64MB of RDRAM (masks, bounds and DMA use this size, so
++// 0x2000000-0x3FFFFFF is real memory of its own), while the game still sees 32MB (PS2_GUEST_RAM_SIZE: GetMemorySize,
++// the stack -1 of SetupThread, the initial sp, the async callback stacks and the runtime heap limits).
++constexpr uint32_t PS2_RAM_SIZE = 64u * 1024u * 1024u;       // 64MB reserved
++constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;         // Mask for the reserved RAM
++constexpr uint32_t PS2_GUEST_RAM_SIZE = 32u * 1024u * 1024u; // 32MB seen by the game
+ constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+ constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
+ constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
+@@ -69,6 +73,8 @@ inline constexpr uint32_t PS2_FIO_S_IFREG = 0x2000;
+ 
+ static_assert((PS2_RAM_SIZE & (PS2_RAM_SIZE - 1u)) == 0u, "PS2_RAM_SIZE must be a power of two");
+ static_assert(PS2_RAM_MASK == (PS2_RAM_SIZE - 1u), "PS2_RAM_MASK must match PS2_RAM_SIZE");
++static_assert((PS2_GUEST_RAM_SIZE & (PS2_GUEST_RAM_SIZE - 1u)) == 0u, "PS2_GUEST_RAM_SIZE must be a power of two");
++static_assert(PS2_GUEST_RAM_SIZE <= PS2_RAM_SIZE, "the guest RAM must fit in the reserved RAM");
+ 
+ inline std::atomic<uint8_t *> &ps2ScratchpadHostPtrStorage()
+ {
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 6c18115..36f114e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -555,23 +555,23 @@ namespace ps2_syscalls
+             if (stackSizeSigned > 0)
+             {
+                 const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+-                if (requestedSize < PS2_RAM_SIZE)
++                if (requestedSize < PS2_GUEST_RAM_SIZE)
+                 {
+-                    // stack == -1 puts the stack at the end of RAM, [RAM_END - size, RAM_END), growing down
+-                    // from its top. Reserve that range from the async-callback stack area, which is also carved
++                    // stack == -1 puts the stack at the end of the guest RAM (PS2_GUEST_RAM_SIZE, patch 0180),
++                    // [RAM_END - size, RAM_END), growing down from its top. Reserve that range from the async-callback stack area, which is also carved
+                     // downwards from RAM_END: otherwise interrupt/callback invocation stacks end up on top of
+                     // the main thread's live frames and corrupt saved return addresses (F1 06 crashed this way).
+                     const uint32_t reservedTop = runtime->reserveAsyncCallbackStack(requestedSize, 16u);
+-                    sp = reservedTop != 0u ? reservedTop + 0x10u : PS2_RAM_SIZE - requestedSize;
++                    sp = reservedTop != 0u ? reservedTop + 0x10u : PS2_GUEST_RAM_SIZE - requestedSize;
+                 }
+                 else
+                 {
+-                    sp = PS2_RAM_SIZE;
++                    sp = PS2_GUEST_RAM_SIZE;
+                 }
+             }
+             else
+             {
+-                sp = PS2_RAM_SIZE;
++                sp = PS2_GUEST_RAM_SIZE;
+             }
+         }
+         else if (stack != 0u)
+@@ -711,7 +711,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+         (void)runtime;
+-        setReturnU32(ctx, PS2_RAM_SIZE);
++        setReturnU32(ctx, PS2_GUEST_RAM_SIZE); // patch 0180: the game sees 32MB
+     }
+ 
+     void InitTLB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 59025f1..a24c0bd 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1274,7 +1274,7 @@ namespace
+             const uint32_t off = addr & 0x3FF0u;
+             return off + bytes <= PS2_SCRATCHPAD_SIZE ? mem.getScratchpad() + off : nullptr;
+         }
+-        const uint32_t off = addr & 0x01FFFFF0u;
++        const uint32_t off = addr & (PS2_RAM_MASK & ~0xFu); // patch 0180: the reserved RAM, 16-byte aligned
+         return off + bytes <= PS2_RAM_SIZE ? mem.getRDRAM() + off : nullptr;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 11339f5..d31adf5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -86,7 +86,7 @@ static constexpr int FB_WIDTH = 640;
+ static constexpr int FB_HEIGHT = 512;
+ static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
+ static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
+-static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
++static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_GUEST_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
+ #if defined(PLATFORM_VITA)
+ static constexpr int HOST_WINDOW_WIDTH = 960;
+ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -663,7 +663,7 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t row
+         if (s_saveRam && rdram != nullptr)
+             if (FILE *ram = std::fopen((path + ".ram").c_str(), "wb"))
+             {
+-                std::fwrite(rdram, 1, PS2_RAM_SIZE, ram);
++                std::fwrite(rdram, 1, PS2_GUEST_RAM_SIZE, ram); // the guest's 32MB (patch 0180)
+                 std::fclose(ram);
+             }
+     }
+@@ -1359,11 +1359,11 @@ PS2Runtime::PS2Runtime()
+     m_guestHeapBlocks.clear();
+     m_guestHeapBase = kGuestHeapDefaultBase;
+     m_guestHeapEnd = kGuestHeapDefaultBase;
+-    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
+     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+     m_guestHeapConfigured = false;
+-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
++    m_asyncCallbackStackTop = PS2_GUEST_RAM_SIZE;
+ }
+ 
+ ps2x::DisplaySettings PS2Runtime::displaySettings() const
+@@ -1923,20 +1923,20 @@ bool PS2Runtime::loadELF(const std::vector<uint8_t> &elfBytes, const std::string
+         return false;
+     }
+ 
+-    if (maxLoadedRdramEnd > PS2_RAM_SIZE)
++    if (maxLoadedRdramEnd > PS2_GUEST_RAM_SIZE)
+     {
+-        maxLoadedRdramEnd = PS2_RAM_SIZE;
++        maxLoadedRdramEnd = PS2_GUEST_RAM_SIZE;
+     }
+ 
+-    const uint32_t paddedEnd = (maxLoadedRdramEnd > (PS2_RAM_SIZE - kGuestHeapSafetyPad))
+-                                   ? PS2_RAM_SIZE
++    const uint32_t paddedEnd = (maxLoadedRdramEnd > (PS2_GUEST_RAM_SIZE - kGuestHeapSafetyPad))
++                                   ? PS2_GUEST_RAM_SIZE
+                                    : (maxLoadedRdramEnd + kGuestHeapSafetyPad);
+     const uint32_t suggestedHeapBase = alignGuestHeapValue(paddedEnd, kGuestHeapDefaultAlignment);
+     {
+         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+         if (!m_guestHeapConfigured)
+         {
+-            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
+             m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+             m_guestHeapBase = m_guestHeapSuggestedBase;
+             m_guestHeapEnd = m_guestHeapSuggestedBase;
+@@ -1945,9 +1945,9 @@ bool PS2Runtime::loadELF(const std::vector<uint8_t> &elfBytes, const std::string
+     }
+     {
+         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
++        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
++        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_GUEST_RAM_SIZE);
++        m_asyncCallbackStackTop = PS2_GUEST_RAM_SIZE;
+     }
+ 
+     LoadedModule module;
+@@ -2699,17 +2699,17 @@ uint32_t PS2Runtime::normalizeGuestHeapAlignment(uint32_t alignment)
+ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
+ {
+     uint32_t normalized = guestBase;
+-    if (normalized >= PS2_RAM_SIZE)
++    if (normalized >= PS2_GUEST_RAM_SIZE)
+     {
+-        normalized &= PS2_RAM_MASK;
++        normalized &= PS2_GUEST_RAM_SIZE - 1u;
+     }
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
+     return std::min(normalized, hardLimit);
+ }
+ 
+ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ {
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_GUEST_RAM_SIZE);
+     if (guestLimit == 0u || guestLimit > hardLimit)
+     {
+         return hardLimit;
+@@ -3082,9 +3082,9 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+ 
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+     uint32_t top = m_asyncCallbackStackTop;
+-    if (top > PS2_RAM_SIZE)
++    if (top > PS2_GUEST_RAM_SIZE)
+     {
+-        top = PS2_RAM_SIZE;
++        top = PS2_GUEST_RAM_SIZE;
+     }
+     top &= ~(kGuestHeapDefaultAlignment - 1u);
+ 
+@@ -3105,7 +3105,7 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     static const bool s_traza = std::getenv("PS2X_MEMORIA_TRAZA") != nullptr;
+     if (s_traza)
+         std::fprintf(stderr, "[memoria] pila de 0x%x en 0x%x-0x%x (usado al final de la RAM: 0x%x)\n", allocSize, base, top,
+-                     PS2_RAM_SIZE - base);
++                     PS2_GUEST_RAM_SIZE - base);
+     return top - 0x10u;
+ }
+ 
+@@ -3448,7 +3448,7 @@ void PS2Runtime::run()
+     initializeEeKernelState(m_memory.getRDRAM());
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+-    m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
++    m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_GUEST_RAM_SIZE - 0x10u));
+     m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
+     m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)), std::memory_order_relaxed);
+     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 8abc3e1..d9057f4 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -193,6 +193,47 @@ void register_ps2_memory_tests()
+             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_ALIAS_BASE + 0x123u), 0x123u, "0xF000 scratchpad alias should translate to local offset");
+         });
+ 
++        // F1 06 port, patch 0180: 64 MB of RDRAM are reserved, so 0x2000000-0x3FFFFFF is real memory of its own (before,
++        // an alias of the low 32 MB), reached directly and through the uncached and KSEG0/KSEG1 mirrors.
++        tc.Run("RDRAM above 32MB is distinct memory reached through its mirrors", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            mem.write32(0x00000010u, 0x11111111u);
++            mem.write32(0x01FFFFF0u, 0x22222222u);
++            mem.write32(0x02000010u, 0x33333333u);
++            mem.write32(0x03FFFFF0u, 0x44444444u);
++            t.Equals(mem.read32(0x00000010u), 0x11111111u, "0x0000010 should keep its own pattern");
++            t.Equals(mem.read32(0x01FFFFF0u), 0x22222222u, "0x1FFFFF0 should keep its own pattern");
++            t.Equals(mem.read32(0x02000010u), 0x33333333u, "0x2000010 should read back its pattern");
++            t.Equals(mem.read32(0x03FFFFF0u), 0x44444444u, "0x3FFFFF0 should read back its pattern");
++
++            t.Equals(mem.read32(0x22000010u), 0x33333333u, "uncached mirror 0x22000010 should reach 0x2000010");
++            t.Equals(mem.read32(0x23FFFFF0u), 0x44444444u, "uncached mirror 0x23FFFFF0 should reach 0x3FFFFF0");
++            t.Equals(mem.read32(0x83FFFFF0u), 0x44444444u, "KSEG0 0x83FFFFF0 should reach 0x3FFFFF0");
++            t.Equals(mem.read32(0xA2000010u), 0x33333333u, "KSEG1 0xA2000010 should reach 0x2000010");
++            t.Equals(mem.translateAddress(0x23FFFFF0u), 0x03FFFFF0u, "uncached mirror should translate above 32MB");
++            t.Equals(mem.translateAddress(0x83FFFFF0u), 0x03FFFFF0u, "KSEG0 should translate above 32MB");
++
++            mem.write32(0x23FFFFE0u, 0x55555555u);
++            mem.write32(0x82000020u, 0x66666666u);
++            t.Equals(mem.read32(0x03FFFFE0u), 0x55555555u, "a write through the uncached mirror should land above 32MB");
++            t.Equals(mem.read32(0x02000020u), 0x66666666u, "a write through KSEG0 should land above 32MB");
++            t.Equals(mem.read32(0x01FFFFE0u), 0u, "0x1FFFFE0 must not alias 0x3FFFFE0");
++            t.Equals(mem.read32(0x00000020u), 0u, "0x0000020 must not alias 0x2000020");
++
++            // The translated code reads and writes through the fast helpers (PS2_RAM_MASK).
++            const uint8_t *rdram = mem.getRDRAM();
++            t.Equals(Ps2FastRead32(rdram, 0x00000010u), 0x11111111u, "fast read of 0x0000010");
++            t.Equals(Ps2FastRead32(rdram, 0x02000010u), 0x33333333u, "fast read of 0x2000010 must not alias 0x0000010");
++            t.Equals(Ps2FastRead32(rdram, 0x22000010u), 0x33333333u, "fast read through the uncached mirror");
++            t.Equals(Ps2FastRead32(rdram, 0x83FFFFF0u), 0x44444444u, "fast read through KSEG0");
++            Ps2FastWrite32(mem.getRDRAM(), 0xA3FFFFD0u, 0x77777777u);
++            t.Equals(mem.read32(0x03FFFFD0u), 0x77777777u, "fast write through KSEG1 should land above 32MB");
++            t.Equals(mem.read32(0x01FFFFD0u), 0u, "fast write above 32MB must not touch the low 32MB");
++        });
++
+         tc.Run("EE timer0 count advances from scheduler cycles and can be reset", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -1983,6 +2024,58 @@ void register_ps2_memory_tests()
+                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+         });
+ 
++        // Patch 0180: DMA sources above 32MB read that memory, not the low 32MB.
++        tc.Run("DMAC SPR_TO and GIF DMA source RDRAM above 32MB", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kLow = 0x00000400u;
++            constexpr uint32_t kHigh = 0x02000400u;
++            constexpr uint32_t kQwc = 2u;
++            constexpr uint32_t kWords = kQwc * 4u;
++            for (uint32_t i = 0; i < kWords; ++i)
++            {
++                mem.write32(kLow + i * 4u, 0x10101010u + i);
++                mem.write32(kHigh + i * 4u, 0xC0C0C0C0u + i);
++            }
++
++            constexpr uint32_t kSprTo = 0x1000D400u;
++            constexpr uint32_t kSadr = 0x00000240u;
++            t.IsTrue(mem.writeIORegister(kSprTo + 0x10u, kHigh), "write SPR_TO MADR should succeed");
++            t.IsTrue(mem.writeIORegister(kSprTo + 0x20u, kQwc), "write SPR_TO QWC should succeed");
++            t.IsTrue(mem.writeIORegister(kSprTo + 0x80u, kSadr), "write SPR_TO SADR should succeed");
++            t.IsTrue(mem.writeIORegister(kSprTo + 0x00u, 0x100u), "start SPR_TO should succeed");
++            bool sprHigh = true;
++            for (uint32_t i = 0; i < kWords; ++i)
++            {
++                uint32_t word = 0;
++                std::memcpy(&word, mem.getScratchpad() + kSadr + i * 4u, sizeof(word));
++                sprHigh = sprHigh && word == 0xC0C0C0C0u + i;
++            }
++            t.IsTrue(sprHigh, "SPR_TO from 0x2000400 should copy the data above 32MB");
++
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                captured.emplace_back(data, data + sizeBytes);
++            });
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kHigh), "write GIF MADR should succeed");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, kQwc), "write GIF QWC should succeed");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write GIF CHCR STR should succeed");
++            mem.processPendingTransfers();
++            t.Equals(captured.size(), static_cast<size_t>(1u), "GIF DMA from above 32MB should emit one packet");
++            bool gifHigh = !captured.empty() && captured[0].size() == kQwc * 16u;
++            for (uint32_t i = 0; gifHigh && i < kWords; ++i)
++            {
++                uint32_t word = 0;
++                std::memcpy(&word, captured[0].data() + i * 4u, sizeof(word));
++                gifHigh = word == 0xC0C0C0C0u + i;
++            }
++            t.IsTrue(gifHigh, "GIF DMA from 0x2000400 should send the data above 32MB");
++        });
++
+         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index f6cb8a7..b1f59e6 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1157,7 +1157,7 @@ void register_ps2_runtime_kernel_tests()
+             setRegU32(env.ctx, 4, 0xFFFFFFFFu);
+             t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+             const uint32_t clampedBase = static_cast<uint32_t>(getRegS32(env.ctx, 2));
+-            t.IsTrue(clampedBase < PS2_RAM_SIZE, "SetupHeap should normalize out-of-range base into guest RAM");
++            t.IsTrue(clampedBase < 0x02000000u, "SetupHeap should normalize out-of-range base into the guest's 32MB");
+ 
+             t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+             const uint32_t heapEnd = static_cast<uint32_t>(getRegS32(env.ctx, 2));
+@@ -1175,9 +1175,11 @@ void register_ps2_runtime_kernel_tests()
+         tc.Run("SetupThread exposes stable main stack metadata through ReferThreadStatus", [](TestCase &t)
+         {
+             TestEnv env;
+-            constexpr uint32_t kInitialLoaderSp = PS2_RAM_SIZE - 0x10u;
++            // Patch 0180: the game still sees 32MB (the runtime reserves more), so the stack -1 ends at 0x2000000.
++            constexpr uint32_t kGuestRamEnd = 0x02000000u;
++            constexpr uint32_t kInitialLoaderSp = kGuestRamEnd - 0x10u;
+             constexpr uint32_t kMainStackSize = 0x00020000u;
+-            constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - kMainStackSize;
++            constexpr uint32_t kExpectedStack = kGuestRamEnd - kMainStackSize;
+             constexpr uint32_t kMainGp = 0x0036A7F0u;
+ 
+             env.ctx.pc = 0x00100000u;
+@@ -1188,8 +1190,8 @@ void register_ps2_runtime_kernel_tests()
+             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                      "SetupThread syscall should dispatch");
+             // Patch 0008: stack -1 occupies [RAM_END - size, RAM_END) and the returned sp is its top.
+-            t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE,
+-                     "automatic main stack sp should start at the top of RDRAM");
++            t.Equals(::getRegU32(&env.ctx, 2), kGuestRamEnd,
++                     "automatic main stack sp should start at the top of the guest's 32MB");
+ 
+             // ReferThreadStatus can be called after many nested frames have moved $sp.
+             // It must report the initial stack recorded by SetupThread, not this live snapshot.
+@@ -1213,6 +1215,15 @@ void register_ps2_runtime_kernel_tests()
+                      "main thread status must never expose a live stack-pointer snapshot");
+         });
+ 
++        tc.Run("guest-visible RAM size stays 32MB", [](TestCase &t)
++        {
++            TestEnv env;
++            t.IsTrue(callSyscall(0x7Fu, env.rdram.data(), &env.ctx, &env.runtime), "GetMemorySize syscall should dispatch");
++            t.Equals(::getRegU32(&env.ctx, 2), 0x02000000u, "GetMemorySize should report the guest's 32MB");
++            t.Equals(env.runtime.reserveAsyncCallbackStack(0x4000u, 16u), 0x01FFFFF0u,
++                     "async callback stacks should be carved from the top of the guest's 32MB");
++        });
++
+         tc.Run("OSD config2 syscalls round-trip extended config", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/test_function_table.cpp b/ps2xTest/src/test_function_table.cpp
+index be6a888..bf4edd0 100644
+--- a/ps2xTest/src/test_function_table.cpp
++++ b/ps2xTest/src/test_function_table.cpp
+@@ -5,7 +5,7 @@
+ 
+ // For Unit tests link ps2_runtime without the generated runner source.
+ extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x00000000u;
+-extern const uint32_t g_ps2RecompiledFunctionTableEnd = PS2_RAM_SIZE;
++extern const uint32_t g_ps2RecompiledFunctionTableEnd = PS2_GUEST_RAM_SIZE; // code lives in the guest's 32MB
+ extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) >> 2;
+ 
+ PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[g_ps2RecompiledFunctionTableSlotCount] = {};

@@ -1,0 +1,961 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..71b76ee 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -97,6 +97,8 @@ namespace ps2x::iop
+         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
+ 
+         virtual std::string hostPath(HostPathKind kind) const = 0;
++        // Byte offset of the ISO inside the HostPathKind::CdImage file (0 for a plain .iso).
++        virtual uint64_t cdImageOffset() const { return 0u; }
+         virtual std::string translateGuestPath(std::string_view path) const = 0;
+         virtual uint64_t openHostFile(std::string_view path) = 0;
+         virtual bool hostFileSize(uint64_t handle, uint64_t &size) const = 0;
+diff --git a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+new file mode 100644
+index 0000000..4870cd0
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+@@ -0,0 +1,242 @@
++#pragma once
++
++#include <algorithm>
++#include <cctype>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++namespace ps2x::iop
++{
++    struct IsoEntry
++    {
++        uint32_t lsn = 0u;
++        uint32_t size = 0u;
++        bool isDirectory = false;
++    };
++
++    // Read-only ISO 9660 image (a plain .iso, or one stored at a byte offset inside a larger file).
++    // open() indexes every directory once; lookup() and readSectors() may then be called from any thread.
++    // open() and close() must not race with readers.
++    class IsoImage
++    {
++    public:
++        static constexpr uint32_t kSectorSize = 2048u;
++        static constexpr uint32_t kPrimaryVolumeDescriptorLsn = 16u;
++
++        IsoImage() = default;
++        IsoImage(const IsoImage &) = delete;
++        IsoImage &operator=(const IsoImage &) = delete;
++
++        bool open(const std::filesystem::path &path, uint64_t baseOffset = 0u)
++        {
++            close();
++            m_stream.open(path, std::ios::binary);
++            if (!m_stream.is_open())
++                return false;
++            m_baseOffset = baseOffset;
++
++            std::vector<uint8_t> pvd(kSectorSize);
++            if (!readRaw(static_cast<uint64_t>(kPrimaryVolumeDescriptorLsn) * kSectorSize, pvd.data(), pvd.size()) ||
++                pvd[0] != 1u || std::memcmp(pvd.data() + 1u, "CD001", 5u) != 0 ||
++                readLe16(pvd.data() + 128u) != kSectorSize)
++            {
++                close();
++                return false;
++            }
++            m_totalSectors = readLe32(pvd.data() + 80u);
++            const IsoEntry root{readLe32(pvd.data() + 156u + 2u), readLe32(pvd.data() + 156u + 10u), true};
++            m_index.emplace(std::string{}, root);
++            if (!indexDirectory(std::string{}, root))
++            {
++                close();
++                return false;
++            }
++            m_path = path;
++            m_open = true;
++            return true;
++        }
++
++        void close()
++        {
++            if (m_stream.is_open())
++                m_stream.close();
++            m_stream.clear();
++            m_index.clear();
++            m_path.clear();
++            m_baseOffset = 0u;
++            m_totalSectors = 0u;
++            m_open = false;
++        }
++
++        [[nodiscard]] bool isOpen() const { return m_open; }
++        [[nodiscard]] const std::filesystem::path &path() const { return m_path; }
++        [[nodiscard]] uint64_t baseOffset() const { return m_baseOffset; }
++        // Volume space size from the PVD (not the file size).
++        [[nodiscard]] uint32_t totalSectors() const { return m_totalSectors; }
++
++        // Accepts "\DIR\FILE.BIN;1", "dir/file.bin" or "cdrom0:\DIR\FILE.BIN;1" (case-insensitive).
++        [[nodiscard]] std::optional<IsoEntry> lookup(std::string_view guestPath) const
++        {
++            if (!m_open)
++                return std::nullopt;
++            const std::optional<std::string> key = normalizePath(guestPath);
++            if (!key)
++                return std::nullopt;
++            const auto found = m_index.find(*key);
++            if (found == m_index.end())
++                return std::nullopt;
++            return found->second;
++        }
++
++        // Reads `count` whole sectors at `lsn` into `destination` (count * kSectorSize bytes).
++        bool readSectors(uint32_t lsn, uint32_t count, void *destination) const
++        {
++            if (!m_open || static_cast<uint64_t>(lsn) + count > m_totalSectors)
++                return false;
++            return readRaw(static_cast<uint64_t>(lsn) * kSectorSize, destination,
++                           static_cast<size_t>(count) * kSectorSize);
++        }
++
++    private:
++        static uint16_t readLe16(const uint8_t *bytes)
++        {
++            return static_cast<uint16_t>(bytes[0] | (bytes[1] << 8u));
++        }
++
++        static uint32_t readLe32(const uint8_t *bytes)
++        {
++            return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8u) |
++                   (static_cast<uint32_t>(bytes[2]) << 16u) | (static_cast<uint32_t>(bytes[3]) << 24u);
++        }
++
++        // Upper case, without the ";1" version suffix or a trailing '.' (ISO names without extension).
++        static std::string normalizeComponent(std::string_view value)
++        {
++            std::string result(value);
++            const size_t semicolon = result.rfind(';');
++            if (semicolon != std::string::npos)
++                result.resize(semicolon);
++            while (!result.empty() && result.back() == '.')
++                result.pop_back();
++            std::transform(result.begin(), result.end(), result.begin(),
++                           [](unsigned char ch)
++                           { return static_cast<char>(std::toupper(ch)); });
++            return result;
++        }
++
++        static std::optional<std::string> normalizePath(std::string_view value)
++        {
++            const size_t colon = value.find(':');
++            if (colon != std::string_view::npos)
++            {
++                std::string device(value.substr(0u, colon));
++                std::transform(device.begin(), device.end(), device.begin(),
++                               [](unsigned char ch)
++                               { return static_cast<char>(std::tolower(ch)); });
++                if (device != "cdrom0" && device != "cdrom")
++                    return std::nullopt;
++                value.remove_prefix(colon + 1u);
++            }
++
++            std::string result;
++            size_t begin = 0u;
++            while (begin <= value.size())
++            {
++                size_t end = value.find_first_of("/\\", begin);
++                if (end == std::string_view::npos)
++                    end = value.size();
++                const std::string_view component = value.substr(begin, end - begin);
++                begin = end + 1u;
++                if (component.empty() || component == ".")
++                    continue;
++                if (component == "..")
++                    return std::nullopt;
++                if (!result.empty())
++                    result += '/';
++                result += normalizeComponent(component);
++            }
++            return result;
++        }
++
++        bool readRaw(uint64_t offset, void *destination, size_t size) const
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stream.clear();
++            m_stream.seekg(static_cast<std::streamoff>(m_baseOffset + offset), std::ios::beg);
++            if (!m_stream)
++                return false;
++            m_stream.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
++            return static_cast<size_t>(m_stream.gcount()) == size;
++        }
++
++        bool indexDirectory(const std::string &prefix, const IsoEntry &directory)
++        {
++            std::vector<std::pair<std::string, IsoEntry>> pending{{prefix, directory}};
++            std::unordered_set<uint32_t> visited;
++            while (!pending.empty())
++            {
++                const auto [base, entry] = pending.back();
++                pending.pop_back();
++                if (!visited.insert(entry.lsn).second)
++                    continue;
++
++                const uint32_t sectors = (entry.size + kSectorSize - 1u) / kSectorSize;
++                if (sectors == 0u || static_cast<uint64_t>(entry.lsn) + sectors > m_totalSectors)
++                    return false;
++                std::vector<uint8_t> bytes(static_cast<size_t>(sectors) * kSectorSize);
++                if (!readRaw(static_cast<uint64_t>(entry.lsn) * kSectorSize, bytes.data(), bytes.size()))
++                    return false;
++
++                size_t offset = 0u;
++                while (offset < entry.size)
++                {
++                    const uint8_t length = bytes[offset];
++                    if (length == 0u)
++                    {
++                        // No more records in this sector: they continue in the next one.
++                        offset = (offset / kSectorSize + 1u) * kSectorSize;
++                        continue;
++                    }
++                    if (length < 34u || offset + length > bytes.size())
++                        return false;
++                    const uint8_t *record = bytes.data() + offset;
++                    offset += length;
++                    const uint8_t nameLength = record[32];
++                    if (33u + nameLength > length)
++                        return false;
++                    if (nameLength == 1u && (record[33] == 0u || record[33] == 1u))
++                        continue; // "." and ".."
++
++                    const std::string name = normalizeComponent(
++                        std::string_view(reinterpret_cast<const char *>(record + 33u), nameLength));
++                    const IsoEntry child{readLe32(record + 2u), readLe32(record + 10u), (record[25] & 0x02u) != 0u};
++                    const std::string key = base.empty() ? name : base + '/' + name;
++                    // Multi-extent files repeat their record: the first extent is kept.
++                    if (!m_index.emplace(key, child).second)
++                        continue;
++                    if (child.isDirectory)
++                        pending.emplace_back(key, child);
++                }
++            }
++            return true;
++        }
++
++        mutable std::mutex m_mutex;
++        mutable std::ifstream m_stream;
++        std::filesystem::path m_path;
++        uint64_t m_baseOffset = 0u;
++        uint32_t m_totalSectors = 0u;
++        bool m_open = false;
++        std::unordered_map<std::string, IsoEntry> m_index;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 9e73a9a..6fc8e37 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -7,6 +7,7 @@
+ #include "../core/iop_kernel.h"
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/ps2_iso_image.h"
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
+@@ -205,7 +206,8 @@ namespace ps2x::iop::detail
+             busyUntil = 0u;
+             nodes.clear();
+             metadataSectors.clear();
+-            imageHandle = 0u;
++            image.close();
++            imageChecked = false;
+         }
+ 
+         void setClock(const uint64_t *iopCycles) noexcept { clock = iopCycles; }
+@@ -408,9 +410,6 @@ namespace ps2x::iop::detail
+ 
+         void closeFiles()
+         {
+-            if (imageHandle != 0u)
+-                host.closeHostFile(imageHandle);
+-            imageHandle = 0u;
+             for (IsoNode &node : nodes)
+             {
+                 if (node.handle != 0u)
+@@ -628,23 +627,69 @@ namespace ps2x::iop::detail
+             return &nodes[current];
+         }
+ 
++        // With a CD image configured, the disc is that image and its real LSNs; without one (or if it is not an
++        // ISO 9660 image) the virtual ISO of the CD root folder.
++        bool useImage()
++        {
++            if (!imageChecked)
++            {
++                imageChecked = true;
++                const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++                if (!imagePath.empty())
++                {
++                    const uint64_t offset = host.cdImageOffset();
++                    if (image.open(std::filesystem::path(imagePath), offset))
++                        std::fprintf(stderr, "[cdvd] imagen %s sectores=%u desplazamiento=%llu\n", imagePath.c_str(),
++                                     image.totalSectors(), static_cast<unsigned long long>(offset));
++                    else
++                        std::fprintf(stderr, "[cdvd] imagen %s no es una ISO 9660: se usa la carpeta\n",
++                                     imagePath.c_str());
++                }
++            }
++            return image.isOpen();
++        }
++
+         bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
+         {
+             if (resultAddress == 0u || nameAddress == 0u)
+                 return false;
+ 
+             const std::string guestPath = memory.readString(nameAddress, 1024u);
+-            IsoNode *node = findVirtualIsoNode(guestPath);
+-            if (!node)
+-                return false;
++            uint32_t lsn = 0u;
++            uint32_t size = 0u;
++            bool directory = false;
++            std::string leaf;
++            if (useImage())
++            {
++                const ParsedPs2Path parsed = parsePs2Path(guestPath);
++                if (!parsed || parsed.device != Ps2PathDevice::Cdrom)
++                    return false;
++                const std::optional<IsoEntry> entry = image.lookup(parsed.path);
++                if (!entry)
++                    return false;
++                lsn = entry->lsn;
++                size = entry->size;
++                directory = entry->isDirectory;
++                const size_t slash = parsed.path.find_last_of('/');
++                leaf = normalizedIsoComponent(slash == std::string::npos ? parsed.path : parsed.path.substr(slash + 1u));
++            }
++            else
++            {
++                IsoNode *node = findVirtualIsoNode(guestPath);
++                if (!node)
++                    return false;
++                lsn = node->lsn;
++                size = node->size;
++                directory = node->directory;
++                leaf = normalizedIsoComponent(node->identifier);
++            }
+ 
+             // sceCdlFILE: lsn, size, name[16], date/flags[8].
+             std::array<uint8_t, 32u> result{};
+-            writeLe32(result.data(), node->lsn);
+-            writeLe32(result.data() + 4u, node->size);
+-            const std::string leaf = normalizedIsoComponent(node->identifier);
++            writeLe32(result.data(), lsn);
++            writeLe32(result.data() + 4u, size);
+             std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+-            result[24u] = node->directory ? 2u : 0u;
++            result[24u] = directory ? 2u : 0u;
+             return memory.writeRam(resultAddress, result.data(), result.size());
+         }
+ 
+@@ -697,11 +742,11 @@ namespace ps2x::iop::detail
+             static const bool s_traced = std::getenv("F1_CDVD_TRAZA") != nullptr;
+             if (s_traced)
+             {
+-                const IsoNode *node = buildVirtualIso() ? fileForSector(lsn) : nullptr;
++                const IsoNode *node = !useImage() && buildVirtualIso() ? fileForSector(lsn) : nullptr;
+                 std::fprintf(stderr, "[cdvd:leer] lsn=%u sectores=%u destino=%x propio=%d archivo=%s desde=%llu\n", lsn,
+                              sectors, destination,
+                              byteCount64 <= IopMemory::RamSize && memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)) ? 1 : 0,
+-                             node ? node->hostPath.string().c_str() : "?",
++                             node ? node->hostPath.string().c_str() : (image.isOpen() ? "imagen" : "?"),
+                              node ? static_cast<unsigned long long>(lsn - node->lsn) * kSectorSize : 0ull);
+             }
+             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
+@@ -713,24 +758,9 @@ namespace ps2x::iop::detail
+             std::vector<uint8_t> bytes(byteCount, 0u);
+ 
+             bool read = false;
+-            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+-            if (!imagePath.empty())
+-            {
+-                if (imageHandle == 0u)
+-                    imageHandle = host.openHostFile(imagePath);
+-                if (imageHandle != 0u)
+-                {
+-                    size_t bytesRead = 0u;
+-                    read = host.readHostFile(imageHandle,
+-                                             static_cast<uint64_t>(lsn) * kSectorSize,
+-                                             bytes.data(),
+-                                             byteCount,
+-                                             bytesRead) &&
+-                           bytesRead == byteCount;
+-                }
+-            }
+-
+-            if (!read && buildVirtualIso())
++            if (useImage())
++                read = image.readSectors(lsn, sectors, bytes.data());
++            else if (buildVirtualIso())
+             {
+                 read = true;
+                 for (uint32_t sector = 0u; sector < sectors; ++sector)
+@@ -766,7 +796,8 @@ namespace ps2x::iop::detail
+         const uint64_t *clock = nullptr; // patch 0114
+         uint64_t busyUntil = 0u;
+         int interruptEventFlagId = 0;
+-        uint64_t imageHandle = 0u;
++        IsoImage image;
++        bool imageChecked = false;
+         bool virtualIsoBuilt = false;
+         bool virtualIsoValid = false;
+         uint32_t volumeSectors = 0u;
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..a9c121d 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -280,6 +280,7 @@ public:
+         std::filesystem::path cdRoot;
+         std::filesystem::path mcRoot;
+         std::filesystem::path cdImage;
++        uint64_t cdImageOffset = 0; // byte offset of the ISO inside cdImage (0 for a plain .iso)
+     };
+ 
+     PS2Runtime();
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..51d9db9 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -286,6 +286,11 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
+     }
+ }
+ 
++uint64_t PS2IopHostAdapter::cdImageOffset() const
++{
++    return PS2Runtime::getIoPaths().cdImageOffset;
++}
++
+ std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
+ {
+     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..1c806c8 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -62,6 +62,7 @@ public:
+                       ps2x::iop::GuestBuffer receive) override;
+ 
+     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
++    uint64_t cdImageOffset() const override;
+     std::string translateGuestPath(std::string_view path) const override;
+     uint64_t openHostFile(std::string_view path) override;
+     bool hostFileSize(uint64_t handle, uint64_t &size) const override;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f812087..4cce146 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1246,6 +1246,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.mcRoot = std::filesystem::path(cards) / "mc0";
+     }
+ 
++    // PS2X_ISO=<path>: the IOP CDVD reads the disc from this ISO 9660 image (real LSNs) instead of the ELF folder.
++    if (const char *iso = std::getenv("PS2X_ISO"); iso && *iso)
++    {
++        paths.cdImage = std::filesystem::path(iso);
++        paths.cdImageOffset = 0;
++    }
++
+     setIoPaths(paths);
+ }
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 5db04b9..967ceb2 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
+     src/ps2_iop_tests.cpp
++    src/ps2_iso_image_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
+     src/ps2_recompiler_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 40a68b1..c20a8c0 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -14,6 +14,7 @@ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
+ void register_ps2_iop_tests();
++void register_ps2_iso_image_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+@@ -36,6 +37,7 @@ int main()
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
+     register_ps2_iop_tests();
++    register_ps2_iso_image_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+     register_ps2_recompiler_tests();
+diff --git a/ps2xTest/src/ps2_iso_image_tests.cpp b/ps2xTest/src/ps2_iso_image_tests.cpp
+new file mode 100644
+index 0000000..fe01ed4
+--- /dev/null
++++ b/ps2xTest/src/ps2_iso_image_tests.cpp
+@@ -0,0 +1,443 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/ps2_iso_image.h"
++#include "../../ps2xIOP/src/emulator/core/iop_cpu.h"
++#include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
++#include "../../ps2xIOP/src/emulator/core/iop_memory.h"
++#include "../../ps2xIOP/src/emulator/imports/iop_cdvd.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++namespace
++{
++    using ps2x::iop::IsoEntry;
++    using ps2x::iop::IsoImage;
++
++    constexpr uint32_t kSector = 2048u;
++    constexpr uint32_t kVolumeSectors = 64u; // larger than the file on purpose: the PVD is authoritative
++    constexpr uint32_t kRootLsn = 18u;       // two sectors: DIR in the first, README.TXT after a zero-length gap
++    constexpr uint32_t kDirLsn = 20u;
++    constexpr uint32_t kFileLsn = 21u; // DIR/FILE.BIN, 5000 bytes over three sectors
++    constexpr uint32_t kFileSize = 5000u;
++    constexpr uint32_t kReadmeLsn = 24u;
++    constexpr uint32_t kImageSectors = 25u;
++    const std::string kReadme = "hello iso!";
++
++    void putBoth32(std::vector<uint8_t> &image, size_t at, uint32_t value)
++    {
++        for (uint32_t i = 0u; i < 4u; ++i)
++        {
++            image[at + i] = static_cast<uint8_t>(value >> (i * 8u));
++            image[at + 4u + i] = static_cast<uint8_t>(value >> ((3u - i) * 8u));
++        }
++    }
++
++    void putBoth16(std::vector<uint8_t> &image, size_t at, uint16_t value)
++    {
++        image[at] = static_cast<uint8_t>(value);
++        image[at + 1u] = static_cast<uint8_t>(value >> 8u);
++        image[at + 2u] = static_cast<uint8_t>(value >> 8u);
++        image[at + 3u] = static_cast<uint8_t>(value);
++    }
++
++    size_t putRecord(std::vector<uint8_t> &image, size_t at, uint32_t lsn, uint32_t size, bool directory,
++                     const std::string &name)
++    {
++        const size_t length = (33u + name.size() + 1u) & ~size_t{1u};
++        image[at] = static_cast<uint8_t>(length);
++        putBoth32(image, at + 2u, lsn);
++        putBoth32(image, at + 10u, size);
++        image[at + 25u] = directory ? 2u : 0u;
++        putBoth16(image, at + 28u, 1u);
++        image[at + 32u] = static_cast<uint8_t>(name.size());
++        std::memcpy(image.data() + at + 33u, name.data(), name.size());
++        return at + length;
++    }
++
++    std::vector<uint8_t> fileBytes()
++    {
++        std::vector<uint8_t> bytes(kFileSize);
++        for (uint32_t i = 0u; i < kFileSize; ++i)
++            bytes[i] = static_cast<uint8_t>((i * 7u + i / kSector) & 0xFFu);
++        return bytes;
++    }
++
++    std::vector<uint8_t> buildIso()
++    {
++        std::vector<uint8_t> image(static_cast<size_t>(kImageSectors) * kSector, 0u);
++        const size_t pvd = 16u * kSector;
++        image[pvd] = 1u;
++        std::memcpy(image.data() + pvd + 1u, "CD001", 5u);
++        image[pvd + 6u] = 1u;
++        putBoth32(image, pvd + 80u, kVolumeSectors);
++        putBoth16(image, pvd + 128u, static_cast<uint16_t>(kSector));
++        (void)putRecord(image, pvd + 156u, kRootLsn, 2u * kSector, true, std::string(1u, '\0'));
++        const size_t terminator = 17u * kSector;
++        image[terminator] = 255u;
++        std::memcpy(image.data() + terminator + 1u, "CD001", 5u);
++
++        size_t at = kRootLsn * kSector;
++        at = putRecord(image, at, kRootLsn, 2u * kSector, true, std::string(1u, '\0'));
++        at = putRecord(image, at, kRootLsn, 2u * kSector, true, std::string(1u, '\1'));
++        (void)putRecord(image, at, kDirLsn, kSector, true, "DIR");
++        (void)putRecord(image, (kRootLsn + 1u) * kSector, kReadmeLsn, static_cast<uint32_t>(kReadme.size()), false,
++                        "README.TXT;1");
++
++        at = kDirLsn * kSector;
++        at = putRecord(image, at, kDirLsn, kSector, true, std::string(1u, '\0'));
++        at = putRecord(image, at, kRootLsn, 2u * kSector, true, std::string(1u, '\1'));
++        (void)putRecord(image, at, kFileLsn, kFileSize, false, "FILE.BIN;1");
++
++        const std::vector<uint8_t> file = fileBytes();
++        std::memcpy(image.data() + kFileLsn * kSector, file.data(), file.size());
++        std::memcpy(image.data() + kReadmeLsn * kSector, kReadme.data(), kReadme.size());
++        return image;
++    }
++
++    struct TempDir
++    {
++        std::filesystem::path path;
++
++        TempDir()
++        {
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            path = std::filesystem::temp_directory_path() / ("ps2x-iso-image-" + std::to_string(stamp));
++            std::filesystem::create_directories(path);
++        }
++
++        ~TempDir()
++        {
++            std::error_code error;
++            std::filesystem::remove_all(path, error);
++        }
++    };
++
++    void writeFile(const std::filesystem::path &path, const std::vector<uint8_t> &bytes)
++    {
++        std::ofstream out(path, std::ios::binary);
++        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    }
++
++    // Writes the ISO after `prefix` junk bytes and before some trailing junk, as when it is appended to a file.
++    std::filesystem::path writeIso(const TempDir &dir, const char *name, uint64_t prefix)
++    {
++        std::vector<uint8_t> bytes(static_cast<size_t>(prefix), 0xEEu);
++        const std::vector<uint8_t> iso = buildIso();
++        bytes.insert(bytes.end(), iso.begin(), iso.end());
++        if (prefix != 0u)
++            bytes.insert(bytes.end(), 777u, 0xEEu);
++        const std::filesystem::path path = dir.path / name;
++        writeFile(path, bytes);
++        return path;
++    }
++
++    void checkImage(TestCase &t, const IsoImage &image, const std::string &label)
++    {
++        t.Equals(image.totalSectors(), kVolumeSectors, label + ": total sectors come from the PVD, not the file size");
++
++        for (const char *path : {"\\DIR\\FILE.BIN;1", "dir/file.bin", "cdrom0:\\DIR\\FILE.BIN;1", "CDROM0:/Dir/File.Bin"})
++        {
++            const std::optional<IsoEntry> entry = image.lookup(path);
++            t.IsTrue(entry.has_value(), label + ": lookup finds " + path);
++            if (entry)
++            {
++                t.Equals(entry->lsn, kFileLsn, label + ": real LSN for " + path);
++                t.Equals(entry->size, kFileSize, label + ": size for " + path);
++                t.IsFalse(entry->isDirectory, label + ": FILE.BIN is a file");
++            }
++        }
++
++        const std::optional<IsoEntry> directory = image.lookup("\\DIR");
++        t.IsTrue(directory.has_value() && directory->isDirectory && directory->lsn == kDirLsn,
++                 label + ": \\DIR is a directory at its real LSN");
++        const std::optional<IsoEntry> readme = image.lookup("\\README.TXT;1");
++        t.IsTrue(readme.has_value() && readme->lsn == kReadmeLsn && readme->size == kReadme.size(),
++                 label + ": a record after a zero-length gap in the next directory sector is found");
++        t.IsFalse(image.lookup("\\DIR\\MISSING.BIN;1").has_value(), label + ": a missing file is not found");
++        t.IsFalse(image.lookup("\\NODIR\\FILE.BIN;1").has_value(), label + ": a missing directory is not found");
++        t.IsFalse(image.lookup("\\FILE.BIN;1").has_value(), label + ": a file is only found in its own directory");
++
++        const std::vector<uint8_t> expected = fileBytes();
++        std::vector<uint8_t> sectors(3u * kSector, 0xAAu);
++        t.IsTrue(image.readSectors(kFileLsn, 3u, sectors.data()), label + ": reading the file sectors succeeds");
++        t.IsTrue(std::memcmp(sectors.data(), expected.data(), expected.size()) == 0,
++                 label + ": readSectors returns the exact file bytes");
++        t.IsTrue(std::all_of(sectors.begin() + kFileSize, sectors.end(), [](uint8_t b) { return b == 0u; }),
++                 label + ": the sector tail comes from the image (zeros), not the caller's buffer");
++
++        std::vector<uint8_t> one(kSector, 0u);
++        t.IsTrue(image.readSectors(kReadmeLsn, 1u, one.data()) &&
++                     std::memcmp(one.data(), kReadme.data(), kReadme.size()) == 0,
++                 label + ": a single sector read returns README.TXT");
++        t.IsFalse(image.readSectors(kVolumeSectors - 1u, 2u, one.data()),
++                  label + ": a read past the volume end is refused");
++    }
++
++    // A minimal IOP host: real host files for the virtual ISO, and the configured image path and offset.
++    class CdvdHost final : public ps2x::iop::IopHost
++    {
++    public:
++        bool readGuest(uint32_t, void *, size_t) const override { return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { return false; }
++        bool zeroGuest(uint32_t, size_t) override { return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(ps2x::iop::IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, ps2x::iop::GuestBuffer, ps2x::iop::GuestBuffer) override {}
++        std::string hostPath(ps2x::iop::HostPathKind kind) const override
++        {
++            if (kind == ps2x::iop::HostPathKind::CdRoot)
++                return cdRoot.string();
++            if (kind == ps2x::iop::HostPathKind::CdImage)
++                return cdImage.empty() ? std::string{} : cdImage.string();
++            return {};
++        }
++        uint64_t cdImageOffset() const override { return imageOffset; }
++        std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            std::FILE *stream = std::fopen(std::string(path).c_str(), "rb");
++            if (!stream)
++                return 0u;
++            files[++lastHandle] = stream;
++            return lastHandle;
++        }
++        bool hostFileSize(uint64_t, uint64_t &) const override { return false; }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead) override
++        {
++            bytesRead = 0u;
++            const auto found = files.find(handle);
++            if (found == files.end() || std::fseek(found->second, static_cast<long>(offset), SEEK_SET) != 0)
++                return false;
++            bytesRead = std::fread(destination, 1u, size, found->second);
++            return true;
++        }
++        void closeHostFile(uint64_t handle) override
++        {
++            const auto found = files.find(handle);
++            if (found == files.end())
++                return;
++            std::fclose(found->second);
++            files.erase(found);
++        }
++        int32_t memoryCard(const ps2x::iop::MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        {
++            return false;
++        }
++        void log(ps2x::iop::LogLevel, std::string_view) override {}
++
++        std::filesystem::path cdRoot;
++        std::filesystem::path cdImage;
++        uint64_t imageOffset = 0u;
++        std::unordered_map<uint64_t, std::FILE *> files;
++        uint64_t lastHandle = 0u;
++    };
++
++    struct CdvdHarness
++    {
++        explicit CdvdHarness(CdvdHost &host) : kernel(memory), cdvd(host, memory, kernel)
++        {
++            kernel.reset();
++            cdvd.reset();
++            resultAddress = memory.allocate(64u);
++            nameAddress = memory.allocate(256u);
++            bufferAddress = memory.allocate(4u * kSector);
++        }
++
++        // sceCdSearchFile: returns 1 when found and leaves sceCdlFILE at resultAddress.
++        uint32_t searchFile(const std::string &name)
++        {
++            (void)memory.writeRam(nameAddress, name.c_str(), name.size() + 1u);
++            ps2x::iop::detail::IopCpuState cpu{};
++            cpu.gpr[4] = resultAddress;
++            cpu.gpr[5] = nameAddress;
++            return cdvd.dispatchImport(10u, cpu) ? cpu.gpr[2] : 0xFFFFFFFFu;
++        }
++
++        // sceCdRead into bufferAddress.
++        uint32_t read(uint32_t lsn, uint32_t sectors)
++        {
++            ps2x::iop::detail::IopCpuState cpu{};
++            cpu.gpr[4] = lsn;
++            cpu.gpr[5] = sectors;
++            cpu.gpr[6] = bufferAddress;
++            return cdvd.dispatchImport(6u, cpu) ? cpu.gpr[2] : 0xFFFFFFFFu;
++        }
++
++        std::vector<uint8_t> buffer(size_t size) const
++        {
++            std::vector<uint8_t> bytes(size, 0u);
++            (void)memory.readRam(bufferAddress, bytes.data(), bytes.size());
++            return bytes;
++        }
++
++        ps2x::iop::detail::IopMemory memory;
++        ps2x::iop::detail::IopKernel kernel;
++        ps2x::iop::detail::IopCdvd cdvd;
++        uint32_t resultAddress = 0u;
++        uint32_t nameAddress = 0u;
++        uint32_t bufferAddress = 0u;
++    };
++}
++
++void register_ps2_iso_image_tests()
++{
++    MiniTest::Case("PS2IsoImage", [](TestCase &tc)
++    {
++        tc.Run("IsoImage reads a plain ISO: lookup forms, real LSNs, sectors and PVD size", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::filesystem::path path = writeIso(dir, "plain.iso", 0u);
++            IsoImage image;
++            t.IsTrue(image.open(path), "a plain ISO opens at offset 0");
++            checkImage(t, image, "plain");
++        });
++
++        tc.Run("IsoImage reads an ISO stored at a non-zero offset inside a larger file", [](TestCase &t)
++        {
++            TempDir dir;
++            constexpr uint64_t prefix = 3u * kSector + 123u;
++            const std::filesystem::path path = writeIso(dir, "appended.bin", prefix);
++            IsoImage image;
++            t.IsFalse(image.open(path, 0u), "the appended ISO is not found at offset 0");
++            t.IsTrue(image.open(path, prefix), "the appended ISO opens at its base offset");
++            checkImage(t, image, "offset");
++        });
++
++        tc.Run("IsoImage refuses files that are not ISO 9660 images", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::filesystem::path text = dir.path / "notes.txt";
++            writeFile(text, std::vector<uint8_t>(20u * kSector, 'x'));
++            IsoImage image;
++            t.IsFalse(image.open(text), "a non-ISO file does not open");
++            t.IsFalse(image.isOpen(), "a failed open leaves the image closed");
++            t.IsFalse(image.open(dir.path / "missing.iso"), "a missing file does not open");
++            const std::filesystem::path small = dir.path / "small.iso";
++            writeFile(small, std::vector<uint8_t>(kSector, 0u));
++            t.IsFalse(image.open(small), "a file shorter than the PVD does not open");
++            t.IsFalse(image.lookup("\\DIR\\FILE.BIN;1").has_value(), "a closed image finds nothing");
++        });
++
++        tc.Run("IsoImage serves concurrent readers the right sectors", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::filesystem::path path = writeIso(dir, "threads.iso", 0u);
++            IsoImage image;
++            t.IsTrue(image.open(path), "the ISO opens");
++            const std::vector<uint8_t> expected = fileBytes();
++            std::atomic<int> bad{0};
++            std::vector<std::thread> threads;
++            for (int thread = 0; thread < 4; ++thread)
++            {
++                threads.emplace_back([&, thread]()
++                {
++                    std::vector<uint8_t> sector(kSector);
++                    for (int i = 0; i < 200; ++i)
++                    {
++                        const bool readme = ((i + thread) & 1) != 0;
++                        if (!image.readSectors(readme ? kReadmeLsn : kFileLsn + 1u, 1u, sector.data()) ||
++                            (readme ? std::memcmp(sector.data(), kReadme.data(), kReadme.size())
++                                    : std::memcmp(sector.data(), expected.data() + kSector, kSector)) != 0)
++                            ++bad;
++                    }
++                });
++            }
++            for (std::thread &thread : threads)
++                thread.join();
++            t.Equals(bad.load(), 0, "every concurrent read returns its own sector");
++        });
++
++        tc.Run("IOP CDVD with an image: sceCdSearchFile and sceCdRead use the real LSNs", [](TestCase &t)
++        {
++            TempDir dir;
++            constexpr uint64_t prefix = 5u * kSector + 7u;
++            CdvdHost host;
++            host.cdRoot = dir.path; // holds only the image file: the virtual ISO could not answer
++            host.cdImage = writeIso(dir, "game.bin", prefix);
++            host.imageOffset = prefix;
++            CdvdHarness cd(host);
++
++            t.Equals(cd.searchFile("cdrom0:\\DIR\\FILE.BIN;1"), 1u, "sceCdSearchFile finds the file in the image");
++            t.Equals(cd.memory.read32(cd.resultAddress), kFileLsn, "sceCdSearchFile returns the real LSN");
++            t.Equals(cd.memory.read32(cd.resultAddress + 4u), kFileSize, "sceCdSearchFile returns the real size");
++            t.Equals(cd.memory.readString(cd.resultAddress + 8u, 16u), std::string("FILE.BIN"),
++                     "sceCdSearchFile returns the leaf name without ;1");
++            t.Equals(cd.searchFile("\\README.TXT;1"), 1u, "a path without device is searched on the disc");
++            t.Equals(cd.memory.read32(cd.resultAddress), kReadmeLsn, "README.TXT has its real LSN");
++            t.Equals(cd.searchFile("cdrom0:\\GAME.BIN;1"), 0u, "files of the host folder are not on the disc");
++
++            t.Equals(cd.read(kFileLsn, 3u), 1u, "sceCdRead of the file sectors succeeds");
++            const std::vector<uint8_t> expected = fileBytes();
++            const std::vector<uint8_t> read = cd.buffer(expected.size());
++            t.IsTrue(read == expected, "sceCdRead returns the file bytes from the image");
++            t.Equals(cd.read(16u, 1u), 1u, "sceCdRead of the PVD succeeds");
++            const std::vector<uint8_t> pvd = cd.buffer(6u);
++            t.IsTrue(pvd[0] == 1u && std::memcmp(pvd.data() + 1u, "CD001", 5u) == 0,
++                     "sector 16 is the image's own PVD");
++        });
++
++        tc.Run("IOP CDVD without an image keeps serving the virtual ISO of the folder", [](TestCase &t)
++        {
++            TempDir dir;
++            std::filesystem::create_directories(dir.path / "DATA");
++            const std::vector<uint8_t> expected = fileBytes();
++            writeFile(dir.path / "DATA" / "file.bin", expected);
++            CdvdHost host;
++            host.cdRoot = dir.path;
++            CdvdHarness cd(host);
++
++            t.Equals(cd.searchFile("cdrom0:\\DATA\\FILE.BIN;1"), 1u, "sceCdSearchFile finds the folder file");
++            const uint32_t lsn = cd.memory.read32(cd.resultAddress);
++            t.IsTrue(lsn >= 20u, "the virtual ISO places files after its directories");
++            t.Equals(cd.memory.read32(cd.resultAddress + 4u), kFileSize, "the size is the host file size");
++            t.Equals(cd.read(lsn, 3u), 1u, "sceCdRead of the virtual sectors succeeds");
++            t.IsTrue(cd.buffer(expected.size()) == expected, "sceCdRead returns the host file bytes");
++            t.Equals(cd.read(16u, 1u), 1u, "sceCdRead of the virtual PVD succeeds");
++            const std::vector<uint8_t> pvd = cd.buffer(6u);
++            t.IsTrue(pvd[0] == 1u && std::memcmp(pvd.data() + 1u, "CD001", 5u) == 0, "sector 16 is the virtual PVD");
++        });
++        tc.Run("PS2X_ISO sets the CD image read from a plain ISO (offset 0)", [](TestCase &t)
++        {
++            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
++            TempDir dir;
++            const std::filesystem::path elf = dir.path / "GAME.ELF";
++            const std::filesystem::path iso = dir.path / "game.iso";
++            PS2Runtime::IoPaths paths = oldPaths;
++            paths.cdImage.clear();
++            paths.cdImageOffset = 0u;
++            PS2Runtime::setIoPaths(paths);
++
++            _putenv_s("PS2X_ISO", "");
++            PS2Runtime::configureIoPathsFromElf(elf.string());
++            t.IsTrue(PS2Runtime::getIoPaths().cdImage.empty(), "without PS2X_ISO there is no CD image");
++
++            _putenv_s("PS2X_ISO", iso.string().c_str());
++            PS2Runtime::configureIoPathsFromElf(elf.string());
++            _putenv_s("PS2X_ISO", "");
++            t.Equals(PS2Runtime::getIoPaths().cdImage.lexically_normal().string(),
++                     std::filesystem::absolute(iso).lexically_normal().string(), "PS2X_ISO=<path> sets cdImage");
++            t.Equals(PS2Runtime::getIoPaths().cdImageOffset, uint64_t{0u}, "PS2X_ISO images start at offset 0");
++            t.Equals(PS2Runtime::getIoPaths().cdRoot.lexically_normal().string(),
++                     std::filesystem::absolute(dir.path).lexically_normal().string(),
++                     "PS2X_ISO leaves the CD root next to the ELF");
++
++            PS2Runtime::setIoPaths(oldPaths);
++        });
++    });
++}

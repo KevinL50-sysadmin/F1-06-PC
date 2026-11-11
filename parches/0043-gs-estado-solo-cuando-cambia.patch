@@ -1,0 +1,102 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 84d7650..17316ac 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -70,8 +70,17 @@ private:
+     {
+         GSPresentationRequest request{};
+     };
++    // A primitive with the draw state of the last GSPrimitiveBatch queued (patch 0043): consecutive primitives
++    // almost always share it, and copying the whole state (most of the batch) into a cold ring slot for each one cost
++    // the EE thread more than the rest of Push.
++    struct PrimitiveCommand
++    {
++        std::array<GSVertex, 3> vertices{};
++        uint8_t vertexCount = 0;
++    };
+     using Command = std::variant<GSPrimitiveBatch, ClutCommand, GSTransferCommand, std::vector<uint8_t>,
+-                                 TextureFlushCommand, ClearCommand, WriteVramCommand, SnapshotCommand>;
++                                 TextureFlushCommand, ClearCommand, WriteVramCommand, SnapshotCommand,
++                                 PrimitiveCommand>;
+     struct Slot
+     {
+         Command command;
+@@ -119,6 +128,9 @@ private:
+     uint64_t m_seenHead = 0u;    // m_head and m_costOut as producers last read them
+     uint64_t m_seenCostOut = 0u;
+     uint32_t m_unnotified = 0u;  // commands queued since the waiting worker was last woken (producers)
++    GSDrawState m_queuedState{};  // draw state of the last GSPrimitiveBatch queued (Submit, EE thread)
++    bool m_queuedStateValid = false;
++    GSPrimitiveBatch m_workerBatch{}; // the worker's: the last batch it ran, with the vertices of a PrimitiveCommand
+     alignas(64) std::atomic<uint64_t> m_published{0u}; // commands [0, m_published) can run
+     alignas(64) std::atomic<uint64_t> m_head{0u};      // commands [0, m_head) have run (worker)
+     std::atomic<uint64_t> m_costOut{0u};               // ... and their total cost
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 31faeb5..8d433f9 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -10,7 +10,8 @@
+ // and copied again by an 'i' bit stall (before patch 0039), 7 (game hook) the host cores as Windows decides, 8 the GS
+ // worker sleeping as soon as its queue is empty (no spinning first), 9 the VU1 pairs decoded and planned again after
+ // every microcode upload (no cache by content), 10 the VU1 block lower instructions WAITQ, B, IBxx, FCEQ, FCAND and
+-// FCOR through execLower (before patch 0042), 11 the VU1 block DIV, SQRT and RSQRT through execLower. A
++// FCOR through execLower (before patch 0042), 11 the VU1 block DIV, SQRT and RSQRT through execLower, 12 the GS queue
++// with the whole draw state in every primitive (before patch 0043). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 52b6ad0..57a4eaa 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -6,6 +6,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <emmintrin.h>
+ #include <type_traits>
+ #include <utility>
+@@ -332,7 +333,16 @@ void GSThreadedBackend::Execute(Command &command, uint64_t index)
+                {
+                    using T = std::decay_t<decltype(payload)>;
+                    if constexpr (std::is_same_v<T, GSPrimitiveBatch>)
++                   {
+                        m_cpu->Submit(payload);
++                       m_workerBatch.state = payload.state;
++                   }
++                   else if constexpr (std::is_same_v<T, PrimitiveCommand>)
++                   {
++                       m_workerBatch.vertices = payload.vertices;
++                       m_workerBatch.vertexCount = payload.vertexCount;
++                       m_cpu->Submit(m_workerBatch);
++                   }
+                    else if constexpr (std::is_same_v<T, ClutCommand>)
+                        m_cpu->LoadClut(payload.tex0, payload.texclut);
+                    else if constexpr (std::is_same_v<T, GSTransferCommand>)
+@@ -390,9 +400,24 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+         // A/B comparison: draw on the calling thread, as the plain CPU backend does.
+         Drain();
+         m_cpu->Submit(batch);
++        m_queuedStateValid = false;
++        return;
++    }
++    // Only the vertices when the state is the one the worker already has (A/B mode 12: always the whole batch).
++    // Bytes compared (padding included): a spurious difference only sends the whole batch.
++    const uint32_t cost = estimatePixels(batch);
++    if (m_queuedStateValid && g_ps2AbMode.load(std::memory_order_relaxed) != 12 &&
++        std::memcmp(&m_queuedState, &batch.state, sizeof(GSDrawState)) == 0)
++    {
++        PrimitiveCommand primitive;
++        primitive.vertices = batch.vertices;
++        primitive.vertexCount = batch.vertexCount;
++        Push(std::move(primitive), cost);
+         return;
+     }
+-    Push(batch, estimatePixels(batch));
++    m_queuedState = batch.state;
++    m_queuedStateValid = true;
++    Push(batch, cost);
+ }
+ 
+ void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)

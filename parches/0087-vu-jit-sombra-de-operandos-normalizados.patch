@@ -1,0 +1,202 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 4a6ab3f..e2be57b 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -198,6 +198,9 @@ namespace
+         uint64_t budgetEnd = 0;
+         const void *jitLast = nullptr;
+         uint8_t chainDeny = 1u;
++        // Patch 0087: normalize4 of VF registers, kept by a compiled schedule for the FMAC operands it reads again
++        // (JitNormShadow says, at compile time, which rows hold the current register's value).
++        alignas(16) float jitNorm[32][4] = {};
+     };
+ 
+     // ---------------------------------------------------------------------------------------------------------
+@@ -1889,7 +1892,7 @@ namespace
+         const int abModeAll = g_ps2AbMode.load(std::memory_order_relaxed);
+         const int abMode = abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 || abModeAll == 70 ||
+                                    abModeAll == 71 || abModeAll == 73 || abModeAll == 74 ||
+-                                   abModeAll == 76 || abModeAll == 77 || abModeAll == 78
++                                   abModeAll == 76 || abModeAll == 77 || abModeAll == 78 || abModeAll == 81
+                                ? abModeAll
+                                : 0;
+         // A/B modes 72 and 73: XGKICK waited for cycle by cycle (before patch 0081).
+@@ -2005,7 +2008,7 @@ namespace
+             }
+             else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 ||
+                       abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76 ||
+-                      abMode == 77 || abMode == 78) &&
++                      abMode == 77 || abMode == 78 || abMode == 81) &&
+                      s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+@@ -2015,7 +2018,7 @@ namespace
+             }
+             else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40 ||
+                      abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76 ||
+-                     abMode == 77 || abMode == 78)
++                     abMode == 77 || abMode == 78 || abMode == 81)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 9e486ea..45906d1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -439,6 +439,35 @@
+         e.movaps(x, 5);
+     }
+ 
++    // Patch 0087: VF registers whose normalize4 (all four lanes) a compiled schedule has stored in st.jitNorm and that
++    // nothing has written since (bit r: st.jitNorm[r]), at compile time. An operand that a FMAC normalizes is stored
++    // there the first time and read back, already normalized, by the next FMACs of the schedule that read the same
++    // register (the transform matrices are read over and over within a block); any write to the register drops it.
++    // Empty at the start of every schedule. The values are the same: normalize4 works lane by lane.
++    struct JitNormShadow
++    {
++        uint32_t valid = 0u;
++    };
++
++    // xmm x = normalize4(vf[r]) (rax = kJitConst), through st.jitNorm when `shadow` (nullptr: off) has it, storing it
++    // there otherwise.
++    inline void jitLoadNormalized(JitEmitter &e, uint8_t x, uint8_t r, JitNormShadow *shadow)
++    {
++        const size_t row = offsetof(BlockState, jitNorm) + 16u * r;
++        if (shadow != nullptr && ((shadow->valid >> r) & 1u) != 0u)
++        {
++            e.loadXmm(x, JitEmitter::St, row);
++            return;
++        }
++        e.loadXmm(x, JitEmitter::Vu, offsetof(VU1State, vf) + 16u * r);
++        jitNormalize(e, x);
++        if (shadow != nullptr && r != 0u)
++        {
++            e.storeXmm(JitEmitter::St, row, x);
++            shadow->valid |= 1u << r;
++        }
++    }
++
+     // xmm dst = exponent field of xmm src (rax = kJitConst).
+     inline void jitExponent(JitEmitter &e, uint8_t dst, uint8_t src)
+     {
+@@ -466,8 +495,9 @@
+     // stickyOnly (patch 0083): a later entry of the schedule overwrites this one before anything reads MAC or status
+     // (jitCompile): the entry only gets its status (Z if a written lane of the value or, for MADD/MSUB, of the product
+     // is zero, S if one is negative; the same bits as current | sticky) and a zero sticky, for jitEmitStickyCommit.
++    // shadow (patch 0087; nullptr: off): the operands through JitNormShadow and st.jitNorm.
+     inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
+-                            const void *lateSlow = nullptr, bool stickyOnly = false)
++                            const void *lateSlow = nullptr, bool stickyOnly = false, JitNormShadow *shadow = nullptr)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -485,12 +515,20 @@
+         e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
+         // a = xmm0, b = xmm1, c = xmm2 (MADD/MSUB: ACC)
+         const uint8_t comp = op.components;
+-        e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * op.fs);
+-        if ((known.vf[op.fs] & comp) != comp)
+-            jitNormalize(e, 0);
++        if ((known.vf[op.fs] & comp) == comp)
++            e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * op.fs);
++        else
++            jitLoadNormalized(e, 0, op.fs, shadow);
+         switch (op.source)
+         {
+         case FmacSourceBc:
++            if ((known.vf[op.ft] & (1u << op.bc)) == 0u && shadow != nullptr)
++            {
++                // The whole register normalized (and kept), then its lane bc in every lane.
++                jitLoadNormalized(e, 1, op.ft, shadow);
++                e.shufps(1, 1, static_cast<uint8_t>(op.bc * 0x55u));
++                break;
++            }
+             e.loadSs(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft + 4u * op.bc);
+             e.shufps(1, 1, 0x00);
+             break;
+@@ -503,11 +541,16 @@
+             e.shufps(1, 1, 0x00);
+             break;
+         default:
++            if ((known.vf[op.ft] & comp) != comp && shadow != nullptr)
++            {
++                jitLoadNormalized(e, 1, op.ft, shadow);
++                break;
++            }
+             e.loadXmm(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft);
+             break;
+         }
+-        const bool bKnown = op.source == FmacSourceBc ? (known.vf[op.ft] & (1u << op.bc)) != 0u
+-                            : op.source == FmacSourceVt ? (known.vf[op.ft] & comp) == comp
++        const bool bKnown = op.source == FmacSourceBc ? (known.vf[op.ft] & (1u << op.bc)) != 0u || shadow != nullptr
++                            : op.source == FmacSourceVt ? (known.vf[op.ft] & comp) == comp || shadow != nullptr
+                                                         : false;
+         if (!bKnown)
+             jitNormalize(e, 1);
+@@ -1578,6 +1621,14 @@
+         // Patch 0081: the late upper results and DIV inline too (A/B modes 74 and 73: through jitUpperLate,
+         // jitUpperDst and kLowerFast).
+         const bool inlineLate = alternative != 74 && alternative != 73 && alternative != 76 && alternative != 78 && s_jitInlineFmac;
++        // Patch 0087: the normalized FMAC operands kept for the next FMACs of the schedule (A/B mode 81, and 34: not).
++        static const bool s_jitNormShadow = []
++        {
++            const char *value = std::getenv("PS2X_VU1_JIT_SOMBRA");
++            return value == nullptr || std::atoi(value) != 0;
++        }();
++        JitNormShadow normShadow;
++        JitNormShadow *const shadow = s_jitNormShadow && trackNormal && alternative != 81 ? &normShadow : nullptr;
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+@@ -1678,7 +1729,10 @@
+             // Commits before the pair may write VF registers: forget those.
+             for (size_t c = nextCommit; c < p.commitEnd; ++c)
+                 if (s.commits[c].kind == CommitVf)
++                {
+                     known.vf[s.commits[c].reg] = 0u;
++                    normShadow.valid &= ~(1u << s.commits[c].reg);
++                }
+             commitsUpTo(p.commitEnd);
+             if (mapFile != nullptr)
+                 pairOffsets.push_back(static_cast<uint32_t>(e.code().size()));
+@@ -1699,7 +1753,7 @@
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+                       jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40,
+-                                  nullptr, stickyOnlyPair(p))) &&
++                                  nullptr, stickyOnlyPair(p), shadow)) &&
+                     !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+@@ -1708,7 +1762,7 @@
+                 const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
+                 if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
+                                                 reinterpret_cast<const void *>(&jitUpperLate<Host>),
+-                                                stickyOnlyPair(p))) &&
++                                                stickyOnlyPair(p), shadow)) &&
+                     !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
+                     e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             }
+@@ -1758,6 +1812,8 @@
+ 
+             // What this pair wrote: a FMAC result is known normalized; any other write forgets the lanes it wrote
+             // (execLower: everything but vf0).
++            if (p.upperDst == DstVf)
++                normShadow.valid &= ~(1u << p.upperReg);
+             if (p.upperDst == DstVf || p.upperDst == DstAcc)
+             {
+                 uint8_t &lanes = p.upperDst == DstAcc ? known.acc : known.vf[p.upperReg];
+@@ -1771,9 +1827,13 @@
+             {
+                 known = JitKnownNormal{};
+                 known.acc = 0u;
++                normShadow.valid = 0u;
+             }
+             else if (p.lowerDst == DstVf || p.lowerDst == DstVfPending || p.lowerDst == DstDiscard)
++            {
+                 known.vf[p.lowerReg] = 0u;
++                normShadow.valid &= ~(1u << p.lowerReg);
++            }
+             known.vf[0] = 0xFu;
+ 
+             if (p.branch || &p == &s.pairs.back())

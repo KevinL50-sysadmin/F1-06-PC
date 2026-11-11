@@ -1,0 +1,437 @@
+diff --git a/ps2xRuntime/include/ps2_user_paths.h b/ps2xRuntime/include/ps2_user_paths.h
+index 555e6ad..4151140 100644
+--- a/ps2xRuntime/include/ps2_user_paths.h
++++ b/ps2xRuntime/include/ps2_user_paths.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#include <ctime>
+ #include <filesystem>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -27,6 +29,9 @@ namespace ps2x
+         // Data the game can rebuild (the GPU's pipeline cache), made only when something is cached: next to the .exe
+         // (portable and development) or LocalAppData\F1-06\cache (installed). Deleting it is always safe.
+         std::filesystem::path cacheDirectory;
++        // Fase 5 (T8): the photos (F12), next to config: <exe>\capturas (portable and development) or
++        // Documents\My Games\F1-06\capturas (installed). Made when the first photo is saved.
++        std::filesystem::path photosDirectory;
+     };
+ 
+     // Development when booting an ELF given by path; otherwise portable if portable.txt sits next to the .exe.
+@@ -86,4 +91,13 @@ namespace ps2x
+     // The cache folder (UserPaths::cacheDirectory) for the rest of the runtime (empty: nothing is cached).
+     void setUserCacheDirectory(const std::filesystem::path &directory);
+     std::filesystem::path userCacheDirectory();
++
++    // Fase 5 (T8): the photos. photoFileName: "F1-06_<yyyy-mm-dd>_<hh-mm-ss>.png", with "_<n>" from the second photo
++    // of the same second. uniquePhotoPath: the first of those names in folder that exists() says is free.
++    std::string photoFileName(const std::tm &time, int number);
++    std::filesystem::path uniquePhotoPath(const std::filesystem::path &folder, const std::tm &time,
++                                          const std::function<bool(const std::filesystem::path &)> &exists);
++    // The photos folder (UserPaths::photosDirectory) for the rest of the runtime (empty: next to the .exe).
++    void setUserPhotosDirectory(const std::filesystem::path &directory);
++    std::filesystem::path userPhotosDirectory();
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_photo.h b/ps2xRuntime/src/lib/ps2_photo.h
+new file mode 100644
+index 0000000..90c1a9d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_photo.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <string>
++
++// Fase 5 (T8, F1 06): the photos (opciones.ini tecla_foto: f12, f9, f8 or no). The key saves the game's picture at its
++// internal resolution (the GPU GS's supersampled or double resolution output included) as a PNG in the photos folder
++// (ps2x::userPhotosDirectory), written on a thread of its own so the game does not wait for it (ps2_runtime.cpp).
++namespace ps2x
++{
++    // Any thread (the options menus); the window uses it from its next frame. Unknown values: no key.
++    void setPhotoKeyOption(const std::string &option);
++    std::string photoKeyOption();
++    // Takes a photo of the next window frame (the key; PS2X_MENU_GUION's "foto" action in the tests).
++    void requestPhoto();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7221e01..91f4695 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -20,6 +20,7 @@
+ #include "ps2x/iop/ps2_iso_image.h"
+ #include "ps2_user_paths.h"
+ #include "ps2_options_menu.h"
++#include "ps2_photo.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -33,6 +34,8 @@
+ #include <chrono>
+ #include <atomic>
+ #include <thread>
++#include <ctime>
++#include <set>
+ #include <unordered_map>
+ #include <sstream>
+ 
+@@ -677,6 +680,161 @@ static void SaveWindowCapture()
+         std::remove(s_captureRequest);
+ }
+ 
++// Fase 5 (T8): the photos (tecla_foto, F12 by default; ps2_photo.h). The key, or the menu script's "foto", asks for one;
++// the next UploadFrame copies the picture on screen (the latched frame at its internal size, before the window's
++// filters) and a thread of its own encodes the PNG and writes it, so the window and the game do not wait for it. The
++// window shows a line for a few seconds and the log gets [foto].
++namespace
++{
++    std::mutex g_photoMutex;
++    std::string g_photoKey;
++    bool g_photoKeyRead = false;
++    std::string g_photoMessage; // what the window shows
++    bool g_photoMessageNew = false;
++    std::set<std::filesystem::path> g_photosReserved; // taken by photos still being written
++    std::atomic<bool> g_photoRequested{false};
++    std::atomic<int> g_photosWriting{0};
++
++    int PhotoKeyCode(const std::string &option)
++    {
++        return option == "f12" ? KEY_F12 : option == "f9" ? KEY_F9 : option == "f8" ? KEY_F8 : KEY_NULL;
++    }
++}
++
++namespace ps2x
++{
++    void setPhotoKeyOption(const std::string &option)
++    {
++        std::lock_guard<std::mutex> lock(g_photoMutex);
++        g_photoKey = option;
++        g_photoKeyRead = true;
++    }
++
++    std::string photoKeyOption()
++    {
++        std::lock_guard<std::mutex> lock(g_photoMutex);
++        if (!g_photoKeyRead)
++        {
++            const char *value = std::getenv("PS2X_TECLA_FOTO");
++            g_photoKey = value != nullptr ? value : "f12";
++            g_photoKeyRead = true;
++        }
++        return g_photoKey;
++    }
++
++    void requestPhoto()
++    {
++        g_photoRequested.store(true, std::memory_order_relaxed);
++    }
++}
++
++static void SetPhotoMessage(const std::string &message)
++{
++    std::lock_guard<std::mutex> lock(g_photoMutex);
++    g_photoMessage = message;
++    g_photoMessageNew = true;
++}
++
++// frame: rows of rowPixels pixels, the picture in its top left width x height pixels (as SaveRequestedCapture).
++static void SavePhoto(const std::vector<uint8_t> &frame, uint32_t rowPixels, uint32_t width, uint32_t height)
++{
++    width = std::min<uint32_t>(width, rowPixels);
++    if (width == 0u || height == 0u || frame.size() < static_cast<size_t>(rowPixels) * height * 4u)
++        return;
++    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
++    for (uint32_t y = 0; y < height; ++y)
++        std::memcpy(pixels.data() + static_cast<size_t>(y) * width * 4u,
++                    frame.data() + static_cast<size_t>(y) * rowPixels * 4u, static_cast<size_t>(width) * 4u);
++    for (size_t i = 3u; i < pixels.size(); i += 4u)
++        pixels[i] = 0xFFu;
++
++    std::filesystem::path folder = ps2x::userPhotosDirectory();
++    if (folder.empty())
++        folder = "capturas";
++    const std::time_t now = std::time(nullptr);
++    std::tm local{};
++#if defined(_WIN32)
++    localtime_s(&local, &now);
++#else
++    localtime_r(&now, &local);
++#endif
++    std::filesystem::path path;
++    {
++        std::lock_guard<std::mutex> lock(g_photoMutex);
++        path = ps2x::uniquePhotoPath(folder, local, [](const std::filesystem::path &candidate)
++                                     {
++                                         std::error_code error;
++                                         return g_photosReserved.count(candidate) != 0u ||
++                                                std::filesystem::exists(candidate, error);
++                                     });
++        g_photosReserved.insert(path);
++    }
++    g_photosWriting.fetch_add(1);
++    std::thread([pixels = std::move(pixels), path, width, height]() mutable
++                {
++                    ThreadNaming::SetCurrentThreadName("Foto");
++                    const auto start = std::chrono::steady_clock::now();
++                    Image image{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1,
++                                PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                    int size = 0;
++                    unsigned char *png = ExportImageToMemory(image, ".png", &size);
++                    std::error_code error;
++                    std::filesystem::create_directories(path.parent_path(), error);
++                    bool saved = false;
++                    if (png != nullptr && size > 0)
++                    {
++                        std::ofstream out(path, std::ios::binary | std::ios::trunc);
++                        out.write(reinterpret_cast<const char *>(png), size);
++                        saved = static_cast<bool>(out);
++                    }
++                    if (png != nullptr)
++                        MemFree(png);
++                    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                             std::chrono::steady_clock::now() - start).count();
++                    if (saved)
++                    {
++                        std::cout << "[foto] guardada " << ps2x::pathForLog(path) << " (" << width << "x" << height
++                                  << ", " << ms << " ms)" << std::endl;
++                        SetPhotoMessage("Foto guardada: " + ps2x::pathForLog(path.filename()));
++                    }
++                    else
++                    {
++                        std::cerr << "[foto] no se pudo guardar " << ps2x::pathForLog(path) << std::endl;
++                        SetPhotoMessage("No se pudo guardar la foto en " + ps2x::pathForLog(path.parent_path()));
++                    }
++                    {
++                        std::lock_guard<std::mutex> lock(g_photoMutex);
++                        g_photosReserved.erase(path);
++                    }
++                    g_photosWriting.fetch_sub(1);
++                })
++        .detach();
++}
++
++// The photo's line at the bottom of the window, for 3 seconds (main thread, between BeginDrawing and EndDrawing).
++static void DrawPhotoMessage()
++{
++    static std::string s_message;
++    static double s_until = 0.0;
++    {
++        std::lock_guard<std::mutex> lock(g_photoMutex);
++        if (g_photoMessageNew)
++        {
++            s_message = g_photoMessage;
++            s_until = GetTime() + 3.0;
++            g_photoMessageNew = false;
++        }
++    }
++    if (s_message.empty() || GetTime() >= s_until)
++        return;
++    const int fontSize = std::max(10, GetScreenHeight() / 40);
++    const int padding = fontSize / 3;
++    const int width = MeasureText(s_message.c_str(), fontSize) + 2 * padding;
++    const int y = GetScreenHeight() - fontSize - 4 * padding;
++    DrawRectangle(2 * padding, y, width, fontSize + 2 * padding, Fade(BLACK, 0.6f));
++    DrawText(s_message.c_str(), 3 * padding, y + padding, fontSize, RAYWHITE);
++}
++
+ // Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest made
+ // uneven pixels). PS2X_FILTRO=0: nearest, as before. Phase 3 (T2): on the desktop ps2x::DisplayPresenter sets the
+ // filter of the frame texture before drawing it; this is the starting one (and the Vita's).
+@@ -754,6 +912,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     if (s_hasUploadedFrame)
+         SaveRequestedCapture(s_uploadBuffer, static_cast<uint32_t>(tex.width), s_lastWidth, s_lastHeight,
+                              rt->memory().getRDRAM());
++    if (s_hasUploadedFrame && g_photoRequested.exchange(false, std::memory_order_relaxed))
++        SavePhoto(s_uploadBuffer, static_cast<uint32_t>(tex.width), s_lastWidth, s_lastHeight);
+ 
+     // T9: with the GPU GS, each picture as soon as it is published (ps2GsPresentationSerial); else once per tick.
+     static uint64_t s_lastSerial = 0u;
+@@ -3142,6 +3302,10 @@ void PS2Runtime::run()
+                                                                        : PresentAspect::Tv4x3;
+             m_presentAspectInUse.store(presentAspectOptionIndex(presentAspect));
+         }
++        // Fase 5 (T8): the photo key (tecla_foto), not while the options menu is open.
++        if (const int photoKey = PhotoKeyCode(ps2x::photoKeyOption());
++            !optionsMenuOpen && photoKey != KEY_NULL && IsKeyPressed(photoKey))
++            ps2x::requestPhoto();
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+                                     : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
+                                                                                : srcWidth / srcHeight;
+@@ -3165,6 +3329,7 @@ void PS2Runtime::run()
+         }
+         else
+             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        DrawPhotoMessage();
+         // Phase 3 (T3): the UI (the options menu, and the debug panel in development) before the window capture, which
+         // shows the window as the player sees it.
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+@@ -3225,6 +3390,9 @@ void PS2Runtime::run()
+         m_debugUiShutdownCallback(*this, m_debugUiUserData);
+         m_debugUiInitialized = false;
+     }
++    // A photo still being written gets up to two seconds to finish.
++    for (int wait = 0; wait < 200 && g_photosWriting.load() > 0; ++wait)
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+     UnloadTexture(frameTex);
+     if (m_displayPresenter)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_user_paths.cpp b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+index af5cb09..bb605f3 100644
+--- a/ps2xRuntime/src/lib/ps2_user_paths.cpp
++++ b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_user_paths.h"
+ 
++#include <cstdio>
+ #include <mutex>
+ #include <system_error>
+ 
+@@ -26,6 +27,7 @@ namespace ps2x
+         std::mutex g_configMutex;
+         fs::path g_configDirectory;
+         fs::path g_cacheDirectory;
++        fs::path g_photosDirectory;
+ 
+         bool pathExists(const fs::path &path)
+         {
+@@ -83,6 +85,7 @@ namespace ps2x
+             paths.configDirectory = exeDirectory;
+             paths.logsDirectory = exeDirectory;
+             paths.cacheDirectory = exeDirectory / "cache";
++            paths.photosDirectory = exeDirectory / "capturas";
+             break;
+         case UserPathsMode::Portable:
+             paths.configDirectory = exeDirectory / "config";
+@@ -90,6 +93,7 @@ namespace ps2x
+             paths.logsDirectory = exeDirectory / "registros";
+             paths.modsDirectory = exeDirectory / "mods";
+             paths.cacheDirectory = exeDirectory / "cache";
++            paths.photosDirectory = exeDirectory / "capturas";
+             break;
+         case UserPathsMode::Installed:
+         {
+@@ -98,6 +102,7 @@ namespace ps2x
+             paths.configDirectory = root / "config";
+             paths.savesDirectory = root / "partidas";
+             paths.modsDirectory = root / "mods";
++            paths.photosDirectory = root / "capturas";
+             paths.logsDirectory = localAppDataDirectory / kGameFolder / "registros";
+             paths.cacheDirectory = localAppDataDirectory / kGameFolder / "cache";
+             break;
+@@ -233,4 +238,38 @@ namespace ps2x
+         std::lock_guard<std::mutex> lock(g_configMutex);
+         return g_cacheDirectory;
+     }
++
++    std::string photoFileName(const std::tm &time, int number)
++    {
++        char name[64];
++        std::snprintf(name, sizeof(name), "F1-06_%04d-%02d-%02d_%02d-%02d-%02d", time.tm_year + 1900, time.tm_mon + 1,
++                      time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec);
++        std::string text = name;
++        if (number > 1)
++            text += "_" + std::to_string(number);
++        return text + ".png";
++    }
++
++    fs::path uniquePhotoPath(const fs::path &folder, const std::tm &time,
++                             const std::function<bool(const fs::path &)> &exists)
++    {
++        for (int number = 1;; ++number)
++        {
++            fs::path path = folder / photoFileName(time, number);
++            if (!exists(path) || number >= 1000)
++                return path;
++        }
++    }
++
++    void setUserPhotosDirectory(const fs::path &directory)
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        g_photosDirectory = directory;
++    }
++
++    fs::path userPhotosDirectory()
++    {
++        std::lock_guard<std::mutex> lock(g_configMutex);
++        return g_photosDirectory;
++    }
+ }
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index b8e7747..6ba2308 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -222,6 +222,7 @@ namespace
+         ps2x::createUserDirectories(paths);
+         ps2x::setUserConfigDirectory(paths.configDirectory);
+         ps2x::setUserCacheDirectory(paths.cacheDirectory);
++        ps2x::setUserPhotosDirectory(paths.photosDirectory);
+         // Development (the test scripts) keeps its own defaults, e.g. the CPU GS (ps2_options.h).
+         ps2x::applyOptionsFile(paths.configDirectory / "opciones.ini", messages,
+                                paths.mode == ps2x::UserPathsMode::Development);
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 4f59fec..e29abf0 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <ctime>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -162,6 +163,42 @@ void register_ps2_user_paths_tests()
+             t.IsTrue(paths.modsDirectory.empty(), "no mods folder");
+         });
+ 
++        // Fase 5 (T8): the photos (F12) go to capturas, next to config.
++        tc.Run("the photos folder: next to config (portable, development) or in My Games\\F1-06", [](TestCase &t)
++        {
++            const fs::path exe = "C:/Games/F1-06";
++            const fs::path documents = "C:/Users/p/Documents";
++            const fs::path local = "C:/Users/p/AppData/Local";
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Portable, exe, documents, local).photosDirectory),
++                     normal(exe / "capturas"), "portable: <exe>\\capturas");
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Installed, exe, documents, local).photosDirectory),
++                     normal(documents / "My Games" / "F1-06" / "capturas"), "installed: My Games\\F1-06\\capturas");
++            t.Equals(normal(ps2x::resolveUserPaths(UserPathsMode::Development, exe, documents, local).photosDirectory),
++                     normal(exe / "capturas"), "development: next to the .exe");
++        });
++
++        tc.Run("a photo is named by its date and time, and never overwrites another", [](TestCase &t)
++        {
++            std::tm time{};
++            time.tm_year = 2026 - 1900;
++            time.tm_mon = 9;
++            time.tm_mday = 4;
++            time.tm_hour = 9;
++            time.tm_min = 5;
++            time.tm_sec = 7;
++            t.Equals(ps2x::photoFileName(time, 1), std::string("F1-06_2026-10-04_09-05-07.png"), "the first");
++            t.Equals(ps2x::photoFileName(time, 2), std::string("F1-06_2026-10-04_09-05-07_2.png"), "the second");
++            const fs::path folder = "C:/Fotos";
++            std::vector<fs::path> taken = {folder / "F1-06_2026-10-04_09-05-07.png",
++                                           folder / "F1-06_2026-10-04_09-05-07_2.png"};
++            const auto exists = [&taken](const fs::path &path)
++            { return std::find(taken.begin(), taken.end(), path) != taken.end(); };
++            t.Equals(normal(ps2x::uniquePhotoPath(folder, time, exists)),
++                     normal(folder / "F1-06_2026-10-04_09-05-07_3.png"), "two in the same second: _3");
++            t.Equals(normal(ps2x::uniquePhotoPath(folder, time, [](const fs::path &) { return false; })),
++                     normal(folder / "F1-06_2026-10-04_09-05-07.png"), "a free name");
++        });
++
+         tc.Run("the cache folder: next to the .exe (portable, development) or in LocalAppData\\F1-06", [](TestCase &t)
+         {
+             const fs::path exe = "C:/Games/F1-06";
+@@ -348,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{11}, "eleven options");
++            t.Equals(ps2x::optionSpecs().size(), size_t{17}, "seventeen options (fase 5: six more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

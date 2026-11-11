@@ -1,0 +1,98 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 4bfaeae..50b74dd 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,7 +1,9 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_intc_queue.h"
++#include <cstdlib>
+ #include <cstring>
++#include <emmintrin.h>
+ #include <iostream>
+ 
+ enum VIFCmd : uint8_t
+@@ -760,6 +762,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             {
+                 const uint8_t *srcBase = data + pos;
+                 uint32_t srcIndex = 0u;
++                // Without the mask and in mode 0 (no addition) every field of a decoded vector is the decoded value:
++                // it is written whole, without the per-field loop (whose lane-by-lane result, read back as 16 bytes,
++                // also stalled), and V4-32, the common format, is a straight copy. F1_VIF1_VERIFICAR=1 takes the
++                // general path and checks that it writes what the fast one would ("[vif1:verificar]").
++                static const bool s_verifyUnpack = []()
++                {
++                    const char *value = std::getenv("F1_VIF1_VERIFICAR");
++                    return value != nullptr && value[0] != '0';
++                }();
++                const bool fastUnpack = !maskEnable && (vif1_regs.mode & 3u) == 0u;
+                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                 {
+                     const uint32_t cyclePos = writeIndex % wl;
+@@ -783,18 +795,24 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         continue;
+                     }
+ 
+-                    uint32_t lanes[4] = {0u, 0u, 0u, 0u};
+-                    std::memcpy(lanes, m_vu1Data + destOff, sizeof(lanes));
+-                    uint32_t decompressed[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
+-                    bool decoded = false;
+-
+                     const uint8_t *srcVec = nullptr;
++                    bool decoded = false;
+                     if (sourceAvailable && srcIndex < sourceVectorCount)
+                     {
+                         srcVec = srcBase + srcIndex * bytesPerVector;
+                         ++srcIndex;
+                         decoded = true;
+                     }
++                    if (fastUnpack && decoded && vl == 0u && vn == 3u && srcVec + 16u <= data + sizeBytes &&
++                        !s_verifyUnpack)
++                    {
++                        std::memcpy(m_vu1Data + destOff, srcVec, 16u);
++                        continue;
++                    }
++
++                    uint32_t lanes[4] = {0u, 0u, 0u, 0u};
++                    std::memcpy(lanes, m_vu1Data + destOff, sizeof(lanes));
++                    uint32_t decompressed[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
+ 
+                     auto extend16 = [&](uint16_t raw) -> uint32_t
+                     {
+@@ -873,6 +891,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     {
+                         handledFormat = false;
+                     }
++                    if (fastUnpack && handledFormat && !s_verifyUnpack)
++                    {
++                        _mm_storeu_si128(reinterpret_cast<__m128i *>(m_vu1Data + destOff),
++                                         _mm_setr_epi32(static_cast<int>(decompressed[0]), static_cast<int>(decompressed[1]),
++                                                        static_cast<int>(decompressed[2]), static_cast<int>(decompressed[3])));
++                        continue;
++                    }
+ 
+                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
+@@ -930,6 +955,22 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         lanes[field] = writeVal;
+                     }
+ 
++                    if (s_verifyUnpack && fastUnpack && handledFormat)
++                    {
++                        // What the fast path writes: the source words for V4-32, the decoded value otherwise.
++                        static uint64_t s_checked = 0u, s_different = 0u;
++                        uint32_t expected[4];
++                        if (vl == 0u && vn == 3u && srcVec + 16u <= data + sizeBytes)
++                            std::memcpy(expected, srcVec, sizeof(expected));
++                        else
++                            std::memcpy(expected, decompressed, sizeof(expected));
++                        if (std::memcmp(expected, lanes, sizeof(lanes)) != 0 && s_different++ < 20u)
++                            std::cerr << "[vif1:verificar] DISTINTO vl=" << static_cast<uint32_t>(vl) << " vn="
++                                      << static_cast<uint32_t>(vn) << " cl=" << cl << " wl=" << wl << std::endl;
++                        if (++s_checked % 1000000u == 0u)
++                            std::cerr << "[vif1:verificar] " << s_checked << " vectores, " << s_different << " distintos"
++                                      << std::endl;
++                    }
+                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                 }
+             }

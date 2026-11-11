@@ -1,0 +1,22 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..bade304 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -374,8 +374,15 @@ public:
+     std::atomic<uint64_t> m_gifCopyCount{0};
+     std::atomic<uint64_t> m_gsWriteCount{0};
+     std::atomic<uint64_t> m_vifWriteCount{0};
+-    std::atomic<uint64_t> m_vu0CodeGeneration{0};
+-    std::atomic<uint64_t> m_vu1CodeGeneration{0};
++    // VU code generations start from a value no other PS2Memory used: the static VU block engines cache schemes by
++    // generation, so two memories both starting at 0 would share stale schemes (each memory gets 2^32 values).
++    static uint64_t uniqueVuCodeGenerationBase()
++    {
++        static std::atomic<uint64_t> s_instances{0};
++        return (s_instances.fetch_add(1, std::memory_order_relaxed) + 1u) << 32;
++    }
++    std::atomic<uint64_t> m_vu0CodeGeneration{uniqueVuCodeGenerationBase()};
++    std::atomic<uint64_t> m_vu1CodeGeneration{uniqueVuCodeGenerationBase()};
+     // I/O registers
+     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+ 

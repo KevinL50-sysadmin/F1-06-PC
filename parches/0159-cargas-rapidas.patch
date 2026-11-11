@@ -1,0 +1,485 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h b/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
+index 4bcf48f..7870f33 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
++++ b/ps2xIOP/include/ps2x/iop/iop_spu2_audio.h
+@@ -24,4 +24,8 @@ namespace ps2x::iop
+     bool parseSpu2OutputLatency(std::string_view text, Spu2OutputLatency &latency);
+     void setSpu2OutputLatency(Spu2OutputLatency latency) noexcept;
+     void setSpu2OutputMono(bool mono) noexcept;
++
++    // Fase 5 (T11, patch 0159; fast loads): how many frames in a row the SPU2 has just played below hearing level
++    // (on its own clock, which follows the IOP's). The EE only fast-forwards while it is quiet. Any thread.
++    std::uint64_t spu2QuietFrames() noexcept;
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 2ddca99..e01dec2 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -285,6 +285,10 @@ namespace ps2x::iop::detail
+         // Fase 5 (T5, T6): latencia_audio waiting for the device's next request (-1: none) and audio_mono.
+         std::atomic<int> g_latencyRequest{-1};
+         std::atomic<bool> g_outputMono{false};
++        // Fase 5 (T11, patch 0159): frames in a row the synthesis has just played at or below kQuietLevel (before the
++        // volume); before it has played anything, "quiet" (huge).
++        constexpr int32_t kQuietLevel = 16; // of 32767, about -66 dBFS
++        std::atomic<uint64_t> g_quietFrames{UINT64_MAX / 2u};
+     }
+ 
+     struct Spu2::Synth
+@@ -805,7 +809,10 @@ namespace ps2x::iop::detail
+ 
+         void pushFrame(int16_t left, int16_t right, const int16_t *wavInput)
+         {
+-            peak = std::max<int32_t>(peak, std::max(std::abs(static_cast<int32_t>(left)), std::abs(static_cast<int32_t>(right))));
++            const int32_t level = std::max(std::abs(static_cast<int32_t>(left)), std::abs(static_cast<int32_t>(right)));
++            peak = std::max<int32_t>(peak, level);
++            g_quietFrames.store(level <= kQuietLevel ? g_quietFrames.load(std::memory_order_relaxed) + 1u : 0u,
++                                std::memory_order_relaxed);
+             const int32_t gain = g_outputGain.load(std::memory_order_relaxed);
+             left = clamp16((left * gain) >> 8);
+             right = clamp16((right * gain) >> 8);
+@@ -1637,4 +1644,9 @@ namespace ps2x::iop
+     {
+         detail::g_outputMono.store(mono, std::memory_order_relaxed);
+     }
++
++    std::uint64_t spu2QuietFrames() noexcept
++    {
++        return detail::g_quietFrames.load(std::memory_order_relaxed);
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index e75cb0a..f413363 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -154,6 +154,52 @@ namespace
+     // in full before the EE goes idle (see run()).
+     uint64_t g_iopDebtCycles = 0u;
+ 
++    // Patch 0159 (fast loads): the guest clock. Every deadline (VBLANK, alarms, timers) and the wall-time catch-up of
++    // accountCycles are paced by guestNow(), the host clock plus g_clockAheadNs. While fast-forward is on
++    // (ps2SetFastForward), the EE does not wait for a deadline: the guest clock jumps to it, so the guest (EE, its
++    // timers and the IOP, which follows the EE cycles) runs as fast as the host can. When it is turned off the clock
++    // stays ahead and the pacing goes on from there: nothing has to catch up. Only the EE executor thread touches it.
++    int64_t g_clockAheadNs = 0;
++    std::atomic<bool> g_fastForward{false};
++    uint64_t g_fastForwardNs = 0u; // total jumped, for the report
++
++    std::chrono::steady_clock::time_point guestNow()
++    {
++        return std::chrono::steady_clock::now() + std::chrono::nanoseconds(g_clockAheadNs);
++    }
++
++    // A guest-clock deadline as a host time point, for the condition variable waits.
++    std::chrono::steady_clock::time_point hostTimeOf(std::chrono::steady_clock::time_point guestTime)
++    {
++        return guestTime == std::chrono::steady_clock::time_point::max()
++                   ? guestTime
++                   : guestTime - std::chrono::nanoseconds(g_clockAheadNs);
++    }
++
++    // PS2X_AVANCE_RAPIDO=1 (measuring): fast-forward all the time.
++    bool fastForward()
++    {
++        static const bool s_always = []
++        {
++            const char *value = std::getenv("PS2X_AVANCE_RAPIDO");
++            return value != nullptr && value[0] == '1';
++        }();
++        return s_always || g_fastForward.load(std::memory_order_relaxed);
++    }
++
++    // Moves the guest clock from guestNow() to the deadline instead of waiting for it.
++    void jumpGuestClockTo(std::chrono::steady_clock::time_point deadline)
++    {
++        if (deadline == std::chrono::steady_clock::time_point::max())
++            return;
++        const auto ahead = deadline - guestNow();
++        if (ahead <= std::chrono::steady_clock::duration::zero())
++            return;
++        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ahead).count();
++        g_clockAheadNs += ns;
++        g_fastForwardNs += static_cast<uint64_t>(ns);
++    }
++
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+     {
+@@ -247,7 +293,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+     scheduleEvent(m_eeCycle + vblankPeriodCycles(),
+-                  std::chrono::steady_clock::now() + vblankPeriod(),
++                  guestNow() + vblankPeriod(),
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -704,15 +750,15 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+         static std::chrono::steady_clock::time_point s_reportStart{};
+         if (s_hostStart == std::chrono::steady_clock::time_point{})
+         {
+-            s_hostStart = std::chrono::steady_clock::now();
+-            s_reportStart = s_hostStart;
++            s_hostStart = guestNow();
++            s_reportStart = std::chrono::steady_clock::now();
+             s_cycleStart = m_eeCycle;
+         }
+         else if (++s_callsSinceCheck >= 64u)
+         {
+             s_callsSinceCheck = 0u;
+             const auto now = std::chrono::steady_clock::now();
+-            const auto hostElapsed = now - s_hostStart;
++            const auto hostElapsed = guestNow() - s_hostStart; // patch 0159: the guest clock
+             const uint64_t hostMicros = static_cast<uint64_t>(
+                 std::chrono::duration_cast<std::chrono::microseconds>(hostElapsed).count());
+             const uint64_t hostCycle = s_cycleStart + microsecondsToEeCycles(hostMicros);
+@@ -1512,7 +1558,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
+     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
+     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
+     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
+-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
++                  guestNow() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
+                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
+     return id;
+ }
+@@ -2255,7 +2301,7 @@ void EeScheduler::processDueDeadlines()
+         std::chrono::steady_clock::time_point pacingDeadline{};
+         {
+             std::unique_lock lock(m_eventMutex);
+-            const auto now = std::chrono::steady_clock::now();
++            const auto now = guestNow();
+             for (const ScheduledEvent &item : m_deadlines)
+             {
+                 if (item.deadlineCycle <= m_eeCycle &&
+@@ -2272,9 +2318,11 @@ void EeScheduler::processDueDeadlines()
+                 return;
+             }
+ 
+-            if (now < pacingDeadline)
++            if (now < pacingDeadline && fastForward() && m_events.empty())
++                jumpGuestClockTo(pacingDeadline); // patch 0159
++            else if (now < pacingDeadline)
+             {
+-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
++                m_eventCv.wait_until(lock, hostTimeOf(pacingDeadline), [this]()
+                                      { return !m_events.empty() ||
+                                               m_stopRequested.load(std::memory_order_acquire); });
+                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+@@ -2284,7 +2332,7 @@ void EeScheduler::processDueDeadlines()
+                 }
+             }
+ 
+-            const auto pacedNow = std::chrono::steady_clock::now();
++            const auto pacedNow = guestNow();
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                               [this, pacedNow](const ScheduledEvent &item)
+                                               { return item.deadlineCycle <= m_eeCycle &&
+@@ -2502,7 +2550,7 @@ void EeScheduler::waitForEvent()
+     }
+     if (hasTimerDeadline)
+     {
+-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
++        const auto timerHostDeadline = guestNow() + eeCyclesToHostDuration(timerCycles);
+         if (timerHostDeadline < hostDeadline)
+         {
+             deadlineCycle = m_eeCycle + timerCycles;
+@@ -2510,9 +2558,13 @@ void EeScheduler::waitForEvent()
+         }
+     }
+ 
+-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+-                                               { return !m_events.empty() ||
+-                                                        m_stopRequested.load(std::memory_order_acquire); });
++    bool signaled = false;
++    if (fastForward())
++        jumpGuestClockTo(hostDeadline); // patch 0159: nothing to wait for but the clock
++    else
++        signaled = m_eventCv.wait_until(lock, hostTimeOf(hostDeadline), [this]()
++                                        { return !m_events.empty() ||
++                                                 m_stopRequested.load(std::memory_order_acquire); });
+     if (!signaled)
+     {
+         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+@@ -2631,6 +2683,14 @@ void ps2SetVideoModePal(bool pal)
+                      forcedVBlankPeriodUs() != 0u ? " (PS2X_VBLANK_HZ manda)" : "");
+ }
+ 
++// Patch 0159 (fast loads): fast-forward on or off (see g_clockAheadNs). Call it on the EE thread.
++void ps2SetFastForward(bool on) noexcept
++{
++    if (g_fastForward.exchange(on, std::memory_order_relaxed) != on && !on)
++        std::fprintf(stderr, "[ee:avance] reloj del juego adelantado %.2f s (total)\n",
++                     static_cast<double>(g_fastForwardNs) / 1e9);
++}
++
+ // Patch 0112: VBLANK period in microseconds (PAL 20000, NTSC 16667, or PS2X_VBLANK_HZ), for the sceMpeg HLE's picture
+ // clock, which counts in VBLANK ticks.
+ uint32_t ps2VBlankPeriodUs()
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 623125f..0c85b0a 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -179,6 +179,13 @@ namespace ps2x
+              "banderas) u oculto (nada, para fotos). Los menus y la pausa no cambian."},
+             {"tecla_hud", "PS2X_TECLA_HUD", "h", {{"h", "h"}, {"f7", "f7"}, {"f6", "f6"}, {"no", "no"}}, 0, 0,
+              "Tecla que cambia el HUD en carrera (h, f7, f6 o no): completo, minimo, oculto y otra vez completo."},
++            // Fase 5 (T11): also a row of AJUSTES PC; the game reads it on every frame of a loading screen
++            // (src/f1_overrides.cpp). Development keeps the game's pace, so the measuring scripts stay comparable.
++            {"cargas_rapidas", "PS2X_CARGAS_RAPIDAS", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Cargas rapidas: 1 = mientras una pantalla de carga espera (tras su fundido y sus consejos), el juego no\n"
++             "espera al reloj real y carga tan rapido como da el PC; los fundidos van a su ritmo y, si suena algo, va\n"
++             "a su ritmo para no cortarlo. 0 = como la consola.",
++             "0"},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index ce93340..a3ddd20 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -112,7 +112,11 @@ namespace
+                "Mínimo: solo el velocímetro con la marcha, la posición y las banderas. Oculto: nada, para fotos. "
+                "Los menús y la pausa no cambian."},
+               {"tecla_hud", "Tecla del HUD", {{"h", "H"}, {"f7", "F7"}, {"f6", "F6"}, {"no", "Ninguna"}},
+-               "Cambia el HUD jugando: completo, mínimo, oculto y otra vez completo."}}},
++               "Cambia el HUD jugando: completo, mínimo, oculto y otra vez completo."},
++              // Fase 5 (T11).
++              {"cargas_rapidas", "Cargas rápidas", {{"0", "No"}, {"1", "Sí"}},
++               "Las pantallas de carga acaban en cuanto el juego ha cargado, sin esperar al ritmo de la consola. Los "
++               "fundidos y los consejos se ven igual."}}},
+         };
+         return list;
+     }
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index a44eef4..5dabea7 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -360,6 +360,30 @@ void register_ps2_iop_tests()
+             t.Equals(blockCFrames, 180, "the refill should play when the read position comes round (sample 512)");
+         });
+ 
++        // Patch 0159 (fast loads): the EE only fast-forwards while the SPU2 is quiet, so no sound is skipped.
++        tc.Run("the SPU2 counts the quiet frames it has just played", [](TestCase &t)
++        {
++            Spu2InputRig rig;
++            rig.setSample(0);
++            rig.fillHalf(0x2400u, 0);
++            rig.fillHalf(0x2500u, 0);
++            rig.setSample(500);
++            t.IsTrue(rig.collect(480u).size() >= 480u, "the silence plays");
++            t.IsTrue(ps2x::iop::spu2QuietFrames() >= 400u,
++                     "after it the count covers it (" + std::to_string(ps2x::iop::spu2QuietFrames()) + ")");
++            rig.fillHalf(0x2400u, 3000);
++            rig.fillHalf(0x2500u, 3000);
++            rig.setSample(1500);
++            t.IsTrue(rig.collect(960u).size() >= 960u, "the sound plays");
++            t.IsTrue(ps2x::iop::spu2QuietFrames() < 50u,
++                     "a sound starts it again (" + std::to_string(ps2x::iop::spu2QuietFrames()) + ")");
++            rig.fillHalf(0x2400u, 4);
++            rig.fillHalf(0x2500u, 4);
++            rig.setSample(2500);
++            t.IsTrue(rig.collect(960u).size() >= 960u, "a whisper plays");
++            t.IsTrue(ps2x::iop::spu2QuietFrames() >= 400u, "a level that cannot be heard counts as quiet");
++        });
++
+         tc.Run("SPU2 output resampler absorbs a slower device clock without dropping frames or clicks", [](TestCase &t)
+         {
+             ResamplerRun run;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index a39a5ee..824abcd 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -430,6 +430,40 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "tecla_hud"), std::string("no"), "and tecla_hud");
+         });
+ 
++        // Fase 5 (T11): fast loads (cargas_rapidas), on for the player; development keeps the game's pace so the
++        // measuring scripts stay comparable.
++        tc.Run("the cargas_rapidas option has its defaults, variable, checks and number", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("cargas_rapidas"), std::string("1"), "on for the player");
++            t.Equals(fileValue("", "cargas_rapidas", true), std::string("0"), "off in development");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "cargas_rapidas = 1\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "hud = completo\n"), "the template keeps hud");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("cargas_rapidas = 0\n");
++            t.IsTrue(file.warnings.empty(), "a valid value gives no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            std::string variable = "<none>";
++            for (const ps2x::EnvironmentSetting &setting : settings)
++                if (setting.variable == "PS2X_CARGAS_RAPIDAS")
++                    variable = setting.value;
++            t.Equals(variable, std::string("0"), "cargas_rapidas -> PS2X_CARGAS_RAPIDAS");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("cargas_rapidas = 2\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "a bad value warns");
++            t.Equals(bad.values.at("cargas_rapidas"), std::string("1"), "and takes the default");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "cargas_rapidas", value), "a number for the game's row");
++            t.Equals(value, 1.0f, "on");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "cargas_rapidas", 0.0f), "off");
++            t.Equals(model.current.at("cargas_rapidas"), std::string("0"), "is 0");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "cargas_rapidas", 2.0f), "past on");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "cargas_rapidas"), std::string("0"), "CONFIRM writes it");
++            t.Equals(fileValue(saved, "hud"), std::string("completo"), "the other options keep their values");
++        });
++
+         tc.Run("the HUD modes: their names, their numbers and the key's cycle", [](TestCase &t)
+         {
+             ps2x::HudMode mode = ps2x::HudMode::Hidden;
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 7c9ce94..f6cb8a7 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <sstream>
+@@ -15,6 +16,9 @@
+ 
+ using namespace ps2_syscalls;
+ 
++// EeScheduler.cpp (patch 0159): the guest clock does not wait for the host clock (fast loads).
++void ps2SetFastForward(bool on) noexcept;
++
+ namespace
+ {
+     constexpr uint32_t K_PARAM_ADDR = 0x1000u;
+@@ -284,6 +288,57 @@ namespace
+         ctx->pc = 0u;
+     }
+ 
++    // Patch 0159 (fast-forward): a main thread that leaves an alarm 0xFFFF ticks away (~4.2 s of guest time) and exits.
++    constexpr uint32_t K_FF_MAIN = 0x310000u;
++    constexpr uint32_t K_FF_FAR = 0x310100u;
++    constexpr uint32_t K_FF_NEAR = 0x310200u;
++    constexpr uint16_t K_FF_FAR_TICKS = 0xFFFFu;
++    constexpr uint16_t K_FF_NEAR_TICKS = 1563u; // ~100 ms
++    std::atomic<int> gFastForwardAlarms{0};
++
++    void fastForwardStopHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gFastForwardAlarms.fetch_add(1);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    // The far alarm turns fast-forward off and paces a near one with the host clock again.
++    void fastForwardOffHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gFastForwardAlarms.fetch_add(1);
++        ps2SetFastForward(false);
++        runtime->eeScheduler().setAlarm(K_FF_NEAR_TICKS, K_FF_NEAR, 0u, 0u, 0u);
++        ctx->pc = 0u;
++    }
++
++    void fastForwardMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        runtime->eeScheduler().setAlarm(K_FF_FAR_TICKS, K_FF_FAR, 0u, 0u, 0u);
++        ExitThread(rdram, ctx, runtime);
++    }
++
++    // Seconds of host time that ee.run() takes with the far alarm handled by `farHandler`.
++    double runFastForwardScenario(PS2Runtime::RecompiledFunction farHandler, bool fastForward)
++    {
++        std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++        R5900Context ctx{};
++        PS2Runtime runtime;
++        runtime.registerFunction(K_FF_MAIN, fastForwardMain);
++        runtime.registerFunction(K_FF_FAR, farHandler);
++        runtime.registerFunction(K_FF_NEAR, fastForwardStopHandler);
++        gFastForwardAlarms.store(0);
++        ctx.pc = K_FF_MAIN;
++        EeScheduler &ee = runtime.eeScheduler();
++        ee.reset(rdram.data(), ctx);
++        ps2SetFastForward(fastForward);
++        const auto begin = std::chrono::steady_clock::now();
++        ee.run();
++        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++        ps2SetFastForward(false);
++        return seconds;
++    }
++
+     constexpr uint32_t K_SCHED_MAIN = 0x300000u;
+     constexpr uint32_t K_SCHED_A = 0x300100u;
+     constexpr uint32_t K_SCHED_A_RESUME = 0x300104u;
+@@ -1000,6 +1055,44 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(getRegS32(env.ctx, 2), -4, "__divdi3 should divide signed 64-bit values");
+         });
+ 
++        // Patch 0159 (fast loads): with fast-forward on, an idle EE moves the guest clock to its next deadline instead
++        // of sleeping until it; turned off, the pacing goes on from the advanced clock (nothing to catch up).
++        tc.Run("fast-forward: an idle EE jumps to its next deadline instead of waiting for it", [](TestCase &t)
++        {
++            const double seconds = runFastForwardScenario(fastForwardStopHandler, true);
++            t.Equals(gFastForwardAlarms.load(), 1, "the far alarm fires");
++            t.IsTrue(seconds < 1.0, "~4.2 s of guest time in less than a second of host time (took " +
++                                        std::to_string(seconds) + " s)");
++        });
++
++        tc.Run("fast-forward off: the pacing goes on from the advanced guest clock", [](TestCase &t)
++        {
++            const double seconds = runFastForwardScenario(fastForwardOffHandler, true);
++            t.Equals(gFastForwardAlarms.load(), 2, "both alarms fire");
++            t.IsTrue(seconds >= 0.09, "the near alarm waits for the host clock again (took " + std::to_string(seconds) + " s)");
++            t.IsTrue(seconds < 1.0, "without waiting for the host clock to reach the jumped time");
++        });
++
++        tc.Run("without fast-forward an alarm waits for the host clock", [](TestCase &t)
++        {
++            gFastForwardAlarms.store(0);
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++            R5900Context ctx{};
++            PS2Runtime runtime;
++            runtime.registerFunction(K_FF_MAIN, [](uint8_t *ram, R5900Context *c, PS2Runtime *rt)
++                                     {
++                                         rt->eeScheduler().setAlarm(K_FF_NEAR_TICKS, K_FF_NEAR, 0u, 0u, 0u);
++                                         ExitThread(ram, c, rt); });
++            runtime.registerFunction(K_FF_NEAR, fastForwardStopHandler);
++            ctx.pc = K_FF_MAIN;
++            runtime.eeScheduler().reset(rdram.data(), ctx);
++            const auto begin = std::chrono::steady_clock::now();
++            runtime.eeScheduler().run();
++            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++            t.Equals(gFastForwardAlarms.load(), 1, "the alarm fires");
++            t.IsTrue(seconds >= 0.09, "~100 ms of guest time take ~100 ms (took " + std::to_string(seconds) + " s)");
++        });
++
+         tc.Run("ReleaseAlarm aliases CancelAlarm and cache syscalls succeed", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index 7242e65..ee296c9 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -193,7 +193,9 @@ void register_ps2_sif_rpc_tests()
+         {
+             TestEnv env;
+ 
+-            env.runtime.eeScheduler().accountCycles(80u);
++            // A whole IOP batch (32 us of EE time, see EeScheduler::accountCycles): with fewer cycles the IOP only ran
++            // if an earlier test had left it real-time debt (patch 0159's tests drain it).
++            env.runtime.eeScheduler().accountCycles(10000u);
+             const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
+             t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
+ 
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index ae95c3a..2a48469 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{19}, "nineteen options (fase 5: eight more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{20}, "twenty options (fase 5: nine more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

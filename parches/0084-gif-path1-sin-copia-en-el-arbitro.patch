@@ -1,0 +1,42 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 0f442eb..cb3c4d0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -365,7 +365,7 @@ namespace
+ void ps2GsGifSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
+ {
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+-    if (s_gifThreadEnabled && mode != 75 && mode != 76 && !t_gifWorker && s_gifThread.submit(gs, data, sizeBytes))
++    if (s_gifThreadEnabled && mode != 75 && mode != 76 && mode != 78 && !t_gifWorker && s_gifThread.submit(gs, data, sizeBytes))
+         return;
+     gs.processGIFPacket(data, sizeBytes); // after the queued ones (gifSyncBeforeAccess)
+ }
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 2e187f6..9d258b6 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_ab.h"
+ #include <algorithm>
+ #include <cstring>
+ 
+@@ -30,6 +31,18 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     if (!data || sizeBytes < 16 || !m_processFn)
+         return;
+ 
++    // Patch 0084: a PATH1 packet (XGKICK) with nothing queued goes on at once, without a copy. It is the path with the
++    // highest priority, so drain would put it first anyway (A/B modes 79 and 78: queued and copied, as before).
++    if (pathId == GifPathId::Path1 && m_queue.empty())
++    {
++        const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++        if (mode != 79 && mode != 78)
++        {
++            m_processFn(data, sizeBytes);
++            return;
++        }
++    }
++
+     GifArbiterPacket pkt;
+     pkt.pathId = pathId;
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;

@@ -1,0 +1,19 @@
+pgs_puente.dll
+==============
+
+pgs_puente.dll is a small C wrapper (pgs_puente.h / pgs_puente.cpp, in this folder) around paraLLEl-GS, a PlayStation 2
+GS renderer on Vulkan compute.
+
+- paraLLEl-GS: Copyright (C) 2024 Arntzen Software AS (Hans-Kristian Arntzen, Runar Heyer).
+  License: GNU Lesser General Public License v3.0 or later (COPYING.LGPLv3 in its source tree).
+  Source: https://github.com/Arntzen-Software/parallel-gs, commit cc6184a.
+- Granite (Vulkan backend used by paraLLEl-GS): Copyright (c) Hans-Kristian Arntzen. License: MIT.
+- volk and the Khronos Vulkan headers (submodules of Granite): MIT / Apache-2.0.
+
+The DLL statically links paraLLEl-GS. The game executable does not: it loads pgs_puente.dll at run time
+(LoadLibrary) and only calls the C functions declared in pgs_puente.h. To use a modified paraLLEl-GS, rebuild this DLL
+from its source (scripts/obtener-parallel-gs.ps1 fetches the pinned commit and builds it with this folder's
+CMakeLists.txt) and replace pgs_puente.dll next to the executable.
+
+Distributions of the DLL must include this notice, the LGPL-3.0 text (and the GPL-3.0 text it refers to), and the
+paraLLEl-GS source of the commit used, or a written offer for it.

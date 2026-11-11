@@ -1,0 +1,615 @@
+diff --git a/ps2xRuntime/include/ps2_host_overlay.h b/ps2xRuntime/include/ps2_host_overlay.h
+index 3a26d07..95e1770 100644
+--- a/ps2xRuntime/include/ps2_host_overlay.h
++++ b/ps2xRuntime/include/ps2_host_overlay.h
+@@ -248,6 +248,33 @@ namespace ps2x
+     // Draws the bar at the bottom of the game's picture (alpha: hostNoticeAlpha); the box it takes on screen.
+     HostOverlayBox drawHostHelpBar(const HelpBar &bar, float alpha = 1.0f);
+ 
++    // Camaras y pilotos T2: the driver's caption of the photo mode as the game's replay draws its own (logs/cyp-t2, at
++    // the game's 512 x 512 frame): the name black on a white row, a chrome line, the team white on the tower's blue and
++    // a dark edge, in the race HUD's letter; on its left a cell with the race position (white on the same blue, as the
++    // position tower). Bottom left, where the replay has it, or just above a help bar (limit: the row it must stay
++    // above). positionWidth: the position's text width (0: no cell); nameWidth, teamWidth: theirs.
++    inline constexpr float kDriverCaptionLeft = 20.0f; // the game's buttons in its help bars start there
++    inline constexpr float kDriverCaptionTop = 441.0f;
++    inline constexpr float kDriverCaptionNameHeight = 18.0f;
++    inline constexpr float kDriverCaptionSeparator = 6.0f;
++    inline constexpr float kDriverCaptionTeamHeight = 15.0f;
++    inline constexpr float kDriverCaptionEdge = 3.0f;
++    inline constexpr float kDriverCaptionMinWidth = 115.0f;
++    inline constexpr float kDriverCaptionPadding = 4.0f;
++    inline constexpr float kDriverCaptionMinPosition = 18.0f;
++    inline constexpr float kDriverCaptionGap = 2.0f;
++    inline constexpr float kDriverCaptionAbove = 6.0f;
++    struct DriverCaptionLayout
++    {
++        HostOverlayRect position, name, team;
++        float bottom = 0.0f; // under the edge
++    };
++    DriverCaptionLayout driverCaptionLayout(float positionWidth, float nameWidth, float teamWidth, float limit);
++    // Draws it (alpha: PhotoCaptionShow's) over the window, never in the photo; the box it takes on screen. Until the
++    // game has read its race letter, nothing.
++    HostOverlayBox drawHostDriverCaption(const std::string &position, const std::string &name, const std::string &team,
++                                         float alpha);
++
+     // Foto y repeticion T3: when a help bar is on screen. When its mode starts it comes for a while (seconds), and again
+     // for that long when the controls shown change (pad or keyboard). The help button (L3) hides it at once while it is
+     // on screen, or else brings it back to stay until the button hides it again or its mode ends (stop): the player
+diff --git a/ps2xRuntime/src/lib/ps2_host_overlay.cpp b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+index c6b5638..aabb1cc 100644
+--- a/ps2xRuntime/src/lib/ps2_host_overlay.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+@@ -1080,6 +1080,121 @@ namespace ps2x
+         g_recentTopRightAt = GetTime();
+     }
+ 
++    DriverCaptionLayout driverCaptionLayout(float positionWidth, float nameWidth, float teamWidth, float limit)
++    {
++        DriverCaptionLayout l;
++        const float height =
++            kDriverCaptionNameHeight + kDriverCaptionSeparator + kDriverCaptionTeamHeight + kDriverCaptionEdge;
++        l.bottom = std::min(kDriverCaptionTop + height, limit - kDriverCaptionAbove);
++        const float top = l.bottom - height;
++        float x = kDriverCaptionLeft;
++        if (positionWidth > 0.0f)
++        {
++            l.position = {x, top, std::max(kDriverCaptionMinPosition, positionWidth + 2.0f * kDriverCaptionPadding),
++                          height};
++            x += l.position.width + kDriverCaptionGap;
++        }
++        else
++            l.position = {x, top, 0.0f, height};
++        const float width =
++            std::max(kDriverCaptionMinWidth, std::max(nameWidth, teamWidth) + 2.0f * kDriverCaptionPadding);
++        l.name = {x, top, width, kDriverCaptionNameHeight};
++        l.team = {x, top + kDriverCaptionNameHeight + kDriverCaptionSeparator, width, kDriverCaptionTeamHeight};
++        return l;
++    }
++
++    HostOverlayBox drawHostDriverCaption(const std::string &position, const std::string &name, const std::string &team,
++                                         float alpha)
++    {
++        if (!(alpha > 0.0f))
++            return {};
++        // The position tower's letter (fruitigerMedium, a 16 row line); the game reads it with the race HUD, and not
++        // always (logs/cyp-t2: not in a race without the tower): else the race letter closest to it, else the menus'.
++        constexpr float kCaptionLine = 16.0f;
++        refreshGameLetters();
++        const GameLetter *letter = readyLetter(kRaceTowerFontFile);
++        if (letter == nullptr)
++        {
++            std::vector<int> heights;
++            std::vector<const GameLetter *> race;
++            for (const GameLetter &l : gameLetters())
++                if (l.ready && l.race)
++                {
++                    heights.push_back(l.lineHeight);
++                    race.push_back(&l);
++                }
++            const int best = nearestGameFont(heights, kCaptionLine);
++            letter = best >= 0 ? race[static_cast<size_t>(best)] : menuLetter(kCaptionLine);
++        }
++        if (letter == nullptr || letter->lineHeight <= 0)
++            return {};
++        // In the game's 512 x 512 frame, stretched to the picture as the game's own; the letter at the tower's size there.
++        const GamePictureRect picture = currentGamePictureRect(GetScreenWidth(), GetScreenHeight());
++        const float sx = picture.width / kGameFrameWidth, sy = picture.height / kGameFrameHeight;
++        const LetterFor frameLetter{letter->font, 0.0f, 1.0f};
++        const float size = kCaptionLine;
++        const auto width = [&](const std::string &text) { return text.empty() ? 0.0f : measureWith(frameLetter, text, size); };
++        float limit = kGameFrameHeight;
++        HostOverlayBox help;
++        if (recentHostOverlayBox(HostOverlayPlace::BottomCentre, help) && sy > 0.0f)
++            limit = (help.y - picture.y) / sy;
++        const DriverCaptionLayout l = driverCaptionLayout(width(position), width(name), width(team), limit);
++        const auto screen = [&](float x, float y, float w, float h)
++        { return Rectangle{picture.x + x * sx, picture.y + y * sy, w * sx, h * sy}; };
++        const auto fill = [&](float x, float y, float w, float h, HostOverlayColor colour)
++        { DrawRectangleRec(screen(x, y, w, h), toColor(colour, alpha)); };
++
++        // The replay's rows, top to bottom (logs/cyp-t2/rotulo-repeticion-x4.png): white, the chrome line, blue, the edge.
++        constexpr HostOverlayColor kWhite{0xFB, 0xFB, 0xFB, 0xFF}, kBlue{0x4E, 0x4F, 0x6F, 0xFF};
++        constexpr HostOverlayColor kChrome[] = {{0xDC, 0xDB, 0xDC, 0xFF}, {0x9D, 0x9C, 0x9E, 0xFF}, {0x6A, 0x68, 0x69, 0xFF},
++                                                {0x90, 0x91, 0x96, 0xFF}, {0x7C, 0x7E, 0xA0, 0xFF}, {0x5C, 0x5F, 0x84, 0xFF}};
++        constexpr HostOverlayColor kEdge[] = {{0x45, 0x43, 0x52, 0xFF}, {0x20, 0x20, 0x20, 0xFF}, {0x20, 0x20, 0x20, 0xFF}};
++        const float edgeTop = l.team.y + l.team.height;
++        const auto column = [&](const HostOverlayRect &r, bool withName)
++        {
++            if (withName)
++            {
++                fill(r.x, r.y, r.width, kDriverCaptionNameHeight, kWhite);
++                for (size_t i = 0; i < std::size(kChrome); ++i)
++                    fill(r.x, r.y + kDriverCaptionNameHeight + i, r.width, 1.0f, kChrome[i]);
++                fill(r.x, l.team.y, r.width, kDriverCaptionTeamHeight, kBlue);
++            }
++            else
++                fill(r.x, r.y, r.width, edgeTop - r.y, kBlue);
++            for (size_t i = 0; i < std::size(kEdge); ++i)
++                fill(r.x, edgeTop + i, r.width, 1.0f, kEdge[i]);
++        };
++        if (l.position.width > 0.0f)
++            column(l.position, false);
++        column(l.name, true);
++
++        // The texts at the letter's size on the picture, their ink centred on their rows.
++        const LetterFor screenLetter{letter->font, 0.0f, sx / sy};
++        const float textSize = size * sy;
++        const float inkMiddle = (letter->inkTop + letter->inkBottom + 1) / 2.0f / letter->lineHeight;
++        const auto text = [&](const std::string &s, float x, float middle, HostOverlayColor colour)
++        {
++            if (s.empty())
++                return;
++            const Rectangle at = screen(x, middle, 0.0f, 0.0f);
++            drawWith(screenLetter, s, Vector2{std::round(at.x), std::round(at.y - inkMiddle * textSize)}, textSize,
++                     toColor(colour, alpha));
++        };
++        text(name, l.name.x + kDriverCaptionPadding, l.name.y + l.name.height / 2.0f, kHostTowerText);
++        text(team, l.team.x + kDriverCaptionPadding, l.team.y + l.team.height / 2.0f, kHostOverlayText);
++        if (l.position.width > 0.0f)
++            text(position, l.position.x + (l.position.width - width(position)) / 2.0f,
++                 l.position.y + (edgeTop - l.position.y) / 2.0f, kHostOverlayText);
++
++        const Rectangle all = screen(l.position.x, l.name.y, l.name.x + l.name.width - l.position.x, l.bottom - l.name.y);
++        HostOverlayBox box;
++        box.x = all.x;
++        box.y = all.y;
++        box.width = all.width;
++        box.height = all.height;
++        return box;
++    }
++
+     bool recentHostOverlayBox(HostOverlayPlace place, HostOverlayBox &box)
+     {
+         const bool helpBar = place == HostOverlayPlace::BottomCentre;
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index c5bd149..33745fc 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -337,6 +337,192 @@ namespace ps2x
+                std::to_string(driving);
+     }
+ 
++    // Camaras y pilotos T2: the race's cameras in the photo mode and in the replay, one list for both: the driving
++    // camera's modes (triangle in a race), then the replay's own (its TV camera's onboard modes, the PlayerCam, and its
++    // trackside TV camera, in the order its triangle takes them), round. The replay's triangle and the photo mode's go
++    // through all of them (src/f1_overrides.cpp writes the game's own indices).
++    struct RaceCameraSet
++    {
++        int driving = 0; // the driving camera's modes
++        int replay = 0;  // the replay's onboard modes
++        bool tv = false; // the replay's trackside camera
++    };
++    enum class RaceCameraKind
++    {
++        Driving,
++        Replay,
++        Tv,
++    };
++    struct RaceCamera
++    {
++        RaceCameraKind kind = RaceCameraKind::Driving;
++        int mode = 0; // Driving and Replay: the mode's index
++    };
++
++    inline int raceCameraCount(const RaceCameraSet &set)
++    {
++        return std::max(set.driving, 0) + std::max(set.replay, 0) + (set.tv ? 1 : 0);
++    }
++
++    // The camera's place in the list, or -1 if the set has no such camera.
++    inline int raceCameraIndex(const RaceCameraSet &set, const RaceCamera &camera)
++    {
++        const int driving = std::max(set.driving, 0), replay = std::max(set.replay, 0);
++        switch (camera.kind)
++        {
++        case RaceCameraKind::Driving:
++            return camera.mode >= 0 && camera.mode < driving ? camera.mode : -1;
++        case RaceCameraKind::Replay:
++            return camera.mode >= 0 && camera.mode < replay ? driving + camera.mode : -1;
++        case RaceCameraKind::Tv:
++            return set.tv ? driving + replay : -1;
++        }
++        return -1;
++    }
++
++    inline bool raceCameraAt(const RaceCameraSet &set, int index, RaceCamera &camera)
++    {
++        const int driving = std::max(set.driving, 0), replay = std::max(set.replay, 0);
++        if (index < 0 || index >= raceCameraCount(set))
++            return false;
++        if (index < driving)
++            camera = {RaceCameraKind::Driving, index};
++        else if (index < driving + replay)
++            camera = {RaceCameraKind::Replay, index - driving};
++        else
++            camera = {RaceCameraKind::Tv, 0};
++        return true;
++    }
++
++    // step places from current, round; from another of the game's cameras (the start's: -1, or out of range) the first
++    // (the last going back). -1 when there is none.
++    inline int stepRaceCamera(int current, const RaceCameraSet &set, int step)
++    {
++        const int total = raceCameraCount(set);
++        if (total == 0)
++            return -1;
++        if (current < 0 || current >= total)
++            return step >= 0 ? 0 : total - 1;
++        return ((current + step) % total + total) % total;
++    }
++
++    // The notice when the camera changes: "Camera 3 of 5" (driving), "Replay camera 2 of 4", "TV camera".
++    inline std::string raceCameraNotice(const RaceCameraSet &set, int index, HostLanguage language)
++    {
++        const bool es = language == HostLanguage::Spanish;
++        RaceCamera camera;
++        if (!raceCameraAt(set, index, camera))
++            return {};
++        const std::string of = es ? " de " : " of ";
++        switch (camera.kind)
++        {
++        case RaceCameraKind::Driving:
++            return (es ? "C\xC3\xA1mara " : "Camera ") + std::to_string(camera.mode + 1) + of +
++                   std::to_string(set.driving);
++        case RaceCameraKind::Replay:
++            return (es ? "C\xC3\xA1mara de repetici\xC3\xB3n " : "Replay camera ") + std::to_string(camera.mode + 1) + of +
++                   std::to_string(set.replay);
++        case RaceCameraKind::Tv:
++            return es ? "C\xC3\xA1mara de televisi\xC3\xB3n" : "TV camera";
++        }
++        return {};
++    }
++
++    // Camaras y pilotos T2: the driver's caption when a car is chosen in the photo mode, as the game's replay shows it
++    // (its HUD's func_203F18: the driver's name as the game keeps it, mixed case, and the team): name and team in the
++    // game's Latin-1, the race position (1 the leader; 0 not known).
++    struct PhotoModeCaption
++    {
++        std::string name, team;
++        int position = 0;
++    };
++    struct PhotoCaptionLines
++    {
++        std::string position, name, team; // UTF-8; position "" when not known
++    };
++
++    namespace photo_mode_detail
++    {
++        inline std::string latin1ToUtf8(const std::string &text)
++        {
++            std::string out;
++            for (unsigned char c : text)
++            {
++                if (c < 0x80u)
++                    out.push_back(static_cast<char>(c));
++                else
++                {
++                    out.push_back(static_cast<char>(0xC0u | (c >> 6)));
++                    out.push_back(static_cast<char>(0x80u | (c & 0x3Fu)));
++                }
++            }
++            return out;
++        }
++    }
++
++    inline PhotoCaptionLines photoCaptionLines(const PhotoModeCaption &caption, HostLanguage language)
++    {
++        PhotoCaptionLines lines;
++        lines.position = caption.position > 0 ? std::to_string(caption.position) : std::string();
++        lines.name = caption.name.empty() ? std::string(language == HostLanguage::Spanish ? "Coche" : "Car")
++                                          : photo_mode_detail::latin1ToUtf8(caption.name);
++        lines.team = photo_mode_detail::latin1ToUtf8(caption.team);
++        return lines;
++    }
++
++    // When the caption is on screen (the window's thread; now: seconds, any clock): for kPhotoCaptionSeconds after each
++    // driver chosen (and when the photo mode goes on), fading in and out. It goes with the help bar: hidden at once when
++    // L3 hides the bar (and kept hidden, another driver too, until L3 brings the bar back) and there, to stay, when L3
++    // brings it back. The photo itself never has it: it is drawn over the window only (ps2_host_overlay.h).
++    constexpr double kPhotoCaptionSeconds = 4.0;
++
++    class PhotoCaptionShow
++    {
++    public:
++        void show(double now)
++        {
++            if (m_state == State::Hidden || m_state == State::Pinned)
++                return;
++            m_start = m_state == State::Timed ? hostNoticeStart(now, m_start, kPhotoCaptionSeconds) : now;
++            m_state = State::Timed;
++        }
++        // L3 (helpShown: the help bar on screen after it).
++        void helpToggled(double now, bool helpShown)
++        {
++            m_state = helpShown ? State::Pinned : State::Hidden;
++            m_start = now;
++        }
++        void stop()
++        {
++            m_state = State::Off;
++            m_start = -1.0;
++        }
++        float alpha(double now) const
++        {
++            if (m_state == State::Timed)
++                return hostNoticeAlpha(now - m_start, kPhotoCaptionSeconds);
++            if (m_state == State::Pinned)
++            {
++                const double elapsed = now - m_start; // 1e-9: as HelpBarShow
++                return elapsed + 1e-9 >= kHostNoticeFadeIn
++                           ? 1.0f
++                           : static_cast<float>(std::max(0.0, elapsed / kHostNoticeFadeIn));
++            }
++            return 0.0f;
++        }
++
++    private:
++        enum class State
++        {
++            Off,    // nothing chosen yet, or after the photo mode
++            Timed,  // for kPhotoCaptionSeconds from m_start
++            Pinned, // with the help bar, from m_start
++            Hidden, // with the help bar, by L3
++        };
++        State m_state = State::Off;
++        double m_start = -1.0;
++    };
++
+     // Foto y repeticion T5: after a car or camera change the free camera starts again from the game's, and follows it
+     // for kPhotoModeFollowSeconds (its cameras settle on the new car; sinceChange: seconds, negative when nothing changed
+     // since it went on) until the player moves it (moved: freeCameraInputMoves since the change); then it stays still.
+@@ -586,6 +772,9 @@ namespace ps2x
+     void requestPhotoModeView(int car, int camera);
+     PhotoModeViewRequest takePhotoModeViewRequest();
+     void showPhotoModeMessage(const std::string &message);
++    // Camaras y pilotos T2: the game's thread tells the driver now chosen (or seen when the photo mode goes on); the
++    // window shows the caption (PhotoCaptionShow) while the photo mode is on.
++    void showPhotoModeCaption(const PhotoModeCaption &caption);
+ 
+     // ps2_pad.cpp (the window's thread): the pad of controles.ini for the free camera (not its keys, as readMenuPad).
+     PhotoModePad readPhotoModePad();
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1dde10f..488d694 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -775,6 +775,12 @@ namespace
+     ps2x::HelpInputMemory g_helpInput; // the window's thread only
+     bool g_helpInputChanged = false;
+     bool g_helpBarToggle = false; // Foto y repeticion T3: L3 pressed (the window's thread only)
++    // Camaras y pilotos T2: the driver's caption of the photo mode goes with the bar: L3 hid it (-1) or brought it back
++    // (1) this frame (the window's thread only).
++    int g_captionHelpToggled = 0;
++    std::mutex g_photoCaptionMutex;
++    ps2x::PhotoModeCaption g_photoCaption;
++    bool g_photoCaptionNew = false;
+ 
+     void ShowHelpBar(HelpBarKind kind)
+     {
+@@ -946,6 +952,13 @@ namespace ps2x
+     {
+         SetPhotoMessage(message);
+     }
++
++    void showPhotoModeCaption(const PhotoModeCaption &caption)
++    {
++        std::lock_guard<std::mutex> lock(g_photoCaptionMutex);
++        g_photoCaption = caption;
++        g_photoCaptionNew = true;
++    }
+ }
+ 
+ // Foto y repeticion T3 (main thread, once per frame): the pad's R3 alone turns the photo mode on and off as
+@@ -1351,8 +1364,9 @@ static void DrawHelpBar()
+     {
+         g_helpBarToggle = false;
+         s_show.toggle(now);
+-        std::cout << "[ayuda] L3: barra " << (s_show.alpha(now + ps2x::kHostNoticeFadeIn) > 0.0f ? "a la vista" : "oculta")
+-                  << std::endl;
++        const bool shown = s_show.alpha(now + ps2x::kHostNoticeFadeIn) > 0.0f;
++        g_captionHelpToggled = shown ? 1 : -1;
++        std::cout << "[ayuda] L3: barra " << (shown ? "a la vista" : "oculta") << std::endl;
+     }
+     const float alpha = s_show.alpha(now);
+     if (!(alpha > 0.0f))
+@@ -1365,6 +1379,42 @@ static void DrawHelpBar()
+                           alpha);
+ }
+ 
++// Camaras y pilotos T2: the driver's caption of the photo mode (main thread, after the help bar, which it keeps clear
++// of): for kPhotoCaptionSeconds after each driver chosen, hidden and brought back with the bar by L3 (PhotoCaptionShow),
++// gone with the photo mode. Over the window only: the photo (the game's frame) never has it.
++static void DrawPhotoCaption()
++{
++    static ps2x::PhotoCaptionShow s_show;
++    static ps2x::PhotoModeCaption s_caption;
++    const double now = GetTime();
++    const int toggled = g_captionHelpToggled;
++    g_captionHelpToggled = 0;
++    bool fresh = false;
++    {
++        std::lock_guard<std::mutex> lock(g_photoCaptionMutex);
++        if (g_photoCaptionNew)
++        {
++            s_caption = g_photoCaption;
++            g_photoCaptionNew = false;
++            fresh = true;
++        }
++    }
++    if (!ps2x::photoModeActive())
++    {
++        s_show.stop();
++        return;
++    }
++    if (toggled != 0)
++        s_show.helpToggled(now, toggled > 0);
++    if (fresh)
++        s_show.show(now);
++    const float alpha = s_show.alpha(now);
++    if (!(alpha > 0.0f))
++        return;
++    const ps2x::PhotoCaptionLines lines = ps2x::photoCaptionLines(s_caption, ps2x::hostLanguage());
++    ps2x::drawHostDriverCaption(lines.position, lines.name, lines.team, alpha);
++}
++
+ // Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest made
+ // uneven pixels). PS2X_FILTRO=0: nearest, as before. Phase 3 (T2): on the desktop ps2x::DisplayPresenter sets the
+ // filter of the frame texture before drawing it; this is the starting one (and the Vita's).
+@@ -3871,6 +3921,7 @@ void PS2Runtime::run()
+         else
+             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+         DrawHelpBar();
++        DrawPhotoCaption();
+         DrawPhotoMessage();
+         // Phase 3 (T3): the UI (the options menu, and the debug panel in development) before the window capture, which
+         // shows the window as the player sees it.
+diff --git a/ps2xTest/src/ps2_game_graphics_tests.cpp b/ps2xTest/src/ps2_game_graphics_tests.cpp
+index effd1d3..d25df99 100644
+--- a/ps2xTest/src/ps2_game_graphics_tests.cpp
++++ b/ps2xTest/src/ps2_game_graphics_tests.cpp
+@@ -676,5 +676,38 @@ void register_ps2_game_graphics_tests()
+             t.IsTrue(ps2x::helpBarNative(bar, noCircle, true, true, true) == false, "still the circle missing");
+             t.IsTrue(ps2x::helpBarNative(bar, all, true, true, true), "with the key cap");
+         });
++
++        tc.Run("the driver's caption: as the replay's (name on white, team on blue), the position on its left",
++               [](TestCase &t)
++        {
++            const ps2x::DriverCaptionLayout l = ps2x::driverCaptionLayout(8.0f, 40.0f, 35.0f, 512.0f);
++            t.Equals(l.position.x, ps2x::kDriverCaptionLeft, "from the help bar's margin");
++            t.Equals(l.position.width, ps2x::kDriverCaptionMinPosition, "a short position: the cell's least width");
++            t.Equals(l.name.x, l.position.x + l.position.width + ps2x::kDriverCaptionGap, "the name after the position");
++            t.Equals(l.name.y, ps2x::kDriverCaptionTop, "as high as the replay's");
++            t.Equals(l.name.width, ps2x::kDriverCaptionMinWidth, "a short name: the replay's width");
++            t.Equals(l.name.height, ps2x::kDriverCaptionNameHeight, "the white row");
++            t.Equals(l.team.y, l.name.y + l.name.height + ps2x::kDriverCaptionSeparator, "the team under it");
++            t.Equals(l.team.width, l.name.width, "as wide as the name");
++            t.Equals(l.team.height, ps2x::kDriverCaptionTeamHeight, "the blue row");
++            t.Equals(l.bottom, l.team.y + l.team.height + ps2x::kDriverCaptionEdge, "its dark edge under the team");
++            t.Equals(l.position.y, l.name.y, "the position as high as both rows");
++            t.Equals(l.position.height, l.bottom - l.name.y, "down to the edge");
++            t.Equals(l.bottom, 483.0f, "where the replay's ends (logs/cyp-t2)");
++
++            const ps2x::DriverCaptionLayout wide = ps2x::driverCaptionLayout(8.0f, 140.0f, 35.0f, 512.0f);
++            t.Equals(wide.name.width, 140.0f + 2.0f * ps2x::kDriverCaptionPadding, "a long name: wider");
++            t.Equals(wide.team.width, wide.name.width, "the team too");
++            const ps2x::DriverCaptionLayout team = ps2x::driverCaptionLayout(8.0f, 40.0f, 150.0f, 512.0f);
++            t.Equals(team.name.width, 150.0f + 2.0f * ps2x::kDriverCaptionPadding, "a long team: both wider");
++
++            const ps2x::DriverCaptionLayout above = ps2x::driverCaptionLayout(8.0f, 40.0f, 35.0f, 430.0f);
++            t.Equals(above.bottom, 430.0f - ps2x::kDriverCaptionAbove, "over a help bar: just above it");
++            t.Equals(above.bottom - above.name.y, l.bottom - l.name.y, "the same size");
++
++            const ps2x::DriverCaptionLayout none = ps2x::driverCaptionLayout(0.0f, 40.0f, 35.0f, 512.0f);
++            t.Equals(none.position.width, 0.0f, "no position: no cell");
++            t.Equals(none.name.x, ps2x::kDriverCaptionLeft, "the name from the margin");
++        });
+     });
+ }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 712d270..460cc0d 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1410,6 +1410,102 @@ void register_ps2_options_menu_tests()
+             t.Equals(photoModeCameraNotice(5, 5, L::English), std::string("TV camera"), "English");
+         });
+ 
++        tc.Run("the race's cameras in the photo mode and the replay: driving, the replay's onboard ones, its TV camera",
++               [](TestCase &t)
++        {
++            using K = ps2x::RaceCameraKind;
++            const ps2x::RaceCameraSet set{5, 4, true};
++            t.Equals(ps2x::raceCameraCount(set), 10, "5 driving, 4 of the replay's onboard, the TV camera");
++            t.Equals(ps2x::raceCameraIndex(set, {K::Driving, 2}), 2, "a driving camera: its mode");
++            t.Equals(ps2x::raceCameraIndex(set, {K::Replay, 0}), 5, "the replay's first after the driving ones");
++            t.Equals(ps2x::raceCameraIndex(set, {K::Tv, 0}), 9, "the TV camera last");
++            t.Equals(ps2x::raceCameraIndex(set, {K::Driving, 5}), -1, "a mode out of range: none");
++            t.Equals(ps2x::raceCameraIndex(set, {K::Replay, -1}), -1, "a negative mode: none");
++            t.Equals(ps2x::raceCameraIndex({5, 0, false}, {K::Tv, 0}), -1, "no TV camera: none");
++            ps2x::RaceCamera c;
++            t.IsTrue(ps2x::raceCameraAt(set, 7, c) && c.kind == K::Replay && c.mode == 2, "7: the replay's third");
++            t.IsTrue(ps2x::raceCameraAt(set, 0, c) && c.kind == K::Driving && c.mode == 0, "0: the first driving one");
++            t.IsTrue(ps2x::raceCameraAt(set, 9, c) && c.kind == K::Tv && c.mode == 0, "9: the TV camera");
++            t.IsFalse(ps2x::raceCameraAt(set, 10, c), "out of range");
++            t.IsFalse(ps2x::raceCameraAt(set, -1, c), "negative");
++
++            using ps2x::stepRaceCamera;
++            t.Equals(stepRaceCamera(2, set, 1), 3, "the next driving camera");
++            t.Equals(stepRaceCamera(4, set, 1), 5, "after the last driving camera, the replay's first");
++            t.Equals(stepRaceCamera(8, set, 1), 9, "after the replay's last onboard, its TV camera (as its triangle)");
++            t.Equals(stepRaceCamera(9, set, 1), 0, "after the TV camera, round to the first driving one");
++            t.Equals(stepRaceCamera(0, set, -1), 9, "back from the first: the TV camera");
++            t.Equals(stepRaceCamera(-1, set, 1), 0, "from another of the game's (the start's): the first");
++            t.Equals(stepRaceCamera(-1, set, -1), 9, "or the last going back");
++            t.Equals(stepRaceCamera(12, set, 1), 0, "out of range: the first");
++            t.Equals(stepRaceCamera(2, set, 0), 2, "no step: the same");
++            t.Equals(stepRaceCamera(3, {0, 4, false}, 1), 0, "only the replay's onboard ones: round them");
++            t.Equals(stepRaceCamera(0, {0, 0, true}, 1), 0, "only the TV camera");
++            t.Equals(stepRaceCamera(0, {}, 1), -1, "no camera: none");
++
++            using L = ps2x::HostLanguage;
++            using ps2x::raceCameraNotice;
++            t.Equals(raceCameraNotice(set, 2, L::Spanish), std::string("C\xC3\xA1mara 3 de 5"), "a driving camera");
++            t.Equals(raceCameraNotice(set, 2, L::English), std::string("Camera 3 of 5"), "English");
++            t.Equals(raceCameraNotice(set, 6, L::Spanish), std::string("C\xC3\xA1mara de repetici\xC3\xB3n 2 de 4"),
++                     "one of the replay's onboard cameras");
++            t.Equals(raceCameraNotice(set, 6, L::English), std::string("Replay camera 2 of 4"), "English");
++            t.Equals(raceCameraNotice(set, 9, L::Spanish), std::string("C\xC3\xA1mara de televisi\xC3\xB3n"),
++                     "the replay's TV camera");
++            t.Equals(raceCameraNotice(set, 9, L::English), std::string("TV camera"), "English");
++            t.Equals(raceCameraNotice(set, 10, L::English), std::string(), "out of range: nothing");
++        });
++
++        tc.Run("the driver's caption in the photo mode: the game's name and team, the race position", [](TestCase &t)
++        {
++            using L = ps2x::HostLanguage;
++            ps2x::PhotoCaptionLines l = ps2x::photoCaptionLines({"Button", "Honda", 3}, L::Spanish);
++            t.Equals(l.position, std::string("3"), "the position");
++            t.Equals(l.name, std::string("Button"), "the name as the game writes it in the replay");
++            t.Equals(l.team, std::string("Honda"), "the team");
++            l = ps2x::photoCaptionLines({"R\xE4ikk\xF6nen", "McLaren Mercedes", 12}, L::English);
++            t.Equals(l.name, std::string("R\xC3\xA4ikk\xC3\xB6nen"), "the game's names are Latin-1: in UTF-8");
++            t.Equals(l.position, std::string("12"), "two figures");
++            t.Equals(ps2x::photoCaptionLines({"Alonso", "Renault", 0}, L::Spanish).position, std::string(),
++                     "no position known: none");
++            t.Equals(ps2x::photoCaptionLines({"", "", 5}, L::Spanish).name, std::string("Coche"), "no name: Coche");
++            t.Equals(ps2x::photoCaptionLines({"", "", 5}, L::English).name, std::string("Car"), "no name: Car");
++            t.Equals(ps2x::photoCaptionLines({"Alonso", "", 1}, L::English).team, std::string(), "no team: none");
++        });
++
++        tc.Run("the driver's caption comes for a while with each driver, hides with the help bar and ends with the mode",
++               [](TestCase &t)
++        {
++            const double in = ps2x::kHostNoticeFadeIn, seconds = ps2x::kPhotoCaptionSeconds;
++            ps2x::PhotoCaptionShow c;
++            t.Equals(c.alpha(1.0), 0.0f, "no driver chosen: nothing");
++            c.show(10.0);
++            t.Equals(c.alpha(10.0 + in), 1.0f, "a driver chosen: on screen");
++            t.Equals(c.alpha(10.0 + seconds - 0.5), 1.0f, "for a while");
++            t.Equals(c.alpha(10.0 + seconds), 0.0f, "then it fades away");
++            c.show(20.0);
++            c.show(21.0);
++            t.Equals(c.alpha(21.0), 1.0f, "another driver while on screen: at once, not faded in again");
++            t.Equals(c.alpha(21.0 + seconds - 1.0), 1.0f, "its seconds again");
++            t.Equals(c.alpha(21.0 + seconds), 0.0f, "then gone");
++            c.helpToggled(22.0, false);
++            t.Equals(c.alpha(22.0), 0.0f, "L3 hides the help bar: the caption too, at once");
++            c.show(23.0);
++            t.Equals(c.alpha(23.0 + in), 0.0f, "hidden by the player: another driver does not bring it back");
++            c.helpToggled(24.0, true);
++            t.Equals(c.alpha(24.0 + in), 1.0f, "L3 brings the help bar back: the caption with it");
++            t.Equals(c.alpha(100.0), 1.0f, "and it stays as the bar does");
++            c.show(101.0);
++            t.Equals(c.alpha(200.0), 1.0f, "another driver: still there");
++            c.helpToggled(201.0, false);
++            t.Equals(c.alpha(201.0), 0.0f, "L3 again: hidden");
++            c.stop();
++            t.Equals(c.alpha(202.0), 0.0f, "the photo mode ended: gone");
++            c.show(300.0);
++            t.Equals(c.alpha(300.0 + in), 1.0f, "a new photo mode: shown again (the hiding was the last one's)");
++            t.IsTrue(seconds >= 3.0 && seconds <= 6.0, "long enough to read, short enough to leave the view clean");
++        });
++
+         tc.Run("after a car or camera change the free camera follows the game's for a while, until it is moved",
+                [](TestCase &t)
+         {

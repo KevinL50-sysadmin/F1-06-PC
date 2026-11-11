@@ -1,0 +1,36 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f413363..615720d 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -789,6 +789,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     // is ready, and with a checkpoint every few dozen EE cycles that was ~10 % of the EE thread in a race. The IOP may
+     // now trail the EE by up to one batch, like a slightly longer SIF latency; run() hands it the rest of the batch
+     // before the EE goes idle. g_ps2AbMode 4 runs it on every call (A/B).
++    // A/B mode 177 (experiment, patch 0200): batches of 1 ms of EE time, to measure the fixed cost of each IOP advance
++    // and whether 1 ms of IOP latency behind the EE is harmless (the step before moving the IOP to a worker thread).
++    // It only stretches the batches made of executed EE cycles: a call that pays real-time debt adds up to 2 ms to the
++    // batch, which then runs at once as with 32 us, and run() still hands the IOP the rest before the EE goes idle.
+     {
+         static const bool s_iopRealTime = []
+         {
+@@ -800,6 +804,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             const char *value = std::getenv("PS2X_IOP_PASO_US");
+             return microsecondsToEeCycles(value != nullptr ? std::strtoull(value, nullptr, 10) : 32u);
+         }();
++        constexpr uint64_t kIopBatchMode177 = microsecondsToEeCycles(1000u);
+         constexpr uint64_t kIopCatchUpPerCall = microsecondsToEeCycles(2000u);
+         constexpr uint64_t kMaxIopDebt = microsecondsToEeCycles(100000u);
+         static uint64_t s_iopDropped = 0u;
+@@ -822,7 +827,11 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             s_iopDropped += catchUp;
+         }
+         g_iopBatchCycles += iopCycles;
+-        if (g_iopBatchCycles >= s_iopBatch || g_ps2AbMode.load(std::memory_order_relaxed) == 4)
++        const bool iopDue = g_iopBatchCycles >= s_iopBatch
++                                ? g_iopBatchCycles >= kIopBatchMode177 ||
++                                      g_ps2AbMode.load(std::memory_order_relaxed) != 177
++                                : g_ps2AbMode.load(std::memory_order_relaxed) == 4;
++        if (iopDue)
+         {
+             const uint64_t batch = g_iopBatchCycles;
+             g_iopBatchCycles = 0u;

@@ -1,0 +1,477 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 23e8836..58d424f 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -18,11 +18,16 @@ struct GSRegisters;
+ //
+ // Scanout: our kernel HLE describes the display in pixels (DISPLAY DW = width - 1, MAGH 0, SMODE1/SMODE2 0), as only
+ // the CPU presenter reads it. The bridge gives paraLLEl-GS hardware registers for one display pixel per scanout pixel
+-// and asks it for each circuit alone (unblended, with alpha), then merges them as the CPU presenter does: same size,
+-// and the same pixels for the same local memory (paraLLEl-GS's own merge takes alpha / 255 for MMOD 0, the CPU and
+-// PCSX2 take min(1, 2 * alpha / 255)). PS2X_GS_GPU_ESCANEO=crudo: the registers as they are, merged by paraLLEl-GS;
+-// =mezcla: translated registers merged by paraLLEl-GS; =vram: the CPU presenter over a copy of the GPU's local
+-// memory (all for diagnosis).
++// and asks it for each circuit alone (unblended, with alpha), merged on the GPU by the DLL (pgs_vsync_composed) as
++// the CPU presenter does: same size, and the same pixels for the same local memory (paraLLEl-GS's own merge takes
++// alpha / 255 for MMOD 0, the CPU and PCSX2 take min(1, 2 * alpha / 255)); only that frame is read back.
++// PS2X_GS_GPU_ESCANEO=cpu: the circuits read back and merged here (patch 0136); =crudo: the registers as they are,
++// merged by paraLLEl-GS; =mezcla: translated registers merged by paraLLEl-GS; =vram: the CPU presenter over a copy of
++// the GPU's local memory (all for diagnosis).
++//
++// One scanout per frame: a queued scanout followed by another one with nothing queued in between (F1 06 changes
++// DISPFB2 and then DISPFB1 at each flip) is dropped, as the CPU GS skips a snapshot while a newer one is queued.
++// PS2X_GS_GPU_FUSIONAR=0 runs them all.
+ //
+ // The GS front-end (gs_frontend.cpp) still parses every GIF packet: it owns CSR/IMR, SIGNAL/FINISH/LABEL and the
+ // state the game waits on. With this backend it also forwards the raw packets and register writes here, and skips
+@@ -89,6 +94,8 @@ public:
+ 
+     // Until every queued command has run on the GS GPU thread.
+     void WaitIdle() const;
++    // Scanouts given to paraLLEl-GS so far (queued ones minus the dropped ones).
++    uint64_t ScanoutsRun() const;
+ 
+     struct Impl;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 00f0d1d..0b415cd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -26,9 +26,9 @@
+ 
+ namespace
+ {
+-    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 2), declared here so that the runtime
++    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 3), declared here so that the runtime
+     // does not depend on the bridge's source tree.
+-    constexpr uint32_t kPgsApiVersion = 2u;
++    constexpr uint32_t kPgsApiVersion = 3u;
+     constexpr size_t kVramSize = 4u * 1024u * 1024u;
+     struct pgs_context;
+     struct PgsCreateInfo
+@@ -46,9 +46,14 @@ namespace
+         const uint8_t *rgba;
+         uint32_t width, height, mode_width, mode_height, interlaced;
+         uint64_t serial;
+-        uint32_t circuits, reserved;
++        uint32_t circuits, composed;
+         uint64_t scanout;
+     };
++    struct PgsComposeInfo
++    {
++        uint32_t struct_size, circuits, ct16, width, height;
++        uint32_t circuit_width[2], circuit_height[2];
++    };
+     struct PgsStats
+     {
+         uint64_t gif_bytes, gif_transfers, vsyncs, frames, fifo_bytes, vram_maps;
+@@ -76,6 +81,7 @@ namespace
+         void (*end_vram_write)(pgs_context *, size_t, size_t);
+         void (*read_transfer_fifo)(pgs_context *, void *, uint32_t);
+         int (*vsync)(pgs_context *, const PgsPrivRegs *, uint32_t, uint32_t);
++        int (*vsync_composed)(pgs_context *, const PgsPrivRegs *, uint32_t, uint32_t, const PgsComposeInfo *);
+         int (*get_frame)(pgs_context *, int, PgsFrame *);
+         void (*get_stats)(pgs_context *, PgsStats *);
+     };
+@@ -181,20 +187,57 @@ namespace
+         return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
+     }
+ 
++    // As hasDisplaySetup (gs_cpu_backend.cpp): an enabled circuit without any display setup is not shown.
++    bool hasSetup(uint64_t dispfb, uint64_t display)
++    {
++        return ((dispfb >> 9u) & 0x3Fu) != 0u || ((display >> 32u) & 0xFFFu) != 0u ||
++               ((display >> 44u) & 0x7FFu) != 0u || ((display >> 23u) & 0xFu) != 0u;
++    }
++
++    // What the CPU presenter shows of request (the rule of composeCircuits, which pgs_vsync_composed replicates on the
++    // GPU): the circuits shown, each one's picture size and the frame's. False when no circuit is shown.
++    bool composeInfoFor(const GSPresentationRequest &request, PgsComposeInfo &info)
++    {
++        info = {};
++        info.struct_size = sizeof(PgsComposeInfo);
++        const bool en1 = (request.pmode & 1u) != 0u && hasSetup(request.dispfb1, request.display1);
++        const bool en2 = (request.pmode & 2u) != 0u && hasSetup(request.dispfb2, request.display2);
++        if (!en1 && !en2)
++            return false;
++        info.circuits = (en1 ? 1u : 0u) | (en2 ? 2u : 0u);
++        info.ct16 = (isCt16(request.dispfb1) ? 1u : 0u) | (isCt16(request.dispfb2) ? 2u : 0u);
++        displaySize(request.display1, info.circuit_width[0], info.circuit_height[0]);
++        displaySize(request.display2, info.circuit_width[1], info.circuit_height[1]);
++        if (en1 && en2)
++        {
++            info.width = std::max(info.circuit_width[0], info.circuit_width[1]);
++            info.height = std::max(info.circuit_height[0], info.circuit_height[1]);
++        }
++        else
++        {
++            info.width = info.circuit_width[en1 ? 0 : 1];
++            info.height = info.circuit_height[en1 ? 0 : 1];
++        }
++        return true;
++    }
++
++    // The buffer a presentation of request shows (PresentationFrame::displayFbp).
++    uint32_t shownFbp(const GSPresentationRequest &request)
++    {
++        const bool en1 = (request.pmode & 1u) != 0u && hasSetup(request.dispfb1, request.display1);
++        return static_cast<uint32_t>((en1 ? request.dispfb1 : request.dispfb2) & 0x1FFu);
++    }
++
+     // The frame the CPU presenter (GSCpuBackend::PresentFromLocalMemory) makes from the same circuits, out of the
+     // circuits paraLLEl-GS scanned out alone (PGS_SCANOUT_SPLIT_CIRCUITS, registers from hardwareDisplay: each display
+     // pixel at the same place of its image): the size from DISPLAY in pixels, BGCOLOR, circuit 2 under circuit 1
+     // unless SLBG, circuit 1 blended with ALP (MMOD 1) or min(255, 2 * its alpha) (MMOD 0, 0x80 = 1.0), alpha 0xFF.
+     // paraLLEl-GS's own merge takes alpha / 255 (0x80 = one half), which blurred F1 06's flicker filter.
++    // PS2X_GS_GPU_ESCANEO=cpu only (diagnosis): by default the DLL merges them on the GPU (pgs_vsync_composed).
+     PresentationFrame composeCircuits(const GSPresentationRequest &request, const uint8_t *images, uint32_t circuits,
+                                       uint32_t imageWidth, uint32_t imageHeight)
+     {
+         PresentationFrame result{};
+-        // As hasDisplaySetup: an enabled circuit without any display setup is not shown.
+-        const auto hasSetup = [](uint64_t dispfb, uint64_t display) {
+-            return ((dispfb >> 9u) & 0x3Fu) != 0u || ((display >> 32u) & 0xFFFu) != 0u ||
+-                   ((display >> 44u) & 0x7FFu) != 0u || ((display >> 23u) & 0xFu) != 0u;
+-        };
+         const uint8_t *crt1 = (circuits & 1u) != 0u ? images : nullptr;
+         const uint8_t *crt2 = (circuits & 2u) != 0u
+                                   ? images + (crt1 != nullptr ? static_cast<size_t>(imageWidth) * imageHeight * 4u : 0u)
+@@ -362,6 +405,20 @@ struct GSGpuBackend::Impl
+     bool scanoutFromVram = false; // PS2X_GS_GPU_ESCANEO=vram: the CPU converts a copy of the GPU's local memory
+     bool translateCrtc = true;    // PS2X_GS_GPU_ESCANEO=crudo: the HLE's CRTC registers as they are
+     bool splitCircuits = true;    // PS2X_GS_GPU_ESCANEO=mezcla: translated, but merged by paraLLEl-GS (before T5)
++    bool composeOnCpu = false;    // PS2X_GS_GPU_ESCANEO=cpu: split, read back and merged here (patch 0136)
++    bool coalesce = true;         // PS2X_GS_GPU_FUSIONAR=0: every queued scanout runs
++
++    // One scanout per presented frame (T6). The game changes DISPFB2 and then DISPFB1 at each flip (F1 06), and each
++    // change queues a scanout of the display it leaves (patch 0104): two per frame, with nothing drawn in between.
++    // The CPU GS skips a snapshot while a newer one is queued (gs_threaded_backend.cpp), so it shows the last one;
++    // here a scanout waits until the next record: another scanout replaces it (same local memory, newer registers),
++    // anything else runs it first. With an idle queue it runs after kCoalesceNs.
++    static constexpr int64_t kCoalesceNs = 8'000'000;
++    bool deferredScanout = false;
++    ScanoutCommand deferred{};
++    int64_t deferredAt = 0;
++    uint64_t scanoutsRun = 0u; // scanouts given to the DLL (GS GPU thread)
++    std::atomic<uint64_t> scanoutsRunShared{0u};
+ 
+     // Reads: a copy of local memory, refreshed when something was queued since.
+     mutable std::mutex readMutex;
+@@ -391,6 +448,7 @@ struct GSGpuBackend::Impl
+     std::atomic<uint64_t> statPackets{0u}, statBytes{0u}, statScanouts{0u}, statFrames{0u};
+     std::atomic<uint64_t> statVramReads{0u}, statVramRefreshes{0u}, statSnapshots{0u}, statLocalToHost{0u};
+     std::atomic<uint64_t> statLocalToHostBytes{0u}, statWaitNs{0u}, statPushNs{0u};
++    uint64_t statCoalesced = 0u, statScanoutNs = 0u, statFrameNs = 0u; // GS GPU thread
+     uint64_t busyNs = 0u; // GS GPU thread
+     int64_t reportAt = 0;
+ 
+@@ -450,11 +508,12 @@ struct GSGpuBackend::Impl
+         lastFrameSerial = frame.serial;
+         statFrames.fetch_add(1u, std::memory_order_relaxed);
+         logFrameSize(frame);
+-        if (frame.circuits != 0u)
++        const bool known = frame.scanout != 0u && frame.scanout <= scanoutsStarted &&
++                           scanoutsStarted - frame.scanout < kScanoutHistory;
++        if (frame.circuits != 0u && frame.composed == 0u)
+         {
+             const uint32_t stacked = (frame.circuits & 1u) + ((frame.circuits >> 1u) & 1u);
+-            if (frame.scanout == 0u || frame.scanout > scanoutsStarted ||
+-                scanoutsStarted - frame.scanout >= kScanoutHistory || frame.height % stacked != 0u)
++            if (!known || frame.height % stacked != 0u)
+                 return;
+             const GSPresentationRequest &request = scanoutRequests[frame.scanout % kScanoutHistory];
+             PresentationFrame composed = composeCircuits(request, frame.rgba, frame.circuits, frame.width,
+@@ -474,7 +533,8 @@ struct GSGpuBackend::Impl
+             for (uint32_t x = 0; x < result.width; ++x)
+                 dst[x * 4u + 3u] = 0xFFu;
+         }
+-        result.displayFbp = static_cast<uint32_t>(lastScanoutRequest.dispfb1 & 0x1FFu);
++        result.displayFbp = frame.composed != 0u && known ? shownFbp(scanoutRequests[frame.scanout % kScanoutHistory])
++                                                          : static_cast<uint32_t>(lastScanoutRequest.dispfb1 & 0x1FFu);
+         result.sourceFbp = result.displayFbp;
+         publish(std::move(result));
+     }
+@@ -495,7 +555,38 @@ struct GSGpuBackend::Impl
+         s_lastCircuits = frame.circuits;
+     }
+ 
++    void deferScanout(const ScanoutCommand &command)
++    {
++        if (!coalesce)
++        {
++            scanout(command);
++            return;
++        }
++        if (deferredScanout)
++            ++statCoalesced; // replaced: nothing was queued in between
++        else
++            deferredAt = nowNs();
++        deferred = command;
++        deferredScanout = true;
++    }
++
++    void runDeferredScanout()
++    {
++        if (!deferredScanout)
++            return;
++        deferredScanout = false;
++        scanout(deferred);
++    }
++
+     void scanout(const ScanoutCommand &command)
++    {
++        const int64_t start = nowNs();
++        runScanout(command);
++        statScanoutNs += static_cast<uint64_t>(nowNs() - start);
++        scanoutsRunShared.store(++scanoutsRun, std::memory_order_release);
++    }
++
++    void runScanout(const ScanoutCommand &command)
+     {
+         statScanouts.fetch_add(1u, std::memory_order_relaxed);
+         lastScanoutRequest = command.request;
+@@ -527,9 +618,28 @@ struct GSGpuBackend::Impl
+             regs.smode2 = 1u; // INT, FFMD 0
+             regs.display1 = hardwareDisplay(request.display1, pal);
+             regs.display2 = hardwareDisplay(request.display2, pal);
+-            if (splitCircuits)
++            if (splitCircuits && composeOnCpu)
+                 flags |= kScanoutSplitCircuits; // merged here as the CPU presenter does (composeCircuits)
++            else if (splitCircuits)
++            {
++                // Merged by the DLL on the GPU as the CPU presenter does; only the frame is read back.
++                PgsComposeInfo compose{};
++                if (!composeInfoFor(request, compose))
++                    return;
++                logRegisters(regs, command.smode1);
++                if (api.vsync_composed(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), flags,
++                                       &compose) == 1)
++                    scanoutRequests[++scanoutsStarted % kScanoutHistory] = request;
++                return;
++            }
+         }
++        logRegisters(regs, command.smode1);
++        if (api.vsync(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), flags) == 1)
++            scanoutRequests[++scanoutsStarted % kScanoutHistory] = request;
++    }
++
++    static void logRegisters(const PgsPrivRegs &regs, uint64_t smode1Register)
++    {
+         static uint32_t s_modeLogs = 0u;
+         static PgsPrivRegs s_lastRegs{};
+         if (std::memcmp(&regs, &s_lastRegs, sizeof(regs)) != 0 && s_modeLogs < 20u)
+@@ -538,14 +648,12 @@ struct GSGpuBackend::Impl
+             std::fprintf(stderr,
+                          "[gs:gpu] escaneo: SMODE1=0x%llx (registro 0x%llx) SMODE2=0x%llx PMODE=0x%llx DISPFB1=0x%llx "
+                          "DISPLAY1=0x%llx DISPFB2=0x%llx DISPLAY2=0x%llx\n",
+-                         static_cast<unsigned long long>(regs.smode1), static_cast<unsigned long long>(command.smode1),
++                         static_cast<unsigned long long>(regs.smode1), static_cast<unsigned long long>(smode1Register),
+                          static_cast<unsigned long long>(regs.smode2), static_cast<unsigned long long>(regs.pmode),
+                          static_cast<unsigned long long>(regs.dispfb1), static_cast<unsigned long long>(regs.display1),
+                          static_cast<unsigned long long>(regs.dispfb2), static_cast<unsigned long long>(regs.display2));
+         }
+         s_lastRegs = regs;
+-        if (api.vsync(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), flags) == 1)
+-            scanoutRequests[++scanoutsStarted % kScanoutHistory] = request;
+     }
+ 
+     void report(int64_t now)
+@@ -564,17 +672,22 @@ struct GSGpuBackend::Impl
+         const uint64_t snapshots = take(statSnapshots), l2h = take(statLocalToHost), l2hBytes = take(statLocalToHostBytes);
+         const uint64_t waitNs = take(statWaitNs), pushNs = take(statPushNs);
+         std::fprintf(stderr,
+-                     "[gs:gpu] 10 s: paquetes=%.0f/s %.2f MB/s escaneos=%.1f/s fotogramas=%.1f/s | lecturas: "
++                     "[gs:gpu] 10 s: paquetes=%.0f/s %.2f MB/s escaneos=%.1f/s (fusionados %.1f/s, %.3f ms cada uno) "
++                     "fotogramas=%.1f/s (%.3f ms cada uno) | lecturas: "
+                      "ReadVram=%llu (copias de VRAM %llu) SnapshotVram=%llu local->host=%llu (%llu bytes) | "
+                      "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms\n",
+                      static_cast<double>(packets) / seconds, static_cast<double>(bytes) / seconds / 1e6,
+-                     static_cast<double>(scanouts) / seconds, static_cast<double>(frames) / seconds,
++                     static_cast<double>(scanouts) / seconds, static_cast<double>(statCoalesced) / seconds,
++                     scanouts != 0u ? static_cast<double>(statScanoutNs) / 1e6 / static_cast<double>(scanouts) : 0.0,
++                     static_cast<double>(frames) / seconds,
++                     frames != 0u ? static_cast<double>(statFrameNs) / 1e6 / static_cast<double>(frames) : 0.0,
+                      static_cast<unsigned long long>(reads), static_cast<unsigned long long>(refreshes),
+                      static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(l2h),
+                      static_cast<unsigned long long>(l2hBytes), static_cast<double>(busyNs) / 1e6,
+                      100.0 * static_cast<double>(busyNs) / static_cast<double>(elapsed),
+                      static_cast<double>(pushNs) / 1e6, static_cast<double>(waitNs) / 1e6);
+         busyNs = 0u;
++        statCoalesced = statScanoutNs = statFrameNs = 0u;
+     }
+ 
+     void process(const std::vector<uint8_t> &records)
+@@ -589,12 +702,14 @@ struct GSGpuBackend::Impl
+             switch (header.kind)
+             {
+             case Kind::Gif:
++                runDeferredScanout();
+                 payloadBytes = header.size;
+                 api.gif_transfer(context, kGifPath, payload, header.size);
+                 // Our front-end parses every packet from its first tag and drops a truncated last one: so here.
+                 api.reset_gif_path(context, kGifPath);
+                 break;
+             case Kind::Register:
++                runDeferredScanout();
+                 api.write_register(context, header.size, header.arg);
+                 break;
+             case Kind::Scanout:
+@@ -602,11 +717,12 @@ struct GSGpuBackend::Impl
+                 payloadBytes = sizeof(ScanoutCommand);
+                 ScanoutCommand command;
+                 std::memcpy(&command, payload, sizeof(command));
+-                scanout(command);
++                deferScanout(command);
+                 break;
+             }
+             case Kind::Call:
+             {
++                runDeferredScanout(); // reads and WaitIdle see every scanout queued before them
+                 auto *call = reinterpret_cast<SyncCall *>(header.arg);
+                 call->fn();
+                 {
+@@ -657,8 +773,14 @@ struct GSGpuBackend::Impl
+                 process(working);
+                 working.clear();
+             }
++            if (deferredScanout && start - deferredAt >= kCoalesceNs)
++                runDeferredScanout();
++            const int64_t pollStart = nowNs();
++            const uint64_t framesBefore = lastFrameSerial;
+             pollFrame();
+             const int64_t end = nowNs();
++            if (lastFrameSerial != framesBefore)
++                statFrameNs += static_cast<uint64_t>(end - pollStart);
+             busyNs += static_cast<uint64_t>(end - start);
+             report(end);
+         }
+@@ -747,6 +869,7 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     resolve(api.end_vram_write, "pgs_end_vram_write");
+     resolve(api.read_transfer_fifo, "pgs_read_transfer_fifo");
+     resolve(api.vsync, "pgs_vsync");
++    resolve(api.vsync_composed, "pgs_vsync_composed");
+     resolve(api.get_frame, "pgs_get_frame");
+     resolve(api.get_stats, "pgs_get_stats");
+     if (!complete || api.api_version() != kPgsApiVersion)
+@@ -760,7 +883,10 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+         impl.scanoutFromVram = std::strcmp(value, "vram") == 0;
+         impl.translateCrtc = std::strcmp(value, "crudo") != 0;
+         impl.splitCircuits = std::strcmp(value, "mezcla") != 0;
++        impl.composeOnCpu = std::strcmp(value, "cpu") == 0;
+     }
++    if (const char *value = std::getenv("PS2X_GS_GPU_FUSIONAR"))
++        impl.coalesce = std::strcmp(value, "0") != 0;
+     if (const char *value = std::getenv("PS2X_GS_GPU_BANDERAS")) // scanout flags of pgs_vsync (diagnosis)
+         impl.scanoutFlags = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+ 
+@@ -967,6 +1093,11 @@ void GSGpuBackend::WaitIdle() const
+     m_impl->runSync([]() {});
+ }
+ 
++uint64_t GSGpuBackend::ScanoutsRun() const
++{
++    return m_impl->scanoutsRunShared.load(std::memory_order_acquire);
++}
++
+ std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend()
+ {
+     if (ps2GsModeFromEnvironment(std::getenv("PS2X_GS")) != GSMode::Gpu)
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index 15a6aea..cf70b9e 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -222,6 +222,20 @@ namespace
+         return {};
+     }
+ 
++    // F1 06's display as our kernel HLE leaves it in the race: SMODE1/SMODE2 0, DISPLAY in pixels (DW 511, MAGH 0),
++    // circuit 2 one line lower (DBY 1) as a flicker filter under circuit 1 (MMOD 0: circuit 1's alpha).
++    GSPresentationRequest f1Request()
++    {
++        GSPresentationRequest request{};
++        request.pmode = 0x8003u; // EN1, EN2, MMOD 0 (circuit 1's alpha), ALP 0x80
++        request.dispfb1 = 8ull << 9u;                    // FBP 0, FBW 8, PSMCT32
++        request.dispfb2 = request.dispfb1 | (1ull << 43u); // DBY 1
++        request.display1 = (511ull << 32u) | (511ull << 44u);
++        request.display2 = (511ull << 32u) | (510ull << 44u);
++        request.bgcolor = 0x203040u;
++        return request;
++    }
++
+     // Same size and the same RGBA in every presented pixel (rows are 640 pixels apart in both).
+     void expectSamePresentation(TestCase &t, const PresentationFrame &cpu, const PresentationFrame &gpu)
+     {
+@@ -422,21 +436,64 @@ void register_ps2_gs_gpu_tests()
+             cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+             backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+ 
+-            // As our kernel HLE leaves them in the race: SMODE1/SMODE2 0, DISPLAY in pixels (DW 511, MAGH 0).
+-            GSPresentationRequest request{};
+-            request.pmode = 0x8003u; // EN1, EN2, MMOD 0 (circuit 1's alpha), ALP 0x80
+-            request.dispfb1 = 8ull << 9u;                    // FBP 0, FBW 8, PSMCT32
+-            request.dispfb2 = request.dispfb1 | (1ull << 43u); // DBY 1
+-            request.display1 = (511ull << 32u) | (511ull << 44u);
+-            request.display2 = (511ull << 32u) | (510ull << 44u);
+-            request.bgcolor = 0x203040u;
+-
++            const GSPresentationRequest request = f1Request();
+             const PresentationFrame expected = cpu.Present(request);
+             t.Equals(expected.width, 512u, "the CPU presents 512 pixels wide");
+             t.Equals(expected.height, 512u, "and 512 lines");
+             expectSamePresentation(t, expected, gpuScanout(*backend, request));
+         });
+ 
++        tc.Run("PS2X_GS_GPU_ESCANEO=cpu merges F1 06's circuits on the CPU into the same frame", [](TestCase &t)
++        {
++            ScopedEnvironment scanoutMode("PS2X_GS_GPU_ESCANEO", "cpu");
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const GSPresentationRequest request = f1Request();
++            expectSamePresentation(t, cpu.Present(request), gpuScanout(*backend, request));
++        });
++
++        tc.Run("two scanouts queued with nothing in between run once, with the newer registers", [](TestCase &t)
++        {
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            GSCpuBackend cpu;
++            cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++
++            // As at an F1 06 flip: DISPFB2 changes first (circuit 2 at another buffer), then DISPFB1.
++            GSPresentationRequest first = f1Request();
++            first.dispfb2 = (first.dispfb2 & ~0x1FFull) | 0x80u;
++            first.bgcolor = 0x102030u;
++            const GSPresentationRequest second = f1Request();
++            const uint64_t before = backend->ScanoutsRun();
++            backend->QueueScanout(first);
++            const PresentationFrame frame = gpuScanout(*backend, second);
++            t.Equals(backend->ScanoutsRun() - before, uint64_t{1}, "one scanout reaches paraLLEl-GS");
++            expectSamePresentation(t, cpu.Present(second), frame);
++        });
++
++        tc.Run("a scanout followed by a register write still runs before it", [](TestCase &t)
++        {
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(512u, 512u);
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            const uint64_t before = backend->ScanoutsRun();
++            backend->QueueScanout(f1Request());
++            backend->WriteRegister(0x3Fu, 0u); // TEXFLUSH: queued between the two scanouts
++            backend->QueueScanout(f1Request());
++            backend->WaitIdle();
++            t.Equals(backend->ScanoutsRun() - before, uint64_t{2}, "both scanouts run");
++        });
++
+         tc.Run("a single 640x448 circuit scans out 1:1 as the CPU presents it", [](TestCase &t)
+         {
+             std::unique_ptr<GSGpuBackend> backend = testGpuBackend();

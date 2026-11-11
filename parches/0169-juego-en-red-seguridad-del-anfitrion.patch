@@ -1,0 +1,1621 @@
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index 018ad49..9e138cb 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -13,6 +13,8 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <deque>
++#include <map>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -43,6 +45,10 @@
+ // AUDIO_PACKET each, which goes out after the control frames and before the video. The guest checks the packets
+ // (AudioReceiver, after the tag), decodes them in its network thread and puts them in the jitter buffer that its audio
+ // device drains.
++// N5: the host takes up to kMaxHandshakes handshakes at once, one per address (a new one from the same address
++// replaces the old), each with kHelloTimeoutMs for its first frame; a wrong password makes the next attempt from the
++// same address wait (1, 2, 4... up to 30 s; nobody else waits); at most kMaxRefusedWaiting refused connections are
++// kept open to read their REJECT; and, unless allowPublicAddresses, only loopback, private and VPN addresses get in.
+ namespace ps2x::netplay
+ {
+     namespace
+@@ -53,7 +59,14 @@ namespace ps2x::netplay
+         constexpr int kIdleTimeoutMs = 5000;      // nothing received for this long: the other side is gone
+         constexpr int kPingIntervalMs = 1000;
+         constexpr int kPadIntervalUs = 16667;     // ~60 Hz
+-        constexpr int kAuthFailureDelayMs = 1000; // no new connection is taken for this long after a wrong password
++        // N5.
++        constexpr int kHelloTimeoutMs = 2000;         // from the connection to its first frame
++        constexpr size_t kMaxHandshakes = 4;          // handshakes at once (one per address)
++        constexpr size_t kMaxRefusedWaiting = 16;     // refused connections kept open to read their REJECT
++        constexpr int kAuthFailureFirstMs = 1000;     // after a wrong password the address waits this, doubled
++        constexpr int kAuthFailureMaxMs = 30000;      // each time up to this
++        constexpr int kAuthFailureMemoryMs = 600000;  // the count starts again after 10 min without failures
++        constexpr size_t kMaxFailureRecords = 256;
+         constexpr int kStatsIntervalMs = 5000;
+         constexpr int kConnectTimeoutMs = 5000;
+         constexpr int kSendTimeoutMs = 2000;
+@@ -229,6 +242,26 @@ namespace ps2x::netplay
+             return (v6 ? "[" + h + "]" : h) + ":" + service;
+         }
+ 
++        // N5: the peer's address bytes (4, or 16 for IPv6; network order) and the key its failures and handshakes go
++        // by (peerKeyOf).
++        std::string peerKey(const sockaddr_storage &address, std::vector<uint8_t> &bytes)
++        {
++            bytes.clear();
++            if (address.ss_family == AF_INET)
++            {
++                const auto *in = reinterpret_cast<const sockaddr_in *>(&address);
++                const auto *v4 = reinterpret_cast<const uint8_t *>(&in->sin_addr);
++                bytes.assign(v4, v4 + 4);
++            }
++            else if (address.ss_family == AF_INET6)
++            {
++                const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(&address);
++                const auto *v6 = reinterpret_cast<const uint8_t *>(&in6->sin6_addr);
++                bytes.assign(v6, v6 + 16);
++            }
++            return peerKeyOf(bytes.data(), bytes.size());
++        }
++
+         void closeSocket(SOCKET &s)
+         {
+             if (s != INVALID_SOCKET)
+@@ -436,11 +469,10 @@ namespace ps2x::netplay
+         std::atomic<uint64_t> padMessages{0};
+         std::atomic<uint64_t> rejected{0};
+ 
+-        // The connection (thread only).
++        // The guest's connection (thread only).
+         enum class Phase
+         {
+             None,
+-            Handshake,
+             Session,
+         };
+         SOCKET client = INVALID_SOCKET;
+@@ -450,19 +482,39 @@ namespace ps2x::netplay
+         Phase phase = Phase::None;
+         MessageAuth auth;
+         FrameReader reader{auth};
+-        std::unique_ptr<HostHandshake> handshake;
+-        Clock::time_point accepted, lastReceived, lastPing, statsStart, acceptAfter;
++        Clock::time_point lastReceived, lastPing, statsStart;
+         uint32_t pingToken = 0;
+         uint64_t statsPads = 0;
+         std::atomic<uint32_t> roundTripMs{0};
+-        // Refused second guests, kept open until they read the REJECT (closing with their HELLO unread would reset
+-        // the connection before it).
++        // N5: the handshakes in progress (thread only), one per peer; the first to finish is the guest.
++        struct Attempt
++        {
++            SOCKET socket = INVALID_SOCKET;
++            std::string address; // "ip:port", for the log
++            std::string peer;    // peerKey()
++            MessageAuth auth;
++            FrameReader reader{auth};
++            std::unique_ptr<HostHandshake> handshake;
++            Clock::time_point accepted, notBefore; // not read before notBefore (a wrong password before it)
++            bool hello = false;                     // its first frame came
++        };
++        std::vector<std::unique_ptr<Attempt>> attempts;
++        // N5: wrong passwords per peer: the next attempt waits until `until`.
++        struct Failure
++        {
++            unsigned count = 0;
++            Clock::time_point until, last;
++        };
++        std::map<std::string, Failure> failures;
++        // Refused connections, kept open until they read the REJECT (closing with their HELLO unread would reset the
++        // connection before it); kMaxRefusedWaiting at most.
+         struct Lingering
+         {
+             SOCKET socket;
+             Clock::time_point until;
+         };
+         std::vector<Lingering> lingering;
++        std::atomic<size_t> refusedCount{0}; // lingering.size(), for any thread
+ 
+         // What leaves during the session, from this thread and the encoder's (io).
+         std::mutex io;
+@@ -496,11 +548,18 @@ namespace ps2x::netplay
+         bool listen(std::string &error);
+         void run();
+         void acceptOne();
++        void refuse(SOCKET s, RejectReason reason);
++        void closeAttempt(size_t index, const std::string &why);
++        size_t attemptIndex(const Attempt *attempt) const;
++        void readAttempt(Attempt *attempt);
++        void recordFailure(const Attempt &attempt);
++        void promote(size_t index);
+         void drop(const std::string &why, bool sendBye, ByeReason reason);
+         bool sendFrame(MessageType type, const uint8_t *payload, size_t size);
+         void flushLocked();
+         bool outputPending();
+         void readClient();
++        void sessionFrames();
+         void onSessionFrame(const Frame &frame);
+         void timers();
+         void lingerTick();
+@@ -550,6 +609,8 @@ namespace ps2x::netplay
+             return true;
+         };
+ 
++        const char *onlyPrivate =
++            settings.allowPublicAddresses ? "" : "; solo acepta direcciones locales, privadas y de VPN";
+         if (settings.listenAddress.empty())
+         {
+             sockaddr_in6 any6{};
+@@ -565,8 +626,8 @@ namespace ps2x::netplay
+                 if (!bindTo(reinterpret_cast<sockaddr *>(&any4), sizeof(any4), AF_INET))
+                     return false;
+             }
+-            logLine("anfitrion escuchando en el puerto TCP %u de todas las interfaces; direcciones de este PC: %s",
+-                    static_cast<unsigned>(port.load()), localAddresses().c_str());
++            logLine("anfitrion escuchando en el puerto TCP %u de todas las interfaces; direcciones de este PC: %s%s",
++                    static_cast<unsigned>(port.load()), localAddresses().c_str(), onlyPrivate);
+             return true;
+         }
+         // --escuchar: a numeric address only (no name lookups).
+@@ -583,8 +644,8 @@ namespace ps2x::netplay
+         }
+         const bool ok = bindTo(list->ai_addr, static_cast<int>(list->ai_addrlen), list->ai_family);
+         if (ok)
+-            logLine("anfitrion escuchando en %s:%u (TCP)", settings.listenAddress.c_str(),
+-                    static_cast<unsigned>(port.load()));
++            logLine("anfitrion escuchando en %s:%u (TCP)%s", settings.listenAddress.c_str(),
++                    static_cast<unsigned>(port.load()), onlyPrivate);
+         freeaddrinfo(list);
+         return ok;
+     }
+@@ -639,19 +700,18 @@ namespace ps2x::netplay
+     bool Host::Impl::sendFrame(MessageType type, const uint8_t *payload, size_t size)
+     {
+         if (phase != Phase::Session)
+-        {
+-            const std::vector<uint8_t> frame = encodeFrame(type, payload, size, nullptr);
+-            return !frame.empty() && sendAll(client, frame);
+-        }
++            return false;
+         std::lock_guard<std::mutex> lock(io);
+         queue.pushControl(type, payload, size);
+         flushLocked();
+         return !sendFailed;
+     }
+ 
++    // Ends the session.
+     void Host::Impl::drop(const std::string &why, bool sendBye, ByeReason reason)
+     {
+-        if (phase == Phase::Session)
++        if (phase != Phase::Session)
++            return;
+         {
+             stopVideo();
+             stopAudio();
+@@ -670,25 +730,19 @@ namespace ps2x::netplay
+             outSent = 0;
+             sendFailed = false;
+         }
+-        if (phase == Phase::Session)
++        clearRemote(this);
++        connected = false;
+         {
+-            clearRemote(this);
+-            connected = false;
+-            {
+-                std::lock_guard<std::mutex> lock(guestAddressMutex);
+-                guestAddress.clear();
+-            }
+-            logLine("invitado %s desconectado (%s); el puerto 2 vuelve a [jugador2] de controles.ini o queda sin mando",
+-                    clientAddress.c_str(), why.c_str());
++            std::lock_guard<std::mutex> lock(guestAddressMutex);
++            guestAddress.clear();
+         }
+-        else
+-            logLine("conexion de %s cerrada en el saludo (%s)", clientAddress.c_str(), why.c_str());
++        logLine("invitado %s desconectado (%s); el puerto 2 vuelve a [jugador2] de controles.ini o queda sin mando",
++                clientAddress.c_str(), why.c_str());
+         {
+             std::lock_guard<std::mutex> lock(io);
+             closeSocket(client);
+         }
+         phase = Phase::None;
+-        handshake.reset();
+         auth.reset();
+         reader.reset();
+     }
+@@ -1060,29 +1114,125 @@ namespace ps2x::netplay
+         if (s == INVALID_SOCKET)
+             return;
+         const std::string address = addressText(reinterpret_cast<sockaddr *>(&from), fromLength);
++        std::vector<uint8_t> bytes;
++        const std::string peer = peerKey(from, bytes);
+         setNonBlocking(s);
+         setNoDelay(s);
+-        if (phase != Phase::None)
++        if (!settings.allowPublicAddresses && !privateNetworkAddress(bytes.data(), bytes.size()))
+         {
+-            uint8_t payload[3] = {static_cast<uint8_t>(RejectReason::Busy), static_cast<uint8_t>(kProtocolVersion & 0xFF),
+-                                  static_cast<uint8_t>(kProtocolVersion >> 8)};
+-            sendAll(s, encodeFrame(MessageType::Reject, payload, sizeof(payload), nullptr));
+-            shutdown(s, SD_SEND);
+-            lingering.push_back({s, Clock::now() + std::chrono::milliseconds(kBusyLingerMs)});
++            refuse(s, RejectReason::Address);
++            logLine("conexion de %s rechazada: direccion publica (red_publicas = 1 o --red-publicas las permite)",
++                    address.c_str());
++            return;
++        }
++        if (phase == Phase::Session)
++        {
++            refuse(s, RejectReason::Busy);
+             logLine("conexion de %s rechazada: ya hay un invitado", address.c_str());
+             return;
+         }
++        const Clock::time_point now = Clock::now();
++        for (size_t i = 0; i < attempts.size(); ++i)
++            if (attempts[i]->peer == peer)
++            {
++                closeAttempt(i, "la sustituye una conexion nueva desde " + address);
++                break;
++            }
++        if (attempts.size() >= kMaxHandshakes)
++        {
++            // Room is made only by an attempt still waiting after a wrong password; otherwise the newcomer goes.
++            size_t oldest = attempts.size();
++            for (size_t i = 0; i < attempts.size(); ++i)
++                if (attempts[i]->notBefore > now &&
++                    (oldest == attempts.size() || attempts[i]->accepted < attempts[oldest]->accepted))
++                    oldest = i;
++            if (oldest == attempts.size())
++            {
++                refuse(s, RejectReason::Busy);
++                logLine("conexion de %s rechazada: ya hay %u saludos en curso", address.c_str(),
++                        static_cast<unsigned>(attempts.size()));
++                return;
++            }
++            closeAttempt(oldest, "deja sitio a " + address);
++        }
+         // A small kernel send buffer: what waits stays in the queue, where control frames pass the video.
+         const int sendBuffer = kSendBufferBytes;
+         setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&sendBuffer), sizeof(sendBuffer));
+-        client = s;
+-        clientAddress = address;
+-        phase = Phase::Handshake;
+-        auth.reset();
+-        reader.reset();
+-        handshake = std::make_unique<HostHandshake>(settings.password, auth);
+-        accepted = lastReceived = Clock::now();
+-        logLine("conexion desde %s: esperando la contrasena", address.c_str());
++        auto attempt = std::make_unique<Attempt>();
++        attempt->socket = s;
++        attempt->address = address;
++        attempt->peer = peer;
++        attempt->handshake = std::make_unique<HostHandshake>(settings.password, attempt->auth);
++        attempt->accepted = attempt->notBefore = now;
++        const auto failure = failures.find(peer);
++        if (failure != failures.end() && failure->second.until > now)
++        {
++            attempt->notBefore = failure->second.until;
++            logLine("conexion desde %s: esperando la contrasena (se lee dentro de %d ms, tras una incorrecta)",
++                    address.c_str(), elapsedMs(now, attempt->notBefore));
++        }
++        else
++            logLine("conexion desde %s: esperando la contrasena", address.c_str());
++        attempts.push_back(std::move(attempt));
++    }
++
++    // REJECT, then the socket waits (kBusyLingerMs) for the other side to read it; with kMaxRefusedWaiting waiting it
++    // closes at once.
++    void Host::Impl::refuse(SOCKET s, RejectReason reason)
++    {
++        const uint8_t payload[3] = {static_cast<uint8_t>(reason), static_cast<uint8_t>(kProtocolVersion & 0xFF),
++                                    static_cast<uint8_t>(kProtocolVersion >> 8)};
++        sendAll(s, encodeFrame(MessageType::Reject, payload, sizeof(payload), nullptr));
++        shutdown(s, SD_SEND);
++        if (lingering.size() >= kMaxRefusedWaiting)
++        {
++            closesocket(s);
++            return;
++        }
++        lingering.push_back({s, Clock::now() + std::chrono::milliseconds(kBusyLingerMs)});
++        refusedCount = lingering.size();
++    }
++
++    void Host::Impl::closeAttempt(size_t index, const std::string &why)
++    {
++        Attempt &a = *attempts[index];
++        logLine("conexion de %s cerrada en el saludo (%s)", a.address.c_str(), why.c_str());
++        closeSocket(a.socket);
++        attempts.erase(attempts.begin() + static_cast<std::ptrdiff_t>(index));
++    }
++
++    size_t Host::Impl::attemptIndex(const Attempt *attempt) const
++    {
++        for (size_t i = 0; i < attempts.size(); ++i)
++            if (attempts[i].get() == attempt)
++                return i;
++        return attempts.size();
++    }
++
++    void Host::Impl::recordFailure(const Attempt &attempt)
++    {
++        ++rejected;
++        const Clock::time_point now = Clock::now();
++        auto found = failures.find(attempt.peer);
++        if (found == failures.end())
++        {
++            if (failures.size() >= kMaxFailureRecords)
++                for (auto i = failures.begin(); i != failures.end();)
++                    i = elapsedMs(i->second.last, now) > kAuthFailureMemoryMs ? failures.erase(i) : std::next(i);
++            if (failures.size() >= kMaxFailureRecords)
++                failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto &a, const auto &b)
++                                                { return a.second.last < b.second.last; }));
++            found = failures.emplace(attempt.peer, Failure{}).first;
++        }
++        Failure &f = found->second;
++        if (f.count > 0 && elapsedMs(f.last, now) > kAuthFailureMemoryMs)
++            f.count = 0;
++        ++f.count;
++        f.last = now;
++        const int delay = std::min(kAuthFailureFirstMs << std::min(f.count - 1u, 5u), kAuthFailureMaxMs);
++        f.until = now + std::chrono::milliseconds(delay);
++        logLine("contrasena incorrecta desde %s: su direccion espera %d ms al siguiente intento", attempt.address.c_str(),
++                delay);
+     }
+ 
+     void Host::Impl::onSessionFrame(const Frame &frame)
+@@ -1154,8 +1304,13 @@ namespace ps2x::netplay
+             drop(std::string("mensaje no valido: ") + frameErrorText(reader.error()), true, ByeReason::Protocol);
+             return;
+         }
++        sessionFrames();
++    }
++
++    void Host::Impl::sessionFrames()
++    {
+         Frame frame;
+-        while (client != INVALID_SOCKET)
++        while (phase == Phase::Session)
+         {
+             const FrameReader::Result result = reader.next(frame);
+             if (result == FrameReader::Result::NeedMore)
+@@ -1165,72 +1320,128 @@ namespace ps2x::netplay
+                 drop(std::string("mensaje no valido: ") + frameErrorText(reader.error()), true, ByeReason::Protocol);
+                 return;
+             }
+-            if (phase == Phase::Session)
++            onSessionFrame(frame);
++        }
++    }
++
++    void Host::Impl::readAttempt(Attempt *attempt)
++    {
++        uint8_t buffer[512];
++        const int n = receiveSome(attempt->socket, buffer, sizeof(buffer));
++        if (n == -1)
++            return;
++        if (n <= 0)
++        {
++            closeAttempt(attemptIndex(attempt), n == 0 ? "cerro la conexion" : "error de red");
++            return;
++        }
++        if (!attempt->reader.feed(buffer, static_cast<size_t>(n)))
++        {
++            closeAttempt(attemptIndex(attempt),
++                         std::string("mensaje no valido: ") + frameErrorText(attempt->reader.error()));
++            return;
++        }
++        Frame frame;
++        for (;;)
++        {
++            const FrameReader::Result result = attempt->reader.next(frame);
++            if (result == FrameReader::Result::NeedMore)
++                return;
++            if (result == FrameReader::Result::Error)
+             {
+-                onSessionFrame(frame);
+-                continue;
++                closeAttempt(attemptIndex(attempt),
++                             std::string("mensaje no valido: ") + frameErrorText(attempt->reader.error()));
++                return;
+             }
++            attempt->hello = true;
+             std::vector<std::vector<uint8_t>> out;
+-            const HostHandshake::Result step = handshake->onFrame(frame, out);
++            const HostHandshake::Result step = attempt->handshake->onFrame(frame, out);
+             for (const std::vector<uint8_t> &bytes : out)
+-                sendAll(client, bytes);
++                sendAll(attempt->socket, bytes);
+             if (step == HostHandshake::Result::Accepted)
+             {
+-                phase = Phase::Session;
+-                handshake.reset();
+-                {
+-                    std::lock_guard<std::mutex> lock(guestAddressMutex);
+-                    guestAddress = clientAddress;
+-                }
+-                connected = true;
+-                lastPing = statsStart = Clock::now();
+-                statsPads = 0;
+-                setRemote(this, PadWire{});
+-                logLine("invitado conectado desde %s: es el jugador 2 (puerto 2 conectado al mando remoto)",
+-                        clientAddress.c_str());
+-                {
+-                    std::lock_guard<std::mutex> lock(io);
+-                    queue.clear();
+-                    out.clear();
+-                    outSent = 0;
+-                    sendFailed = false;
+-                    sessionOpen = true;
+-                }
+-                startVideo();
+-                startAudio();
+-            }
+-            else if (step == HostHandshake::Result::Rejected)
+-            {
+-                if (handshake->rejectReason() == RejectReason::Password)
+-                {
+-                    ++rejected;
+-                    acceptAfter = Clock::now() + std::chrono::milliseconds(kAuthFailureDelayMs);
+-                    logLine("contrasena incorrecta desde %s: conexion rechazada", clientAddress.c_str());
+-                }
+-                const std::string why = handshake->reason();
+-                drop(why, false, ByeReason::Protocol);
++                promote(attemptIndex(attempt));
+                 return;
+             }
+-            else if (step == HostHandshake::Result::Invalid)
++            if (step == HostHandshake::Result::Rejected || step == HostHandshake::Result::Invalid)
+             {
+-                const std::string why = handshake->reason();
+-                drop(why, false, ByeReason::Protocol);
++                if (step == HostHandshake::Result::Rejected &&
++                    attempt->handshake->rejectReason() == RejectReason::Password)
++                    recordFailure(*attempt);
++                const std::string why = attempt->handshake->reason();
++                closeAttempt(attemptIndex(attempt), why);
+                 return;
+             }
+         }
+     }
+ 
+-    void Host::Impl::timers()
++    // The attempt is the guest: its socket, tags and unread frames become the session's; the other attempts are
++    // refused.
++    void Host::Impl::promote(size_t index)
+     {
+-        if (phase == Phase::None)
++        Attempt &a = *attempts[index];
++        const std::vector<uint8_t> leftover = a.reader.takePending();
++        failures.erase(a.peer);
++        client = a.socket;
++        a.socket = INVALID_SOCKET;
++        clientAddress = a.address;
++        auth = a.auth;
++        reader.reset();
++        for (size_t i = 0; i < attempts.size(); ++i)
++            if (i != index)
++            {
++                refuse(attempts[i]->socket, RejectReason::Busy);
++                logLine("conexion de %s rechazada: ya hay un invitado", attempts[i]->address.c_str());
++            }
++        attempts.clear();
++
++        phase = Phase::Session;
++        {
++            std::lock_guard<std::mutex> lock(guestAddressMutex);
++            guestAddress = clientAddress;
++        }
++        connected = true;
++        lastReceived = lastPing = statsStart = Clock::now();
++        statsPads = 0;
++        setRemote(this, PadWire{});
++        logLine("invitado conectado desde %s: es el jugador 2 (puerto 2 conectado al mando remoto)",
++                clientAddress.c_str());
++        {
++            std::lock_guard<std::mutex> lock(io);
++            queue.clear();
++            out.clear();
++            outSent = 0;
++            sendFailed = false;
++            sessionOpen = true;
++        }
++        startVideo();
++        startAudio();
++        if (leftover.empty())
+             return;
+-        const Clock::time_point now = Clock::now();
+-        if (phase == Phase::Handshake)
++        if (!reader.feed(leftover.data(), leftover.size()))
+         {
+-            if (elapsedMs(accepted, now) > kHandshakeTimeoutMs)
+-                drop("saludo sin terminar en 5 s", false, ByeReason::Timeout);
++            drop(std::string("mensaje no valido: ") + frameErrorText(reader.error()), true, ByeReason::Protocol);
+             return;
+         }
++        sessionFrames();
++    }
++
++    void Host::Impl::timers()
++    {
++        const Clock::time_point now = Clock::now();
++        for (size_t i = 0; i < attempts.size();)
++        {
++            const Attempt &a = *attempts[i];
++            const Clock::time_point from = std::max(a.accepted, a.notBefore); // a parked one is not counted yet
++            if (now >= from && !a.hello && elapsedMs(from, now) > kHelloTimeoutMs)
++                closeAttempt(i, "sin HELLO en 2 s");
++            else if (now >= from && elapsedMs(from, now) > kHandshakeTimeoutMs)
++                closeAttempt(i, "saludo sin terminar en 5 s");
++            else
++                ++i;
++        }
++        if (phase != Phase::Session)
++            return;
+         if (elapsedMs(lastReceived, now) > kIdleTimeoutMs)
+         {
+             drop("tiempo agotado: nada recibido en 5 s", true, ByeReason::Timeout);
+@@ -1319,9 +1530,10 @@ namespace ps2x::netplay
+         {
+             uint8_t scratch[256];
+             int n = 0;
+-            while ((n = recv(lingering[i].socket, reinterpret_cast<char *>(scratch), sizeof(scratch), 0)) > 0)
+-            {
+-            }
++            // A bounded drain per tick: a refused peer that keeps sending cannot hold the network thread.
++            for (int reads = 0; reads < 16; ++reads)
++                if ((n = recv(lingering[i].socket, reinterpret_cast<char *>(scratch), sizeof(scratch), 0)) <= 0)
++                    break;
+             const bool closed = n == 0 || (n == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK);
+             if (closed || now >= lingering[i].until)
+             {
+@@ -1331,6 +1543,7 @@ namespace ps2x::netplay
+             else
+                 ++i;
+         }
++        refusedCount = lingering.size();
+     }
+ 
+     void Host::Impl::run()
+@@ -1340,19 +1553,19 @@ namespace ps2x::netplay
+             fd_set readable, writable;
+             FD_ZERO(&readable);
+             FD_ZERO(&writable);
+-            const bool canAccept = Clock::now() >= acceptAfter;
+-            if (canAccept)
+-                FD_SET(listener, &readable);
++            FD_SET(listener, &readable);
+             if (client != INVALID_SOCKET)
+             {
+                 FD_SET(client, &readable);
+                 if (phase == Phase::Session && outputPending())
+                     FD_SET(client, &writable);
+             }
++            const Clock::time_point now = Clock::now();
++            for (const std::unique_ptr<Attempt> &a : attempts)
++                if (now >= a->notBefore) // a parked one is not read (its HELLO waits in the kernel)
++                    FD_SET(a->socket, &readable);
+             timeval wait{0, kPollMs * 1000};
+-            if (readable.fd_count == 0)
+-                std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+-            else if (select(0, &readable, writable.fd_count > 0 ? &writable : nullptr, nullptr, &wait) > 0)
++            if (select(0, &readable, writable.fd_count > 0 ? &writable : nullptr, nullptr, &wait) > 0)
+             {
+                 if (client != INVALID_SOCKET && FD_ISSET(client, &writable))
+                 {
+@@ -1361,7 +1574,14 @@ namespace ps2x::netplay
+                 }
+                 if (client != INVALID_SOCKET && FD_ISSET(client, &readable))
+                     readClient();
+-                if (canAccept && FD_ISSET(listener, &readable))
++                std::vector<Attempt *> ready;
++                for (const std::unique_ptr<Attempt> &a : attempts)
++                    if (FD_ISSET(a->socket, &readable))
++                        ready.push_back(a.get());
++                for (Attempt *a : ready)
++                    if (attemptIndex(a) < attempts.size()) // not closed or promoted by one before it
++                        readAttempt(a);
++                if (FD_ISSET(listener, &readable))
+                     acceptOne();
+             }
+             timers();
+@@ -1369,9 +1589,13 @@ namespace ps2x::netplay
+         }
+         if (client != INVALID_SOCKET)
+             drop("el anfitrion para", true, ByeReason::Shutdown);
++        for (std::unique_ptr<Attempt> &a : attempts)
++            closeSocket(a->socket);
++        attempts.clear();
+         for (Lingering &l : lingering)
+             closesocket(l.socket);
+         lingering.clear();
++        refusedCount = 0;
+         closeSocket(listener);
+     }
+ 
+@@ -1385,17 +1609,16 @@ namespace ps2x::netplay
+     bool Host::start(const HostSettings &settings, std::string &error)
+     {
+         stop();
+-        if (settings.password.size() < kMinPasswordSize || settings.password.size() > kMaxPasswordSize)
++        if (settings.password.size() < kMinHostPasswordSize || settings.password.size() > kMaxPasswordSize)
+         {
+-            error = "contrasena de longitud no valida";
++            error = "la contrasena debe tener entre " + std::to_string(kMinHostPasswordSize) + " y " +
++                    std::to_string(kMaxPasswordSize) + " caracteres";
+             return false;
+         }
+         m_impl->settings = settings;
++        m_impl->failures.clear();
+         if (!m_impl->listen(error))
+             return false;
+-        if (settings.password.size() < 8)
+-            logLine("aviso: contrasena corta (%u caracteres); mejor 8 o mas",
+-                    static_cast<unsigned>(settings.password.size()));
+         m_impl->running = true;
+         m_impl->thread = std::thread([impl = m_impl.get()] { impl->run(); });
+         return true;
+@@ -1436,6 +1659,11 @@ namespace ps2x::netplay
+         return m_impl->rejected;
+     }
+ 
++    size_t Host::refusedWaiting() const
++    {
++        return m_impl->refusedCount;
++    }
++
+     HostVideoStats Host::videoStats() const
+     {
+         std::lock_guard<std::mutex> lock(m_impl->statsMutex);
+@@ -2165,6 +2393,7 @@ namespace ps2x::netplay
+     std::string Host::guestAddress() const { return {}; }
+     uint64_t Host::padMessages() const { return 0; }
+     uint64_t Host::rejectedLogins() const { return 0; }
++    size_t Host::refusedWaiting() const { return 0; }
+     HostVideoStats Host::videoStats() const { return {}; }
+     HostAudioStats Host::audioStats() const { return {}; }
+     struct Guest::Impl
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.h b/ps2xRuntime/src/lib/ps2_netplay.h
+index bc0acc4..e19b403 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.h
++++ b/ps2xRuntime/src/lib/ps2_netplay.h
+@@ -36,6 +36,7 @@ namespace ps2x::netplay
+         std::string password;
+         HostVideoSettings video;
+         HostAudioSettings audio;
++        bool allowPublicAddresses = false; // guests from addresses outside privateNetworkAddress()
+     };
+ 
+     struct HostAudioStats
+@@ -74,6 +75,7 @@ namespace ps2x::netplay
+         std::string guestAddress() const; // N4: "1.2.3.4:5" while a guest is connected, else empty
+         uint64_t padMessages() const;
+         uint64_t rejectedLogins() const;
++        size_t refusedWaiting() const; // refused connections kept open until they read their REJECT
+         HostVideoStats videoStats() const;
+         HostAudioStats audioStats() const;
+ 
+@@ -180,7 +182,7 @@ namespace ps2x::netplay
+ 
+     // Guest mode of F1-06.exe: its window (state of the connection) and the local pad (player 1 of the guest's own
+     // controles.ini) sent to the host. Returns the process exit code. N4: askFirst (--invitado without an address or a
+-    // password) shows a form first (address, port, password; the last address and port from configed.ini), and
++    // password) shows a form first (address, port, password; the last address and port from config\red.ini), and
+     // again after a session ends.
+     int runGuestWindow(const GuestSettings &settings, bool askFirst = false);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index 2682c94..f756f71 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -82,6 +82,31 @@ namespace ps2x::netplay
+             return out.empty() ? "-" : out;
+         }
+ 
++        // N5: a line broken at spaces so each piece is at most width wide (raylib draws '\n' as a new line); the
++        // host's longer reasons (red_publicas) do not fit in one.
++        template <typename Measure>
++        std::string wrapped(const std::string &text, float width, Measure measure)
++        {
++            std::string out, line;
++            for (size_t start = 0;;)
++            {
++                const size_t space = text.find(' ', start);
++                const std::string word = text.substr(start, space == std::string::npos ? space : space - start);
++                const std::string longer = line.empty() ? word : line + " " + word;
++                if (!line.empty() && measure(longer) > width)
++                {
++                    out += line + "\n";
++                    line = word;
++                }
++                else
++                    line = longer;
++                if (space == std::string::npos)
++                    break;
++                start = space + 1;
++            }
++            return out + line;
++        }
++
+         // The connection screen (before the first picture, or when the session ends). canReturn: the form is there.
+         void drawStatus(const GuestStatus &status, const PadWire &wire, int screenHeight, bool canReturn)
+         {
+@@ -94,7 +119,9 @@ namespace ps2x::netplay
+                                          ? YELLOW
+                                          : RED;
+             DrawText(stateName(status.state), 24, 100, 32, stateColor);
+-            DrawText(status.text.c_str(), 24, 142, 18, RAYWHITE);
++            const auto measure = [](const std::string &s) { return static_cast<float>(MeasureText(s.c_str(), 18)); };
++            const std::string text = wrapped(status.text, static_cast<float>(GetScreenWidth() - 48), measure);
++            DrawText(text.c_str(), 24, 142, 18, RAYWHITE);
+             if (status.state == GuestState::Connected)
+             {
+                 DrawText(TextFormat("Ida y vuelta: %u ms", static_cast<unsigned>(status.roundTripMs)), 24, 176, 18,
+@@ -227,7 +254,11 @@ namespace ps2x::netplay
+             text("Conectar", button.x + (button.width - size.x) * 0.5f, button.y + (button.height - size.y) * 0.5f, 24,
+                  RAYWHITE);
+             if (!form.error.empty())
+-                text(form.error.c_str(), 24, button.y + button.height + 18, 20, Color{255, 110, 110, 255});
++            {
++                const auto measure = [&](const std::string &s) { return MeasureTextEx(font, s.c_str(), 20, 1.0f).x; };
++                const std::string error = wrapped(form.error, static_cast<float>(GetScreenWidth() - 48), measure);
++                text(error.c_str(), 24, button.y + button.height + 18, 20, Color{255, 110, 110, 255});
++            }
+             text("Tab o flechas: cambiar de campo  ·  Intro: conectar  ·  Ctrl+V: pegar  ·  F4: ver la contraseña", 24,
+                  static_cast<float>(screenHeight) - 92, 18, LIGHTGRAY);
+             text("El anfitrión ve su dirección, su puerto y la contraseña en su menú F2 > Juego en red.", 24,
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+index 5fe83ce..5d0818f 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdio>
+ #include <cstring>
+ 
+ // Fase 5 (T15, netplay N1, N2, N3): see ps2_netplay_protocol.h.
+@@ -121,6 +122,7 @@ namespace ps2x::netplay
+         case RejectReason::Password: return "contrasena incorrecta";
+         case RejectReason::Busy: return "el anfitrion ya tiene un invitado";
+         case RejectReason::Protocol: return "mensaje no valido";
++        case RejectReason::Address: return "el anfitrion solo acepta redes locales y VPN privadas (red_publicas)";
+         }
+         return "motivo desconocido";
+     }
+@@ -331,6 +333,13 @@ namespace ps2x::netplay
+         m_error = FrameError::None;
+     }
+ 
++    std::vector<uint8_t> FrameReader::takePending()
++    {
++        std::vector<uint8_t> out;
++        out.swap(m_pending);
++        return out;
++    }
++
+     HostHandshake::HostHandshake(std::string password, MessageAuth &auth, RandomSource random)
+         : m_password(std::move(password)), m_auth(auth), m_random(std::move(random))
+     {
+@@ -1015,11 +1024,57 @@ namespace ps2x::netplay
+         return true;
+     }
+ 
++    std::string peerKeyOf(const uint8_t *address, size_t size)
++    {
++        static const uint8_t kMapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
++        const uint8_t *v4 = nullptr;
++        if (size == 4)
++            v4 = address;
++        else if (size == 16 && std::memcmp(address, kMapped, sizeof(kMapped)) == 0)
++            v4 = address + 12;
++        if (v4 != nullptr)
++            return std::to_string(v4[0]) + "." + std::to_string(v4[1]) + "." + std::to_string(v4[2]) + "." +
++                   std::to_string(v4[3]);
++        if (size != 16)
++            return "?";
++        const bool whole = privateNetworkAddress(address, size);
++        std::string key;
++        for (size_t g = 0; g < (whole ? 8u : 4u); ++g)
++        {
++            char group[8];
++            std::snprintf(group, sizeof(group), "%x", (address[g * 2] << 8) | address[g * 2 + 1]);
++            key += (g == 0 ? "" : ":") + std::string(group);
++        }
++        return whole ? key : key + "::/64";
++    }
++
++    bool privateNetworkAddress(const uint8_t *address, size_t size)
++    {
++        if (address == nullptr)
++            return false;
++        if (size == 16)
++        {
++            static const uint8_t kMapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
++            if (std::memcmp(address, kMapped, sizeof(kMapped)) == 0)
++                return privateNetworkAddress(address + 12, 4);
++            static const uint8_t kLoopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
++            return std::memcmp(address, kLoopback, sizeof(kLoopback)) == 0 ||
++                   (address[0] & 0xFE) == 0xFC ||                         // fc00::/7
++                   (address[0] == 0xFE && (address[1] & 0xC0) == 0x80); // fe80::/10
++        }
++        if (size != 4)
++            return false;
++        const uint8_t a = address[0], b = address[1];
++        return a == 127 || a == 10 || (a == 172 && (b & 0xF0) == 16) || (a == 192 && b == 168) ||
++               (a == 169 && b == 254) || (a == 100 && (b & 0xC0) == 64);
++    }
++
+     bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
+                                std::string &error)
+     {
+         std::vector<std::string> rest;
+         bool host = false, guest = false, portGiven = false, listenGiven = false, passwordGiven = false;
++        bool publicGiven = false;
+         bool videoGiven = false, audioGiven = false;
+         std::string guestAddress, portText, heightText, kbpsText, codecText, audioCodecText, audioKbpsText;
+         for (size_t i = 0; i < args.size(); ++i)
+@@ -1056,6 +1111,8 @@ namespace ps2x::netplay
+                 if (!value(options.listenAddress))
+                     return false;
+             }
++            else if (a == "--red-publicas")
++                publicGiven = true;
+             else if (a == "--clave")
+             {
+                 passwordGiven = true;
+@@ -1079,9 +1136,10 @@ namespace ps2x::netplay
+         }
+         if (!host && !guest)
+         {
+-            if (portGiven || listenGiven || passwordGiven || videoGiven || audioGiven)
++            if (portGiven || listenGiven || passwordGiven || videoGiven || audioGiven || publicGiven)
+             {
+-                error = "--puerto, --escuchar, --clave, --imagen-* y --sonido-* van con --anfitrion o --invitado";
++                error = "--puerto, --escuchar, --red-publicas, --clave, --imagen-* y --sonido-* van con --anfitrion o "
++                        "--invitado";
+                 return false;
+             }
+             options.mode = NetplayMode::Off;
+@@ -1097,6 +1155,11 @@ namespace ps2x::netplay
+             error = "--escuchar es solo para el anfitrion";
+             return false;
+         }
++        if (guest && publicGiven)
++        {
++            error = "--red-publicas es solo para el anfitrion";
++            return false;
++        }
+         if (guest && videoGiven)
+         {
+             error = "--imagen-alto, --imagen-kbps y --imagen-codec son solo para el anfitrion";
+@@ -1195,13 +1258,17 @@ namespace ps2x::netplay
+         // N4: a guest without an address or a password fills the form (a password given must still be valid).
+         options.guestForm = guest && (guestAddress.empty() || options.password.empty());
+         const bool passwordMissing = options.guestForm && options.password.empty();
++        // N5: the host's own password has 8 or more (it can be guessed offline from a recorded handshake).
++        const size_t minPassword = host ? kMinHostPasswordSize : kMinPasswordSize;
+         if (!passwordMissing &&
+-            (options.password.size() < kMinPasswordSize || options.password.size() > kMaxPasswordSize))
++            (options.password.size() < minPassword || options.password.size() > kMaxPasswordSize))
+         {
+-            error = "la contrasena (--clave o PS2X_RED_CLAVE) debe tener entre " + std::to_string(kMinPasswordSize) +
+-                    " y " + std::to_string(kMaxPasswordSize) + " caracteres";
++            error = std::string(host ? "la contrasena del anfitrion" : "la contrasena") +
++                    " (--clave o PS2X_RED_CLAVE) debe tener entre " + std::to_string(minPassword) + " y " +
++                    std::to_string(kMaxPasswordSize) + " caracteres";
+             return false;
+         }
++        options.allowPublicAddresses = publicGiven;
+         options.mode = host ? NetplayMode::Host : NetplayMode::Guest;
+         args = std::move(rest);
+         return true;
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.h b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+index 0c427a9..3d1335a 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_protocol.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+@@ -63,6 +63,7 @@ namespace ps2x::netplay
+     constexpr size_t kMaxOpusPacketData = 1275;  // one Opus frame (RFC 6716, 3.4)
+     constexpr uint32_t kKeyIterations = 20000;
+     constexpr size_t kMinPasswordSize = 4;
++    constexpr size_t kMinHostPasswordSize = 8; // the host's own (generated ones have 8); the guest types any of 4+
+     constexpr size_t kMaxPasswordSize = 256;
+     constexpr char kMagic[8] = {'F', '1', '-', '0', '6', 'N', 'P', '\0'};
+ 
+@@ -91,6 +92,7 @@ namespace ps2x::netplay
+         Password = 2,
+         Busy = 3,
+         Protocol = 4,
++        Address = 5, // N5: a public address, and the host takes only private and VPN ones (red_publicas)
+     };
+ 
+     enum class ByeReason : uint8_t
+@@ -195,6 +197,8 @@ namespace ps2x::netplay
+         void finish();
+         FrameError error() const { return m_error; }
+         void reset();
++        // N5: the bytes not taken yet (the reader keeps none), for a reader that goes on with the same stream.
++        std::vector<uint8_t> takePending();
+ 
+         // Two whole frames: the reader is drained after every read of at most kMaxFrame bytes.
+         static constexpr size_t kPendingLimit = 2 * kMaxFrame;
+@@ -498,7 +502,7 @@ namespace ps2x::netplay
+     };
+ 
+     // Command line of the netplay (the game's other arguments stay in args, in order):
+-    //   --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
++    //   --anfitrion [--escuchar <address>] [--puerto N] [--red-publicas] --clave <password>
+     //   --invitado <address>[:port] [--puerto N] --clave <password>
+     // N4: --invitado without an address or without a password (none in PS2X_RED_CLAVE either) is guestForm: the
+     // guest's window asks for what is missing.
+@@ -507,8 +511,9 @@ namespace ps2x::netplay
+     // in that order; no = no picture).
+     // The host's sound (N3): [--sonido-codec auto|opus|pcm|no] (default auto: Opus if it opens, else PCM; no = no
+     // sound) [--sonido-kbps N] (32..256; default 128; Opus only).
+-    // Without --clave the password comes from environmentPassword (PS2X_RED_CLAVE), if any. Returns false with
+-    // error set when a netplay argument is wrong.
++    // Without --clave the password comes from environmentPassword (PS2X_RED_CLAVE), if any. The host's has
++    // kMinHostPasswordSize characters or more, the guest's kMinPasswordSize. N5: --red-publicas (host only) lets
++    // guests from public addresses in. Returns false with error set when a netplay argument is wrong.
+     enum class NetplayMode
+     {
+         Off,
+@@ -524,6 +529,7 @@ namespace ps2x::netplay
+         uint16_t port = kDefaultPort;
+         std::string password;
+         bool guestForm = false; // N4: --invitado without an address or a password: the guest's window asks first
++        bool allowPublicAddresses = false; // host: --red-publicas (guests from outside private/VPN ranges)
+         uint16_t videoHeight = 540;
+         uint32_t videoKbps = 8000;
+         std::string videoCodec = "auto";
+@@ -531,6 +537,15 @@ namespace ps2x::netplay
+         uint32_t audioKbps = 128;
+     };
+ 
++    // A peer address (4 or 16 bytes, network order) of a loopback, private, link-local or VPN range: 127/8, 10/8,
++    // 172.16/12, 192.168/16, 169.254/16, 100.64/10 (Tailscale, CGNAT), ::1, fc00::/7 (ZeroTier, Tailscale), fe80::/10
++    // and IPv4-mapped forms of them. Hamachi (25/8) and Radmin VPN (26/8) are public ranges.
++    bool privateNetworkAddress(const uint8_t *address, size_t size);
++    // The key a peer's handshakes and wrong passwords go by: the IPv4 address (also of an IPv4-mapped one), the whole
++    // IPv6 address on a private network (machines of one LAN or tailnet share a /64), or the /64 prefix of a public
++    // IPv6 address (one machine has many). "?" for anything else.
++    std::string peerKeyOf(const uint8_t *address, size_t size);
++
+     bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
+                                std::string &error);
+     // "1.2.3.4", "1.2.3.4:5000", "name:5000", "[::1]:5000", "::1" (a bare IPv6 address has no port).
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+index 6b84299..b72315b 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -282,6 +282,7 @@ namespace ps2x::netplay
+             HostSettings host{settings.listenAddress, settings.port, status.password};
+             host.video = settings.video;
+             host.audio = settings.audio;
++            host.allowPublicAddresses = settings.allowPublicAddresses;
+             status.hosting = m_impl->host.start(host, error);
+         }
+         if (!status.hosting)
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+index 49ea057..b9edc9d 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -67,6 +67,7 @@ namespace ps2x::netplay
+         std::string password; // empty: generatePassword()
+         HostVideoSettings video;
+         HostAudioSettings audio;
++        bool allowPublicAddresses = false;
+     };
+ 
+     struct HostSessionStatus
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index a4d7c61..c4c8368 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -211,6 +211,11 @@ namespace ps2x
+             {"red_calidad", "PS2X_RED_CALIDAD", "media", {{"baja", "baja"}, {"media", "media"}, {"alta", "alta"}}, 0, 0,
+              "Juego en red: calidad de la imagen que recibe el invitado: baja (4 Mbit/s, 360 lineas), media (8 Mbit/s,\n"
+              "540 lineas) o alta (15 Mbit/s, 720 lineas). Si la imagen va a saltos, baja la calidad."},
++            // Fase 5 (T15, N5): the host takes only private and VPN addresses unless this is 1 (ps2_netplay.h).
++            {"red_publicas", "PS2X_RED_PUBLICAS", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Juego en red: 0 = el anfitrion solo acepta invitados de la red local y de VPN privadas (Tailscale,\n"
++             "ZeroTier); 1 = tambien de direcciones publicas (Internet con un puerto abierto en el router, Hamachi\n"
++             "25.x, Radmin VPN 26.x)."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 4f6a89c..3eaad3a 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -151,7 +151,12 @@ namespace
+               {"red_calidad", "Calidad de la imagen",
+                {{"baja", "Baja (4 Mbit/s, 360)"}, {"media", "Media (8 Mbit/s, 540)"}, {"alta", "Alta (15 Mbit/s, 720)"}},
+                "La imagen que recibe el invitado. Si le va a saltos o con retraso, baja la calidad. Alta necesita una "
+-               "red local buena."}}},
++               "red local buena."},
++              // Fase 5 (T15, N5).
++              {"red_publicas", "Direcciones públicas",
++               {{"0", "No (red local y VPN privadas)"}, {"1", "Sí (Hamachi, Radmin, Internet)"}},
++               "No: solo entra un invitado de tu red local o de una VPN privada (Tailscale, ZeroTier). Sí: también "
++               "desde Hamachi, Radmin VPN o Internet con un puerto abierto en el router."}}},
+         };
+         return list;
+     }
+@@ -168,11 +173,11 @@ namespace
+         return request >= 0 ? request == 1 : ps2x::netplay::hostSession().status().hosting;
+     }
+ 
+-    // Port and quality are fixed while hosting (they apply when the host starts).
++    // Port, quality and public addresses are fixed while hosting (they apply when the host starts).
+     bool netplayRowLocked(const char *key)
+     {
+         const std::string name = key;
+-        return (name == "red_puerto" || name == "red_calidad") && netplayHostingWanted();
++        return (name == "red_puerto" || name == "red_calidad" || name == "red_publicas") && netplayHostingWanted();
+     }
+ 
+     // Fase 5 (T9): the key of tecla_hud.
+@@ -471,7 +476,8 @@ namespace
+             std::snprintf(s.netplayPassword, sizeof(s.netplayPassword), "%s", password);
+     }
+ 
+-    // Starts (or restarts) the host with the menu's port, quality and password; PS2X_RED_ESCUCHAR fixes the address.
++    // Starts (or restarts) the host with the menu's port, quality, public addresses and password; PS2X_RED_ESCUCHAR
++    // fixes the address.
+     template <typename MenuState>
+     void startNetplayHost(MenuState &s)
+     {
+@@ -483,6 +489,7 @@ namespace
+         ps2x::netplay::PictureQuality quality = ps2x::netplay::PictureQuality::Medium;
+         ps2x::netplay::parsePictureQuality(valueOf(s.model.current, "red_calidad"), quality);
+         settings.video = ps2x::netplay::videoSettingsFor(quality);
++        settings.allowPublicAddresses = valueOf(s.model.current, "red_publicas") == "1";
+         settings.password = s.netplayPassword;
+         std::string error;
+         if (ps2x::netplay::hostSession().start(settings, error))
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index f3afb9d..108068d 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -392,8 +392,10 @@ namespace
+ }
+ 
+ // Fase 5 (T15, netplay N1; ps2_netplay.h). Besides the game's own argument (an ELF or an ISO):
+-//   F1-06.exe --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
++//   F1-06.exe --anfitrion [--escuchar <address>] [--puerto N] [--red-publicas] --clave <password>
+ //       runs the game and waits for one guest on TCP port N (50650 by default, every interface unless --escuchar).
++//       N5: the password has 8 characters or more; only guests from local, private and VPN addresses get in unless
++//       --red-publicas or PS2X_RED_PUBLICAS=1 (red_publicas of opciones.ini).
+ //   F1-06.exe --invitado <address>[:port] [--puerto N] --clave <password>
+ //       does not run the game: a window that sends this PC's pad (player 1 of controles.ini) as the host's player 2.
+ // Without --clave the password comes from PS2X_RED_CLAVE. N4: --invitado without an address or a password opens the
+@@ -446,7 +448,8 @@ int main(int argc, char *argv[])
+         if (!netplayOk)
+         {
+             std::cerr << "[red] argumentos no validos: " << netplayError << std::endl
+-                      << "[red] uso: --anfitrion [--escuchar <direccion>] [--puerto N] --clave <contrasena>" << std::endl
++                      << "[red] uso: --anfitrion [--escuchar <direccion>] [--puerto N] [--red-publicas]" << std::endl
++                      << "[red]      --clave <contrasena de 8 o mas>" << std::endl
+                       << "[red]      [--imagen-alto 144-1080] [--imagen-kbps 500-50000]" << std::endl
+                       << "[red]      [--imagen-codec auto|h264_nvenc|h264_amf|h264_qsv|h264_mf|mjpeg|no]" << std::endl
+                       << "[red]      [--sonido-codec auto|opus|pcm|no] [--sonido-kbps 32-256]" << std::endl
+@@ -584,6 +587,9 @@ int main(int argc, char *argv[])
+             hostSettings.password = netplay.password;
+             hostSettings.video = {netplay.videoHeight, netplay.videoKbps, netplay.videoCodec};
+             hostSettings.audio = {netplay.audioCodec, netplay.audioKbps};
++            const char *publicAddresses = std::getenv("PS2X_RED_PUBLICAS");
++            hostSettings.allowPublicAddresses =
++                netplay.allowPublicAddresses || (publicAddresses != nullptr && std::string(publicAddresses) == "1");
+             if (!ps2x::netplay::hostSession().start(hostSettings, error))
+                 std::cerr << "[red] no se puede escuchar en el puerto " << netplay.port << ": " << error
+                           << " (el juego sigue sin red)" << std::endl;
+diff --git a/ps2xTest/src/ps2_netplay_audio_tests.cpp b/ps2xTest/src/ps2_netplay_audio_tests.cpp
+index 696fc90..e27f572 100644
+--- a/ps2xTest/src/ps2_netplay_audio_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_audio_tests.cpp
+@@ -577,7 +577,7 @@ void register_ps2_netplay_audio_tests()
+ 
+         tc.Run("command line: the host's sound options", [](TestCase &t)
+         {
+-            std::vector<std::string> args = {"--anfitrion", "--clave", "secreto"};
++            std::vector<std::string> args = {"--anfitrion", "--clave", "secreto1"};
+             NetplayOptions o;
+             std::string error;
+             t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "defaults: " + error);
+@@ -585,7 +585,7 @@ void register_ps2_netplay_audio_tests()
+             t.Equals(o.audioKbps, 128u, "default bit rate");
+             for (const char *codec : {"opus", "pcm", "no", "auto"})
+             {
+-                args = {"--anfitrion", "--clave", "secreto", "--sonido-codec", codec, "--sonido-kbps", "96"};
++                args = {"--anfitrion", "--clave", "secreto1", "--sonido-codec", codec, "--sonido-kbps", "96"};
+                 o = {};
+                 t.IsTrue(parseNetplayArguments(args, nullptr, o, error), std::string("codec ") + codec + ": " + error);
+                 t.Equals(o.audioCodec, std::string(codec), "--sonido-codec");
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 308954d..27aef75 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -23,6 +23,17 @@
+ #include <string>
+ #include <thread>
+ #include <vector>
++// After the project headers: their names must not meet the Windows macros.
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#endif
+ 
+ // Fase 5 (T15, netplay N1): hashes (published vectors), frames, handshake, pad state, command line and a host and a
+ // guest talking over 127.0.0.1 in this process. N2: protocol version 2 (video frames, pictures in chunks, the send
+@@ -207,6 +218,102 @@ namespace
+         return out;
+     }
+ 
++#if defined(_WIN32)
++    // A plain TCP connection to a host on 127.0.0.1 from a chosen loopback address (Windows answers the whole
++    // 127/8): what a stranger can do before it knows the password.
++    struct RawConnection
++    {
++        SOCKET s = INVALID_SOCKET;
++        MessageAuth auth;
++        FrameReader reader{auth};
++
++        RawConnection(uint16_t port, const char *from)
++        {
++            WSADATA data;
++            WSAStartup(MAKEWORD(2, 2), &data);
++            s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++            sockaddr_in local{};
++            local.sin_family = AF_INET;
++            inet_pton(AF_INET, from, &local.sin_addr);
++            sockaddr_in remote{};
++            remote.sin_family = AF_INET;
++            remote.sin_port = htons(port);
++            inet_pton(AF_INET, "127.0.0.1", &remote.sin_addr);
++            if (s == INVALID_SOCKET || bind(s, reinterpret_cast<sockaddr *>(&local), sizeof(local)) != 0 ||
++                connect(s, reinterpret_cast<sockaddr *>(&remote), sizeof(remote)) != 0)
++                close();
++        }
++        ~RawConnection() { close(); }
++        RawConnection(const RawConnection &) = delete;
++        RawConnection &operator=(const RawConnection &) = delete;
++
++        void close()
++        {
++            if (s != INVALID_SOCKET)
++                closesocket(s);
++            s = INVALID_SOCKET;
++        }
++        bool connected() const { return s != INVALID_SOCKET; }
++        bool send(const std::vector<uint8_t> &bytes)
++        {
++            return connected() && ::send(s, reinterpret_cast<const char *>(bytes.data()), static_cast<int>(bytes.size()),
++                                         0) == static_cast<int>(bytes.size());
++        }
++        // 1: a frame (type), 0: the host closed, -1: nothing within the time.
++        int next(int milliseconds, uint8_t &type)
++        {
++            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
++            Frame frame;
++            while (connected())
++            {
++                if (reader.next(frame) == FrameReader::Result::Frame)
++                {
++                    type = frame.type;
++                    return 1;
++                }
++                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end -
++                                                                                        std::chrono::steady_clock::now());
++                if (left.count() <= 0)
++                    return -1;
++                fd_set readable;
++                FD_ZERO(&readable);
++                FD_SET(s, &readable);
++                timeval wait{0, static_cast<long>(left.count()) * 1000};
++                if (select(0, &readable, nullptr, nullptr, &wait) <= 0)
++                    return -1;
++                uint8_t buffer[512];
++                const int n = recv(s, reinterpret_cast<char *>(buffer), sizeof(buffer), 0);
++                if (n <= 0 || !reader.feed(buffer, static_cast<size_t>(n)))
++                    return 0;
++            }
++            return 0;
++        }
++        // The host closes this connection within the time (after any frames it sent).
++        bool closedWithin(int milliseconds)
++        {
++            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
++            uint8_t type = 0;
++            while (std::chrono::steady_clock::now() < end)
++            {
++                const int left = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                                      end - std::chrono::steady_clock::now())
++                                                      .count());
++                const int r = next(std::max(left, 1), type);
++                if (r == 0)
++                    return true;
++                if (r < 0)
++                    return false;
++            }
++            return false;
++        }
++    };
++
++    double secondsSince(std::chrono::steady_clock::time_point start)
++    {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++    }
++#endif
++
+     // The game's pad on a test: no physical pads, and a controles.ini that does not exist (no [jugador2]: port 2
+     // is empty without a guest, as in patch 0123).
+     void isolatePads()
+@@ -624,13 +731,14 @@ void register_ps2_netplay_tests()
+         tc.Run("command line: host, guest, password and the game's own arguments", [](TestCase &t)
+         {
+             std::vector<std::string> args = {"juego\\SCES_539.50", "--anfitrion", "--puerto", "50700", "--clave",
+-                                             "secreto", "--escuchar", "127.0.0.1"};
++                                             "secreto1", "--escuchar", "127.0.0.1"};
+             NetplayOptions o;
+             std::string error;
+             t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "host parses: " + error);
+             t.Equals(o.mode, NetplayMode::Host, "host");
+             t.Equals(o.port, static_cast<uint16_t>(50700), "port");
+-            t.Equals(o.password, std::string("secreto"), "password");
++            t.Equals(o.password, std::string("secreto1"), "password");
++            t.IsFalse(o.allowPublicAddresses, "public addresses refused by default");
+             t.Equals(o.listenAddress, std::string("127.0.0.1"), "listen address");
+             t.Equals(args, std::vector<std::string>{"juego\\SCES_539.50"}, "the ELF stays");
+ 
+@@ -657,14 +765,14 @@ void register_ps2_netplay_tests()
+             t.Equals(o.videoKbps, 8000u, "default bit rate");
+             t.Equals(o.videoCodec, std::string("auto"), "default encoder");
+ 
+-            args = {"--anfitrion", "--clave", "secreto", "--imagen-alto", "720", "--imagen-kbps", "12000",
++            args = {"--anfitrion", "--clave", "secreto1", "--imagen-alto", "720", "--imagen-kbps", "12000",
+                     "--imagen-codec", "h264_mf"};
+             o = {};
+             t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "picture options: " + error);
+             t.Equals(o.videoHeight, static_cast<uint16_t>(720), "--imagen-alto");
+             t.Equals(o.videoKbps, 12000u, "--imagen-kbps");
+             t.Equals(o.videoCodec, std::string("h264_mf"), "--imagen-codec");
+-            args = {"--anfitrion", "--clave", "secreto", "--imagen-codec", "no"};
++            args = {"--anfitrion", "--clave", "secreto1", "--imagen-codec", "no"};
+             o = {};
+             t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "no picture");
+             t.Equals(o.videoCodec, std::string("no"), "--imagen-codec no");
+@@ -703,6 +811,140 @@ void register_ps2_netplay_tests()
+                 t.IsFalse(parseNetplayArguments(a, nullptr, bo, e), "refused: " + line);
+                 t.IsFalse(e.empty(), "with a message: " + line);
+             }
++        });
++
++        tc.Run("command line: the host's password has 8 characters at least; the guest's 4", [](TestCase &t)
++        {
++            std::vector<std::string> args = {"--anfitrion", "--clave", "1234567"};
++            NetplayOptions o;
++            std::string error;
++            t.IsFalse(parseNetplayArguments(args, nullptr, o, error), "a 7 character host password is refused");
++            t.Equals(error, std::string("la contrasena del anfitrion (--clave o PS2X_RED_CLAVE) debe tener entre 8 y "
++                                        "256 caracteres"),
++                     "the host's message");
++            args = {"--anfitrion"};
++            o = {};
++            t.IsFalse(parseNetplayArguments(args, "1234567", o, error), "also from PS2X_RED_CLAVE");
++            args = {"--anfitrion", "--clave", "12345678"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "8 characters: " + error);
++            args = {"--invitado", "1.2.3.4", "--clave", "abcd"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "the guest still types 4 or more: " + error);
++            args = {"--invitado", "1.2.3.4", "--clave", "abc"};
++            o = {};
++            t.IsFalse(parseNetplayArguments(args, nullptr, o, error), "not 3");
++            t.Equals(error, std::string("la contrasena (--clave o PS2X_RED_CLAVE) debe tener entre 4 y 256 caracteres"),
++                     "the guest's message is the one it had");
++        });
++
++        tc.Run("command line: --red-publicas lets the host take public addresses", [](TestCase &t)
++        {
++            std::vector<std::string> args = {"--anfitrion", "--clave", "12345678", "--red-publicas"};
++            NetplayOptions o;
++            std::string error;
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "parses: " + error);
++            t.IsTrue(o.allowPublicAddresses, "allowed");
++            t.IsTrue(args.empty(), "taken out of the game's arguments");
++            args = {"--invitado", "1.2.3.4", "--clave", "abcd", "--red-publicas"};
++            o = {};
++            t.IsFalse(parseNetplayArguments(args, nullptr, o, error), "host only");
++            t.Equals(error, std::string("--red-publicas es solo para el anfitrion"), "message");
++            args = {"--red-publicas"};
++            o = {};
++            t.IsFalse(parseNetplayArguments(args, nullptr, o, error), "not without netplay");
++        });
++
++        tc.Run("peer addresses: local, private and VPN ranges are accepted; public ones are not", [](TestCase &t)
++        {
++            struct Case
++            {
++                std::vector<uint8_t> address;
++                bool allowed;
++                const char *name;
++            };
++            auto v6 = [](std::initializer_list<uint16_t> groups)
++            {
++                std::vector<uint8_t> out(16, 0);
++                size_t i = 0;
++                for (uint16_t g : groups)
++                {
++                    out[i++] = static_cast<uint8_t>(g >> 8);
++                    out[i++] = static_cast<uint8_t>(g & 0xFF);
++                }
++                return out;
++            };
++            auto mapped = [](uint8_t a, uint8_t b, uint8_t c, uint8_t d)
++            {
++                std::vector<uint8_t> out(16, 0);
++                out[10] = out[11] = 0xFF;
++                out[12] = a, out[13] = b, out[14] = c, out[15] = d;
++                return out;
++            };
++            std::vector<uint8_t> loop6(16, 0);
++            loop6[15] = 1;
++            const std::vector<Case> cases = {
++                {{127, 0, 0, 1}, true, "127.0.0.1"},
++                {{10, 1, 2, 3}, true, "10/8"},
++                {{172, 16, 0, 1}, true, "172.16/12 low"},
++                {{172, 31, 255, 254}, true, "172.16/12 high"},
++                {{172, 32, 0, 1}, false, "172.32 is public"},
++                {{172, 15, 255, 255}, false, "172.15 is public"},
++                {{192, 168, 1, 20}, true, "192.168/16"},
++                {{100, 64, 0, 1}, true, "100.64/10 (Tailscale, CGNAT) low"},
++                {{100, 127, 255, 254}, true, "100.64/10 high"},
++                {{100, 128, 0, 1}, false, "100.128 is public"},
++                {{169, 254, 3, 4}, true, "link-local"},
++                {{8, 8, 8, 8}, false, "8.8.8.8"},
++                {{25, 1, 2, 3}, false, "25/8 (Hamachi) is public"},
++                {{26, 1, 2, 3}, false, "26/8 (Radmin VPN) is public"},
++                {loop6, true, "::1"},
++                {v6({0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1}), true, "fd7a:115c:a1e0::1 (Tailscale)"},
++                {v6({0xfc00, 0, 0, 0, 0, 0, 0, 1}), true, "fc00::/7"},
++                {v6({0xfe80, 0, 0, 0, 0, 0, 0, 1}), true, "fe80::/10"},
++                {v6({0xfebf, 0, 0, 0, 0, 0, 0, 1}), true, "fe80::/10 high"},
++                {v6({0xfec0, 0, 0, 0, 0, 0, 0, 1}), false, "fec0 is not link-local"},
++                {v6({0x2001, 0x0db8, 0, 0, 0, 0, 0, 1}), false, "2001:db8::1"},
++                {v6({0x2a02, 0x9130, 0, 0, 0, 0, 0, 1}), false, "a public IPv6 address"},
++                {mapped(192, 168, 1, 5), true, "::ffff:192.168.1.5"},
++                {mapped(8, 8, 4, 4), false, "::ffff:8.8.4.4"},
++                {{}, false, "no address"},
++                {{10, 0, 0}, false, "3 bytes"},
++            };
++            for (const Case &c : cases)
++                t.Equals(privateNetworkAddress(c.address.data(), c.address.size()), c.allowed, c.name);
++        });
++
++        tc.Run("peer keys: one per machine on a private network, one per /64 on the public one", [](TestCase &t)
++        {
++            auto v6 = [](std::initializer_list<uint16_t> groups)
++            {
++                std::vector<uint8_t> out(16, 0);
++                size_t i = 0;
++                for (uint16_t g : groups)
++                {
++                    out[i++] = static_cast<uint8_t>(g >> 8);
++                    out[i++] = static_cast<uint8_t>(g & 0xFF);
++                }
++                return out;
++            };
++            auto key = [](const std::vector<uint8_t> &a) { return peerKeyOf(a.data(), a.size()); };
++            t.Equals(key({192, 168, 1, 20}), std::string("192.168.1.20"), "IPv4");
++            std::vector<uint8_t> mapped(16, 0);
++            mapped[10] = mapped[11] = 0xFF;
++            mapped[12] = 10, mapped[15] = 1;
++            t.Equals(key(mapped), std::string("10.0.0.1"), "IPv4-mapped is the IPv4 address");
++            const std::string a = key(v6({0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1}));
++            const std::string b = key(v6({0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 2}));
++            t.IsTrue(a != b, "two machines of one private /64 (Tailscale, a home LAN) are two peers: " + a);
++            t.Equals(a, std::string("fd7a:115c:a1e0:0:0:0:0:1"), "the whole private address");
++            t.IsTrue(key(v6({0xfe80, 0, 0, 0, 1, 2, 3, 4})) != key(v6({0xfe80, 0, 0, 0, 1, 2, 3, 5})),
++                     "link-local too");
++            t.Equals(key(v6({0x2a02, 0x9130, 0, 0, 0, 0, 0, 1})), std::string("2a02:9130:0:0::/64"),
++                     "a public IPv6 address goes by its /64 (one machine has many)");
++            t.Equals(key(v6({0x2a02, 0x9130, 0, 0, 0, 0, 0, 1})), key(v6({0x2a02, 0x9130, 0, 0, 9, 9, 9, 9})),
++                     "the same /64");
++            t.Equals(key({}), std::string("?"), "no address");
+         }); });
+ 
+     MiniTest::Case("NetplayVideoProtocol", [](TestCase &tc)
+@@ -1177,6 +1419,134 @@ void register_ps2_netplay_tests()
+             t.IsFalse(remotePadActive(), "nothing left after stop");
+         });
+ 
++#if defined(_WIN32)
++        tc.Run("a silent stranger does not keep the guest out, and is dropped after 2 s", [](TestCase &t)
++        {
++            Host host;
++            std::string error;
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-de-prueba"}, error), "host listens: " + error);
++            RawConnection other(host.port(), "127.0.0.2");
++            t.IsTrue(other.connected(), "a stranger from 127.0.0.2 connects and says nothing");
++            RawConnection same(host.port(), "127.0.0.1");
++            t.IsTrue(same.connected(), "another one from the guest's own address");
++            std::this_thread::sleep_for(std::chrono::milliseconds(200));
++
++            const auto start = std::chrono::steady_clock::now();
++            Guest good;
++            good.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++            t.IsTrue(waitFor([&] { return good.status().state == GuestState::Connected; }, 1500),
++                     "the guest gets in at once, while both strangers wait");
++            t.IsTrue(secondsSince(start) < 1.5, "not after a timeout");
++            t.IsTrue(same.closedWithin(500), "the same address's older attempt is replaced");
++            uint8_t type = 0;
++            t.Equals(other.next(1000, type), 1, "the other stranger is told");
++            t.Equals(type, static_cast<uint8_t>(MessageType::Reject), "with a REJECT (busy)");
++            good.stop();
++            host.stop();
++
++            // A fresh host, so nothing the strangers above left can be what closes it.
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-de-prueba"}, error), "host listens again: " + error);
++            RawConnection silent(host.port(), "127.0.0.3");
++            t.IsTrue(silent.connected(), "a silent one, with no guest");
++            const auto silentStart = std::chrono::steady_clock::now();
++            t.IsTrue(silent.closedWithin(3500), "dropped without its HELLO");
++            t.IsTrue(secondsSince(silentStart) < 3.0, "after 2 s, not the 5 s of the whole handshake");
++            host.stop();
++        });
++
++        tc.Run("a wrong password slows down its own address, more each time, and no other", [](TestCase &t)
++        {
++            Host host;
++            std::string error;
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-buena"}, error), "host listens: " + error);
++            auto attempt = [&]
++            {
++                const auto start = std::chrono::steady_clock::now();
++                Guest bad;
++                bad.start({"127.0.0.1", host.port(), "clave-mala"});
++                const bool rejected = waitFor([&] { return bad.status().state == GuestState::Rejected; }, 4500);
++                bad.stop();
++                return rejected ? secondsSince(start) : -1.0;
++            };
++            const double first = attempt();
++            t.IsTrue(first >= 0.0 && first < 0.9, "the first wrong password is answered at once");
++            const double second = attempt();
++            t.IsTrue(second >= 0.9, "the second waits about 1 s: " + std::to_string(second));
++            const double third = attempt();
++            t.IsTrue(third >= 1.9, "the third about 2 s: " + std::to_string(third));
++            t.Equals(host.rejectedLogins(), 3ull, "three counted");
++
++            RawConnection other(host.port(), "127.0.0.2");
++            t.IsTrue(other.connected(), "another address connects");
++            MessageAuth guestAuth;
++            GuestHandshake handshake("clave-buena", guestAuth);
++            t.IsTrue(other.send(handshake.hello()), "and says HELLO");
++            uint8_t type = 0;
++            t.Equals(other.next(500, type), 1, "it is answered at once");
++            t.Equals(type, static_cast<uint8_t>(MessageType::Challenge), "with the CHALLENGE");
++            host.stop();
++        });
++
++        tc.Run("refused connections waiting to read their REJECT are 16 at most", [](TestCase &t)
++        {
++            Host host;
++            std::string error;
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-de-prueba"}, error), "host listens: " + error);
++            Guest good;
++            good.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++            t.IsTrue(waitFor([&] { return good.status().state == GuestState::Connected; }), "a guest");
++            std::vector<std::unique_ptr<RawConnection>> strangers;
++            size_t most = 0;
++            for (int i = 0; i < 24; ++i)
++            {
++                strangers.push_back(std::make_unique<RawConnection>(host.port(), "127.0.0.2"));
++                std::this_thread::sleep_for(std::chrono::milliseconds(15));
++                most = std::max(most, host.refusedWaiting());
++            }
++            for (int i = 0; i < 30; ++i)
++            {
++                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                most = std::max(most, host.refusedWaiting());
++            }
++            t.IsTrue(most > 0 && most <= 16, "refused and waiting: " + std::to_string(most));
++            size_t told = 0;
++            for (auto &s : strangers)
++            {
++                uint8_t type = 0;
++                const int r = s->next(3000, type);
++                told += r == 0 || (r == 1 && type == static_cast<uint8_t>(MessageType::Reject)) ? 1u : 0u;
++            }
++            t.Equals(told, strangers.size(), "every stranger is refused or closed");
++            t.IsTrue(good.status().state == GuestState::Connected, "the guest stays");
++            good.stop();
++            host.stop();
++        });
++
++        tc.Run("the host's password has 8 characters at least", [](TestCase &t)
++        {
++            Host host;
++            std::string error;
++            t.IsFalse(host.start({"127.0.0.1", 0, "1234567"}, error), "7 characters are refused");
++            t.Equals(error, std::string("la contrasena debe tener entre 8 y 256 caracteres"), "with the reason");
++            t.IsTrue(host.start({"127.0.0.1", 0, "12345678"}, error), "8 are taken: " + error);
++            host.stop();
++
++            HostSession session;
++            HostSessionSettings settings;
++            settings.listenAddress = "127.0.0.1";
++            settings.port = 0;
++            settings.password = "corta";
++            settings.video.codec = "no";
++            settings.audio.codec = "no";
++            t.IsFalse(session.start(settings, error), "a short password typed in F2 is refused");
++            t.Equals(hostStatusText(session.status()),
++                     std::string("Juego en red: no se puede ser anfitrion (la contrasena debe tener entre 8 y 256 "
++                                 "caracteres)"),
++                     "the F2 text");
++            t.IsFalse(settings.allowPublicAddresses, "public addresses are off by default");
++        });
++#endif
++
+         tc.Run("the host's picture reaches the guest while the pad keeps working", [](TestCase &t)
+         {
+             isolatePads();
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index b11b910..82ed51a 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -586,6 +586,29 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "red_puerto"), std::string("50651"), "and the port");
+         });
+ 
++        tc.Run("the red_publicas option is off by default, has its variable and checks", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("red_publicas"), std::string("0"), "0 by default");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "red_publicas = 0\n"), "the template has it");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("red_publicas = 1\n");
++            t.IsTrue(file.warnings.empty(), "1 gives no warning");
++            std::map<std::string, std::string> variables;
++            for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(file, environmentOf({})))
++                variables[setting.variable] = setting.value;
++            t.Equals(variables["PS2X_RED_PUBLICAS"], std::string("1"), "red_publicas -> PS2X_RED_PUBLICAS");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("red_publicas = si\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "an unknown value warns");
++            t.Equals(bad.values.at("red_publicas"), std::string("0"), "and gives the default");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.IsTrue(ps2x::setMenuOption(model, "red_publicas", "1"), "the menu sets it");
++            t.IsFalse(ps2x::setMenuOption(model, "red_publicas", "2"), "not another value");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "red_publicas"), std::string("1"), "saving writes it");
++        });
++
+         tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)
+         {
+             t.Equals(ps2x::aiDifficultyNearestLevel(0), 0, "0: EASY");
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index e53846a..6d9906b 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{25}, "twenty-five options (fase 5: fourteen more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{26}, "twenty-six options (fase 5: fifteen more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

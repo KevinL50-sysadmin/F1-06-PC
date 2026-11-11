@@ -1,0 +1,148 @@
+diff --git a/ps2xRuntime/src/lib/ps2_camera_fov.h b/ps2xRuntime/src/lib/ps2_camera_fov.h
+new file mode 100644
+index 0000000..7ac2ac9
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_camera_fov.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++// Fase 5 (T12, F1 06): the race cameras' field of view (opciones.ini fov: 0 = the game's, 5 to 30 = that percent
++// wider; AJUSTES PC and the F2 menu). The game gives every race camera a half angle (vertical, in radians) through
++// func_2C5948; src/f1_overrides.cpp widens it there on every frame, so a change shows on the next frame.
++namespace ps2x
++{
++    constexpr int kCameraFovMaxPercent = 30;
++    // The widest half angle given to the game (about 80 degrees; the game itself stops at pi/2, where the tangent of
++    // its projection blows up).
++    constexpr float kCameraFovLimit = 1.4f;
++
++    // The game's half angle widened by percent (clamped to 0..kCameraFovMaxPercent), at most kCameraFovLimit. A
++    // percent of 0 or an angle that is not a positive number leaves it as it was; it never narrows it.
++    inline float widenedCameraFov(float halfAngle, int percent)
++    {
++        if (!(halfAngle > 0.0f) || percent <= 0)
++            return halfAngle;
++        const float widened = halfAngle * (1.0f + static_cast<float>(std::min(percent, kCameraFovMaxPercent)) / 100.0f);
++        return std::max(halfAngle, std::min(widened, kCameraFovLimit));
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 0c85b0a..fc7cfd8 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -186,6 +186,12 @@ namespace ps2x
+              "espera al reloj real y carga tan rapido como da el PC; los fundidos van a su ritmo y, si suena algo, va\n"
+              "a su ritmo para no cortarlo. 0 = como la consola.",
+              "0"},
++            // Fase 5 (T12): also a row of AJUSTES PC; the game reads it on every frame of a race camera
++            // (src/f1_overrides.cpp, ps2_camera_fov.h).
++            {"fov", "PS2X_FOV", "0",
++             {{"0", "0"}, {"5", "5"}, {"10", "10"}, {"15", "15"}, {"20", "20"}, {"25", "25"}, {"30", "30"}}, 0, 0,
++             "Campo de vision de las camaras de la carrera (cabina, morro, persecucion...): 0 = el del juego; 5, 10,\n"
++             "15, 20, 25 o 30 = ese tanto por ciento mas abierto. El HUD y los menus no cambian."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index a3ddd20..e989f17 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -116,7 +116,13 @@ namespace
+               // Fase 5 (T11).
+               {"cargas_rapidas", "Cargas rápidas", {{"0", "No"}, {"1", "Sí"}},
+                "Las pantallas de carga acaban en cuanto el juego ha cargado, sin esperar al ritmo de la consola. Los "
+-               "fundidos y los consejos se ven igual."}}},
++               "fundidos y los consejos se ven igual."},
++              // Fase 5 (T12).
++              {"fov", "Campo de visión",
++               {{"0", "Normal"}, {"5", "+5 %"}, {"10", "+10 %"}, {"15", "+15 %"}, {"20", "+20 %"}, {"25", "+25 %"},
++                {"30", "+30 %"}},
++               "Las cámaras de la carrera (cabina, morro, persecución...) más abiertas: se ve más a los lados. El HUD y "
++               "los menús no cambian."}}},
+         };
+         return list;
+     }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 824abcd..829c85f 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1,5 +1,6 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
++#include "ps2_camera_fov.h"
+ #include "ps2_hud.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_race_laps.h"
+@@ -464,6 +465,56 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "hud"), std::string("completo"), "the other options keep their values");
+         });
+ 
++        // Fase 5 (T12): the race cameras' field of view (fov = 0, the game's, to 30, that percent wider).
++        tc.Run("the fov option has its default, variable, checks and number", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("fov"), std::string("0"), "the game's by default");
++            t.Equals(fileValue("", "fov", true), std::string("0"), "also in development");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "fov = 0\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "cargas_rapidas = 1\n"), "and keeps cargas_rapidas");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("fov = 30\n");
++            t.IsTrue(file.warnings.empty(), "a valid value gives no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            std::string variable = "<none>";
++            for (const ps2x::EnvironmentSetting &setting : settings)
++                if (setting.variable == "PS2X_FOV")
++                    variable = setting.value;
++            t.Equals(variable, std::string("30"), "fov -> PS2X_FOV");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("fov = 12\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "a value between the steps warns");
++            t.Equals(bad.values.at("fov"), std::string("0"), "and takes the default");
++            t.Equals(ps2x::parseOptions("fov = 35\n").values.at("fov"), std::string("0"), "past 30 too");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "fov", value), "a number for the game's row");
++            t.Equals(value, 0.0f, "0");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "fov", 15.0f), "+15 %");
++            t.Equals(model.current.at("fov"), std::string("15"), "is 15");
++            t.IsTrue(ps2x::menuOptionNumber(model, "fov", value), "read back");
++            t.Equals(value, 15.0f, "as the percent itself");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "fov", 12.0f), "not between the steps");
++            t.Equals(model.current.at("fov"), std::string("15"), "stays 15");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "fov"), std::string("15"), "CONFIRM writes it");
++            t.Equals(fileValue(saved, "hud"), std::string("completo"), "the other options keep their values");
++        });
++
++        tc.Run("widenedCameraFov widens the game's half angle by the percent, within its limits", [](TestCase &t)
++        {
++            t.Equals(ps2x::widenedCameraFov(0.260804f, 0), 0.260804f, "0 %: the game's angle, exactly");
++            t.IsTrue(std::fabs(ps2x::widenedCameraFov(0.5f, 15) - 0.575f) < 1e-6f, "+15 %");
++            t.IsTrue(std::fabs(ps2x::widenedCameraFov(0.5f, 30) - 0.65f) < 1e-6f, "+30 %");
++            t.IsTrue(std::fabs(ps2x::widenedCameraFov(0.5f, 45) - 0.65f) < 1e-6f, "past 30 %: 30 %");
++            t.Equals(ps2x::widenedCameraFov(0.5f, -10), 0.5f, "a negative percent: unchanged");
++            t.Equals(ps2x::widenedCameraFov(1.2f, 30), ps2x::kCameraFovLimit, "at most the limit");
++            t.Equals(ps2x::widenedCameraFov(1.5f, 30), 1.5f, "never narrower than the game's");
++            t.Equals(ps2x::widenedCameraFov(0.0f, 30), 0.0f, "0 stays 0");
++            t.IsTrue(std::isnan(ps2x::widenedCameraFov(std::nanf(""), 30)), "not a number: as it was");
++        });
++
+         tc.Run("the HUD modes: their names, their numbers and the key's cycle", [](TestCase &t)
+         {
+             ps2x::HudMode mode = ps2x::HudMode::Hidden;
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 2a48469..d986a06 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{20}, "twenty options (fase 5: nine more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{21}, "twenty-one options (fase 5: ten more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

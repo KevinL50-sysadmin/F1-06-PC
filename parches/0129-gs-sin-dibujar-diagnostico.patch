@@ -1,0 +1,42 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 621b253..0a9a065 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -726,9 +726,27 @@ void GSThreadedBackend::Reset()
+     m_cpu->Reset();
+ }
+ 
++namespace
++{
++    // Diagnosis (PS2X_GS_SIN_DIBUJAR=1): primitives are dropped before the GS worker, so drawing costs nothing while
++    // uploads, CLUTs and transfers still run. It measures how fast the rest of the emulation goes with a free GS.
++    bool dropPrimitives()
++    {
++        static const bool drop = []()
++        {
++            const char *value = std::getenv("PS2X_GS_SIN_DIBUJAR");
++            const bool on = value != nullptr && value[0] == '1';
++            if (on)
++                std::fprintf(stderr, "[gs] PS2X_GS_SIN_DIBUJAR=1: las primitivas no se dibujan\n");
++            return on;
++        }();
++        return drop;
++    }
++}
++
+ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    if (batch.vertexCount == 0u)
++    if (batch.vertexCount == 0u || dropPrimitives())
+         return;
+     if (g_ps2AbMode.load(std::memory_order_relaxed) == 1)
+     {
+@@ -757,6 +775,8 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+ 
+ void GSThreadedBackend::SubmitSameState(const GSPrimitiveBatch &batch)
+ {
++    if (dropPrimitives())
++        return;
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+     if (!m_queuedStateValid || mode == 1 || mode == 12 || batch.vertexCount == 0u)
+     {

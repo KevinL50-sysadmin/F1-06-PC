@@ -1,0 +1,1501 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1ec0780..f8e288e 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -382,6 +382,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_audio_vag.cpp
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
++    src/lib/gs/gs_gpu_bridge.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/gs/gs_threaded_backend.cpp
+     src/lib/ps2_iop_host.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 1f53c01..1e59c41 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -10,6 +10,8 @@
+ 
+ #include "runtime/gs/gs_backend.h"
+ 
++class GSGpuBackend;
++
+ struct GSDebugSnapshot
+ {
+     GSContext ctx[2]{};
+@@ -245,6 +247,8 @@ private:
+     bool m_debugHistoryPaused = true;
+ 
+     std::unique_ptr<GSRasterBackend> m_backend;
++    // m_backend when it is the GS on the GPU (gs_gpu_bridge.h): the raw packets and register writes go to it too.
++    GSGpuBackend *m_gpu = nullptr;
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+new file mode 100644
+index 0000000..27ed54e
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <string>
++
++struct GSRegisters;
++
++// Phase 2 (F1 06): the GS on the GPU. `gs = gpu` in opciones.ini or PS2X_GS=gpu (the variable wins) runs
++// paraLLEl-GS (Vulkan compute) through our bridge DLL pgs_puente.dll (gpu/pgs_puente, C API pgs_puente.h), loaded at
++// run time from the .exe's folder (PS2X_GS_GPU_DLL: another path). Without the DLL or Vulkan the CPU GS is used, with
++// one "[gs:gpu]" line in the log. `gs = cpu` (the default) does not load anything: the CPU GS ("Software" mode) is the
++// reference.
++//
++// The GS front-end (gs_frontend.cpp) still parses every GIF packet: it owns CSR/IMR, SIGNAL/FINISH/LABEL and the
++// state the game waits on. With this backend it also forwards the raw packets and register writes here, and skips
++// the CPU drawing (Submit, uploads and CLUT loads do nothing). paraLLEl-GS keeps the only copy of local memory, so
++// every read (ReadVram, SnapshotVram, local -> host transfers) is served from it.
++//
++// Threading: the Vulkan device and every paraLLEl-GS call live on one thread ("GS GPU"), fed by a queue. Producers
++// (the GIF thread, the EE thread) only copy into the queue; reads wait for the queue to reach them. Presentation
++// never waits: a scanout is queued at the display flips (patch 0104) or by the window's latch, read back
++// asynchronously, and Present returns the newest frame read back.
++enum class GSMode : uint8_t
++{
++    Cpu,
++    Gpu,
++};
++
++// PS2X_GS: "gpu" (any case) selects the GPU; anything else, or unset, the CPU.
++GSMode ps2GsModeFromEnvironment(const char *value);
++
++// PS2X_GS_GPU_DLL, or pgs_puente.dll next to the executable.
++std::filesystem::path ps2GsGpuBridgePath();
++
++class GSGpuBackend final : public GSRasterBackend
++{
++public:
++    // Loads the DLL and creates the device on the GS GPU thread. Null, with the reason in error, if not possible.
++    static std::unique_ptr<GSGpuBackend> Create(const std::filesystem::path &dll, std::string &error);
++    ~GSGpuBackend() override;
++
++    std::string DeviceName() const;
++
++    // The registers that are not in a GSPresentationRequest (SMODE1).
++    void SetPrivilegedRegisters(const GSRegisters *registers);
++
++    // Raw data for paraLLEl-GS, in order.
++    void GifPacket(const uint8_t *data, uint32_t sizeBytes);
++    void WriteRegister(uint8_t address, uint64_t value);
++    // A scanout of the display described by request (queued in order with the packets).
++    void QueueScanout(const GSPresentationRequest &request);
++    // The newest frame read back (never waits).
++    PresentationFrame PresentPublished();
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    // QueueScanout(request), then PresentPublished().
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++    // Until every queued command has run on the GS GPU thread.
++    void WaitIdle() const;
++
++    struct Impl;
++
++private:
++    GSGpuBackend();
++    std::unique_ptr<Impl> m_impl;
++};
++
++// GS::init: the GPU backend when PS2X_GS asks for it and it can be created; otherwise null, with "[gs:gpu] ..." in the
++// log the first time (ps2GsGpuFallbackWarnings counts those lines).
++std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend();
++uint32_t ps2GsGpuFallbackWarnings();
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index a6739ac..ea28fd8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_gpu_bridge.h"
+ #include "runtime/gs/gs_threaded_backend.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_ab.h"
+@@ -410,6 +411,13 @@ namespace
+ 
+     void queueDisplaySnapshot(const GSPresentationRequest &request)
+     {
++        if (auto *gpu = dynamic_cast<GSGpuBackend *>(g_displayBackend))
++        {
++            // Fase 2: a scanout of the buffer being left, in order with the packets (read back asynchronously).
++            gpu->QueueScanout(request);
++            g_lastFlipSnapshotNs.store(steadyNs(), std::memory_order_relaxed);
++            return;
++        }
+         if (auto *threaded = dynamic_cast<GSThreadedBackend *>(g_displayBackend))
+         {
+             static bool s_asJobs = false;
+@@ -486,6 +494,14 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_privRegs = privRegs;
+     if (!m_backend)
+         m_backend = CreateDefaultGSRasterBackend();
++    // Fase 2: PS2X_GS=gpu (opciones.ini: gs = gpu) puts the GS on the GPU; without the bridge DLL or Vulkan the CPU
++    // backend stays (one "[gs:gpu]" line in the log).
++    if (!m_gpu)
++        if (std::unique_ptr<GSGpuBackend> gpu = ps2GsCreateRequestedGpuBackend())
++            m_backend = std::move(gpu);
++    m_gpu = dynamic_cast<GSGpuBackend *>(m_backend.get());
++    if (m_gpu)
++        m_gpu->SetPrivilegedRegisters(privRegs);
+     g_displayPrivRegs = privRegs; // patch 0104
+     g_displayBackend = m_backend.get();
+     m_backend->Initialize(vram, vramSize);
+@@ -956,8 +972,11 @@ void GS::latchHostPresentationFrame()
+             // (ps2GsBeforeDisplayChange) and the window only converts the last one published. A screen that has not
+             // flipped for 100 ms is snapshotted from here, as before.
+             auto *threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get());
+-            if (threaded && steadyNs() - g_lastFlipSnapshotNs.load(std::memory_order_relaxed) < 100000000)
++            const bool recentFlip = steadyNs() - g_lastFlipSnapshotNs.load(std::memory_order_relaxed) < 100000000;
++            if (threaded && recentFlip)
+                 frame = threaded->PresentPublished();
++            else if (m_gpu && recentFlip)
++                frame = m_gpu->PresentPublished(); // the scanouts come from the flips; never waits
+             else
+             {
+                 m_backend->Flush();
+@@ -1096,6 +1115,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
++    if (m_gpu)
++        m_gpu->GifPacket(data, sizeBytes); // paraLLEl-GS draws it; the parse below keeps our state and events
++
+     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+ 
+@@ -1198,6 +1220,9 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
+ 
++    if (m_gpu)
++        m_gpu->GifPacket(data, sizeBytes);
++
+     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
+                                                 {
+         m_curQ = 1.0f;
+@@ -1238,6 +1263,26 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+ {
+     gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_gpu && data && sizeBytes != 0u)
++    {
++        // The same upload as a GIF packet for paraLLEl-GS: A+D for the four transfer registers, then IMAGE.
++        thread_local std::vector<uint8_t> packet;
++        const uint32_t imageQwords = (sizeBytes + 15u) / 16u;
++        packet.assign(16u + 4u * 16u + 16u + static_cast<size_t>(imageQwords) * 16u, 0u);
++        const auto put = [&](size_t offset, uint64_t value) { std::memcpy(packet.data() + offset, &value, 8u); };
++        put(0u, 4ull | (1ull << 60)); // NLOOP 4, PACKED, NREG 1
++        put(8u, 0x0Eull);             // A+D
++        const uint64_t regs[4][2] = {{bitbltbuf, GS_REG_BITBLTBUF}, {trxpos, GS_REG_TRXPOS},
++                                     {trxreg, GS_REG_TRXREG}, {trxdir, GS_REG_TRXDIR}};
++        for (size_t i = 0; i < 4u; ++i)
++        {
++            put(16u + i * 16u, regs[i][0]);
++            put(24u + i * 16u, regs[i][1]);
++        }
++        put(80u, static_cast<uint64_t>(imageQwords) | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58));
++        std::memcpy(packet.data() + 96u, data, sizeBytes);
++        m_gpu->GifPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++    }
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1517,6 +1562,8 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
+     gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_gpu)
++        m_gpu->WriteRegister(regAddr, value);
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+@@ -2043,7 +2090,8 @@ void GS::vertexKick(bool drawing)
+     if (m_vtxCount < needed)
+         return;
+ 
+-    if (drawing && m_backend)
++    // On the GPU (m_gpu) paraLLEl-GS draws from the raw packets: no batch to build.
++    if (drawing && m_backend && !m_gpu)
+     {
+         if (g_ps2AbMode.load(std::memory_order_relaxed) == 23)
+         {
+@@ -2185,6 +2233,9 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+     m_backend = std::move(backend);
+     g_displayBackend = m_backend.get(); // patch 0104
++    m_gpu = dynamic_cast<GSGpuBackend *>(m_backend.get());
++    if (m_gpu)
++        m_gpu->SetPrivilegedRegisters(m_privRegs);
+     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+     s_drawBatchCache.owner = nullptr; // a new backend may reuse the old one's address
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+new file mode 100644
+index 0000000..6bd0cce
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -0,0 +1,842 @@
++#include "runtime/gs/gs_gpu_bridge.h"
++#include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/ps2_memory.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <iterator>
++#include <mutex>
++#include <thread>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++namespace
++{
++    // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 1), declared here so that the runtime
++    // does not depend on the bridge's source tree.
++    constexpr uint32_t kPgsApiVersion = 1u;
++    constexpr size_t kVramSize = 4u * 1024u * 1024u;
++    struct pgs_context;
++    struct PgsCreateInfo
++    {
++        uint32_t struct_size;
++        uint32_t super_sampling;
++        uint32_t flags;
++    };
++    struct PgsPrivRegs
++    {
++        uint64_t pmode, smode1, smode2, dispfb1, display1, dispfb2, display2, extbuf, extdata, extwrite, bgcolor;
++    };
++    struct PgsFrame
++    {
++        const uint8_t *rgba;
++        uint32_t width, height, mode_width, mode_height, interlaced;
++        uint64_t serial;
++    };
++    struct PgsStats
++    {
++        uint64_t gif_bytes, gif_transfers, vsyncs, frames, fifo_bytes, vram_maps;
++    };
++    enum : uint32_t
++    {
++        kScanoutForceProgressive = 1u << 0,
++        kScanoutAntiBlur = 1u << 2,
++        kScanoutAdaptHorizontal = 1u << 4,
++    };
++
++    struct PgsApi
++    {
++        uint32_t (*api_version)();
++        pgs_context *(*create)(const PgsCreateInfo *, char *, size_t);
++        void (*destroy)(pgs_context *);
++        const char *(*device_name)(pgs_context *);
++        void (*gif_transfer)(pgs_context *, uint32_t, const void *, size_t);
++        void (*write_register)(pgs_context *, uint32_t, uint64_t);
++        void (*reset_gif_path)(pgs_context *, uint32_t);
++        void (*flush)(pgs_context *);
++        const void *(*map_vram_read)(pgs_context *, size_t, size_t);
++        void *(*map_vram_write)(pgs_context *, size_t, size_t);
++        void (*end_vram_write)(pgs_context *, size_t, size_t);
++        void (*read_transfer_fifo)(pgs_context *, void *, uint32_t);
++        int (*vsync)(pgs_context *, const PgsPrivRegs *, uint32_t, uint32_t);
++        int (*get_frame)(pgs_context *, int, PgsFrame *);
++        void (*get_stats)(pgs_context *, PgsStats *);
++    };
++
++    constexpr uint32_t kHostFrameWidth = 640u; // the presentation frame's row stride (gs_frontend.cpp)
++    constexpr uint32_t kHostFrameHeight = 512u;
++    constexpr uint32_t kGifPath = 3u;          // whole packets, each one parsed from its first tag (see GifPacket)
++
++    std::atomic<uint32_t> g_fallbackWarnings{0u};
++
++    // GIF bits per pixel of a transfer format (local -> host size).
++    uint32_t bitsPerPixel(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT24:
++        case 0x31u: // Z24
++            return 24u;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case 0x32u: // Z16
++        case 0x3Au: // Z16S
++            return 16u;
++        case 0x13u: // T8
++            return 8u;
++        case 0x14u: // T4
++            return 4u;
++        default:
++            return 32u;
++        }
++    }
++
++    // SMODE1 as the BIOS sets it (SetGsCrt does not store it here): PAL for 512-line displays, else NTSC.
++    uint64_t smode1For(uint64_t smode1, uint64_t display)
++    {
++        const uint32_t lc = static_cast<uint32_t>((smode1 >> 3u) & 0x7Fu);
++        if (lc == 32u || lc == 22u || lc == 15u || lc == 29u)
++            return smode1;
++        const uint32_t lines = static_cast<uint32_t>((display >> 44u) & 0x7FFu) + 1u;
++        return lines > 480u ? 0x740836504ull : 0x740834504ull;
++    }
++
++    // Our kernel HLE (Stubs/GS.cpp) writes DISPLAY in pixels (DW + 1 = width with MAGH 0, DH + 1 = frame lines) and
++    // leaves SMODE2 at 0 when the game does not call SetGsCrt: a CRTC description only the CPU presenter reads that
++    // way. paraLLEl-GS emulates the real CRTC (DW in video clocks, 2560 per PAL/NTSC line; 256/224 lines per field
++    // without INT), so it showed a 512-clock-wide strip of the top 256 lines. Translate such registers to the hardware
++    // ones of the same picture: interlaced field mode (forced progressive: the whole frame), MAGH from the width, and
++    // the standard origin (offsets do not matter: the scanout removes the common one). F1 06: 512x512, DBY 1 on
++    // circuit 2 (its flicker filter), blended as the CPU presenter does.
++    bool hleDisplayRegisters(uint64_t smode2, uint64_t display)
++    {
++        const uint32_t lines = static_cast<uint32_t>((display >> 44u) & 0x7FFu) + 1u;
++        return (smode2 & 1u) == 0u && lines > 300u;
++    }
++
++    uint64_t hardwareDisplay(uint64_t display, bool pal)
++    {
++        const uint32_t dw = static_cast<uint32_t>((display >> 32u) & 0xFFFu);
++        const uint32_t dh = static_cast<uint32_t>((display >> 44u) & 0x7FFu);
++        const uint32_t magh = static_cast<uint32_t>((display >> 23u) & 0xFu);
++        const uint32_t width = (dw + 1u) / (magh + 1u);
++        if (width < 64u || dh + 1u < 64u)
++            return display;
++        const uint32_t clocks = std::clamp<uint32_t>((2560u + width / 2u) / width, 1u, 16u);
++        const uint64_t dx = (pal ? 169u : 159u) * 4u; // the mode's scan offsets (gs_renderer.cpp), so the origin is 0
++        const uint64_t dy = (pal ? 36u : 25u) * 2u;
++        return dx | (dy << 12u) | (static_cast<uint64_t>(clocks - 1u) << 23u) |
++               (static_cast<uint64_t>(width * clocks - 1u) << 32u) | (static_cast<uint64_t>(dh) << 44u);
++    }
++
++    int64_t nowNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(
++                   std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++
++    thread_local bool t_onGpuThread = false;
++
++    // As ThreadNaming::SetCurrentThreadName (that header cannot be included with windows.h).
++    void nameThisThread()
++    {
++#if defined(_WIN32)
++        using SetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PCWSTR);
++        if (HMODULE kernel32 = GetModuleHandleW(L"Kernel32.dll"))
++            if (auto setName = reinterpret_cast<SetThreadDescriptionFn>(
++                    reinterpret_cast<void *>(GetProcAddress(kernel32, "SetThreadDescription"))))
++                setName(GetCurrentThread(), L"GS GPU");
++#endif
++    }
++}
++
++GSMode ps2GsModeFromEnvironment(const char *value)
++{
++    if (value == nullptr)
++        return GSMode::Cpu;
++    std::string text(value);
++    for (char &c : text)
++        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    return text == "gpu" ? GSMode::Gpu : GSMode::Cpu;
++}
++
++std::filesystem::path ps2GsGpuBridgePath()
++{
++    if (const char *value = std::getenv("PS2X_GS_GPU_DLL"); value != nullptr && value[0] != '\0')
++        return std::filesystem::path(value);
++#if defined(_WIN32)
++    wchar_t buffer[MAX_PATH * 2] = {};
++    const DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
++    if (length != 0u && length < std::size(buffer))
++        return std::filesystem::path(buffer).parent_path() / "pgs_puente.dll";
++#endif
++    return std::filesystem::path("pgs_puente.dll");
++}
++
++struct GSGpuBackend::Impl
++{
++    enum class Kind : uint32_t
++    {
++        Gif,
++        Register,
++        Scanout,
++        Call,
++    };
++    struct Header
++    {
++        Kind kind;
++        uint32_t size; // payload bytes (Register: the address)
++        uint64_t arg;  // Register: the value; Call: the SyncCall
++    };
++    static_assert(sizeof(Header) == 16u, "queue records are 16-byte aligned");
++    struct ScanoutCommand
++    {
++        GSPresentationRequest request{};
++        uint64_t smode1 = 0u;
++    };
++    struct SyncCall
++    {
++        std::function<void()> fn;
++        bool done = false;
++    };
++
++    static constexpr size_t kMaxPending = 64u << 20;
++
++    // The DLL.
++#if defined(_WIN32)
++    HMODULE module = nullptr;
++#else
++    void *module = nullptr;
++#endif
++    PgsApi api{};
++    pgs_context *context = nullptr;
++    std::string deviceName;
++
++    // The queue: producers append records to pending under mutex, the GS GPU thread swaps it with working.
++    std::thread worker;
++    std::mutex mutex;
++    std::condition_variable wake, room, done;
++    std::vector<uint8_t> pending, working;
++    bool stop = false;
++    bool created = false;
++    std::string createError;
++    std::atomic<uint64_t> mutations{0u}; // records that may change local memory, queued so far
++
++    const GSRegisters *privRegs = nullptr;
++    uint32_t scanoutFlags = kScanoutForceProgressive | kScanoutAdaptHorizontal;
++    bool scanoutFromVram = false; // PS2X_GS_GPU_ESCANEO=vram: the CPU converts a copy of the GPU's local memory
++    bool translateCrtc = true;    // PS2X_GS_GPU_ESCANEO=crudo: the HLE's CRTC registers as they are
++
++    // Reads: a copy of local memory, refreshed when something was queued since.
++    mutable std::mutex readMutex;
++    mutable std::vector<uint8_t> vramCache;
++    mutable uint64_t cacheMutations = UINT64_MAX;
++    mutable GSCpuBackend view; // ReadVram/WriteVram/ClearFramebuffer in the GS layout, over a buffer
++
++    // Local -> host transfer (frontend thread, under the GS state lock).
++    GSTransferSnapshot transfer{};
++    bool localToHostActive = false;
++    bool localToHostFetched = false;
++    std::vector<uint8_t> localToHost;
++    size_t localToHostPos = 0u;
++
++    // Presentation.
++    std::mutex publishMutex;
++    PresentationFrame published;
++    uint64_t lastFrameSerial = 0u;
++    GSPresentationRequest lastScanoutRequest{};
++
++    // Statistics (the 10 s "[gs:gpu]" line).
++    std::atomic<uint64_t> statPackets{0u}, statBytes{0u}, statScanouts{0u}, statFrames{0u};
++    std::atomic<uint64_t> statVramReads{0u}, statVramRefreshes{0u}, statSnapshots{0u}, statLocalToHost{0u};
++    std::atomic<uint64_t> statLocalToHostBytes{0u}, statWaitNs{0u}, statPushNs{0u};
++    uint64_t busyNs = 0u; // GS GPU thread
++    int64_t reportAt = 0;
++
++    void push(Kind kind, uint32_t size, uint64_t arg, const void *payload, size_t payloadBytes)
++    {
++        const int64_t start = nowNs();
++        const size_t padded = (payloadBytes + 15u) & ~static_cast<size_t>(15u);
++        {
++            std::unique_lock<std::mutex> lock(mutex);
++            if (pending.size() > kMaxPending && !t_onGpuThread)
++            {
++                const int64_t waitStart = nowNs();
++                room.wait(lock, [&]() { return pending.size() <= kMaxPending || stop; });
++                statWaitNs.fetch_add(static_cast<uint64_t>(nowNs() - waitStart), std::memory_order_relaxed);
++            }
++            const size_t offset = pending.size();
++            pending.resize(offset + sizeof(Header) + padded);
++            Header header{kind, size, arg};
++            std::memcpy(pending.data() + offset, &header, sizeof(header));
++            if (payloadBytes != 0u)
++                std::memcpy(pending.data() + offset + sizeof(Header), payload, payloadBytes);
++            if (kind != Kind::Scanout)
++                mutations.fetch_add(1u, std::memory_order_relaxed);
++        }
++        wake.notify_one();
++        statPushNs.fetch_add(static_cast<uint64_t>(nowNs() - start), std::memory_order_relaxed);
++    }
++
++    // Runs fn on the GS GPU thread after everything queued so far, and waits for it.
++    void runSync(std::function<void()> fn)
++    {
++        if (t_onGpuThread)
++        {
++            fn();
++            return;
++        }
++        const int64_t start = nowNs();
++        SyncCall call{std::move(fn)};
++        push(Kind::Call, 0u, reinterpret_cast<uint64_t>(&call), nullptr, 0u);
++        std::unique_lock<std::mutex> lock(mutex);
++        done.wait(lock, [&]() { return call.done; });
++        statWaitNs.fetch_add(static_cast<uint64_t>(nowNs() - start), std::memory_order_relaxed);
++    }
++
++    void publish(PresentationFrame &&frame)
++    {
++        std::lock_guard<std::mutex> lock(publishMutex);
++        published = std::move(frame);
++    }
++
++    // The newest frame read back by the DLL (never waits for the GPU).
++    void pollFrame()
++    {
++        PgsFrame frame{};
++        if (!api.get_frame(context, 0, &frame) || frame.serial == lastFrameSerial || frame.rgba == nullptr)
++            return;
++        lastFrameSerial = frame.serial;
++        statFrames.fetch_add(1u, std::memory_order_relaxed);
++        PresentationFrame result{};
++        result.width = std::min(frame.width, kHostFrameWidth);
++        result.height = std::min(frame.height, kHostFrameHeight);
++        result.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
++        for (uint32_t y = 0; y < result.height; ++y)
++        {
++            uint8_t *dst = result.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
++            std::memcpy(dst, frame.rgba + static_cast<size_t>(y) * frame.width * 4u, result.width * 4u);
++            for (uint32_t x = 0; x < result.width; ++x)
++                dst[x * 4u + 3u] = 0xFFu;
++        }
++        result.displayFbp = static_cast<uint32_t>(lastScanoutRequest.dispfb1 & 0x1FFu);
++        result.sourceFbp = result.displayFbp;
++        static uint32_t s_sizeLogs = 0u, s_lastWidth = 0u, s_lastHeight = 0u;
++        if ((frame.width != s_lastWidth || frame.height != s_lastHeight) && s_sizeLogs < 20u)
++        {
++            ++s_sizeLogs;
++            std::fprintf(stderr, "[gs:gpu] fotograma: %ux%u (modo %ux%u, entrelazado=%u)\n", frame.width,
++                         frame.height, frame.mode_width, frame.mode_height, frame.interlaced);
++        }
++        s_lastWidth = frame.width;
++        s_lastHeight = frame.height;
++        publish(std::move(result));
++    }
++
++    void scanout(const ScanoutCommand &command)
++    {
++        statScanouts.fetch_add(1u, std::memory_order_relaxed);
++        lastScanoutRequest = command.request;
++        const GSPresentationRequest &request = command.request;
++        if (scanoutFromVram)
++        {
++            const void *mapped = api.map_vram_read(context, 0u, kVramSize);
++            if (mapped == nullptr)
++                return;
++            thread_local std::vector<uint8_t> copy;
++            copy.assign(static_cast<const uint8_t *>(mapped), static_cast<const uint8_t *>(mapped) + kVramSize);
++            thread_local GSCpuBackend converter;
++            converter.Initialize(copy.data(), static_cast<uint32_t>(copy.size()));
++            PresentationFrame frame = converter.Present(request);
++            if (frame)
++            {
++                statFrames.fetch_add(1u, std::memory_order_relaxed);
++                publish(std::move(frame));
++            }
++            return;
++        }
++        const uint64_t display = (request.pmode & 1u) != 0u ? request.display1 : request.display2;
++        PgsPrivRegs regs{request.pmode, smode1For(command.smode1, display), request.smode2, request.dispfb1,
++                         request.display1, request.dispfb2, request.display2, 0u, 0u, 0u, request.bgcolor};
++        if (translateCrtc && hleDisplayRegisters(request.smode2, display))
++        {
++            const bool pal = ((regs.smode1 >> 13u) & 3u) == 3u;
++            regs.smode2 = 1u; // INT, FFMD 0
++            regs.display1 = hardwareDisplay(request.display1, pal);
++            regs.display2 = hardwareDisplay(request.display2, pal);
++        }
++        static uint32_t s_modeLogs = 0u;
++        static PgsPrivRegs s_lastRegs{};
++        if (std::memcmp(&regs, &s_lastRegs, sizeof(regs)) != 0 && s_modeLogs < 20u)
++        {
++            ++s_modeLogs;
++            std::fprintf(stderr,
++                         "[gs:gpu] escaneo: SMODE1=0x%llx (registro 0x%llx) SMODE2=0x%llx PMODE=0x%llx DISPFB1=0x%llx "
++                         "DISPLAY1=0x%llx DISPFB2=0x%llx DISPLAY2=0x%llx\n",
++                         static_cast<unsigned long long>(regs.smode1), static_cast<unsigned long long>(command.smode1),
++                         static_cast<unsigned long long>(regs.smode2), static_cast<unsigned long long>(regs.pmode),
++                         static_cast<unsigned long long>(regs.dispfb1), static_cast<unsigned long long>(regs.display1),
++                         static_cast<unsigned long long>(regs.dispfb2), static_cast<unsigned long long>(regs.display2));
++        }
++        s_lastRegs = regs;
++        api.vsync(context, &regs, static_cast<uint32_t>(request.vsyncTick & 1u), scanoutFlags);
++    }
++
++    void report(int64_t now)
++    {
++        if (reportAt == 0)
++            reportAt = now;
++        const int64_t elapsed = now - reportAt;
++        if (elapsed < 10'000'000'000ll)
++            return;
++        reportAt = now;
++        const double seconds = static_cast<double>(elapsed) / 1e9;
++        const auto take = [](std::atomic<uint64_t> &value) { return value.exchange(0u, std::memory_order_relaxed); };
++        const uint64_t packets = take(statPackets), bytes = take(statBytes);
++        const uint64_t scanouts = take(statScanouts), frames = take(statFrames);
++        const uint64_t reads = take(statVramReads), refreshes = take(statVramRefreshes);
++        const uint64_t snapshots = take(statSnapshots), l2h = take(statLocalToHost), l2hBytes = take(statLocalToHostBytes);
++        const uint64_t waitNs = take(statWaitNs), pushNs = take(statPushNs);
++        std::fprintf(stderr,
++                     "[gs:gpu] 10 s: paquetes=%.0f/s %.2f MB/s escaneos=%.1f/s fotogramas=%.1f/s | lecturas: "
++                     "ReadVram=%llu (copias de VRAM %llu) SnapshotVram=%llu local->host=%llu (%llu bytes) | "
++                     "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms\n",
++                     static_cast<double>(packets) / seconds, static_cast<double>(bytes) / seconds / 1e6,
++                     static_cast<double>(scanouts) / seconds, static_cast<double>(frames) / seconds,
++                     static_cast<unsigned long long>(reads), static_cast<unsigned long long>(refreshes),
++                     static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(l2h),
++                     static_cast<unsigned long long>(l2hBytes), static_cast<double>(busyNs) / 1e6,
++                     100.0 * static_cast<double>(busyNs) / static_cast<double>(elapsed),
++                     static_cast<double>(pushNs) / 1e6, static_cast<double>(waitNs) / 1e6);
++        busyNs = 0u;
++    }
++
++    void process(const std::vector<uint8_t> &records)
++    {
++        size_t offset = 0u;
++        while (offset + sizeof(Header) <= records.size())
++        {
++            Header header{};
++            std::memcpy(&header, records.data() + offset, sizeof(header));
++            const uint8_t *payload = records.data() + offset + sizeof(Header);
++            size_t payloadBytes = 0u;
++            switch (header.kind)
++            {
++            case Kind::Gif:
++                payloadBytes = header.size;
++                api.gif_transfer(context, kGifPath, payload, header.size);
++                // Our front-end parses every packet from its first tag and drops a truncated last one: so here.
++                api.reset_gif_path(context, kGifPath);
++                break;
++            case Kind::Register:
++                api.write_register(context, header.size, header.arg);
++                break;
++            case Kind::Scanout:
++            {
++                payloadBytes = sizeof(ScanoutCommand);
++                ScanoutCommand command;
++                std::memcpy(&command, payload, sizeof(command));
++                scanout(command);
++                break;
++            }
++            case Kind::Call:
++            {
++                auto *call = reinterpret_cast<SyncCall *>(header.arg);
++                call->fn();
++                {
++                    std::lock_guard<std::mutex> lock(mutex);
++                    call->done = true;
++                }
++                done.notify_all();
++                break;
++            }
++            }
++            offset += sizeof(Header) + ((payloadBytes + 15u) & ~static_cast<size_t>(15u));
++        }
++    }
++
++    void workerLoop()
++    {
++        t_onGpuThread = true;
++        nameThisThread();
++        char error[256] = {};
++        PgsCreateInfo info{sizeof(PgsCreateInfo), 1u, 0u};
++        context = api.create(&info, error, sizeof(error));
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            created = true;
++            if (context == nullptr)
++                createError = error[0] != '\0' ? error : "pgs_create fallo";
++            else
++                deviceName = api.device_name(context);
++        }
++        done.notify_all();
++        if (context == nullptr)
++            return;
++
++        for (;;)
++        {
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                if (pending.empty() && !stop)
++                    wake.wait_for(lock, std::chrono::milliseconds(2), [&]() { return !pending.empty() || stop; });
++                if (stop && pending.empty())
++                    break;
++                working.swap(pending);
++            }
++            room.notify_all();
++            const int64_t start = nowNs();
++            if (!working.empty())
++            {
++                process(working);
++                working.clear();
++            }
++            pollFrame();
++            const int64_t end = nowNs();
++            busyNs += static_cast<uint64_t>(end - start);
++            report(end);
++        }
++        api.destroy(context);
++        context = nullptr;
++    }
++
++    // Copies all of the GPU's local memory into vramCache (GS GPU thread).
++    void copyVram(std::vector<uint8_t> &out) const
++    {
++        const void *mapped = api.map_vram_read(context, 0u, kVramSize);
++        out.resize(kVramSize);
++        if (mapped != nullptr)
++            std::memcpy(out.data(), mapped, kVramSize);
++    }
++
++    // With readMutex held: vramCache up to date with everything queued so far.
++    void refreshCacheLocked()
++    {
++        const uint64_t queued = mutations.load(std::memory_order_relaxed);
++        if (cacheMutations == queued && !vramCache.empty())
++            return;
++        statVramRefreshes.fetch_add(1u, std::memory_order_relaxed);
++        if (vramCache.empty())
++        {
++            vramCache.resize(kVramSize);
++            view.Initialize(vramCache.data(), static_cast<uint32_t>(vramCache.size()));
++        }
++        runSync([&]() { copyVram(vramCache); });
++        cacheMutations = queued;
++    }
++
++    // Runs edit over the GPU's local memory, mapped for writing (GS GPU thread), as a GS-layout view.
++    void editVram(const std::function<void(GSCpuBackend &)> &edit)
++    {
++        runSync([&]() {
++            void *mapped = api.map_vram_write(context, 0u, kVramSize);
++            if (mapped == nullptr)
++                return;
++            GSCpuBackend target;
++            target.Initialize(static_cast<uint8_t *>(mapped), static_cast<uint32_t>(kVramSize));
++            edit(target);
++            api.end_vram_write(context, 0u, kVramSize);
++        });
++        mutations.fetch_add(1u, std::memory_order_relaxed);
++    }
++};
++
++std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &dll, std::string &error)
++{
++    std::unique_ptr<GSGpuBackend> backend(new GSGpuBackend());
++    Impl &impl = *backend->m_impl;
++#if defined(_WIN32)
++    impl.module = LoadLibraryW(dll.wstring().c_str());
++    if (impl.module == nullptr)
++    {
++        error = "no se puede cargar " + dll.string() + " (error " + std::to_string(GetLastError()) + ")";
++        return nullptr;
++    }
++    const auto symbol = [&](const char *name) { return reinterpret_cast<void *>(GetProcAddress(impl.module, name)); };
++#else
++    impl.module = dlopen(dll.c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (impl.module == nullptr)
++    {
++        error = "no se puede cargar " + dll.string();
++        return nullptr;
++    }
++    const auto symbol = [&](const char *name) { return dlsym(impl.module, name); };
++#endif
++    bool complete = true;
++    const auto resolve = [&](auto &function, const char *name) {
++        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(symbol(name));
++        complete = complete && function != nullptr;
++    };
++    PgsApi &api = impl.api;
++    resolve(api.api_version, "pgs_api_version");
++    resolve(api.create, "pgs_create");
++    resolve(api.destroy, "pgs_destroy");
++    resolve(api.device_name, "pgs_device_name");
++    resolve(api.gif_transfer, "pgs_gif_transfer");
++    resolve(api.write_register, "pgs_write_register");
++    resolve(api.reset_gif_path, "pgs_reset_gif_path");
++    resolve(api.flush, "pgs_flush");
++    resolve(api.map_vram_read, "pgs_map_vram_read");
++    resolve(api.map_vram_write, "pgs_map_vram_write");
++    resolve(api.end_vram_write, "pgs_end_vram_write");
++    resolve(api.read_transfer_fifo, "pgs_read_transfer_fifo");
++    resolve(api.vsync, "pgs_vsync");
++    resolve(api.get_frame, "pgs_get_frame");
++    resolve(api.get_stats, "pgs_get_stats");
++    if (!complete || api.api_version() != kPgsApiVersion)
++    {
++        error = dll.string() + " no tiene la API esperada (version " + std::to_string(kPgsApiVersion) + ")";
++        return nullptr;
++    }
++
++    if (const char *value = std::getenv("PS2X_GS_GPU_ESCANEO"))
++    {
++        impl.scanoutFromVram = std::strcmp(value, "vram") == 0;
++        impl.translateCrtc = std::strcmp(value, "crudo") != 0;
++    }
++    if (const char *value = std::getenv("PS2X_GS_GPU_BANDERAS")) // scanout flags of pgs_vsync (diagnosis)
++        impl.scanoutFlags = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
++
++    impl.worker = std::thread([&impl]() { impl.workerLoop(); });
++    {
++        std::unique_lock<std::mutex> lock(impl.mutex);
++        impl.done.wait(lock, [&]() { return impl.created; });
++    }
++    if (impl.context == nullptr)
++    {
++        error = impl.createError;
++        return nullptr; // the destructor joins the thread and unloads the DLL
++    }
++    return backend;
++}
++
++GSGpuBackend::GSGpuBackend() : m_impl(std::make_unique<Impl>()) {}
++
++GSGpuBackend::~GSGpuBackend()
++{
++    Impl &impl = *m_impl;
++    if (impl.worker.joinable())
++    {
++        {
++            std::lock_guard<std::mutex> lock(impl.mutex);
++            impl.stop = true;
++        }
++        impl.wake.notify_all();
++        impl.room.notify_all();
++        impl.worker.join();
++    }
++#if defined(_WIN32)
++    if (impl.module != nullptr)
++        FreeLibrary(impl.module);
++#else
++    if (impl.module != nullptr)
++        dlclose(impl.module);
++#endif
++}
++
++std::string GSGpuBackend::DeviceName() const
++{
++    return m_impl->deviceName;
++}
++
++void GSGpuBackend::SetPrivilegedRegisters(const GSRegisters *registers)
++{
++    m_impl->privRegs = registers;
++}
++
++void GSGpuBackend::GifPacket(const uint8_t *data, uint32_t sizeBytes)
++{
++    if (data == nullptr || sizeBytes < 16u)
++        return;
++    m_impl->statPackets.fetch_add(1u, std::memory_order_relaxed);
++    m_impl->statBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
++    const uint32_t whole = sizeBytes & ~15u;
++    m_impl->push(Impl::Kind::Gif, whole, 0u, data, whole);
++}
++
++void GSGpuBackend::WriteRegister(uint8_t address, uint64_t value)
++{
++    if (address > 0x7Fu)
++        return;
++    m_impl->push(Impl::Kind::Register, address, value, nullptr, 0u);
++}
++
++void GSGpuBackend::QueueScanout(const GSPresentationRequest &request)
++{
++    Impl::ScanoutCommand command{};
++    command.request = request;
++    command.smode1 = m_impl->privRegs != nullptr ? m_impl->privRegs->smode1 : 0u;
++    m_impl->push(Impl::Kind::Scanout, sizeof(command), 0u, &command, sizeof(command));
++}
++
++PresentationFrame GSGpuBackend::PresentPublished()
++{
++    std::lock_guard<std::mutex> lock(m_impl->publishMutex);
++    return m_impl->published; // a copy: the latch moves it into the GS
++}
++
++void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    // The GS hands local memory over in this array (setRasterBackend): it becomes the GPU's.
++    if (vram == nullptr || vramSize == 0u)
++        return;
++    const size_t bytes = std::min<size_t>(vramSize, kVramSize);
++    Impl &impl = *m_impl;
++    impl.runSync([&]() {
++        void *mapped = impl.api.map_vram_write(impl.context, 0u, kVramSize);
++        if (mapped == nullptr)
++            return;
++        std::memcpy(mapped, vram, bytes);
++        impl.api.end_vram_write(impl.context, 0u, kVramSize);
++    });
++    impl.mutations.fetch_add(1u, std::memory_order_relaxed);
++}
++
++void GSGpuBackend::Reset()
++{
++    m_impl->transfer = {};
++    m_impl->transfer.direction = 3u;
++    m_impl->localToHostActive = false;
++    m_impl->localToHost.clear();
++    m_impl->localToHostPos = 0u;
++}
++
++// paraLLEl-GS draws, uploads and loads CLUTs from the raw packets (GifPacket): nothing to do for the CPU.
++void GSGpuBackend::Submit(const GSPrimitiveBatch &) {}
++void GSGpuBackend::LoadClut(const GSTex0Reg &, const GSTexClutReg &) {}
++void GSGpuBackend::UploadImage(const uint8_t *, uint32_t) {}
++void GSGpuBackend::Flush() {}
++void GSGpuBackend::TextureFlush() {}
++void GSGpuBackend::Sync(GSSyncReason) {}
++
++void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    Impl &impl = *m_impl;
++    impl.transfer = {};
++    impl.transfer.direction = command.direction;
++    impl.transfer.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * command.trxreg.rrh;
++    impl.localToHostActive = command.direction == 1u;
++    impl.localToHostFetched = false;
++    impl.localToHost.clear();
++    impl.localToHostPos = 0u;
++    if (impl.localToHostActive)
++    {
++        const uint64_t bytes = static_cast<uint64_t>(impl.transfer.totalPixels) * bitsPerPixel(command.bitbltbuf.spsm) / 8u;
++        impl.localToHost.resize(static_cast<size_t>(bytes));
++        impl.transfer.localToHostPendingBytes = impl.localToHost.size();
++    }
++}
++
++PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
++{
++    QueueScanout(request);
++    return PresentPublished();
++}
++
++bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    bool cleared = false;
++    m_impl->editVram([&](GSCpuBackend &vram) { cleared = vram.ClearFramebuffer(context, rgba); });
++    return cleared;
++}
++
++uint32_t GSGpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    Impl &impl = *m_impl;
++    if (dst == nullptr || maxBytes == 0u || !impl.localToHostActive)
++        return 0u;
++    if (!impl.localToHostFetched)
++    {
++        // The whole transfer at once: paraLLEl-GS read it into its FIFO when the TRXDIR write reached it.
++        impl.localToHostFetched = true;
++        const uint32_t words = static_cast<uint32_t>((impl.localToHost.size() + 15u) / 16u);
++        std::vector<uint8_t> fifo(static_cast<size_t>(words) * 16u);
++        if (words != 0u)
++            impl.runSync([&]() { impl.api.read_transfer_fifo(impl.context, fifo.data(), words); });
++        std::memcpy(impl.localToHost.data(), fifo.data(), impl.localToHost.size());
++        impl.statLocalToHost.fetch_add(1u, std::memory_order_relaxed);
++        impl.statLocalToHostBytes.fetch_add(impl.localToHost.size(), std::memory_order_relaxed);
++    }
++    if (impl.localToHostPos >= impl.localToHost.size())
++        return 0u;
++    const size_t count = std::min<size_t>(maxBytes, impl.localToHost.size() - impl.localToHostPos);
++    std::memcpy(dst, impl.localToHost.data() + impl.localToHostPos, count);
++    impl.localToHostPos += count;
++    impl.transfer.copiedPixels = impl.transfer.totalPixels;
++    impl.transfer.localToHostPendingBytes = impl.localToHost.size() - impl.localToHostPos;
++    return static_cast<uint32_t>(count);
++}
++
++uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    Impl &impl = *m_impl;
++    std::lock_guard<std::mutex> lock(impl.readMutex);
++    impl.statVramReads.fetch_add(1u, std::memory_order_relaxed);
++    impl.refreshCacheLocked();
++    return impl.view.ReadVram(psm, base, bw, x, y);
++}
++
++void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    m_impl->editVram([&](GSCpuBackend &vram) { vram.WriteVram(psm, base, bw, x, y, value); });
++}
++
++void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    Impl &impl = *m_impl;
++    std::lock_guard<std::mutex> lock(impl.readMutex);
++    impl.statSnapshots.fetch_add(1u, std::memory_order_relaxed);
++    impl.refreshCacheLocked();
++    out = impl.vramCache;
++}
++
++GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
++{
++    return m_impl->transfer;
++}
++
++void GSGpuBackend::WaitIdle() const
++{
++    m_impl->runSync([]() {});
++}
++
++std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend()
++{
++    if (ps2GsModeFromEnvironment(std::getenv("PS2X_GS")) != GSMode::Gpu)
++        return nullptr;
++    const std::filesystem::path dll = ps2GsGpuBridgePath();
++    std::string error;
++    std::unique_ptr<GSGpuBackend> backend = GSGpuBackend::Create(dll, error);
++    if (!backend)
++    {
++        static std::once_flag s_warned;
++        std::call_once(s_warned, [&]() {
++            g_fallbackWarnings.fetch_add(1u, std::memory_order_relaxed);
++            std::fprintf(stderr, "[gs:gpu] no se puede usar el GS por GPU: %s; se usa el GS de CPU\n", error.c_str());
++        });
++        return nullptr;
++    }
++    std::fprintf(stderr, "[gs:gpu] GS por GPU: paraLLEl-GS en %s (%s)\n", backend->DeviceName().c_str(),
++                 dll.string().c_str());
++    return backend;
++}
++
++uint32_t ps2GsGpuFallbackWarnings()
++{
++    return g_fallbackWarnings.load(std::memory_order_relaxed);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index fa5f099..f6ba45a 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -76,6 +76,9 @@ namespace ps2x
+             {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
+             {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
++            {"gs", "PS2X_GS", "cpu", {{"cpu", nullptr}, {"gpu", "gpu"}}, 0, 0,
++             "Dibujo de los graficos: cpu = por software (el de siempre) o gpu = en la tarjeta grafica con Vulkan\n"
++             "(en pruebas; necesita pgs_puente.dll junto al juego, si no se usa cpu)."},
+         };
+         return specs;
+     }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index ac9558e..914fc19 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -32,6 +32,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
++    src/ps2_gs_gpu_tests.cpp
+     src/ps2_iop_tests.cpp
+     src/ps2_iso_image_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+@@ -51,6 +52,10 @@ target_include_directories(ps2_test_lib PRIVATE
+ 
+ # Lets tests read source files (e.g. instructions.h) whatever the working directory.
+ target_compile_definitions(ps2_test_lib PRIVATE PS2X_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
++# The GS on the GPU (fase 2): the bridge DLL built by scripts/obtener-parallel-gs.ps1; its tests skip without it.
++set(PS2X_TEST_PGS_PUENTE_DLL "${CMAKE_SOURCE_DIR}/../../build/pgs-puente/pgs_puente.dll" CACHE FILEPATH
++    "pgs_puente.dll for the GS GPU tests")
++target_compile_definitions(ps2_test_lib PRIVATE PS2X_TEST_PGS_PUENTE_DLL="${PS2X_TEST_PGS_PUENTE_DLL}")
+ 
+ target_link_libraries(ps2_test_lib PRIVATE
+     ps2_recomp_lib
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 6a23afb..c0159ed 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -13,6 +13,7 @@ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
++void register_ps2_gs_gpu_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_iso_image_tests();
+ void register_ps2_sif_rpc_tests();
+@@ -37,6 +38,7 @@ int main()
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
++    register_ps2_gs_gpu_tests();
+     register_ps2_iop_tests();
+     register_ps2_iso_image_tests();
+     register_ps2_sif_rpc_tests();
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+new file mode 100644
+index 0000000..1cd7576
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -0,0 +1,314 @@
++#include "MiniTest.h"
++#include "ps2_options.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/gs_gpu_bridge.h"
++#include "runtime/ps2_memory.h"
++#include "gs_test_sync.h"
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace fs = std::filesystem;
++
++namespace
++{
++    // Sets an environment variable for the life of the object, and restores it (or unsets it) after.
++    struct ScopedEnvironment
++    {
++        std::string name;
++        std::string previous;
++        bool hadPrevious = false;
++
++        ScopedEnvironment(const char *variable, const char *value) : name(variable)
++        {
++            if (const char *current = std::getenv(variable))
++            {
++                previous = current;
++                hadPrevious = true;
++            }
++            set(value);
++        }
++        ~ScopedEnvironment() { set(hadPrevious ? previous.c_str() : nullptr); }
++
++        void set(const char *value)
++        {
++#if defined(_WIN32)
++            _putenv_s(name.c_str(), value != nullptr ? value : "");
++#else
++            if (value != nullptr)
++                setenv(name.c_str(), value, 1);
++            else
++                unsetenv(name.c_str());
++#endif
++        }
++    };
++
++    std::map<std::string, std::string> settingsOf(const ps2x::OptionsFile &options,
++                                                  const std::function<const char *(const char *)> &getEnvironment)
++    {
++        std::map<std::string, std::string> result;
++        for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(options, getEnvironment))
++            result[setting.variable] = setting.value;
++        return result;
++    }
++
++    constexpr uint8_t kRegPrim = 0x00u;
++    constexpr uint8_t kRegRgbaq = 0x01u;
++    constexpr uint8_t kRegXyz2 = 0x05u;
++    constexpr uint8_t kRegXyoffset1 = 0x18u;
++    constexpr uint8_t kRegPrmodecont = 0x1Au;
++    constexpr uint8_t kRegScissor1 = 0x40u;
++    constexpr uint8_t kRegTest1 = 0x47u;
++    constexpr uint8_t kRegFrame1 = 0x4Cu;
++    constexpr uint8_t kRegZbuf1 = 0x4Eu;
++    constexpr uint8_t kRegBitbltbuf = 0x50u;
++    constexpr uint8_t kRegTrxpos = 0x51u;
++    constexpr uint8_t kRegTrxreg = 0x52u;
++    constexpr uint8_t kRegTrxdir = 0x53u;
++
++    void appendU64(std::vector<uint8_t> &packet, uint64_t value)
++    {
++        for (int i = 0; i < 8; ++i)
++            packet.push_back(static_cast<uint8_t>(value >> (8 * i)));
++    }
++
++    // A PACKED A+D GIF packet writing these registers in order.
++    std::vector<uint8_t> adPacket(const std::vector<std::pair<uint8_t, uint64_t>> &writes)
++    {
++        std::vector<uint8_t> packet;
++        appendU64(packet, static_cast<uint64_t>(writes.size()) | (1ull << 15) | (1ull << 60));
++        appendU64(packet, 0x0Eull);
++        for (const auto &write : writes)
++        {
++            appendU64(packet, write.second);
++            appendU64(packet, write.first);
++        }
++        return packet;
++    }
++
++    // 16x16 PSMCT32 pixels uploaded at block 0x1000 (page 128), width 64.
++    constexpr uint32_t kImageBase = 0x1000u;
++    constexpr uint32_t kImageSize = 16u;
++
++    std::vector<uint8_t> imagePixels()
++    {
++        std::vector<uint8_t> pixels(kImageSize * kImageSize * 4u);
++        for (size_t i = 0; i < pixels.size(); ++i)
++            pixels[i] = static_cast<uint8_t>(i * 7u + 3u);
++        return pixels;
++    }
++
++    std::vector<uint8_t> imageUploadPacket()
++    {
++        std::vector<uint8_t> packet = adPacket({
++            {kRegBitbltbuf, (static_cast<uint64_t>(kImageBase) << 32) | (1ull << 48)}, // DBW 1, DPSM CT32
++            {kRegTrxpos, 0ull},
++            {kRegTrxreg, static_cast<uint64_t>(kImageSize) | (static_cast<uint64_t>(kImageSize) << 32)},
++            {kRegTrxdir, 0ull}, // host -> local
++        });
++        const std::vector<uint8_t> pixels = imagePixels();
++        appendU64(packet, static_cast<uint64_t>(pixels.size() / 16u) | (1ull << 15) | (2ull << 58)); // IMAGE
++        appendU64(packet, 0ull);
++        packet.insert(packet.end(), pixels.begin(), pixels.end());
++        return packet;
++    }
++
++    // A flat sprite (8,8)-(40,24) in a 64-pixel wide PSMCT32 frame at page 0.
++    std::vector<uint8_t> spritePacket()
++    {
++        return adPacket({
++            {kRegPrmodecont, 1ull},
++            {kRegFrame1, 1ull << 16},                          // FBP 0, FBW 1, PSMCT32, no mask
++            {kRegZbuf1, (64ull) | (1ull << 32)},               // ZBP 64 pages, ZMSK
++            {kRegScissor1, 63ull << 16 | 63ull << 48},         // 0..63 x 0..63
++            {kRegXyoffset1, 0ull},
++            {kRegTest1, (1ull << 16) | (1ull << 17)},          // ZTE, ZTST always
++            {kRegPrim, 6ull},                                  // sprite, flat, no texture
++            {kRegRgbaq, 0x80402010ull | (0x3F800000ull << 32)},
++            {kRegXyz2, (8ull << 4) | ((8ull << 4) << 16)},
++            {kRegXyz2, (40ull << 4) | ((24ull << 4) << 16)},
++        });
++    }
++
++    std::vector<uint8_t> localToHostSetupPacket()
++    {
++        return adPacket({
++            {kRegBitbltbuf, static_cast<uint64_t>(kImageBase) | (1ull << 16)}, // SBP, SBW 1, SPSM CT32
++            {kRegTrxpos, 0ull},
++            {kRegTrxreg, static_cast<uint64_t>(kImageSize) | (static_cast<uint64_t>(kImageSize) << 32)},
++            {kRegTrxdir, 1ull}, // local -> host
++        });
++    }
++
++    std::vector<uint8_t> vramOf(GS &gs)
++    {
++        gs.refreshDisplaySnapshot();
++        uint32_t size = 0u;
++        const uint8_t *data = gs.lockDisplaySnapshot(size);
++        std::vector<uint8_t> copy;
++        if (data != nullptr)
++            copy.assign(data, data + size);
++        gs.unlockDisplaySnapshot();
++        return copy;
++    }
++
++    fs::path testBridgeDll()
++    {
++#if defined(PS2X_TEST_PGS_PUENTE_DLL)
++        return fs::path(PS2X_TEST_PGS_PUENTE_DLL);
++#else
++        return {};
++#endif
++    }
++}
++
++void register_ps2_gs_gpu_tests()
++{
++    MiniTest::Case("GsGpu", [](TestCase &tc)
++    {
++        tc.Run("the gs option is cpu by default and leaves PS2X_GS unset", [](TestCase &t)
++        {
++            const std::string text = ps2x::defaultOptionsText();
++            t.IsTrue(text.find("\ngs = cpu\n") != std::string::npos, "the default file has gs = cpu");
++            const ps2x::OptionsFile defaults = ps2x::parseOptions(text);
++            t.IsTrue(defaults.warnings.empty(), "the default file parses without warnings");
++            t.Equals(defaults.values.at("gs"), std::string("cpu"), "gs defaults to cpu");
++            const auto none = [](const char *) -> const char * { return nullptr; };
++            t.IsTrue(settingsOf(defaults, none).count("PS2X_GS") == 0u, "gs = cpu sets no variable");
++        });
++
++        tc.Run("gs = gpu sets PS2X_GS=gpu unless the variable is already set", [](TestCase &t)
++        {
++            const ps2x::OptionsFile options = ps2x::parseOptions("gs = GPU\n");
++            t.IsTrue(options.warnings.empty(), "gs = GPU is valid (any case)");
++            t.Equals(options.values.at("gs"), std::string("gpu"), "the value is gpu");
++            const auto none = [](const char *) -> const char * { return nullptr; };
++            const auto settings = settingsOf(options, none);
++            t.IsTrue(settings.count("PS2X_GS") == 1u && settings.at("PS2X_GS") == "gpu", "PS2X_GS=gpu");
++            const auto cpuSet = [](const char *name) -> const char * {
++                return std::strcmp(name, "PS2X_GS") == 0 ? "cpu" : nullptr;
++            };
++            t.IsTrue(settingsOf(options, cpuSet).count("PS2X_GS") == 0u, "PS2X_GS already set wins over the file");
++        });
++
++        tc.Run("a bad gs value keeps cpu with one warning", [](TestCase &t)
++        {
++            const ps2x::OptionsFile options = ps2x::parseOptions("gs = vulkan\n");
++            t.Equals(options.values.at("gs"), std::string("cpu"), "falls back to cpu");
++            t.Equals(options.warnings.size(), size_t{1}, "one warning");
++            t.IsTrue(!options.warnings.empty() &&
++                         options.warnings.front() ==
++                             "[opciones] opciones.ini:1: valor no valido 'vulkan' para gs; se usa cpu (valores: cpu, gpu)",
++                     "the warning names the values");
++        });
++
++        tc.Run("PS2X_GS selects the GPU only for gpu", [](TestCase &t)
++        {
++            t.IsTrue(ps2GsModeFromEnvironment(nullptr) == GSMode::Cpu, "unset: cpu");
++            t.IsTrue(ps2GsModeFromEnvironment("") == GSMode::Cpu, "empty: cpu");
++            t.IsTrue(ps2GsModeFromEnvironment("cpu") == GSMode::Cpu, "cpu");
++            t.IsTrue(ps2GsModeFromEnvironment("gpu") == GSMode::Gpu, "gpu");
++            t.IsTrue(ps2GsModeFromEnvironment("GPU") == GSMode::Gpu, "GPU");
++            t.IsTrue(ps2GsModeFromEnvironment("vulkan") == GSMode::Cpu, "anything else: cpu");
++        });
++
++        tc.Run("without the bridge DLL the CPU GS draws, with one [gs:gpu] warning", [](TestCase &t)
++        {
++            const fs::path missing = fs::temp_directory_path() / "ps2x-no-such-dir" / "pgs_puente.dll";
++            ScopedEnvironment mode("PS2X_GS", "gpu");
++            ScopedEnvironment dll("PS2X_GS_GPU_DLL", missing.string().c_str());
++            const uint32_t before = ps2GsGpuFallbackWarnings();
++
++            t.IsTrue(ps2GsCreateRequestedGpuBackend() == nullptr, "no backend without the DLL");
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GSRegisters regs{};
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++            const std::vector<uint8_t> packet = spritePacket();
++            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
++            t.Equals(gs.ReadVram(0u, 0u, 1u, 10u, 10u), 0x80402010u, "the CPU GS drew the sprite");
++            t.Equals(vram[0] | 0u, 0u, "outside the sprite stays clear");
++            t.Equals(before, 0u, "no warning before");
++            t.Equals(ps2GsGpuFallbackWarnings(), 1u, "one [gs:gpu] warning for the whole process");
++        });
++
++        tc.Run("with PS2X_GS unset nothing is loaded", [](TestCase &t)
++        {
++            ScopedEnvironment mode("PS2X_GS", nullptr);
++            const uint32_t before = ps2GsGpuFallbackWarnings();
++            t.IsTrue(ps2GsCreateRequestedGpuBackend() == nullptr, "no GPU backend in cpu mode");
++            t.Equals(ps2GsGpuFallbackWarnings(), before, "and no warning");
++        });
++
++        tc.Run("a sprite, an IMAGE upload and a local->host transfer match the CPU GS through the bridge", [](TestCase &t)
++        {
++            const fs::path dllPath = testBridgeDll();
++            if (dllPath.empty() || !fs::exists(dllPath))
++            {
++                std::cout << "    [Skipped] pgs_puente.dll not built (" << dllPath.string()
++                          << "): run scripts/obtener-parallel-gs.ps1" << std::endl;
++                return;
++            }
++            std::string error;
++            std::unique_ptr<GSGpuBackend> backend = GSGpuBackend::Create(dllPath, error);
++            if (!backend)
++            {
++                std::cout << "    [Skipped] no GPU bridge: " << error << std::endl;
++                return;
++            }
++
++            std::vector<uint8_t> cpuVram(PS2_GS_VRAM_SIZE, 0u), gpuVram(PS2_GS_VRAM_SIZE, 0u);
++            GSRegisters cpuRegs{}, gpuRegs{};
++            GS cpu;
++            cpu.init(cpuVram.data(), static_cast<uint32_t>(cpuVram.size()), &cpuRegs);
++            GS gpu;
++            gpu.init(gpuVram.data(), static_cast<uint32_t>(gpuVram.size()), &gpuRegs);
++            gpu.setRasterBackend(std::move(backend));
++
++            for (const std::vector<uint8_t> &packet : {imageUploadPacket(), spritePacket()})
++            {
++                cpu.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++                gpu.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            }
++
++            t.Equals(gpu.ReadVram(0u, 0u, 1u, 10u, 10u), 0x80402010u, "the GPU drew the sprite");
++            t.Equals(gpu.ReadVram(0u, 0u, 1u, 7u, 10u), 0u, "left of the sprite is clear");
++            t.Equals(gpu.ReadVram(0u, 0u, 1u, 40u, 10u), 0u, "the right edge is not drawn");
++            const std::vector<uint8_t> pixels = imagePixels();
++            uint32_t first = 0u;
++            std::memcpy(&first, pixels.data(), 4u);
++            t.Equals(gpu.ReadVram(0u, kImageBase, 1u, 0u, 0u), first, "the GPU has the uploaded image");
++
++            const std::vector<uint8_t> cpuBytes = vramOf(cpu);
++            const std::vector<uint8_t> gpuBytes = vramOf(gpu);
++            t.Equals(gpuBytes.size(), size_t{PS2_GS_VRAM_SIZE}, "the bridge reads all local memory");
++            size_t different = 0u, firstDifferent = SIZE_MAX;
++            for (size_t i = 0; i < std::min(cpuBytes.size(), gpuBytes.size()); ++i)
++                if (cpuBytes[i] != gpuBytes[i])
++                {
++                    ++different;
++                    firstDifferent = std::min(firstDifferent, i);
++                }
++            t.Equals(different, size_t{0}, "same local memory bytes (first difference at " +
++                                               std::to_string(firstDifferent) + ")");
++
++            const std::vector<uint8_t> setup = localToHostSetupPacket();
++            cpu.processGIFPacket(setup.data(), static_cast<uint32_t>(setup.size()));
++            gpu.processGIFPacket(setup.data(), static_cast<uint32_t>(setup.size()));
++            std::vector<uint8_t> cpuOut(pixels.size(), 0xCCu), gpuOut(pixels.size(), 0xCCu);
++            const uint32_t cpuRead = cpu.consumeLocalToHostBytes(cpuOut.data(), static_cast<uint32_t>(cpuOut.size()));
++            const uint32_t gpuRead = gpu.consumeLocalToHostBytes(gpuOut.data(), static_cast<uint32_t>(gpuOut.size()));
++            t.Equals(gpuRead, cpuRead, "the same number of bytes read back");
++            t.IsTrue(gpuOut == pixels, "the GPU's local -> host data is the uploaded image");
++            t.IsTrue(gpuOut == cpuOut, "and matches the CPU GS");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index f3c15a3..f77a2d4 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -323,7 +323,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{5}, "five options");
++            t.Equals(ps2x::optionSpecs().size(), size_t{6}, "six options");
+         });
+ 
+         tc.Run("parseOptions accepts spaces, comments, CRLF, a BOM and any case", [](TestCase &t)

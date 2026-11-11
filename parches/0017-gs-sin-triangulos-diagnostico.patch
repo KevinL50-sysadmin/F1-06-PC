@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..484d10f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -8,6 +8,8 @@
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -1277,6 +1279,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ 
+ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ {
++    // Debug (F1 06): F1_GS_SIN_TRIANGULOS=<seconds> skips triangle rasterization from that second after start-up
++    // (sprites, such as most 2D/HUD, still draw). The software rasterizer is the bottleneck in a race; this shows
++    // whether the game logic runs once it is fast, without changing the menu timings before that second.
++    static const auto s_start = std::chrono::steady_clock::now();
++    static const double s_skipFrom = []
++    {
++        const char *value = std::getenv("F1_GS_SIN_TRIANGULOS");
++        return value != nullptr ? std::atof(value) : -1.0;
++    }();
++    if (s_skipFrom >= 0.0 &&
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() >= s_skipFrom)
++        return;
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];

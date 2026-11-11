@@ -1,0 +1,285 @@
+diff --git a/ps2xRuntime/include/ps2_display.h b/ps2xRuntime/include/ps2_display.h
+index 98e2a3c..4a2187f 100644
+--- a/ps2xRuntime/include/ps2_display.h
++++ b/ps2xRuntime/include/ps2_display.h
+@@ -54,6 +54,12 @@ namespace ps2x
+     // "<width>x<height>" (digits only), from 320x240 to 7680x4320.
+     bool parseWindowSize(std::string_view text, int &width, int &height);
+     std::string windowSizeText(int width, int height);
++    // Nativizacion T5: the window sizes the game's OPTIONS > PC DISPLAY page offers, sorted by width and height: the
++    // common 4:3 and 16:9 ones (960x720, the default, always) that fit in a desktop of desktopWidth x desktopHeight
++    // (0 x 0: unknown, all of them), the desktop's own size and the valid sizes of include (the ones in use, even if
++    // larger), once each.
++    std::vector<std::string> windowSizeChoices(const std::vector<std::string> &include, int desktopWidth,
++                                               int desktopHeight);
+ 
+     // From the variables that opciones.ini sets (PS2X_FILTRO, PS2X_VSYNC, PS2X_MOSTRAR_FPS, PS2X_PANTALLA, or the old
+     // PS2X_PANTALLA_COMPLETA=1 when PS2X_PANTALLA is not set, and PS2X_TAMANO_VENTANA). Unset or bad: the defaults of
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index 5f989eb..e02a6fe 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -133,6 +133,9 @@ namespace ps2x
+     // Back to the saved values, or to the defaults of the mode (not saved yet); forced options do not change.
+     void discardMenuChanges(OptionsMenuModel &model);
+     void resetMenuToDefaults(OptionsMenuModel &model);
++    // Nativizacion T5: the same for some options only (the rows of one page of the game's OPTIONS); unknown keys are
++    // ignored.
++    void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys);
+     // The values to write: current, except the forced options, which keep the file's value.
+     std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model);
+     bool menuHasChanges(const OptionsMenuModel &model);
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index b1ef453..41a332a 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -146,6 +146,15 @@ public:
+     // A screen opens: the values F11 and F10 may have changed, as when this menu opens.
+     static void syncGameOptions(PS2Runtime &runtime);
+     static bool saveGameOptions();
++    // Nativizacion T5 (OPTIONS > PC DISPLAY): an option's opciones.ini value as text (tamano_ventana is not a number),
++    // set through ps2x::setMenuOption; the page's defaults (ps2x::resetMenuOptionsToDefaults); the window sizes it
++    // offers (ps2x::windowSizeChoices with the saved and current sizes and the desktop of the window's monitor, read by
++    // update()); and the GS in use (gpu or cpu: gs changes when the game restarts).
++    static bool gameOptionText(const std::string &key, std::string &value);
++    static bool setGameOptionText(const std::string &key, const std::string &value);
++    static void resetGameOptions(const std::vector<std::string> &keys);
++    static std::vector<std::string> gameWindowSizes();
++    static std::string gameGsInUse();
+ 
+ private:
+     struct State;
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+index dd66106..7cac66a 100644
+--- a/ps2xRuntime/src/lib/ps2_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -140,6 +140,31 @@ namespace ps2x
+         return std::to_string(width) + "x" + std::to_string(height);
+     }
+ 
++    std::vector<std::string> windowSizeChoices(const std::vector<std::string> &include, int desktopWidth,
++                                               int desktopHeight)
++    {
++        static constexpr int kCommon[][2] = {{960, 720},   {1280, 720},  {1280, 960},  {1440, 1080}, {1600, 900},
++                                             {1600, 1200}, {1920, 1080}, {1920, 1440}, {2560, 1440}, {3840, 2160}};
++        std::vector<std::pair<int, int>> sizes;
++        const bool desktopKnown = desktopWidth > 0 && desktopHeight > 0;
++        for (const auto &size : kCommon)
++            if (!desktopKnown || (size[0] <= desktopWidth && size[1] <= desktopHeight) ||
++                (size[0] == DisplaySettings{}.windowWidth && size[1] == DisplaySettings{}.windowHeight))
++                sizes.push_back({size[0], size[1]});
++        int width = 0, height = 0;
++        if (desktopKnown && parseWindowSize(windowSizeText(desktopWidth, desktopHeight), width, height))
++            sizes.push_back({width, height});
++        for (const std::string &value : include)
++            if (parseWindowSize(value, width, height))
++                sizes.push_back({width, height});
++        std::sort(sizes.begin(), sizes.end());
++        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
++        std::vector<std::string> choices;
++        for (const auto &[w, h] : sizes)
++            choices.push_back(windowSizeText(w, h));
++        return choices;
++    }
++
+     DisplaySettings displaySettingsFromEnvironment(const std::function<const char *(const char *)> &getEnvironment)
+     {
+         DisplaySettings settings;
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index c4c8368..09d01f7 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -557,6 +557,13 @@ namespace ps2x
+                 model.current[spec.key] = optionDefault(spec, model.development);
+     }
+ 
++    void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys)
++    {
++        for (const std::string &key : keys)
++            if (const OptionSpec *spec = findSpec(key); spec != nullptr && model.forced.count(key) == 0u)
++                model.current[key] = optionDefault(*spec, model.development);
++    }
++
+     std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model)
+     {
+         std::map<std::string, std::string> values = model.current;
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 3eaad3a..e66d9ab 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -298,6 +298,9 @@ namespace
+     // model: update() and draw() run on the main thread, the game's screens on the EE thread.
+     std::mutex g_modelMutex;
+     PS2OptionsMenu *g_gameMenu = nullptr;
++    // Nativizacion T5: the desktop of the window's monitor (0: not known yet), for gameWindowSizes on the EE thread.
++    std::atomic<int> g_desktopWidth{0};
++    std::atomic<int> g_desktopHeight{0};
+ 
+     std::string readFile(const std::filesystem::path &file);
+ 
+@@ -590,6 +593,14 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+     if (!s.initialized)
+         return;
+     const double now = GetTime();
++    static double s_desktopRead = -1.0;
++    if (s_desktopRead < 0.0 || now - s_desktopRead >= 1.0)
++    {
++        const int monitor = GetCurrentMonitor();
++        g_desktopWidth.store(GetMonitorWidth(monitor));
++        g_desktopHeight.store(GetMonitorHeight(monitor));
++        s_desktopRead = now;
++    }
+ 
+     const auto setOpen = [&](bool open)
+     {
+@@ -1134,3 +1145,60 @@ bool PS2OptionsMenu::saveGameOptions()
+     saveAndReport(s.model, s.file, s.status, s.statusError);
+     return !s.statusError;
+ }
++
++bool PS2OptionsMenu::gameOptionText(const std::string &key, std::string &value)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    const auto found = s.model.current.find(key);
++    if (found == s.model.current.end())
++        return false;
++    value = found->second;
++    return true;
++}
++
++bool PS2OptionsMenu::setGameOptionText(const std::string &key, const std::string &value)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return false;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    return ps2x::setMenuOption(s.model, key, value);
++}
++
++void PS2OptionsMenu::resetGameOptions(const std::vector<std::string> &keys)
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return;
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    ps2x::resetMenuOptionsToDefaults(s.model, keys);
++}
++
++std::vector<std::string> PS2OptionsMenu::gameWindowSizes()
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    std::vector<std::string> inUse;
++    if (g_gameMenu != nullptr)
++    {
++        State &s = *g_gameMenu->m_state;
++        ensureModel(s);
++        inUse = {valueOf(s.model.saved, "tamano_ventana"), valueOf(s.model.current, "tamano_ventana")};
++    }
++    return ps2x::windowSizeChoices(inUse, g_desktopWidth.load(), g_desktopHeight.load());
++}
++
++std::string PS2OptionsMenu::gameGsInUse()
++{
++    std::lock_guard<std::mutex> lock(g_modelMutex);
++    if (g_gameMenu == nullptr)
++        return ps2GsActiveGpuBackend() != nullptr ? "gpu" : "cpu";
++    State &s = *g_gameMenu->m_state;
++    ensureModel(s);
++    return s.runningGs;
++}
+diff --git a/ps2xTest/src/ps2_display_tests.cpp b/ps2xTest/src/ps2_display_tests.cpp
+index 67f908b..ce8269f 100644
+--- a/ps2xTest/src/ps2_display_tests.cpp
++++ b/ps2xTest/src/ps2_display_tests.cpp
+@@ -335,6 +335,35 @@ void register_ps2_display_tests()
+                      std::string("320x240 at 8,31"), "never below the smallest window");
+         });
+ 
++        tc.Run("the window sizes of the game's PC DISPLAY page fit the desktop and keep the ones in use", [](TestCase &t)
++        {
++            const auto text = [](const std::vector<std::string> &sizes)
++            {
++                std::string joined;
++                for (const std::string &size : sizes)
++                    joined += (joined.empty() ? "" : " ") + size;
++                return joined;
++            };
++            t.Equals(text(ps2x::windowSizeChoices({}, 0, 0)),
++                     std::string("960x720 1280x720 1280x960 1440x1080 1600x900 1600x1200 1920x1080 1920x1440 2560x1440 "
++                                 "3840x2160"),
++                     "desktop unknown: every common 4:3 and 16:9 size, the default first");
++            t.Equals(text(ps2x::windowSizeChoices({"960x720"}, 1920, 1080)),
++                     std::string("960x720 1280x720 1280x960 1440x1080 1600x900 1920x1080"),
++                     "a 1920x1080 desktop: the ones that fit, the desktop's own size last");
++            t.Equals(text(ps2x::windowSizeChoices({}, 2560, 1600)),
++                     std::string("960x720 1280x720 1280x960 1440x1080 1600x900 1600x1200 1920x1080 1920x1440 2560x1440 "
++                                 "2560x1600"),
++                     "a 16:10 desktop: its size is offered too");
++            t.Equals(text(ps2x::windowSizeChoices({"1000x700", "1920x1080", "10x10", "nada"}, 1280, 720)),
++                     std::string("960x720 1000x700 1280x720 1920x1080"),
++                     "the sizes in use stay (also larger than the desktop), sorted; bad ones are left out");
++            t.Equals(text(ps2x::windowSizeChoices({}, 800, 600)), std::string("800x600 960x720"),
++                     "a small desktop: its size and the default");
++            t.Equals(text(ps2x::windowSizeChoices({}, 100, 100)), std::string("960x720"),
++                     "a desktop below the smallest window: only the default");
++        });
++
+         tc.Run("the FPS counter is one line above the game's HUD", [](TestCase &t)
+         {
+             for (const int height : {480, 720, 960, 993, 1080, 1440, 2160})
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 4a72c62..8b615f7 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -252,6 +252,45 @@ void register_ps2_options_menu_tests()
+             t.Equals(development.current.at("gs"), std::string("cpu"), "development: its own defaults");
+         });
+ 
++        tc.Run("the defaults of one page of the game's OPTIONS change only its options", [](TestCase &t)
++        {
++            const Environment environment = {{"PS2X_ASPECTO", "4:3"}};
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                "aspecto = 4:3\ntamano_ventana = 1920x1080\ngs = cpu\nfiltro = crt\n", false,
++                ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            ps2x::setMenuOption(model, "vsync", "0");
++            ps2x::resetMenuOptionsToDefaults(model, {"aspecto", "tamano_ventana", "gs", "no_existe"});
++            t.Equals(model.current.at("tamano_ventana"), std::string("960x720"), "the default window size");
++            t.Equals(model.current.at("gs"), std::string("gpu"), "the player's GS");
++            t.Equals(model.current.at("aspecto"), std::string("4:3"), "a forced option keeps its variable's value");
++            t.Equals(model.current.at("filtro"), std::string("crt"), "the other pages' options do not change");
++            t.Equals(model.current.at("vsync"), std::string("0"), "not even their unsaved changes");
++            t.IsFalse(model.current.count("no_existe") != 0u, "an unknown key adds nothing");
++            t.Equals(model.saved.at("tamano_ventana"), std::string("1920x1080"), "nothing is saved yet");
++
++            ps2x::OptionsMenuModel development = ps2x::makeOptionsMenuModel("gs = gpu\n", true, {}, environmentOf({}));
++            ps2x::resetMenuOptionsToDefaults(development, {"gs"});
++            t.Equals(development.current.at("gs"), std::string("cpu"), "development: its own defaults");
++        });
++
++        tc.Run("the PC DISPLAY rows read and set aspecto and gs as the position of their choice", [](TestCase &t)
++        {
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("aspecto = 16:9\n", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "aspecto", value), "aspecto is a number");
++            t.Equals(value, 2.0f, "16:9: the third choice");
++            t.IsTrue(ps2x::menuOptionNumber(model, "gs", value), "gs is a number");
++            t.Equals(value, 1.0f, "gpu: the second choice");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "aspecto", 3.0f), "pixel");
++            t.Equals(model.current.at("aspecto"), std::string("pixel"), "aspecto = pixel");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "gs", 0.0f), "cpu");
++            t.Equals(model.current.at("gs"), std::string("cpu"), "gs = cpu");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "aspecto", 4.0f), "no fifth aspect");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "tamano_ventana", 1.0f), "a window size is not a number");
++            t.IsTrue(ps2x::setMenuOption(model, "tamano_ventana", "1280x720"), "but its text is");
++            t.Equals(model.current.at("tamano_ventana"), std::string("1280x720"), "tamano_ventana = 1280x720");
++        });
++
+         tc.Run("saveOptionsMenu writes the menu's values, keeps unknown keys and the forced options' file values", [](TestCase &t)
+         {
+             TempDir dir;

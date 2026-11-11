@@ -1,0 +1,933 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 1766ee7..6ff47e1 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "Pad.h"
+ #include "../../ps2_pad_win.h"
++#include "../../ps2_pad_players.h"
+ #include <cstring>
+ 
+ namespace ps2_stubs
+@@ -22,6 +23,8 @@ namespace ps2_stubs
+         // connected pad at rest, so F1 06 let a single player into SPLIT SCREEN, where player 2 could never press
+         // READY; on the console (and PCSX2) the game says "This game mode requires two controllers". PS2X_MANDO2=1:
+         // the second port connected, as before.
++        // Patch 0150: the second port also has a controller when controles.ini has a usable player 2 ([jugador2] with
++        // keys, or with its gamepad present).
+         bool portHasController(int port)
+         {
+             static const bool s_secondPort = []
+@@ -29,7 +32,7 @@ namespace ps2_stubs
+                 const char *value = std::getenv("PS2X_MANDO2");
+                 return value != nullptr && value[0] != '\0' && value[0] != '0';
+             }();
+-            return port == 0 || s_secondPort;
++            return port == 0 || s_secondPort || (port == 1 && ps2x::padPortConnected(1));
+         }
+ 
+         constexpr uint16_t kPadBtnSelect = 1u << 0;
+@@ -733,40 +736,44 @@ namespace ps2_stubs
+ 
+     // Patch 0105: the DualShock 2 motors on the host pad (port 0). SetActAlign says which byte of SetActDirect's data
+     // drives each motor (0 = the small one, on or off; 1 = the large one, 0-255; 0xFF = none).
++    // Patch 0150: port 1 drives player 2's pad (controles.ini [jugador2]).
+     namespace
+     {
+-        uint8_t g_actAlign[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
+-        float g_lastSmall = -1.0f, g_lastLarge = -1.0f;
++        uint8_t g_actAlign[kPadPortCount][6] = {{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu},
++                                                {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
++        float g_lastSmall[kPadPortCount] = {-1.0f, -1.0f}, g_lastLarge[kPadPortCount] = {-1.0f, -1.0f};
+     }
+ 
+     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)runtime;
+-        if (getRegU32(ctx, 4) == 0u)
++        const uint32_t port = getRegU32(ctx, 4);
++        if (port < kPadPortCount)
+             if (const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6)))
+-                std::memcpy(g_actAlign, align, sizeof(g_actAlign));
++                std::memcpy(g_actAlign[port], align, sizeof(g_actAlign[port]));
+         setReturnS32(ctx, 1);
+     }
+ 
+     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)runtime;
+-        if (getRegU32(ctx, 4) == 0u)
++        const uint32_t port = getRegU32(ctx, 4);
++        if (port < kPadPortCount)
+             if (const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6)))
+             {
+                 float motorSmall = 0.0f, motorLarge = 0.0f;
+                 for (int i = 0; i < 6; ++i)
+                 {
+-                    if (g_actAlign[i] == 0u)
++                    if (g_actAlign[port][i] == 0u)
+                         motorSmall = data[i] != 0u ? 1.0f : 0.0f;
+-                    else if (g_actAlign[i] == 1u)
++                    else if (g_actAlign[port][i] == 1u)
+                         motorLarge = static_cast<float>(data[i]) / 255.0f;
+                 }
+-                if (motorSmall != g_lastSmall || motorLarge != g_lastLarge)
++                if (motorSmall != g_lastSmall[port] || motorLarge != g_lastLarge[port])
+                 {
+-                    g_lastSmall = motorSmall;
+-                    g_lastLarge = motorLarge;
+-                    ps2_pad_win::setRumble(motorSmall * 0.6f, motorLarge);
++                    g_lastSmall[port] = motorSmall;
++                    g_lastLarge[port] = motorLarge;
++                    ps2x::setPadPortRumble(static_cast<int>(port), motorSmall * 0.6f, motorLarge);
+                 }
+             }
+         setReturnS32(ctx, 1);
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index c6993a6..5f66dcd 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_win.h"
++#include "ps2_pad_players.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
+ 
+@@ -9,6 +10,7 @@
+ #include <atomic>
+ #include <cctype>
+ #include <cmath>
++#include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -24,6 +26,9 @@
+ // dos sticks como medios ejes) toma el maximo de sus entradas: teclas (raylib), botones, ejes y gatillos del mando
+ // (raylib/XInput) y ejes, botones y cruceta del volante (DirectInput, ps2_pad_win.cpp). Solo el puerto 0; el 1 queda
+ // suelto. Antes: mando o teclado fijos y presiones de todo o nada.
++// Patch 0150 (fase 4): la seccion [jugador2] es el puerto 1 (pantalla partida): su mando de raylib y sus teclas, sin
++// volante. Sin la seccion, el puerto 1 sigue desconectado (parche 0123) y el jugador 1 queda como antes.
++
+ namespace
+ {
+     constexpr uint8_t kPadAnalogMarker = 0x73;
+@@ -57,6 +62,7 @@ namespace
+         SourceKind kind = SourceKind::Key;
+         int code = 0;
+         char mode = '+';
++        std::string text; // "tecla:X": como se escribe, para el registro y las pruebas
+     };
+ 
+     struct Config
+@@ -128,7 +134,34 @@ namespace
+         "stick_der_izquierda = mando:RX-\n"
+         "stick_der_derecha = mando:RX+\n"
+         "stick_der_arriba = mando:RY-\n"
+-        "stick_der_abajo = mando:RY+\n";
++        "stick_der_abajo = mando:RY+\n"
++        "\n"
++        "# Jugador 2 (SPLIT SCREEN, pantalla partida). Sin la seccion [jugador2] el segundo mando sale desconectado, como\n"
++        "# en una PS2 con un solo mando, y el juego pide el segundo mando. Para jugar dos, quita el # de [jugador2] y de\n"
++        "# las lineas que quieras. Debajo de [jugador2] van los mismos controles y parametros que arriba, salvo el volante\n"
++        "# (es del jugador 1). Los controles que no pongas usan las entradas mando: de arriba, en el mando del jugador 2.\n"
++        "# El segundo mando sale conectado si el jugador 2 tiene alguna tecla o si su mando esta enchufado. Cada mando es\n"
++        "# de un solo jugador: si le pones el del jugador 1, el jugador 2 se queda sin mando. Las teclas del jugador 2 no\n"
++        "# deben ser las del jugador 1 (si no, las pulsan los dos jugadores a la vez).\n"
++        "#[jugador2]\n"
++        "# Mando del jugador 2 (1 = el segundo; -1 = ninguno, solo teclado). La vibracion va a su mando XInput.\n"
++        "#mando = 1\n"
++        "#vibracion = 1\n"
++        "# Ejemplo con teclado (teclas que el jugador 1 no usa): M acelera, N frena, I J K L para la direccion.\n"
++        "#cruz = tecla:M, mando:A\n"
++        "#cuadrado = tecla:N, mando:X\n"
++        "#circulo = tecla:B, mando:B\n"
++        "#triangulo = tecla:G, mando:Y\n"
++        "#l1 = tecla:U, mando:LB\n"
++        "#r1 = tecla:O, mando:RB\n"
++        "#start = tecla:P, mando:START\n"
++        "#select = tecla:Y, mando:BACK\n"
++        "#arriba = tecla:I, mando:ARRIBA\n"
++        "#abajo = tecla:K, mando:ABAJO\n"
++        "#izquierda = tecla:J, mando:IZQUIERDA\n"
++        "#derecha = tecla:L, mando:DERECHA\n"
++        "#stick_izq_izquierda = tecla:J, mando:LX-\n"
++        "#stick_izq_derecha = tecla:L, mando:LX+\n";
+ 
+     struct Named
+     {
+@@ -167,6 +200,7 @@ namespace
+             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+         for (char &c : what)
+             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++        out.text = device + ":" + what;
+         if (device == "tecla")
+         {
+             out.kind = SourceKind::Key;
+@@ -259,24 +293,88 @@ namespace
+         return s.substr(a, b - a);
+     }
+ 
+-    void parseConfig(const std::string &text, Config &cfg)
++    // Patch 0150: los dos jugadores de controles.ini (el 2, el de la seccion [jugador2]).
++    struct Players
++    {
++        Config player[2];
++        bool second = false; // hay seccion [jugador2]
++    };
++
++    std::string formatted(const char *format, ...)
++    {
++        char buffer[512];
++        va_list args;
++        va_start(args, format);
++        std::vsnprintf(buffer, sizeof(buffer), format, args);
++        va_end(args);
++        return buffer;
++    }
++
++    std::string lowercase(std::string s)
++    {
++        for (char &c : s)
++            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        return s;
++    }
++
++    bool isWheelSource(const Source &s)
++    {
++        return s.kind == SourceKind::WheelAxis || s.kind == SourceKind::WheelButton || s.kind == SourceKind::WheelPov;
++    }
++
++    bool isGamepadSource(const Source &s)
++    {
++        return s.kind == SourceKind::PadButton || s.kind == SourceKind::PadAxis || s.kind == SourceKind::PadTrigger;
++    }
++
++    // messages: los avisos, sin el "[pad] " (config() los saca por stderr).
++    void parseConfig(const std::string &text, Players &players, std::vector<std::string> &messages)
+     {
+         std::istringstream in(text);
+         std::string line;
+         int lineNumber = 0;
++        int section = 0; // 0 = jugador 1 (sin seccion o [jugador1]), 1 = [jugador2], -1 = seccion desconocida
+         while (std::getline(in, line))
+         {
+             ++lineNumber;
+             const size_t hash = line.find('#');
+             if (hash != std::string::npos)
+                 line.resize(hash);
++            const std::string header = trim(line);
++            if (!header.empty() && header.front() == '[')
++            {
++                const size_t close = header.find(']');
++                const std::string name =
++                    lowercase(trim(header.substr(1u, close == std::string::npos ? std::string::npos : close - 1u)));
++                if (name == "jugador1")
++                    section = 0;
++                else if (name == "jugador2")
++                {
++                    section = 1;
++                    players.second = true;
++                }
++                else
++                {
++                    section = -1;
++                    messages.push_back(formatted("controles.ini:%d: seccion desconocida '%s' (sus lineas no cuentan)",
++                                                 lineNumber, header.c_str()));
++                }
++                continue;
++            }
++            if (section < 0)
++                continue;
++            Config &cfg = players.player[section];
+             const size_t eq = line.find('=');
+             if (eq == std::string::npos)
+                 continue;
+-            std::string key = trim(line.substr(0, eq));
++            const std::string key = lowercase(trim(line.substr(0, eq)));
+             const std::string value = trim(line.substr(eq + 1u));
+-            for (char &c : key)
+-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            if (section == 1 && (key == "volante" || key == "zona_muerta_volante" || key == "sensibilidad_volante"))
++            {
++                messages.push_back(formatted("controles.ini:%d: el volante es del jugador 1: '%s' no vale en [jugador2]",
++                                             lineNumber, key.c_str()));
++                continue;
++            }
+             if (key == "volante")
+                 cfg.wheel = value;
+             else if (key == "mando")
+@@ -299,7 +397,7 @@ namespace
+                         target = i;
+                 if (target < 0)
+                 {
+-                    std::fprintf(stderr, "[pad] controles.ini:%d: control desconocido '%s'\n", lineNumber, key.c_str());
++                    messages.push_back(formatted("controles.ini:%d: control desconocido '%s'", lineNumber, key.c_str()));
+                     continue;
+                 }
+                 cfg.map[static_cast<size_t>(target)].clear();
+@@ -311,22 +409,121 @@ namespace
+                     if (item.empty())
+                         continue;
+                     Source src;
+-                    if (parseSource(item, src))
+-                        cfg.map[static_cast<size_t>(target)].push_back(src);
++                    if (!parseSource(item, src))
++                        messages.push_back(
++                            formatted("controles.ini:%d: entrada desconocida '%s'", lineNumber, item.c_str()));
++                    else if (section == 1 && isWheelSource(src))
++                        messages.push_back(formatted(
++                            "controles.ini:%d: el volante es del jugador 1: '%s' no vale en [jugador2]", lineNumber,
++                            item.c_str()));
+                     else
+-                        std::fprintf(stderr, "[pad] controles.ini:%d: entrada desconocida '%s'\n", lineNumber,
+-                                     item.c_str());
++                        cfg.map[static_cast<size_t>(target)].push_back(src);
+                 }
+             }
+         }
+     }
+ 
+-    Config &config()
++    // Los valores por defecto: el jugador 1 como en kDefaultConfig; el 2 con el segundo mando y solo las entradas
++    // mando: de kDefaultConfig.
++    Players defaultPlayers()
++    {
++        Players p;
++        std::vector<std::string> ignored;
++        parseConfig(kDefaultConfig, p, ignored);
++        Config &two = p.player[1];
++        two = Config{};
++        two.gamepad = 1;
++        two.wheel = "ninguno";
++        for (int t = 0; t < kTargetCount; ++t)
++            for (const Source &s : p.player[0].map[static_cast<size_t>(t)])
++                if (isGamepadSource(s))
++                    two.map[static_cast<size_t>(t)].push_back(s);
++        return p;
++    }
++
++    // Tras leer el archivo: cada mando para un solo jugador (el 1 se queda el suyo), avisos de teclas compartidas y
++    // PS2X_SIN_MANDOS.
++    void finishPlayers(Players &p, bool noDevices, std::vector<std::string> &messages)
++    {
++        Config &one = p.player[0];
++        Config &two = p.player[1];
++        if (!p.second)
++        {
++            two.gamepad = -1;
++            two.rumble = false;
++        }
++        else
++        {
++            if (two.gamepad >= 0 && two.gamepad == one.gamepad)
++            {
++                messages.push_back(formatted("jugador2: el mando %d es del jugador 1; el jugador 2 se queda sin mando",
++                                             two.gamepad));
++                two.gamepad = -1;
++            }
++            std::vector<int> reported;
++            for (const std::vector<Source> &sources : two.map)
++                for (const Source &s : sources)
++                {
++                    if (s.kind != SourceKind::Key ||
++                        std::find(reported.begin(), reported.end(), s.code) != reported.end())
++                        continue;
++                    bool shared = false;
++                    for (const std::vector<Source> &mine : one.map)
++                        for (const Source &m : mine)
++                            shared = shared || (m.kind == SourceKind::Key && m.code == s.code);
++                    if (!shared)
++                        continue;
++                    reported.push_back(s.code);
++                    messages.push_back(formatted("jugador2: la tecla %s tambien es del jugador 1 (la pulsan los dos)",
++                                                 s.text.c_str() + 6)); // sin "tecla:"
++                }
++        }
++        if (noDevices)
++            for (Config &c : p.player)
++            {
++                c.gamepad = -1;
++                c.wheel = "ninguno";
++                c.rumble = false;
++                c.noDevices = true;
++            }
++    }
++
++    ps2x::PadPlayerInfo describePlayer(const Config &cfg, bool configured)
++    {
++        ps2x::PadPlayerInfo info;
++        info.configured = configured;
++        info.gamepad = cfg.gamepad;
++        info.rumble = cfg.rumble;
++        for (int t = 0; t < kTargetCount; ++t)
++        {
++            std::string line = std::string(kTargetNames[t]) + "=";
++            const std::vector<Source> &sources = cfg.map[static_cast<size_t>(t)];
++            for (size_t i = 0; i < sources.size(); ++i)
++            {
++                const Source &s = sources[i];
++                line += (i == 0u ? "" : ",") + s.text;
++                info.keyInputs += s.kind == SourceKind::Key ? 1 : 0;
++                info.gamepadInputs += isGamepadSource(s) ? 1 : 0;
++                info.wheelInputs += isWheelSource(s) ? 1 : 0;
++            }
++            info.controls.push_back(line);
++        }
++        return info;
++    }
++
++    struct LoadedPlayers
++    {
++        Players players;
++        ps2x::PadPlayerInfo second; // describePlayer del jugador 2, para padPortConnected
++    };
++
++    LoadedPlayers &loadedPlayers()
+     {
+-        static Config cfg = []()
++        static LoadedPlayers loaded = []()
+         {
+-            Config c;
+-            parseConfig(kDefaultConfig, c);
++            LoadedPlayers l;
++            l.players = defaultPlayers();
++            std::vector<std::string> messages;
+             const char *override = std::getenv("PS2X_CONTROLES"); // otro archivo (pruebas)
+             // Fase 1: la carpeta config del jugador (ps2_user_paths); sin ella, junto al .exe como antes.
+             const std::filesystem::path configDirectory = ps2x::userConfigDirectory();
+@@ -340,7 +537,10 @@ namespace
+             {
+                 std::stringstream text;
+                 text << file.rdbuf();
+-                parseConfig(text.str(), c);
++                parseConfig(text.str(), l.players, messages);
++                for (const std::string &m : messages)
++                    std::fprintf(stderr, "[pad] %s\n", m.c_str());
++                messages.clear();
+                 std::fprintf(stderr, "[pad] controles: %s\n", path.c_str());
+             }
+             else if (!override)
+@@ -352,21 +552,30 @@ namespace
+             // PS2X_SIN_MANDOS=1 (pruebas automaticas): no abre ni lee ningun mando fisico (DualSense por HID, XInput,
+             // raylib, volante por DirectInput) y no les manda vibracion, para no molestar a quien este usando el
+             // mando o el volante en otro programa. El piloto automatico y los guiones de pulsaciones siguen.
+-            const char *noDevices = std::getenv("PS2X_SIN_MANDOS");
+-            if (noDevices && noDevices[0] != '\0' && noDevices[0] != '0')
++            const char *noDevicesValue = std::getenv("PS2X_SIN_MANDOS");
++            const bool noDevices = noDevicesValue && noDevicesValue[0] != '\0' && noDevicesValue[0] != '0';
++            finishPlayers(l.players, noDevices, messages);
++            for (const std::string &m : messages)
++                std::fprintf(stderr, "[pad] %s\n", m.c_str());
++            l.second = describePlayer(l.players.player[1], l.players.second);
++            if (l.second.configured)
++                std::fprintf(stderr, "[pad] jugador 2: mando=%d, %d teclas, %d entradas de mando, vibracion=%d\n",
++                             l.second.gamepad, l.second.keyInputs, l.second.gamepadInputs, l.second.rumble ? 1 : 0);
++            if (noDevices)
+             {
+-                c.gamepad = -1;
+-                c.wheel = "ninguno";
+-                c.rumble = false;
+-                c.noDevices = true;
+                 ps2_pad_win::setRumbleEnabled(false, true);
+                 std::fprintf(stderr, "[pad] PS2X_SIN_MANDOS: sin mandos fisicos\n");
+-                return c;
++                return l;
+             }
+-            ps2_pad_win::setRumbleEnabled(c.rumble);
+-            return c;
++            ps2_pad_win::setRumbleEnabled(l.players.player[0].rumble);
++            return l;
+         }();
+-        return cfg;
++        return loaded;
++    }
++
++    Config &config()
++    {
++        return loadedPlayers().players.player[0];
+     }
+ 
+     float deadzoned(float v, float dz)
+@@ -501,10 +710,137 @@ namespace
+                 pressed |= static_cast<uint16_t>(1u << b);
+         return pressed;
+     }
++
++    void readValues(const Config &cfg, const Frame &f, float (&value)[kTargetCount])
++    {
++        for (int t = 0; t < kTargetCount; ++t)
++            for (const Source &s : cfg.map[static_cast<size_t>(t)])
++                value[t] = std::max(value[t], sourceValue(s, cfg, f));
++    }
++
++    // Botones, sticks y presiones del informe del DualShock 2 (bytes 2-20).
++    void writeReport(uint8_t *data, uint16_t pressed, const float (&value)[kTargetCount], const Config &cfg)
++    {
++        const uint16_t buttons = static_cast<uint16_t>(~pressed);
++        data[2] = static_cast<uint8_t>(buttons & 0xFFu);
++        data[3] = static_cast<uint8_t>(buttons >> 8);
++
++        auto stick = [&value](int negative, int positive)
++        {
++            const float v = std::clamp(value[positive] - value[negative], -1.0f, 1.0f);
++            return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(127.5f + v * 127.5f)), 0, 255));
++        };
++        data[4] = stick(kRsLeft, kRsRight);
++        data[5] = stick(kRsUp, kRsDown);
++        data[6] = stick(kLsLeft, kLsRight);
++        data[7] = stick(kLsUp, kLsDown);
++
++        // Presiones (bytes 8-19 del DualShock 2): derecha, izquierda, arriba, abajo, triangulo, circulo, cruz,
++        // cuadrado, l1, l2, r1, r2. Solo con el boton pulsado (como el mando real).
++        static const int kPressureOrder[12] = {kRight, kLeft, kUp, kDown, kTriangle, kCircle, kCross, kSquare,
++                                               kL1, kL2, kR1, kR2};
++        for (int i = 0; i < 12; ++i)
++        {
++            const float v = value[kPressureOrder[i]];
++            data[8 + i] = v >= cfg.buttonThreshold
++                              ? static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 255.0f)), 1, 255))
++                              : 0u;
++        }
++        data[20] = 1u; // presiones validas (Pad.cpp)
++    }
++
++    // PS2X_PAD_DEPURAR=1: el informe cada vez que cambia (botones, sticks y presiones), las 2.000 primeras veces de
++    // cada puerto. El del jugador 2 lleva "jugador2 " delante.
++    void debugReport(int port, const uint8_t *data, const Frame &f)
++    {
++        static const bool s_debug = []()
++        {
++            const char *v = std::getenv("PS2X_PAD_DEPURAR");
++            return v && v[0] != '0';
++        }();
++        if (!s_debug || port < 0 || port > 1)
++            return;
++        static uint8_t s_last[2][21] = {};
++        static unsigned s_count[2] = {};
++        if (std::memcmp(s_last[port], data, sizeof(s_last[port])) == 0 || s_count[port] >= 2000u)
++            return;
++        ++s_count[port];
++        std::memcpy(s_last[port], data, sizeof(s_last[port]));
++        const unsigned buttons = static_cast<unsigned>(data[2] | (data[3] << 8));
++        std::fprintf(stderr, "[pad] %sbotones=%04x stick_izq=(%u,%u) stick_der=(%u,%u) presiones=",
++                     port == 1 ? "jugador2 " : "", buttons, data[6], data[7], data[4], data[5]);
++        for (int i = 8; i < 20; ++i)
++            std::fprintf(stderr, "%s%u", i == 8 ? "" : ",", data[i]);
++        std::fprintf(stderr, " mando=%d%s volante=%d\n", f.gamepad ? 1 : 0, f.dualSense ? " (DualSense HID)" : "",
++                     f.wheel.present ? 1 : 0);
++    }
++
++    // Patch 0150: el informe del jugador 2 (puerto 1): su mando de raylib (sin DualSense por HID ni volante) y sus
++    // teclas. Con el menu de opciones abierto, en reposo.
++    void readSecondPlayer(uint8_t *data)
++    {
++        const Players &p = loadedPlayers().players;
++        if (!p.second)
++            return;
++        const Config &cfg = p.player[1];
++        Frame f;
++        f.pad = cfg.gamepad;
++        f.gamepad = cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad);
++        float value[kTargetCount] = {};
++        readValues(cfg, f, value);
++        if (g_optionsMenuOpen.load(std::memory_order_relaxed))
++            return;
++        writeReport(data, pressedButtons(value, cfg), value, cfg);
++        debugReport(1, data, f);
++    }
+ }
+ 
+ namespace ps2x
+ {
++    PadPlayersInfo describePadPlayers(const std::string &iniText, bool noDevices)
++    {
++        Players p = defaultPlayers();
++        PadPlayersInfo info;
++        parseConfig(iniText, p, info.messages);
++        finishPlayers(p, noDevices, info.messages);
++        info.players[0] = describePlayer(p.player[0], true);
++        info.players[1] = describePlayer(p.player[1], p.second);
++        return info;
++    }
++
++    bool secondPadPortConnected(const PadPlayerInfo &player2, bool gamepadPresent)
++    {
++        return player2.configured &&
++               (player2.keyInputs > 0 || (player2.gamepad >= 0 && player2.gamepadInputs > 0 && gamepadPresent));
++    }
++
++    bool padPortConnected(int port)
++    {
++        if (port == 0)
++            return true;
++        if (port != 1)
++            return false;
++        const PadPlayerInfo &second = loadedPlayers().second;
++        const bool connected =
++            secondPadPortConnected(second, second.gamepad >= 0 && IsGamepadAvailable(second.gamepad));
++        static std::atomic<int> s_logged{-1};
++        if (second.configured && s_logged.exchange(connected ? 1 : 0, std::memory_order_relaxed) != (connected ? 1 : 0))
++            std::fprintf(stderr, "[pad] puerto 2 (jugador 2): %s\n", connected ? "conectado" : "desconectado");
++        return connected;
++    }
++
++    void setPadPortRumble(int port, float smallMotor, float largeMotor)
++    {
++        if (port == 0)
++        {
++            ps2_pad_win::setRumble(smallMotor, largeMotor);
++            return;
++        }
++        const Players &p = loadedPlayers().players;
++        if (port == 1 && p.second && p.player[1].rumble && p.player[1].gamepad >= 0)
++            ps2_pad_win::setXInputRumble(p.player[1].gamepad, smallMotor, largeMotor);
++    }
++
+     void setOptionsMenuOpen(bool open)
+     {
+         g_optionsMenuOpen.store(open, std::memory_order_relaxed);
+@@ -550,8 +886,10 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     data[2] = 0xFF;
+     data[3] = 0xFF;
+     data[4] = data[5] = data[6] = data[7] = 0x80;
++    if (port == 1)
++        readSecondPlayer(data); // sin [jugador2], suelto
+     if (port != 0)
+-        return true; // el segundo mando, suelto
++        return true;
+ 
+     const Config &cfg = config();
+     std::call_once(g_wheelOnce, [&cfg]()
+@@ -576,9 +914,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     }
+ 
+     float value[kTargetCount] = {};
+-    for (int t = 0; t < kTargetCount; ++t)
+-        for (const Source &s : cfg.map[static_cast<size_t>(t)])
+-            value[t] = std::max(value[t], sourceValue(s, cfg, f));
++    readValues(cfg, f, value);
+ 
+     // Phase 3 (T3): the options menu open (or a button still held after closing it): the neutral pad above.
+     uint16_t pressed = pressedButtons(value, cfg);
+@@ -594,55 +930,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     if ((pressed & ps2x::kPadR3) == 0u)
+         value[kR3] = 0.0f;
+ 
+-    const uint16_t buttons = static_cast<uint16_t>(~pressed);
+-    data[2] = static_cast<uint8_t>(buttons & 0xFFu);
+-    data[3] = static_cast<uint8_t>(buttons >> 8);
+-
+-    auto stick = [&value](int negative, int positive)
+-    {
+-        const float v = std::clamp(value[positive] - value[negative], -1.0f, 1.0f);
+-        return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(127.5f + v * 127.5f)), 0, 255));
+-    };
+-    data[4] = stick(kRsLeft, kRsRight);
+-    data[5] = stick(kRsUp, kRsDown);
+-    data[6] = stick(kLsLeft, kLsRight);
+-    data[7] = stick(kLsUp, kLsDown);
+-
+-    // Presiones (bytes 8-19 del DualShock 2): derecha, izquierda, arriba, abajo, triangulo, circulo, cruz,
+-    // cuadrado, l1, l2, r1, r2. Solo con el boton pulsado (como el mando real).
+-    static const int kPressureOrder[12] = {kRight, kLeft, kUp, kDown, kTriangle, kCircle, kCross, kSquare,
+-                                           kL1, kL2, kR1, kR2};
+-    for (int i = 0; i < 12; ++i)
+-    {
+-        const float v = value[kPressureOrder[i]];
+-        data[8 + i] = v >= cfg.buttonThreshold
+-                          ? static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 255.0f)), 1, 255))
+-                          : 0u;
+-    }
+-    data[20] = 1u; // presiones validas (Pad.cpp)
+-
+-    // PS2X_PAD_DEPURAR=1: el informe cada vez que cambia (botones, sticks y presiones), las 2.000 primeras veces.
+-    static const bool s_debug = []()
+-    {
+-        const char *v = std::getenv("PS2X_PAD_DEPURAR");
+-        return v && v[0] != '0';
+-    }();
+-    if (s_debug)
+-    {
+-        static uint8_t s_last[21] = {};
+-        static unsigned s_count = 0u;
+-        if (std::memcmp(s_last, data, sizeof(s_last)) != 0 && s_count < 2000u)
+-        {
+-            ++s_count;
+-            std::memcpy(s_last, data, sizeof(s_last));
+-            std::fprintf(stderr, "[pad] botones=%04x stick_izq=(%u,%u) stick_der=(%u,%u) presiones=", buttons, data[6],
+-                         data[7], data[4], data[5]);
+-            for (int i = 8; i < 20; ++i)
+-                std::fprintf(stderr, "%s%u", i == 8 ? "" : ",", data[i]);
+-            std::fprintf(stderr, " mando=%d%s volante=%d\n", f.gamepad ? 1 : 0, f.dualSense ? " (DualSense HID)" : "",
+-                         f.wheel.present ? 1 : 0);
+-        }
+-    }
++    writeReport(data, pressed, value, cfg);
++    debugReport(0, data, f);
+     return true;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad_players.h b/ps2xRuntime/src/lib/ps2_pad_players.h
+new file mode 100644
+index 0000000..e668e3a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pad_players.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++// Patch 0150 (F1 06, fase 4): the second player of controles.ini ([jugador2]) on the PS2's second pad port, for split
++// screen. Without that section the second port stays disconnected, as in patch 0123.
++namespace ps2x
++{
++    struct PadPlayerInfo
++    {
++        bool configured = false; // player 1 always; player 2 only with a [jugador2] section
++        int gamepad = -1;        // raylib gamepad it reads (-1 = none)
++        bool rumble = false;
++        int keyInputs = 0;       // tecla: entries in its controls
++        int gamepadInputs = 0;   // mando: entries
++        int wheelInputs = 0;     // volante: entries (player 1 only)
++        // Every control with its inputs, in the order of the PS2 report: "cruz=tecla:X,mando:A,volante:Y~".
++        std::vector<std::string> controls;
++    };
++
++    struct PadPlayersInfo
++    {
++        PadPlayerInfo players[2];
++        std::vector<std::string> messages; // the warnings the game logs as "[pad] <message>"
++    };
++
++    // Parses a controles.ini text over the defaults, as the game does (without reading or writing any file).
++    // noDevices: PS2X_SIN_MANDOS (no physical gamepad for anybody).
++    PadPlayersInfo describePadPlayers(const std::string &iniText, bool noDevices);
++    // Whether the second port has a controller: player 2 configured with some key, or with its gamepad present.
++    bool secondPadPortConnected(const PadPlayerInfo &player2, bool gamepadPresent);
++
++    // The game's controles.ini: whether a PS2 port (0 or 1) has a controller, and the motors of that port's pad.
++    bool padPortConnected(int port);
++    void setPadPortRumble(int port, float smallMotor, float largeMotor);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+index db218cf..3b58cce 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -605,6 +605,19 @@ namespace ps2_pad_win
+                         static_cast<uint8_t>(std::clamp(largeMotor, 0.0f, 1.0f) * 255.0f));
+     }
+ 
++    void setXInputRumble(int index, float smallMotor, float largeMotor)
++    {
++        if (index < 0 || index > 3)
++            return;
++        if (XInputSetStateFn fn = loadXInputSetState())
++        {
++            XINPUT_VIBRATION v{};
++            v.wRightMotorSpeed = static_cast<WORD>(std::clamp(smallMotor, 0.0f, 1.0f) * 65535.0f);
++            v.wLeftMotorSpeed = static_cast<WORD>(std::clamp(largeMotor, 0.0f, 1.0f) * 65535.0f);
++            fn(static_cast<DWORD>(index), &v);
++        }
++    }
++
+     bool readDualSenseBluetooth(DualSenseInput &out)
+     {
+         return dualSense().readInput(out);
+@@ -622,6 +635,7 @@ namespace ps2_pad_win
+     std::string wheelName() { return {}; }
+     void setRumbleEnabled(bool, bool) {}
+     void setRumble(float, float) {}
++    void setXInputRumble(int, float, float) {}
+     bool readDualSenseBluetooth(DualSenseInput &) { return false; }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.h b/ps2xRuntime/src/lib/ps2_pad_win.h
+index 1b836e2..1b1b1ff 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.h
++++ b/ps2xRuntime/src/lib/ps2_pad_win.h
+@@ -30,6 +30,8 @@ namespace ps2_pad_win
+     // silent: solo cambia el estado, sin mandar "motores parados" a ningun mando (PS2X_SIN_MANDOS).
+     void setRumbleEnabled(bool enabled, bool silent = false);
+     void setRumble(float smallMotor, float largeMotor);
++    // Patch 0150: solo el mando XInput index (0 a 3), para el jugador 2. No mira setRumbleEnabled (es del jugador 1).
++    void setXInputRumble(int index, float smallMotor, float largeMotor);
+ 
+     // DualSense por Bluetooth leido por HID (parche 0117). Al mandarle la vibracion (informe 0x31) pasa a enviar sus
+     // entradas en el informe completo 0x31, que raylib no entiende: se quedaba con lo ultimo que leyo. Mientras haya un
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index c165eef..269be65 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "Stubs/Pad.h"
++#include "ps2_pad_players.h"
+ 
+ #include <vector>
+ #include <cstdint>
+@@ -57,6 +58,23 @@ namespace
+         ps2_stubs::scePadRead(rdram.data(), &ctx, nullptr);
+     }
+ 
++    // Patch 0150: one control of a player, "cruz=tecla:X,..." (empty if it is not there).
++    std::string controlOf(const ps2x::PadPlayerInfo &player, const std::string &name)
++    {
++        for (const std::string &line : player.controls)
++            if (line.compare(0, name.size() + 1u, name + "=") == 0)
++                return line;
++        return {};
++    }
++
++    bool hasMessage(const ps2x::PadPlayersInfo &info, const std::string &message)
++    {
++        for (const std::string &m : info.messages)
++            if (m == message)
++                return true;
++        return false;
++    }
++
+     uint16_t readButtons(const std::vector<uint8_t> &rdram)
+     {
+         const uint8_t *data = rdram.data() + kPadDataAddr;
+@@ -531,4 +549,136 @@ void register_pad_input_tests()
+             t.IsTrue(std::string(reqStr).find("COMPLETE") != std::string::npos, "req string should include COMPLETE");
+         });
+     });
++
++    // Patch 0150: player 2 ([jugador2] in controles.ini) on the second port, for split screen.
++    MiniTest::Case("PadPlayers", [](TestCase &tc)
++                   {
++        tc.Run("a controles.ini without [jugador2] keeps player 1 as before and port 2 disconnected", [](TestCase &t)
++               {
++            // The user's file: the 0105 template, without any section.
++            const std::string oldIni =
++                "volante = auto\nmando = 0\nzona_muerta = 0.15\nvibracion = 1\n"
++                "cruz = tecla:X, tecla:ESPACIO, mando:A, volante:Y~\n"
++                "stick_izq_derecha = tecla:DERECHA, mando:LX+, volante:X+\n";
++            const ps2x::PadPlayersInfo defaults = ps2x::describePadPlayers("", false);
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers(oldIni, false);
++            t.IsTrue(info.players[0].configured, "player 1 is always configured");
++            t.Equals(info.players[0].gamepad, 0, "player 1 reads the first gamepad");
++            t.IsTrue(info.players[0].rumble, "player 1 rumble on");
++            t.Equals(info.players[0].controls.size(), size_t{24}, "the 24 controls of the DualShock 2");
++            t.IsTrue(info.players[0].controls == defaults.players[0].controls, "player 1 controls are the defaults");
++            t.Equals(controlOf(info.players[0], "cruz"), std::string("cruz=tecla:X,tecla:ESPACIO,mando:A,volante:Y~"),
++                     "cruz as in the template");
++            t.Equals(controlOf(info.players[0], "stick_izq_derecha"),
++                     std::string("stick_izq_derecha=tecla:DERECHA,mando:LX+,volante:X+"), "steering as in the template");
++            t.IsFalse(info.players[1].configured, "no player 2 without the section");
++            t.Equals(info.players[1].gamepad, -1, "player 2 reads no gamepad");
++            t.IsFalse(ps2x::secondPadPortConnected(info.players[1], true), "port 2 disconnected even with a gamepad");
++            t.IsFalse(ps2x::secondPadPortConnected(info.players[1], false), "port 2 disconnected");
++            t.IsTrue(info.messages.empty(), "no warnings");
++        });
++
++        tc.Run("player 1 messages for unknown controls stay as before", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers("foo = tecla:X\ncruz = tecla:X, raton:1\n", false);
++            t.Equals(info.messages.size(), size_t{2}, "two warnings");
++            t.IsTrue(hasMessage(info, "controles.ini:1: control desconocido 'foo'"), "unknown control");
++            t.IsTrue(hasMessage(info, "controles.ini:2: entrada desconocida 'raton:1'"), "unknown input");
++            t.Equals(controlOf(info.players[0], "cruz"), std::string("cruz=tecla:X"), "the valid input stays");
++        });
++
++        tc.Run("[jugador2] with keys connects port 2 without a gamepad and leaves player 1 alone", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo base = ps2x::describePadPlayers("mando = 0\n", false);
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers(
++                "mando = 0\n[jugador2]\nmando = -1\ncruz = tecla:K\nstart = tecla:NUM1\n", false);
++            t.IsTrue(info.players[0].controls == base.players[0].controls, "player 1 controls unchanged");
++            t.Equals(info.players[0].gamepad, 0, "player 1 keeps the first gamepad");
++            t.IsTrue(info.players[1].configured, "player 2 configured");
++            t.Equals(info.players[1].gamepad, -1, "player 2 without gamepad");
++            t.Equals(info.players[1].keyInputs, 2, "two keys");
++            t.Equals(info.players[1].wheelInputs, 0, "no wheel for player 2");
++            t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=tecla:K"), "player 2 cruz");
++            t.Equals(controlOf(info.players[1], "start"), std::string("start=tecla:NUM1"), "player 2 start");
++            t.Equals(controlOf(info.players[1], "circulo"), std::string("circulo=mando:B"),
++                     "controls not given: the default gamepad inputs");
++            t.IsTrue(ps2x::secondPadPortConnected(info.players[1], false), "port 2 connected with keys");
++            t.IsTrue(info.messages.empty(), "no warnings");
++        });
++
++        tc.Run("[jugador2] with only a gamepad connects port 2 when that gamepad is present", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers("[jugador2]\nmando = 1\n", false);
++            t.Equals(info.players[1].gamepad, 1, "the second gamepad");
++            t.IsTrue(info.players[1].rumble, "rumble on by default");
++            t.Equals(info.players[1].keyInputs, 0, "no keys");
++            t.Equals(info.players[1].gamepadInputs, 24, "the default gamepad inputs");
++            t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=mando:A"), "cruz on the gamepad");
++            t.Equals(controlOf(info.players[1], "stick_izq_izquierda"), std::string("stick_izq_izquierda=mando:LX-"),
++                     "steering on the gamepad");
++            t.IsTrue(ps2x::secondPadPortConnected(info.players[1], true), "connected with the gamepad present");
++            t.IsFalse(ps2x::secondPadPortConnected(info.players[1], false), "disconnected without it");
++            const ps2x::PadPlayersInfo implicitGamepad = ps2x::describePadPlayers("[jugador2]\nvibracion = 0\n", false);
++            t.Equals(implicitGamepad.players[1].gamepad, 1, "mando = 1 by default");
++            t.IsFalse(implicitGamepad.players[1].rumble, "its own rumble setting");
++            t.IsTrue(implicitGamepad.players[0].rumble, "player 1 rumble untouched");
++        });
++
++        tc.Run("a gamepad goes to one player only: player 1 keeps it", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers("mando = 1\n[jugador2]\nmando = 1\n", false);
++            t.Equals(info.players[0].gamepad, 1, "player 1 keeps gamepad 1");
++            t.Equals(info.players[1].gamepad, -1, "player 2 loses it");
++            t.IsTrue(hasMessage(info, "jugador2: el mando 1 es del jugador 1; el jugador 2 se queda sin mando"),
++                     "warning");
++            t.IsFalse(ps2x::secondPadPortConnected(info.players[1], true), "no device: disconnected");
++        });
++
++        tc.Run("the wheel stays with player 1", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info =
++                ps2x::describePadPlayers("[jugador2]\ncruz = tecla:K, volante:Y~\nvolante = auto\n", false);
++            t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=tecla:K"), "the wheel input is dropped");
++            t.Equals(info.players[1].wheelInputs, 0, "no wheel inputs");
++            t.Equals(controlOf(info.players[0], "cruz"), std::string("cruz=tecla:X,tecla:ESPACIO,mando:A,volante:Y~"),
++                     "player 1 keeps its wheel");
++            t.IsTrue(hasMessage(info, "controles.ini:2: el volante es del jugador 1: 'volante:Y~' no vale en [jugador2]"),
++                     "warning for the input");
++            t.IsTrue(hasMessage(info, "controles.ini:3: el volante es del jugador 1: 'volante' no vale en [jugador2]"),
++                     "warning for the parameter");
++        });
++
++        tc.Run("PS2X_SIN_MANDOS: no gamepad for anybody, keys still connect port 2", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo keys = ps2x::describePadPlayers("[jugador2]\nmando = 1\ncruz = tecla:K\n", true);
++            t.Equals(keys.players[0].gamepad, -1, "player 1 without gamepad");
++            t.Equals(keys.players[1].gamepad, -1, "player 2 without gamepad");
++            t.IsFalse(keys.players[1].rumble, "no rumble");
++            t.IsTrue(ps2x::secondPadPortConnected(keys.players[1], true), "connected by its keys");
++            const ps2x::PadPlayersInfo pad = ps2x::describePadPlayers("[jugador2]\nmando = 1\n", true);
++            t.IsFalse(ps2x::secondPadPortConnected(pad.players[1], true), "only a gamepad: disconnected");
++        });
++
++        tc.Run("sections: [jugador1] goes back to player 1, unknown ones are ignored", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info =
++                ps2x::describePadPlayers("[ Jugador2 ]\ncruz = tecla:K\n[jugador1]\ncruz = tecla:J\n", false);
++            t.Equals(controlOf(info.players[0], "cruz"), std::string("cruz=tecla:J"), "player 1 cruz");
++            t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=tecla:K"), "player 2 cruz");
++            const ps2x::PadPlayersInfo unknown = ps2x::describePadPlayers("[jugador3]\ncruz = tecla:K\n", false);
++            t.Equals(controlOf(unknown.players[0], "cruz"), std::string("cruz=tecla:X,tecla:ESPACIO,mando:A,volante:Y~"),
++                     "its lines do not count");
++            t.IsFalse(unknown.players[1].configured, "not player 2");
++            t.IsTrue(hasMessage(unknown, "controles.ini:1: seccion desconocida '[jugador3]' (sus lineas no cuentan)"),
++                     "warning");
++        });
++
++        tc.Run("a key of both players is reported", [](TestCase &t)
++               {
++            const ps2x::PadPlayersInfo info = ps2x::describePadPlayers("[jugador2]\ncruz = tecla:X, tecla:K\n", false);
++            t.IsTrue(hasMessage(info, "jugador2: la tecla X tambien es del jugador 1 (la pulsan los dos)"), "warning");
++            t.Equals(info.messages.size(), size_t{1}, "only X");
++            t.Equals(controlOf(info.players[1], "cruz"), std::string("cruz=tecla:X,tecla:K"), "the key stays");
++        });
++    });
+ }

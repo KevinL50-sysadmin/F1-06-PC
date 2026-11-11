@@ -1,0 +1,230 @@
+diff --git a/ps2xRuntime/src/lib/ps2_hud.h b/ps2xRuntime/src/lib/ps2_hud.h
+new file mode 100644
+index 0000000..e716366
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_hud.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <cctype>
++#include <string>
++#include <string_view>
++
++// Fase 5 (T9, F1 06): the race HUD (opciones.ini hud: completo, minimo or oculto; AJUSTES PC and the F2 menu). The game
++// draws it in src/f1_overrides.cpp (func_1F6BB0), which reads the mode every frame; tecla_hud (h, f7, f6 or no) moves it
++// to the next mode while playing (ps2_options_menu.cpp).
++namespace ps2x
++{
++    // The numbers are the choices' order in the option (the game's row works with them).
++    enum class HudMode : int
++    {
++        Full = 0,
++        Minimal = 1,
++        Hidden = 2,
++    };
++
++    // completo, minimo or oculto, any case; false (mode unchanged) for anything else.
++    inline bool parseHudMode(std::string_view text, HudMode &mode)
++    {
++        std::string lower;
++        for (const char c : text)
++            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++        if (lower == "completo")
++            mode = HudMode::Full;
++        else if (lower == "minimo")
++            mode = HudMode::Minimal;
++        else if (lower == "oculto")
++            mode = HudMode::Hidden;
++        else
++            return false;
++        return true;
++    }
++
++    inline const char *hudModeOption(HudMode mode)
++    {
++        return mode == HudMode::Minimal ? "minimo" : mode == HudMode::Hidden ? "oculto" : "completo";
++    }
++
++    // The key: completo -> minimo -> oculto -> completo.
++    inline HudMode nextHudMode(HudMode mode)
++    {
++        return mode == HudMode::Full ? HudMode::Minimal : mode == HudMode::Minimal ? HudMode::Hidden : HudMode::Full;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 266200d..623125f 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -173,6 +173,12 @@ namespace ps2x
+             {"tecla_foto", "PS2X_TECLA_FOTO", "f12", {{"f12", "f12"}, {"f9", "f9"}, {"f8", "f8"}, {"no", "no"}}, 0, 0,
+              "Tecla de las fotos (f12, f9, f8 o no): guarda la imagen del juego a su resolucion interna, en PNG, en la\n"
+              "carpeta capturas."},
++            // Fase 5 (T9): also a row of AJUSTES PC; the game reads it every frame (src/f1_overrides.cpp).
++            {"hud", "PS2X_HUD", "completo", {{"completo", "completo"}, {"minimo", "minimo"}, {"oculto", "oculto"}}, 0, 0,
++             "Marcadores de la carrera (HUD): completo, minimo (solo el velocimetro con la marcha, la posicion y las\n"
++             "banderas) u oculto (nada, para fotos). Los menus y la pausa no cambian."},
++            {"tecla_hud", "PS2X_TECLA_HUD", "h", {{"h", "h"}, {"f7", "f7"}, {"f6", "f6"}, {"no", "no"}}, 0, 0,
++             "Tecla que cambia el HUD en carrera (h, f7, f6 o no): completo, minimo, oculto y otra vez completo."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 7ff68c9..ce93340 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -1,6 +1,7 @@
+ #include "ps2_options_menu.h"
+ #include "ps2_color_vision.h"
+ #include "ps2_display.h"
++#include "ps2_hud.h"
+ #include "ps2_options.h"
+ #include "ps2_pad_players.h"
+ #include "ps2_photo.h"
+@@ -105,11 +106,23 @@ namespace
+             {"Juego",
+              {{"saltar_intro", "Saltar los vídeos de inicio", {{"0", "No"}, {"1", "Sí"}},
+                "La presentación y la demostración de la pantalla de título se cortan a los dos segundos."},
+-              {"vibracion", "Vibración", {}, "La fuerza de la vibración del mando y del volante; 0 % la quita."}}},
++              {"vibracion", "Vibración", {}, "La fuerza de la vibración del mando y del volante; 0 % la quita."},
++              // Fase 5 (T9).
++              {"hud", "HUD de la carrera", {{"completo", "Completo"}, {"minimo", "Mínimo"}, {"oculto", "Oculto"}},
++               "Mínimo: solo el velocímetro con la marcha, la posición y las banderas. Oculto: nada, para fotos. "
++               "Los menús y la pausa no cambian."},
++              {"tecla_hud", "Tecla del HUD", {{"h", "H"}, {"f7", "F7"}, {"f6", "F6"}, {"no", "Ninguna"}},
++               "Cambia el HUD jugando: completo, mínimo, oculto y otra vez completo."}}},
+         };
+         return list;
+     }
+ 
++    // Fase 5 (T9): the key of tecla_hud.
++    int hudKeyCode(const std::string &option)
++    {
++        return option == "h" ? KEY_H : option == "f7" ? KEY_F7 : option == "f6" ? KEY_F6 : KEY_NULL;
++    }
++
+     constexpr const char *kDisplayKeys[] = {"pantalla", "tamano_ventana", "filtro", "vsync", "mostrar_fps"};
+ 
+     std::string valueOf(const std::map<std::string, std::string> &values, const char *key)
+@@ -478,6 +491,23 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+         }
+     }
+ 
++    // Fase 5 (T9): tecla_hud moves the HUD to its next mode (not saved; CONFIRM or Guardar save it), not while this menu
++    // is open. The game reads the mode in its next frame.
++    if (!s.open)
++    {
++        ensureModel(s);
++        if (const int key = hudKeyCode(valueOf(s.model.current, "tecla_hud")); key != KEY_NULL && IsKeyPressed(key))
++        {
++            ps2x::HudMode mode = ps2x::HudMode::Full;
++            ps2x::parseHudMode(valueOf(s.model.current, "hud"), mode);
++            const char *next = ps2x::hudModeOption(ps2x::nextHudMode(mode));
++            const bool done = ps2x::setMenuOption(s.model, "hud", next);
++            applyLive(s.model, s.applied, runtime);
++            std::cout << "[menu] tecla del HUD: hud = " << valueOf(s.model.current, "hud") << (done ? "" : " (forzada)")
++                      << std::endl;
++        }
++    }
++
+     // F1: the debug panel, in development mode only (S4).
+     if (ps2x::debugPanelAllowed(s.mode) && IsKeyPressed(KEY_F1))
+         s.debugToggle = true;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 8e5a9e6..a39a5ee 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1,5 +1,6 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
++#include "ps2_hud.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_race_laps.h"
+ #include "ps2_user_paths.h"
+@@ -383,6 +384,74 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "filtro"), std::string("fsr"), "the older options keep their values");
+         });
+ 
++        // Fase 5 (T9): the race HUD (hud = completo, minimo or oculto) and the key that changes it (tecla_hud).
++        tc.Run("the hud and tecla_hud options have their defaults, variables, checks and numbers", [](TestCase &t)
++        {
++            const ps2x::OptionsFile defaults = ps2x::parseOptions("");
++            t.Equals(defaults.values.at("hud"), std::string("completo"), "the whole HUD by default");
++            t.Equals(defaults.values.at("tecla_hud"), std::string("h"), "H changes it by default");
++            const std::string text = ps2x::defaultOptionsText(false);
++            t.IsTrue(contains(text, "hud = completo\n"), "the template has hud");
++            t.IsTrue(contains(text, "tecla_hud = h\n"), "the template has tecla_hud");
++            t.IsTrue(contains(text, "tecla_foto = f12\n"), "the template keeps tecla_foto");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("hud = OCULTO\ntecla_hud = f7\n");
++            t.IsTrue(file.warnings.empty(), "valid values give no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            const auto variable = [&settings](const char *name)
++            {
++                for (const ps2x::EnvironmentSetting &setting : settings)
++                    if (setting.variable == name)
++                        return setting.value;
++                return std::string("<none>");
++            };
++            t.Equals(variable("PS2X_HUD"), std::string("oculto"), "hud -> PS2X_HUD");
++            t.Equals(variable("PS2X_TECLA_HUD"), std::string("f7"), "tecla_hud -> PS2X_TECLA_HUD");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("hud = nada\ntecla_hud = f12\n");
++            t.Equals(bad.warnings.size(), size_t{2u}, "one warning per bad value");
++            t.Equals(bad.values.at("hud"), std::string("completo"), "a bad hud takes the default");
++            t.Equals(bad.values.at("tecla_hud"), std::string("h"), "the photo key is not a HUD key");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "hud", value), "hud is a number for the game's row");
++            t.Equals(value, 0.0f, "completo: the first choice");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "hud", 1.0f), "hud 1");
++            t.Equals(model.current.at("hud"), std::string("minimo"), "is minimo");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "hud", 2.0f), "hud 2");
++            t.Equals(model.current.at("hud"), std::string("oculto"), "is oculto");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "hud", 3.0f), "past oculto");
++            t.Equals(model.current.at("hud"), std::string("oculto"), "stays oculto");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "tecla_hud", 3.0f), "tecla_hud 3");
++            t.Equals(model.current.at("tecla_hud"), std::string("no"), "no HUD key");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "hud"), std::string("oculto"), "CONFIRM writes hud");
++            t.Equals(fileValue(saved, "tecla_hud"), std::string("no"), "and tecla_hud");
++        });
++
++        tc.Run("the HUD modes: their names, their numbers and the key's cycle", [](TestCase &t)
++        {
++            ps2x::HudMode mode = ps2x::HudMode::Hidden;
++            t.IsTrue(ps2x::parseHudMode("completo", mode), "completo");
++            t.IsTrue(mode == ps2x::HudMode::Full, "is the whole HUD");
++            t.IsTrue(ps2x::parseHudMode("Minimo", mode), "minimo, any case");
++            t.IsTrue(mode == ps2x::HudMode::Minimal, "is the minimal HUD");
++            t.IsTrue(ps2x::parseHudMode("oculto", mode), "oculto");
++            t.IsTrue(mode == ps2x::HudMode::Hidden, "is no HUD");
++            t.IsFalse(ps2x::parseHudMode("nada", mode), "an unknown name");
++            t.IsTrue(mode == ps2x::HudMode::Hidden, "leaves the mode as it was");
++            t.Equals(static_cast<int>(ps2x::HudMode::Full), 0, "completo is the row's first choice");
++            t.Equals(static_cast<int>(ps2x::HudMode::Minimal), 1, "minimo the second");
++            t.Equals(static_cast<int>(ps2x::HudMode::Hidden), 2, "oculto the third");
++            t.Equals(std::string(ps2x::hudModeOption(ps2x::HudMode::Full)), std::string("completo"), "name of Full");
++            t.Equals(std::string(ps2x::hudModeOption(ps2x::HudMode::Minimal)), std::string("minimo"), "of Minimal");
++            t.Equals(std::string(ps2x::hudModeOption(ps2x::HudMode::Hidden)), std::string("oculto"), "of Hidden");
++            t.IsTrue(ps2x::nextHudMode(ps2x::HudMode::Full) == ps2x::HudMode::Minimal, "the key: completo -> minimo");
++            t.IsTrue(ps2x::nextHudMode(ps2x::HudMode::Minimal) == ps2x::HudMode::Hidden, "minimo -> oculto");
++            t.IsTrue(ps2x::nextHudMode(ps2x::HudMode::Hidden) == ps2x::HudMode::Full, "oculto -> completo");
++        });
++
+         tc.Run("the pad combo fires once after being held for its time", [](TestCase &t)
+         {
+             ps2x::HoldComboDetector combo(0.5);
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index e29abf0..ae95c3a 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{17}, "seventeen options (fase 5: six more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{19}, "nineteen options (fase 5: eight more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

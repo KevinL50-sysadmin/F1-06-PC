@@ -1,0 +1,110 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 484d10f..602241f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1325,10 +1325,44 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
++    // Each barycentric weight is linear in px on a row: w = slope * px + offset(py). Instead of testing every pixel
++    // of the bounding box (huge for long thin triangles), compute the span where the three weights can pass the
++    // test, widened by one pixel on each side; the per-pixel test below still decides, so the output is unchanged.
++    const float k = winding * invAbsDenom;
++    const float slope0 = (fy1 - fy2) * k;
++    const float slope1 = (fy2 - fy0) * k;
++    const float slope2 = -(slope0 + slope1);
++    auto narrowSpan = [](float slope, float offset, float &lo, float &hi) -> bool
++    {
++        // slope * px + offset >= -kEdgeEpsilon
++        if (std::fabs(slope) < 1.0e-12f)
++            return offset >= -kEdgeEpsilon;
++        const float bound = (-kEdgeEpsilon - offset) / slope;
++        if (slope > 0.0f)
++            lo = std::max(lo, bound);
++        else
++            hi = std::min(hi, bound);
++        return true;
++    };
++
+     for (int y = minY; y <= maxY; ++y)
+     {
+         float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        int spanX0 = minX;
++        int spanX1 = maxX;
++        {
++            const float offset0 = ((fx2 - fx1) * (py - fy2) - (fy1 - fy2) * fx2) * k;
++            const float offset1 = ((fx0 - fx2) * (py - fy2) - (fy2 - fy0) * fx2) * k;
++            const float offset2 = 1.0f - offset0 - offset1;
++            float lo = static_cast<float>(minX) + 0.5f;
++            float hi = static_cast<float>(maxX) + 0.5f;
++            if (!narrowSpan(slope0, offset0, lo, hi) || !narrowSpan(slope1, offset1, lo, hi) ||
++                !narrowSpan(slope2, offset2, lo, hi) || !(lo <= hi + 2.0f))
++                continue;
++            spanX0 = std::max(minX, static_cast<int>(std::floor(lo - 0.5f)) - 1);
++            spanX1 = std::min(maxX, static_cast<int>(std::ceil(hi - 0.5f)) + 1);
++        }
++        for (int x = spanX0; x <= spanX1; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+index a8f9fa8..e0f8dba 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+@@ -220,36 +220,41 @@ namespace GSMem
+         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
+     }
+ 
+-    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
++    // Reads VRAM directly. Going through the page cache copied 8 KB of VRAM every time a texel fell in a
++    // different page than the previous one (PSMT4 textures span several pages, bilinear filtering and
++    // stretched triangles alternate pages almost every texel): that memcpy dominated the race profile. The
++    // rasterizer runs on the thread that writes VRAM, so the data is always current; only the stale-cache
++    // behaviour of the real GS until TEXFLUSH (rarely relied upon) is lost.
++    u32 ReadTexture(TexturePageCache& /*cache*/, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+     {
+         switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+         {
+         case C32:
+-            return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y, nullptr);
+         case C24:
+-            return PixelStorageTraits<C24>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<C24>::Read(PageTableC32, data, bp, bw, x, y, nullptr);
+         case C16:
+-            return PixelStorageTraits<C16>::Read(PageTableC16, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<C16>::Read(PageTableC16, data, bp, bw, x, y, nullptr);
+         case C16S:
+-            return PixelStorageTraits<C16S>::Read(PageTableC16S, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<C16S>::Read(PageTableC16S, data, bp, bw, x, y, nullptr);
+         case P8:
+-            return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y, nullptr);
+         case P4:
+-            return PixelStorageTraits<P4>::Read(PageTableP4, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<P4>::Read(PageTableP4, data, bp, bw, x, y, nullptr);
+         case P8H:
+-            return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y, nullptr);
+         case P4HL:
+-            return PixelStorageTraits<P4HL>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<P4HL>::Read(PageTableC32, data, bp, bw, x, y, nullptr);
+         case P4HH:
+-            return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y, nullptr);
+         case Z32:
+-            return PixelStorageTraits<Z32>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<Z32>::Read(PageTableZ32, data, bp, bw, x, y, nullptr);
+         case Z24:
+-            return PixelStorageTraits<Z24>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<Z24>::Read(PageTableZ32, data, bp, bw, x, y, nullptr);
+         case Z16:
+-            return PixelStorageTraits<Z16>::Read(PageTableZ16, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<Z16>::Read(PageTableZ16, data, bp, bw, x, y, nullptr);
+         case Z16S:
+-            return PixelStorageTraits<Z16S>::Read(PageTableZ16S, data, bp, bw, x, y, &cache);
++            return PixelStorageTraits<Z16S>::Read(PageTableZ16S, data, bp, bw, x, y, nullptr);
+         default:
+             return 0u;
+         }

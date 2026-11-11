@@ -1,0 +1,492 @@
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index 9e138cb..d2c9d43 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -215,10 +215,14 @@ namespace ps2x::netplay
+ 
+         std::string socketError(int code)
+         {
+-            char text[256] = {};
+-            if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+-                               static_cast<DWORD>(code), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), text,
+-                               sizeof(text), nullptr) == 0)
++            // Pruebas autonomas T3: UTF-16 to UTF-8, as the windows draw it (the ANSI text showed '?' for the accents).
++            wchar_t wide[256] = {};
++            const DWORD length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
++                                                static_cast<DWORD>(code), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
++                                                wide, static_cast<DWORD>(std::size(wide)), nullptr);
++            char text[1024] = {};
++            if (length == 0 || WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(length), text,
++                                                   static_cast<int>(sizeof(text) - 1), nullptr, nullptr) == 0)
+                 return "error " + std::to_string(code);
+             std::string s(text);
+             while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '.'))
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index eee10ee..d7fa510 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -643,6 +643,24 @@ namespace ps2x::netplay
+             std::error_code error;
+             std::filesystem::remove(s_request, error);
+         }
++
++        // Pruebas autonomas T2: the captures PS2X_INVITADO_GUION asks for, to <PS2X_INVITADO_CAPTURAS>-<n>.png (n from 1;
++        // without the variable, invitado-guion-<n>.png in the working folder).
++        void saveScriptCaptures(const RenderTexture2D &canvas, int &pending, int &taken)
++        {
++            for (; pending > 0; --pending)
++            {
++                const char *prefix = std::getenv("PS2X_INVITADO_CAPTURAS");
++                const std::string path = std::string(prefix != nullptr && prefix[0] != '\0' ? prefix : "invitado-guion") +
++                                         "-" + std::to_string(++taken) + ".png";
++                Image image = LoadImageFromTexture(canvas.texture);
++                ImageFlipVertical(&image);
++                const bool saved = ExportImage(image, path.c_str());
++                UnloadImage(image);
++                std::fprintf(stderr, "[red] guion: captura %s: %s\n", saved ? "guardada" : "fallida", path.c_str());
++                std::fflush(stderr);
++            }
++        }
+     }
+ 
+     int runGuestWindow(const GuestSettings &settings, bool askFirst)
+@@ -661,6 +679,25 @@ namespace ps2x::netplay
+             SetWindowPos(GetWindowHandle(), reinterpret_cast<void *>(1) /* HWND_BOTTOM */, -4000, 0, 0, 0,
+                          0x0001u /* SWP_NOSIZE */ | 0x0010u /* SWP_NOACTIVATE */ | 0x0040u /* SWP_SHOWWINDOW */);
+ #endif
++        // Pruebas autonomas T2 (S3): the scripted pad. A bad script stops here: a test must not run something else.
++        std::vector<GuestPadScriptStep> scriptSteps;
++        if (const char *scriptText = std::getenv("PS2X_INVITADO_GUION"); scriptText != nullptr && scriptText[0] != '\0')
++        {
++            std::string scriptError;
++            if (!parseGuestPadScript(scriptText, scriptSteps, scriptError))
++            {
++                std::fprintf(stderr, "[red] %s\n", scriptError.c_str());
++                std::fflush(stderr);
++                return 2;
++            }
++            std::fprintf(stderr, "[red] guion del invitado: %zu entradas\n", scriptSteps.size());
++            std::fflush(stderr);
++        }
++        GuestPadScript script(std::move(scriptSteps));
++        int scriptCapturesPending = 0, scriptCapturesTaken = 0;
++        uint16_t scriptPressedBefore = 0;
++        bool scriptClose = false;
++
+         SetExitKey(KEY_NULL); // ESC may be one of the player's controls
+         SetTargetFPS(120);    // a new picture shows at most ~8 ms after it was decoded
+ 
+@@ -734,7 +771,9 @@ namespace ps2x::netplay
+         RenderTexture2D canvas{};
+         std::vector<uint8_t> rgba;
+         bool showFigures = true;
+-        while (!WindowShouldClose())
++        if (inForm)
++            script.event("formulario", GetTime());
++        while (!WindowShouldClose() && !scriptClose)
+         {
+             const int screenWidth = std::max(1, GetScreenWidth()), screenHeight = std::max(1, GetScreenHeight());
+             if (canvas.id == 0 || canvas.texture.width != screenWidth || canvas.texture.height != screenHeight)
+@@ -747,7 +786,22 @@ namespace ps2x::netplay
+             // S2: the pad every frame. Its edges are ignored while a keyboard key is down: controles.ini may map keys to
+             // its buttons. The help bar shows the controls used last.
+             pad.readState(0, 0, report, sizeof(report));
+-            const PadWire wire = padWireFromReport(report);
++            PadWire wire = padWireFromReport(report);
++            const GuestPadScript::Frame scripted = script.frame(GetTime());
++            wire.pressed = static_cast<uint16_t>(wire.pressed | scripted.pressed);
++            if (scripted.pressed != scriptPressedBefore)
++            {
++                std::fprintf(stderr, "[red] guion: botones 0x%04X\n", static_cast<unsigned>(scripted.pressed));
++                std::fflush(stderr);
++                scriptPressedBefore = scripted.pressed;
++            }
++            scriptCapturesPending += scripted.captures;
++            if (scripted.close)
++            {
++                std::fprintf(stderr, "[red] guion: cerrar\n");
++                std::fflush(stderr);
++                scriptClose = true;
++            }
+             const uint16_t before = padBefore;
+             padBefore = wire.pressed;
+             bool keyboardBusy = false;
+@@ -776,6 +830,7 @@ namespace ps2x::netplay
+                     form.error = ended.text;
+                     inForm = true;
+                     returning = true;
++                    script.event("formulario", GetTime());
+                     while (GetCharPressed() != 0)
+                     {
+                     }
+@@ -829,6 +884,7 @@ namespace ps2x::netplay
+                     drawForm(form, page, shownInput, bandTop);
+                     EndTextureMode();
+                     saveRequestedCapture(canvas);
++                    saveScriptCaptures(canvas, scriptCapturesPending, scriptCapturesTaken);
+                     BeginDrawing();
+                     ClearBackground(BLACK);
+                     DrawTextureRec(canvas.texture,
+@@ -846,6 +902,8 @@ namespace ps2x::netplay
+                 lastState = status.state;
+                 std::fprintf(stderr, "[red] invitado: %s - %s\n", stateName(status.state), status.text.c_str());
+                 std::fflush(stderr);
++                if (const char *scriptEvent = guestScriptEvent(status.state))
++                    script.event(scriptEvent, GetTime());
+             }
+ 
+             uint16_t width = 0, height = 0;
+@@ -934,6 +992,7 @@ namespace ps2x::netplay
+             }
+             EndTextureMode();
+             saveRequestedCapture(canvas);
++            saveScriptCaptures(canvas, scriptCapturesPending, scriptCapturesTaken);
+             BeginDrawing();
+             ClearBackground(BLACK);
+             DrawTextureRec(canvas.texture,
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+index 81b5097..985d7dd 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cmath>
+ #include <cstdlib>
+ #include <fstream>
+ #include <mutex>
+@@ -191,6 +192,155 @@ namespace ps2x::netplay
+         return enterPressed || (!keyboardBusy && padEdge(pressed, before, kPadCross));
+     }
+ 
++    namespace
++    {
++        constexpr const char *kScriptEvents[] = {"formulario", "conectando", "contrasena", "conectado",
++                                                 "rechazado",  "desconectado", "error"};
++        constexpr const char *kScriptButtons[] = {"select", "l3",    "r3",        "start",   "arriba", "derecha",
++                                                  "abajo",  "izquierda", "l2",   "r2",      "l1",     "r1",
++                                                  "triangulo", "circulo", "cruz", "cuadrado"};
++
++        // A whole decimal number, nothing else (std::strtod alone takes "1x" as 1).
++        bool parseSeconds(const std::string &text, double &value)
++        {
++            if (text.empty())
++                return false;
++            char *end = nullptr;
++            value = std::strtod(text.c_str(), &end);
++            return end == text.c_str() + text.size() && std::isfinite(value);
++        }
++    }
++
++    bool parseGuestPadScript(std::string_view text, std::vector<GuestPadScriptStep> &steps, std::string &error)
++    {
++        std::vector<GuestPadScriptStep> parsed;
++        const std::string all(text);
++        size_t start = 0;
++        while (!all.empty() && start <= all.size())
++        {
++            const size_t comma = std::min(all.find(',', start), all.size());
++            std::string entry = all.substr(start, comma - start);
++            start = comma + 1;
++            const size_t first = entry.find_first_not_of(" \t");
++            entry = first == std::string::npos ? std::string() : entry.substr(first, entry.find_last_not_of(" \t") - first + 1);
++            const auto refuse = [&](const char *why)
++            {
++                error = "PS2X_INVITADO_GUION: entrada no valida '" + entry + "' (" + why + ")";
++                return false;
++            };
++            const size_t plus = entry.find('+');
++            const size_t colon = entry.find(':', plus == std::string::npos ? 0 : plus);
++            if (plus == std::string::npos || colon == std::string::npos)
++                return refuse("se espera evento[#n]+retraso:boton[:duracion]");
++            GuestPadScriptStep step;
++            step.event = entry.substr(0, plus);
++            if (const size_t hash = step.event.find('#'); hash != std::string::npos)
++            {
++                const std::string number = step.event.substr(hash + 1);
++                if (number.empty() || number.size() > 6 || number.find_first_not_of("0123456789") != std::string::npos ||
++                    std::atoi(number.c_str()) < 1)
++                    return refuse("#n debe ser un numero de 1 en adelante");
++                step.occurrence = static_cast<uint32_t>(std::atoi(number.c_str()));
++                step.event.resize(hash);
++            }
++            if (std::find_if(std::begin(kScriptEvents), std::end(kScriptEvents), [&](const char *name)
++                             { return step.event == name; }) == std::end(kScriptEvents))
++                return refuse("evento desconocido");
++            if (!parseSeconds(entry.substr(plus + 1, colon - plus - 1), step.delay) || step.delay < 0.0)
++                return refuse("retraso en segundos, 0 o mas");
++            std::string button = entry.substr(colon + 1);
++            if (const size_t more = button.find(':'); more != std::string::npos)
++            {
++                if (!parseSeconds(button.substr(more + 1), step.duration) || step.duration <= 0.0)
++                    return refuse("duracion en segundos, mas de 0");
++                button.resize(more);
++            }
++            if (button == "captura")
++                step.capture = true;
++            else if (button == "cerrar")
++                step.close = true;
++            else
++            {
++                const auto found = std::find_if(std::begin(kScriptButtons), std::end(kScriptButtons),
++                                                [&](const char *name) { return button == name; });
++                if (found == std::end(kScriptButtons))
++                    return refuse("boton desconocido");
++                step.buttons = static_cast<uint16_t>(1u << (found - std::begin(kScriptButtons)));
++            }
++            parsed.push_back(std::move(step));
++            if (comma == all.size())
++                break;
++        }
++        steps = std::move(parsed);
++        error.clear();
++        return true;
++    }
++
++    const char *guestScriptEvent(GuestState state)
++    {
++        switch (state)
++        {
++        case GuestState::Connecting: return "conectando";
++        case GuestState::Authenticating: return "contrasena";
++        case GuestState::Connected: return "conectado";
++        case GuestState::Rejected: return "rechazado";
++        case GuestState::Disconnected: return "desconectado";
++        case GuestState::Failed: return "error";
++        case GuestState::Idle: break;
++        }
++        return nullptr;
++    }
++
++    GuestPadScript::GuestPadScript(std::vector<GuestPadScriptStep> steps)
++    {
++        for (auto &step : steps)
++            m_steps.push_back(Armed{std::move(step)});
++    }
++
++    void GuestPadScript::event(std::string_view name, double now)
++    {
++        uint32_t count = 1;
++        auto seen = std::find_if(m_seen.begin(), m_seen.end(), [&](const auto &entry) { return entry.first == name; });
++        if (seen == m_seen.end())
++            m_seen.emplace_back(std::string(name), 1u);
++        else
++            count = ++seen->second;
++        for (auto &armed : m_steps)
++            if (armed.at < 0.0 && armed.step.event == name && armed.step.occurrence == count)
++                armed.at = now + armed.step.delay;
++    }
++
++    GuestPadScript::Frame GuestPadScript::frame(double now)
++    {
++        Frame frame;
++        for (auto &armed : m_steps)
++        {
++            if (armed.done || armed.at < 0.0 || now < armed.at)
++                continue;
++            if (armed.step.capture || armed.step.close)
++            {
++                frame.captures += armed.step.capture ? 1 : 0;
++                frame.close = frame.close || armed.step.close;
++                armed.done = true;
++                continue;
++            }
++            // Held for its duration, and seen by at least one frame even when the frames come slower than that.
++            if (now < armed.at + armed.step.duration || !armed.reported)
++            {
++                frame.pressed = static_cast<uint16_t>(frame.pressed | armed.step.buttons);
++                armed.reported = true;
++            }
++            else
++                armed.done = true;
++        }
++        return frame;
++    }
++
++    bool GuestPadScript::finished() const
++    {
++        return std::all_of(m_steps.begin(), m_steps.end(), [](const Armed &armed) { return armed.done; });
++    }
++
+     GuestMemory rememberedFrom(const GuestSettings &settings)
+     {
+         return {settings.host, settings.port};
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+index c88323a..a750a55 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -60,6 +60,52 @@ namespace ps2x::netplay
+     // A session that ended goes back to the form with Enter or the cross's press edge (not while a key is down).
+     bool guestFormReturn(bool enterPressed, uint16_t pressed, uint16_t before, bool keyboardBusy);
+ 
++    // Pruebas autonomas T2 (S3): PS2X_INVITADO_GUION, the guest's pad scripted by its window's own events, as F1_GUION
++    // is for the game, so the guest's window is tested without anyone at the pad: "evento[#n]+retraso:boton[:duracion]"
++    // separated by commas. Events: formulario (the form shows, also on the way back to it), conectando, contrasena,
++    // conectado, rechazado, desconectado, error. Buttons: select, l3, r3, start, arriba, derecha, abajo, izquierda, l2,
++    // r2, l1, r1, triangulo, circulo, cruz, cuadrado (PadWire.pressed bits 0-15), captura (the window as drawn, to
++    // <PS2X_INVITADO_CAPTURAS>-<n>.png) or cerrar (closes the window). A step fires delay seconds after the n-th time
++    // (default the first) its event happens and holds its button duration seconds (default 0.2), at least one frame.
++    struct GuestPadScriptStep
++    {
++        std::string event;
++        uint32_t occurrence = 1;
++        double delay = 0.0;
++        uint16_t buttons = 0;
++        bool capture = false;
++        bool close = false;
++        double duration = 0.2;
++    };
++    // False with a Spanish message quoting the bad entry, steps unchanged then. Empty text: no steps.
++    bool parseGuestPadScript(std::string_view text, std::vector<GuestPadScriptStep> &steps, std::string &error);
++    const char *guestScriptEvent(GuestState state); // its event name; nullptr for Idle
++    class GuestPadScript
++    {
++    public:
++        struct Frame
++        {
++            uint16_t pressed = 0; // buttons held now
++            int captures = 0;     // captures due now, each once
++            bool close = false;
++        };
++        explicit GuestPadScript(std::vector<GuestPadScriptStep> steps);
++        void event(std::string_view name, double now); // counts it; arms the steps waiting for this occurrence
++        Frame frame(double now);
++        bool finished() const; // every step fired and released
++
++    private:
++        struct Armed
++        {
++            GuestPadScriptStep step;
++            double at = -1.0; // when it fires; < 0 while its event has not happened
++            bool reported = false;
++            bool done = false;
++        };
++        std::vector<Armed> m_steps;
++        std::vector<std::pair<std::string, uint32_t>> m_seen;
++    };
++
+     // config\red.ini of the guest: the last address and port that connected. Never the password.
+     struct GuestMemory
+     {
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index 529ca17..362a8b1 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -1795,6 +1795,116 @@ void register_ps2_netplay_tests()
+             t.IsFalse(guestFormReturn(false, 0u, 0u, false), "nothing");
+         });
+ 
++        // Pruebas autonomas T2 (S3): PS2X_INVITADO_GUION, the guest's pad scripted by its window's events.
++        tc.Run("guest pad script: entries, buttons, captures and close", [=](TestCase &t)
++        {
++            std::vector<GuestPadScriptStep> steps;
++            std::string error;
++            t.IsTrue(parseGuestPadScript("formulario+1.5:abajo, formulario#2+0.5:cruz:1,error+2:captura,conectado+30:cerrar",
++                                         steps, error),
++                     "parsed: " + error);
++            t.IsTrue(error.empty(), "no message");
++            t.Equals(steps.size(), static_cast<size_t>(4), "four entries");
++            if (steps.size() == 4)
++            {
++                t.IsTrue(steps[0].event == "formulario" && steps[0].occurrence == 1 && steps[0].delay == 1.5 &&
++                             steps[0].buttons == kDown && !steps[0].capture && !steps[0].close &&
++                             steps[0].duration == 0.2,
++                         "down: first time, the default 0.2 s");
++                t.IsTrue(steps[1].event == "formulario" && steps[1].occurrence == 2 && steps[1].delay == 0.5 &&
++                             steps[1].buttons == kCross && steps[1].duration == 1.0,
++                         "cross: the second time, held 1 s");
++                t.IsTrue(steps[2].event == "error" && steps[2].capture && steps[2].buttons == 0u, "capture");
++                t.IsTrue(steps[3].event == "conectado" && steps[3].close && steps[3].buttons == 0u, "close");
++            }
++            const std::pair<const char *, uint16_t> buttons[] = {
++                {"select", 1u << 0}, {"l3", 1u << 1}, {"r3", 1u << 2}, {"start", 1u << 3}, {"arriba", 1u << 4},
++                {"derecha", 1u << 5}, {"abajo", 1u << 6}, {"izquierda", 1u << 7}, {"l2", 1u << 8}, {"r2", 1u << 9},
++                {"l1", 1u << 10}, {"r1", 1u << 11}, {"triangulo", 1u << 12}, {"circulo", 1u << 13},
++                {"cruz", 1u << 14}, {"cuadrado", 1u << 15}};
++            for (const auto &[name, bit] : buttons)
++            {
++                std::vector<GuestPadScriptStep> one;
++                t.IsTrue(parseGuestPadScript(std::string("conectando+0:") + name, one, error) && one.size() == 1 &&
++                             one[0].buttons == bit,
++                         std::string("button ") + name);
++            }
++            for (const char *event : {"formulario", "conectando", "contrasena", "conectado", "rechazado",
++                                      "desconectado", "error"})
++            {
++                std::vector<GuestPadScriptStep> one;
++                t.IsTrue(parseGuestPadScript(std::string(event) + "+1:cruz", one, error), std::string("event ") + event);
++            }
++            std::vector<GuestPadScriptStep> none{GuestPadScriptStep{}};
++            t.IsTrue(parseGuestPadScript("", none, error) && none.empty(), "empty: no entries");
++        });
++
++        tc.Run("guest pad script: a bad entry is refused with its text, the steps unchanged", [](TestCase &t)
++        {
++            for (const char *bad : {"formulario:cruz", "formulario+1", "formulario+1:", "pantalla+1:cruz",
++                                    "formulario+1:boton", "formulario+x:cruz", "formulario+-1:cruz",
++                                    "formulario+1:cruz:0", "formulario+1:cruz:x", "formulario#0+1:cruz",
++                                    "formulario#x+1:cruz", "formulario+1:cruz,,error+1:cruz"})
++            {
++                std::vector<GuestPadScriptStep> steps(1);
++                steps[0].event = "sin-tocar";
++                std::string error;
++                t.IsFalse(parseGuestPadScript(bad, steps, error), std::string("refused: ") + bad);
++                t.IsTrue(error.find("PS2X_INVITADO_GUION") != std::string::npos, std::string("message: ") + error);
++                t.IsTrue(steps.size() == 1 && steps[0].event == "sin-tocar", std::string("unchanged: ") + bad);
++            }
++            std::vector<GuestPadScriptStep> steps;
++            std::string error;
++            t.IsFalse(parseGuestPadScript("formulario+1:cruz,error+1:boton", steps, error), "second entry bad");
++            t.IsTrue(error.find("error+1:boton") != std::string::npos, "the message quotes the bad entry: " + error);
++            t.IsTrue(steps.empty(), "no entries kept");
++        });
++
++        tc.Run("guest pad script: events, delays, holding, captures and close", [=](TestCase &t)
++        {
++            std::vector<GuestPadScriptStep> steps;
++            std::string error;
++            t.IsTrue(parseGuestPadScript("formulario+1:abajo:0.5,formulario#2+0:cruz,error+2:captura,error+3:cerrar",
++                                         steps, error),
++                     "parsed");
++            GuestPadScript script(steps);
++            t.Equals(script.frame(0.0).pressed, static_cast<uint16_t>(0), "nothing before any event");
++            script.event("conectando", 0.0);
++            t.Equals(script.frame(5.0).pressed, static_cast<uint16_t>(0), "another event: nothing");
++            script.event("formulario", 10.0);
++            t.Equals(script.frame(10.5).pressed, static_cast<uint16_t>(0), "before the delay: nothing");
++            t.Equals(script.frame(11.0).pressed, kDown, "down at the delay");
++            t.Equals(script.frame(11.4).pressed, kDown, "still held");
++            t.Equals(script.frame(11.6).pressed, static_cast<uint16_t>(0), "released after its duration");
++            t.Equals(script.frame(20.0).pressed, static_cast<uint16_t>(0), "the cross waits for the second form");
++            script.event("formulario", 30.0);
++            t.Equals(script.frame(40.0).pressed, kCross,
++                     "a press late for its frame is still held for one frame (slow frames)");
++            t.Equals(script.frame(40.1).pressed, static_cast<uint16_t>(0), "then released");
++            script.event("formulario", 50.0);
++            t.Equals(script.frame(50.0).pressed, static_cast<uint16_t>(0), "a third form fires nothing");
++            t.IsFalse(script.finished(), "not finished: the error steps wait");
++            script.event("error", 60.0);
++            GuestPadScript::Frame f = script.frame(62.0);
++            t.IsTrue(f.captures == 1 && !f.close, "one capture at its delay");
++            f = script.frame(62.5);
++            t.IsTrue(f.captures == 0 && !f.close, "the capture only once");
++            f = script.frame(63.0);
++            t.IsTrue(f.close && f.captures == 0, "close at its delay");
++            t.IsTrue(script.finished(), "all done");
++        });
++
++        tc.Run("guest pad script: the events of the guest's states", [](TestCase &t)
++        {
++            t.IsTrue(guestScriptEvent(GuestState::Idle) == nullptr, "idle: none");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Connecting)) == "conectando", "connecting");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Authenticating)) == "contrasena", "password");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Connected)) == "conectado", "connected");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Rejected)) == "rechazado", "rejected");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Disconnected)) == "desconectado", "disconnected");
++            t.IsTrue(std::string(guestScriptEvent(GuestState::Failed)) == "error", "failed");
++        });
++
+         tc.Run("red.ini keeps the last address and port, never the password", [](TestCase &t)
+         {
+             const GuestSettings settings{"192.168.1.40", 50700, "SECRETO99"};

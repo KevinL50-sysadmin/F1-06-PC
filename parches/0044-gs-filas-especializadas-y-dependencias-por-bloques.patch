@@ -1,0 +1,866 @@
+diff --git a/ps2xRuntime/include/ThreadNaming.h b/ps2xRuntime/include/ThreadNaming.h
+index b82ecc1..5f7bc7f 100644
+--- a/ps2xRuntime/include/ThreadNaming.h
++++ b/ps2xRuntime/include/ThreadNaming.h
+@@ -28,6 +28,15 @@ extern "C"
+ 
+ namespace ThreadNaming
+ {
++    // Host cores of hybrid CPUs (gs_threaded_backend.cpp, patch 0044). With the window hidden or in the background,
++    // Windows can treat the process as background work and move busy threads to efficiency cores. Both do nothing
++    // on CPUs with a single kind of core or outside Windows.
++    // The calling thread is on an efficiency core right now.
++    bool OnEfficiencyCore();
++    // Where the calling thread may run: 0 as Windows decides, 1 only the performance cores (without power
++    // throttling), 2 only the efficiency cores.
++    void SetCoreKind(int kind);
++
+     inline void SetCurrentThreadName(std::string_view name)
+     {
+ #if defined(_WIN32) 
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 8d433f9..0b39036 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -11,7 +11,9 @@
+ // worker sleeping as soon as its queue is empty (no spinning first), 9 the VU1 pairs decoded and planned again after
+ // every microcode upload (no cache by content), 10 the VU1 block lower instructions WAITQ, B, IBxx, FCEQ, FCAND and
+ // FCOR through execLower (before patch 0042), 11 the VU1 block DIV, SQRT and RSQRT through execLower, 12 the GS queue
+-// with the whole draw state in every primitive (before patch 0043). A
++// with the whole draw state in every primitive (before patch 0043), 13 the GS triangle rows calling the pixel writer
++// and sampler through their pointers (before patch 0044), 14 the GS band workers on the efficiency cores, 15 the GS band dependencies tracked by
++// pages instead of blocks (before patch 0045). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 12889fa..c72dabf 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1611,6 +1611,10 @@ void GSCpuBackend::DrawSpriteReference(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
++// gs_threaded_backend.cpp: a GS thread between chunks of work keeps to the cores it should and counts the chunks it
++// starts on an efficiency core.
++void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bool bandWorker);
++
+ namespace
+ {
+     using ReadVramFn = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
+@@ -1673,7 +1677,7 @@ namespace
+     }
+ 
+     template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z>
+-    void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog);
++    PS2_GS_INLINE void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog);
+ 
+     template <GSMem::PixelStorageMode F>
+     WritePixelFn selectWritePixelForZ(uint32_t zpsm)
+@@ -1748,7 +1752,7 @@ namespace
+     }
+ 
+     template <GSMem::PixelStorageMode F, GSMem::PixelStorageMode Z>
+-    void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog)
++    PS2_GS_INLINE void writePixelTyped(const PixelPipeline &pp, int x, int y, int z, uint32_t rgba, uint8_t fog)
+     {
+         if (x < pp.scissorX0 || x > pp.scissorX1 || y < pp.scissorY0 || y > pp.scissorY1)
+             return;
+@@ -1943,7 +1947,7 @@ namespace
+     }
+ 
+     template <GSMem::PixelStorageMode P>
+-    uint32_t samplerSample(const TextureSampler &ts, float s, float t, float q, uint16_t u, uint16_t v)
++    PS2_GS_INLINE uint32_t samplerSample(const TextureSampler &ts, float s, float t, float q, uint16_t u, uint16_t v)
+     {
+         float texUf, texVf;
+         if (ts.fst)
+@@ -2226,7 +2230,13 @@ namespace
+     }
+ 
+     // The rows of the triangle in the band set (count 1: all of them), with DrawTriangle's per-pixel arithmetic.
+-    void rasterTriangleRows(const BandJob &job, int shift, unsigned count, unsigned index)
++    using SampleFn = uint32_t (*)(const TextureSampler &, float, float, float, uint16_t, uint16_t);
++
++    // The rows of the triangle in the band set. W and S, when not null, are the job's pixel writer and texture sampler
++    // known at compile time, so they inline into the pixel loop (patch 0044; the calls through the job's pointers were
++    // two indirect calls per pixel). Same arithmetic either way.
++    template <WritePixelFn W, SampleFn S>
++    void rasterTriangleRowsWith(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         const TriangleSetup t = job.tri;
+         const PixelPipeline &pp = job.pp;
+@@ -2305,17 +2315,48 @@ namespace
+                         iu = 0;
+                         iv = 0;
+                     }
+-                    rgba = combineTexturePacked(job.combiner, rgba, job.sampler.sample(job.sampler, is, it, iq, iu, iv));
++                    uint32_t texel;
++                    if constexpr (S != nullptr)
++                        texel = S(job.sampler, is, it, iq, iu, iv);
++                    else
++                        texel = job.sampler.sample(job.sampler, is, it, iq, iu, iv);
++                    rgba = combineTexturePacked(job.combiner, rgba, texel);
+                 }
+ 
+                 const uint8_t fog = clampU8(static_cast<int>(t.fog0 * w0 + t.fog1 * w1 + t.fog2 * w2));
+-                pp.writePixel(pp, x, y, static_cast<u32>(z + 0.5), rgba, fog);
++                if constexpr (W != nullptr)
++                    W(pp, x, y, static_cast<u32>(z + 0.5), rgba, fog);
++                else
++                    pp.writePixel(pp, x, y, static_cast<u32>(z + 0.5), rgba, fog);
+             }
+         }
+     }
+ 
+-    // The rows of the sprite in the band set, with DrawSprite's per-pixel arithmetic.
+-    void rasterSpriteRows(const BandJob &job, int shift, unsigned count, unsigned index)
++    // The frame/depth formats of the race (CT32 with Z24) with the samplers it uses most (8 and 4 bit indexed, CT32)
++    // get their own loop; anything else, and A/B mode 13, goes through the pointers.
++    void rasterTriangleRows(const BandJob &job, int shift, unsigned count, unsigned index)
++    {
++        constexpr WritePixelFn kCt32Z24 = &writePixelTyped<GSMem::C32, GSMem::Z24>;
++        if (job.pp.writePixel == kCt32Z24 && g_ps2AbMode.load(std::memory_order_relaxed) != 13)
++        {
++            const SampleFn sample = job.tri.tme ? job.sampler.sample : nullptr;
++            if (sample == nullptr)
++                return rasterTriangleRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::P8>)
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P8>>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::P4>)
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::P4>>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::C32>)
++                return rasterTriangleRowsWith<kCt32Z24, &samplerSample<GSMem::C32>>(job, shift, count, index);
++            return rasterTriangleRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
++        }
++        rasterTriangleRowsWith<nullptr, nullptr>(job, shift, count, index);
++    }
++
++    // The rows of the sprite in the band set, with DrawSprite's per-pixel arithmetic (W, S: as in
++    // rasterTriangleRowsWith).
++    template <WritePixelFn W, SampleFn S>
++    void rasterSpriteRowsWith(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         const SpriteSetup s = job.sprite;
+         const PixelPipeline &pp = job.pp;
+@@ -2325,7 +2366,12 @@ namespace
+         {
+             for (int y = firstRow; y <= s.drawY1; y = nextBandRow(y, shift, skip))
+                 for (int x = s.drawX0; x <= s.drawX1; ++x)
+-                    pp.writePixel(pp, x, y, s.z, s.vertexRgba, s.fog);
++                {
++                    if constexpr (W != nullptr)
++                        W(pp, x, y, s.z, s.vertexRgba, s.fog);
++                    else
++                        pp.writePixel(pp, x, y, s.z, s.vertexRgba, s.fog);
++                }
+             return;
+         }
+ 
+@@ -2345,17 +2391,46 @@ namespace
+                     const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+                     const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+                     const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+-                    texel = job.sampler.sample(job.sampler, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
++                    if constexpr (S != nullptr)
++                        texel = S(job.sampler, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
++                    else
++                        texel = job.sampler.sample(job.sampler, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                 }
+                 else
+                 {
+-                    texel = job.sampler.sample(job.sampler, texUf / s.texWf, texVf / s.texHf, 1.0f, 0u, 0u);
++                    if constexpr (S != nullptr)
++                        texel = S(job.sampler, texUf / s.texWf, texVf / s.texHf, 1.0f, 0u, 0u);
++                    else
++                        texel = job.sampler.sample(job.sampler, texUf / s.texWf, texVf / s.texHf, 1.0f, 0u, 0u);
+                 }
+-                pp.writePixel(pp, x, y, s.z, combineTexturePacked(job.combiner, s.vertexRgba, texel), s.fog);
++                const uint32_t rgba = combineTexturePacked(job.combiner, s.vertexRgba, texel);
++                if constexpr (W != nullptr)
++                    W(pp, x, y, s.z, rgba, s.fog);
++                else
++                    pp.writePixel(pp, x, y, s.z, rgba, s.fog);
+             }
+         }
+     }
+ 
++    void rasterSpriteRows(const BandJob &job, int shift, unsigned count, unsigned index)
++    {
++        constexpr WritePixelFn kCt32Z24 = &writePixelTyped<GSMem::C32, GSMem::Z24>;
++        if (job.pp.writePixel == kCt32Z24 && g_ps2AbMode.load(std::memory_order_relaxed) != 13)
++        {
++            const SampleFn sample = job.sprite.tme ? job.sampler.sample : nullptr;
++            if (sample == nullptr)
++                return rasterSpriteRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::P8>)
++                return rasterSpriteRowsWith<kCt32Z24, &samplerSample<GSMem::P8>>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::P4>)
++                return rasterSpriteRowsWith<kCt32Z24, &samplerSample<GSMem::P4>>(job, shift, count, index);
++            if (sample == &samplerSample<GSMem::C32>)
++                return rasterSpriteRowsWith<kCt32Z24, &samplerSample<GSMem::C32>>(job, shift, count, index);
++            return rasterSpriteRowsWith<kCt32Z24, nullptr>(job, shift, count, index);
++        }
++        rasterSpriteRowsWith<nullptr, nullptr>(job, shift, count, index);
++    }
++
+     PS2_GS_INLINE void rasterJobRows(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         if (job.isSprite)
+@@ -2513,6 +2588,148 @@ namespace
+                 bits.set((basePage + row * pagesPerRow + col) % kPageCount);
+     }
+ 
++    // Blocks (256 bytes) of the pixels [x0, x1] x [y0, y1] of a buffer, as (page, mask of its 32 blocks) entries
++    // appended to `out` (patch 0045; a page can appear more than once). Blocks are placed as the GSMem page tables
++    // place them: the block of a pixel is the page of PixelStorageTraits::PageId plus (base % 32 + BlockId), which
++    // may spill into the next page. Pages wrap at the end of local memory, as addresses do. Unknown formats: every
++    // block of every page.
++    using BlockMasks = std::vector<std::pair<uint32_t, uint32_t>>;
++    void addRectBlocks(BlockMasks &out, uint32_t baseBlock, uint32_t bw, uint32_t psm, int x0, int y0, int x1, int y1)
++    {
++        if (x1 < x0 || y1 < y0)
++            return;
++        const uint16_t *table = nullptr; // the page table of the format for a base at block 0: [y][x]
++        uint32_t pageW = 0u, pageH = 0u, blockW = 0u, blockH = 0u, pixelsPerBlock = 0u;
++        switch (psm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_CT24:
++        case GS_PSM_T8H:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            table = &GSMem::PageTableC32[0][0][0], pageW = 64u, pageH = 32u, blockW = 8u, blockH = 8u, pixelsPerBlock = 64u;
++            break;
++        case GS_PSM_Z32:
++        case GS_PSM_Z24:
++            table = &GSMem::PageTableZ32[0][0][0], pageW = 64u, pageH = 32u, blockW = 8u, blockH = 8u, pixelsPerBlock = 64u;
++            break;
++        case GS_PSM_CT16:
++            table = &GSMem::PageTableC16[0][0][0], pageW = 64u, pageH = 64u, blockW = 16u, blockH = 8u, pixelsPerBlock = 128u;
++            break;
++        case GS_PSM_CT16S:
++            table = &GSMem::PageTableC16S[0][0][0], pageW = 64u, pageH = 64u, blockW = 16u, blockH = 8u, pixelsPerBlock = 128u;
++            break;
++        case GS_PSM_Z16:
++            table = &GSMem::PageTableZ16[0][0][0], pageW = 64u, pageH = 64u, blockW = 16u, blockH = 8u, pixelsPerBlock = 128u;
++            break;
++        case GS_PSM_Z16S:
++            table = &GSMem::PageTableZ16S[0][0][0], pageW = 64u, pageH = 64u, blockW = 16u, blockH = 8u, pixelsPerBlock = 128u;
++            break;
++        case GS_PSM_T8:
++            table = &GSMem::PageTableP8[0][0][0], pageW = 128u, pageH = 64u, blockW = 16u, blockH = 16u, pixelsPerBlock = 256u;
++            break;
++        case GS_PSM_T4:
++            table = &GSMem::PageTableP4[0][0][0], pageW = 128u, pageH = 128u, blockW = 32u, blockH = 16u, pixelsPerBlock = 512u;
++            break;
++        default:
++            for (uint32_t page = 0; page < kPageCount; ++page)
++                out.emplace_back(page, ~0u);
++            return;
++        }
++        const uint32_t pagesPerRow = (bw * 64u) / pageW;
++        const uint32_t basePage = baseBlock / 32u;
++        const uint32_t offset = baseBlock % 32u;
++        const uint32_t ux0 = static_cast<uint32_t>(std::max(x0, 0)), uy0 = static_cast<uint32_t>(std::max(y0, 0));
++        const uint32_t ux1 = static_cast<uint32_t>(std::max(x1, 0)), uy1 = static_cast<uint32_t>(std::max(y1, 0));
++        if (static_cast<uint64_t>(uy1 / pageH - uy0 / pageH + 1u) * (ux1 / pageW - ux0 / pageW + 1u) >= kPageCount)
++        {
++            for (uint32_t page = 0; page < kPageCount; ++page)
++                out.emplace_back(page, ~0u);
++            return;
++        }
++        for (uint32_t row = uy0 / pageH; row <= uy1 / pageH; ++row)
++        {
++            const uint32_t cy0 = std::max(uy0, row * pageH), cy1 = std::min(uy1, row * pageH + pageH - 1u);
++            for (uint32_t col = ux0 / pageW; col <= ux1 / pageW; ++col)
++            {
++                const uint32_t cx0 = std::max(ux0, col * pageW), cx1 = std::min(ux1, col * pageW + pageW - 1u);
++                uint32_t ids = 0u; // BlockIds (0-31) the pixels of this page cell fall in
++                if (cx0 == col * pageW && cx1 == col * pageW + pageW - 1u && cy0 == row * pageH &&
++                    cy1 == row * pageH + pageH - 1u)
++                    ids = ~0u;
++                else
++                    for (uint32_t y = cy0 - cy0 % blockH; y <= cy1; y += blockH)
++                        for (uint32_t x = cx0 - cx0 % blockW; x <= cx1; x += blockW)
++                            ids |= 1u << (table[(y % pageH) * pageW + (x % pageW)] / pixelsPerBlock);
++                const uint32_t page = basePage + row * pagesPerRow + col;
++                const uint32_t low = ids << offset;
++                const uint32_t high = offset != 0u ? ids >> (32u - offset) : 0u;
++                if (low != 0u)
++                    out.emplace_back(page % kPageCount, low);
++                if (high != 0u)
++                    out.emplace_back((page + 1u) % kPageCount, high);
++            }
++        }
++    }
++
++    // PS2X_GS_PROBAR_BLOQUES=1: checks addRectBlocks against the address of every pixel of random rectangles
++    // (GSMem::PixelStorageTraits::Address, the addressing the reads and writes use). "faltan" must be 0; "sobran"
++    // only makes waits less precise.
++    template <GSMem::PixelStorageMode P>
++    void testRectBlocksFormat(uint32_t psm, uint32_t bitsPerPixel, const typename GSMem::PixelStorageTraits<P>::PageLookupTableT &table,
++                              uint32_t &cases, uint64_t &missing, uint64_t &extra)
++    {
++        uint32_t seed = 12345u + psm;
++        const auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
++        for (int n = 0; n < 3000; ++n)
++        {
++            const uint32_t base = next() % 16384u;
++            const uint32_t bw = 1u + next() % 16u;
++            const int x0 = static_cast<int>(next() % 1024u), y0 = static_cast<int>(next() % 1024u);
++            const int big = (n % 10) == 0 ? 300 : 70;
++            const int x1 = x0 + static_cast<int>(next() % big), y1 = y0 + static_cast<int>(next() % big);
++            std::array<uint32_t, kPageCount> want{}, got{};
++            for (int y = y0; y <= y1; ++y)
++                for (int x = x0; x <= x1; ++x)
++                {
++                    const uint64_t pixel = GSMem::PixelStorageTraits<P>::Address(table, base, bw, static_cast<uint32_t>(x),
++                                                                                static_cast<uint32_t>(y));
++                    const uint64_t block = (pixel * bitsPerPixel / 8u) / 256u;
++                    want[(block / 32u) % kPageCount] |= 1u << (block % 32u);
++                }
++            BlockMasks blocks;
++            addRectBlocks(blocks, base, bw, psm, x0, y0, x1, y1);
++            for (const auto &[page, mask] : blocks)
++                got[page] |= mask;
++            for (uint32_t page = 0; page < kPageCount; ++page)
++            {
++                missing += static_cast<uint64_t>(std::popcount(want[page] & ~got[page]));
++                extra += static_cast<uint64_t>(std::popcount(got[page] & ~want[page]));
++            }
++            ++cases;
++        }
++    }
++
++    void testRectBlocks()
++    {
++        const char *value = std::getenv("PS2X_GS_PROBAR_BLOQUES");
++        if (value == nullptr || value[0] != '1')
++            return;
++        GSMem::InitLookupTables();
++        uint32_t cases = 0u;
++        uint64_t missing = 0u, extra = 0u;
++        testRectBlocksFormat<GSMem::C32>(GS_PSM_CT32, 32u, GSMem::PageTableC32, cases, missing, extra);
++        testRectBlocksFormat<GSMem::Z32>(GS_PSM_Z24, 32u, GSMem::PageTableZ32, cases, missing, extra);
++        testRectBlocksFormat<GSMem::C16>(GS_PSM_CT16, 16u, GSMem::PageTableC16, cases, missing, extra);
++        testRectBlocksFormat<GSMem::C16S>(GS_PSM_CT16S, 16u, GSMem::PageTableC16S, cases, missing, extra);
++        testRectBlocksFormat<GSMem::Z16>(GS_PSM_Z16, 16u, GSMem::PageTableZ16, cases, missing, extra);
++        testRectBlocksFormat<GSMem::Z16S>(GS_PSM_Z16S, 16u, GSMem::PageTableZ16S, cases, missing, extra);
++        testRectBlocksFormat<GSMem::P8>(GS_PSM_T8, 8u, GSMem::PageTableP8, cases, missing, extra);
++        testRectBlocksFormat<GSMem::P4>(GS_PSM_T4, 4u, GSMem::PageTableP4, cases, missing, extra);
++        std::fprintf(stderr, "[gs:bloques] prueba: %u rectangulos, bloques que faltan=%llu, que sobran=%llu\n", cases,
++                     static_cast<unsigned long long>(missing), static_cast<unsigned long long>(extra));
++    }
++
+     // Identifies how a buffer maps pixels to addresses (base page, width, format).
+     uint32_t layoutCode(uint32_t baseBlock, uint32_t bw, uint32_t psm)
+     {
+@@ -2565,6 +2782,8 @@ struct GSCpuBackend::BandState
+     {
+         std::atomic<uint64_t> done{0u}; // jobs [0, done) finished by this worker
+         std::atomic<uint64_t> busyNs{0u};
++        std::atomic<uint32_t> chunks{0u};       // batches of jobs it ran ...
++        std::atomic<uint32_t> onEfficiency{0u}; // ... starting on an efficiency core
+     };
+     std::unique_ptr<Worker[]> worker;
+ 
+@@ -2582,6 +2801,14 @@ struct GSCpuBackend::BandState
+     uint64_t textureLastJob = 0u;
+     PageBits texturePages;
+     PageBits transferPages; // destination of the current host-to-local transfer
++    // Blocks (patch 0045): of each page, the blocks pending jobs write and read as textures (unions, cleared with
++    // pendingWrites/pendingReads). A request or a draw that shares a page with them but none of their blocks does not
++    // wait. A/B mode 15: pages only, as before.
++    std::array<uint32_t, kPageCount> pendingWriteBlocks{};
++    std::array<uint32_t, kPageCount> pendingReadBlocks{};
++    BlockMasks requestBlocks, transferBlocks, targetBlocks, textureBlocks;
++    bool textureBlocksApplied = false; // textureBlocks are in pendingReadBlocks
++    char transferText[160] = {};
+     // Palettes of the jobs: copies of m_palette, reused once the jobs reading them are done.
+     std::unique_ptr<std::array<uint32_t, 256>[]> palettes;
+     std::array<uint64_t, kPaletteCount> paletteLastJob{};
+@@ -2618,6 +2845,9 @@ struct GSCpuBackend::BandState
+         minDone = lowest;
+         if (lowest == prepared)
+         {
++            pendingWrites.forEach([this](uint32_t page) { pendingWriteBlocks[page] = 0u; });
++            pendingReads.forEach([this](uint32_t page) { pendingReadBlocks[page] = 0u; });
++            textureBlocksApplied = false;
+             pendingWrites.clear();
+             pendingReads.clear();
+         }
+@@ -2705,6 +2935,9 @@ struct GSCpuBackend::BandState
+         const int maxU = (clamp & 0x3u) >= 2u ? 1023 : std::max<int>(state.textureWidth, 1) - 1;
+         const int maxV = ((clamp >> 2) & 0x3u) >= 2u ? 1023 : std::max<int>(state.textureHeight, 1) - 1;
+         addRectPages(texturePages, tex.tbp0, tex.tbw, tex.psm, 0, 0, maxU, maxV);
++        textureBlocks.clear();
++        addRectBlocks(textureBlocks, tex.tbp0, tex.tbw, tex.psm, 0, 0, maxU, maxV);
++        textureBlocksApplied = false;
+         textureKey0 = key0;
+         textureKey1 = clamp;
+         textureLastJob = 0u;
+@@ -2712,15 +2945,78 @@ struct GSCpuBackend::BandState
+         return texturePages;
+     }
+ 
++    // PS2X_GS_ESPERAS=<s> (diagnostic): the first waits of each reason with what was asked for (requestText, set by
++    // the caller) and the pending job it waits for.
++    char requestText[160] = {};
++    void NoteWait(int reason, uint32_t page, uint64_t tag, bool readConflict)
++    {
++        // PS2X_GS_ESPERAS=<s>: from that many seconds after the band workers start.
++        static const double s_from = []
++        {
++            const char *value = std::getenv("PS2X_GS_ESPERAS");
++            return value != nullptr ? std::atof(value) : -1.0;
++        }();
++        static const auto s_start = std::chrono::steady_clock::now();
++        static uint32_t s_count[kWaitReasonCount] = {};
++        if (s_from < 0.0 || tag == 0u ||
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() < s_from ||
++            s_count[reason]++ >= 40u)
++            return;
++        const BandJob &job = jobs[(tag - 1u) % kJobCapacity];
++        std::fprintf(stderr,
++                     "[gs:espera] %s pagina=%u %s | trabajo %llu (pendientes %llu) %s fbp=0x%x fbw=%u fpsm=0x%x zbp=0x%x "
++                     "zpsm=0x%x caja=(%d,%d)-(%d,%d) tex=0x%x tbw=%u tpsm=0x%x %s\n",
++                     kWaitReasonNames[reason], page, requestText, static_cast<unsigned long long>(tag),
++                     static_cast<unsigned long long>(prepared - minDone), job.isSprite ? "sprite" : "triangulo",
++                     job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.pp.zpsm, job.minX, job.minY, job.maxX,
++                     job.maxY, job.sampler.tbp0, job.sampler.tbw, job.sampler.psm,
++                     readConflict ? "(la lee como textura)" : "(la escribe)");
++    }
++
+     // Waits for the pending jobs writing `pages` (and, for a write, reading them as textures).
+     void WaitForPages(const PageBits &pages, bool write, int reason)
+     {
+         PublishPending(); // a command other than a draw: let the workers start on what is ready
+         uint64_t need = 0u;
+-        pages.forEachCommon(pendingWrites, [&](uint32_t page) { need = std::max(need, pageWriteJob[page]); });
++        uint32_t needPage = 0u;
++        bool needRead = false;
++        pages.forEachCommon(pendingWrites, [&](uint32_t page)
++                            { if (pageWriteJob[page] > need) { need = pageWriteJob[page]; needPage = page; } });
+         if (write)
+-            pages.forEachCommon(pendingReads, [&](uint32_t page) { need = std::max(need, ReadJobOf(page)); });
++            pages.forEachCommon(pendingReads, [&](uint32_t page)
++                                { if (ReadJobOf(page) > need) { need = ReadJobOf(page); needPage = page; needRead = true; } });
++        if (need > minDone)
++            NoteWait(reason, needPage, need, needRead);
++        WaitDone(need, reason);
++        requestText[0] = '\0';
++    }
++
++    // Waits for the pending jobs writing these blocks (and, for a write, reading them as textures).
++    void WaitForBlocks(const BlockMasks &blocks, bool write, int reason)
++    {
++        PublishPending();
++        uint64_t need = 0u;
++        uint32_t needPage = 0u;
++        bool needRead = false;
++        for (const auto &[page, mask] : blocks)
++        {
++            if ((mask & pendingWriteBlocks[page]) != 0u && pageWriteJob[page] > need)
++            {
++                need = pageWriteJob[page];
++                needPage = page;
++                needRead = false;
++            }
++            if (write && (mask & pendingReadBlocks[page]) != 0u && ReadJobOf(page) > need)
++            {
++                need = ReadJobOf(page);
++                needPage = page;
++                needRead = true;
++            }
++        }
++        if (need > minDone)
++            NoteWait(reason, needPage, need, needRead);
+         WaitDone(need, reason);
++        requestText[0] = '\0';
+     }
+ 
+     void WorkerLoop(unsigned index)
+@@ -2732,6 +3028,7 @@ struct GSCpuBackend::BandState
+         const int shift = bandShift;
+         const unsigned count = threads;
+         uint64_t next = 0u;
++        int coresApplied = 0;
+         for (;;)
+         {
+             uint64_t available = published.load(std::memory_order_acquire);
+@@ -2756,6 +3053,12 @@ struct GSCpuBackend::BandState
+                     continue;
+                 }
+             }
++            {
++                uint32_t chunks = 0u, onEfficiency = 0u;
++                ps2GsThreadCores(coresApplied, chunks, onEfficiency, true);
++                me.chunks.fetch_add(chunks, std::memory_order_relaxed);
++                me.onEfficiency.fetch_add(onEfficiency, std::memory_order_relaxed);
++            }
+             const auto start = std::chrono::steady_clock::now();
+             for (; next < available; ++next)
+             {
+@@ -2779,7 +3082,7 @@ struct GSCpuBackend::BandState
+         const double seconds = std::chrono::duration<double>(now - reportStart).count();
+         if (seconds < 10.0)
+             return;
+-        char line[1024];
++        char line[1100];
+         int length = std::snprintf(line, sizeof(line), "[gs:bandas] trabajos/s=%.0f ocupados=",
+                                    static_cast<double>(jobsSinceReport) / seconds);
+         for (unsigned k = 0; k < threads && length < 900; ++k)
+@@ -2797,8 +3100,15 @@ struct GSCpuBackend::BandState
+             length += std::snprintf(line + length, sizeof(line) - length, " %s=%llu/%.0fms", kWaitReasonNames[r],
+                                     static_cast<unsigned long long>(waits[r]), ms);
+         }
+-        std::snprintf(line + length, sizeof(line) - length, " (coordinador esperando %.0f%%)",
+-                      0.1 * waitedMs / seconds);
++        length += std::snprintf(line + length, sizeof(line) - length, " (coordinador esperando %.0f%%) nucleosE=",
++                                0.1 * waitedMs / seconds);
++        for (unsigned k = 0; k < threads && length < 1000; ++k)
++        {
++            const uint32_t chunks = worker[k].chunks.exchange(0u, std::memory_order_relaxed);
++            const uint32_t onEfficiency = worker[k].onEfficiency.exchange(0u, std::memory_order_relaxed);
++            length += std::snprintf(line + length, sizeof(line) - length, "%s%u%%", k ? "/" : "",
++                                    chunks != 0u ? 100u * onEfficiency / chunks : 0u);
++        }
+         std::fprintf(stderr, "%s\n", line);
+         reportStart = now;
+         jobsSinceReport = 0u;
+@@ -2837,6 +3147,7 @@ void GSCpuBackend::StartBandWorkers(unsigned threads)
+         bands->workers.emplace_back([state = bands.get(), k]()
+                                     { state->WorkerLoop(k); });
+     std::fprintf(stderr, "[gs:bandas] %u hilos, bandas de %d filas\n", bands->threads, 1 << bands->bandShift);
++    testRectBlocks();
+     m_bands = std::move(bands);
+ }
+ 
+@@ -2873,6 +3184,15 @@ void GSCpuBackend::WaitBandsForRead(int reason, uint32_t baseBlock, uint32_t bw,
+     if (!m_bands)
+         return;
+     CloseBandVerification();
++    std::snprintf(m_bands->requestText, sizeof(m_bands->requestText), "lee base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)",
++                  baseBlock, bw, psm, x0, y0, x1, y1);
++    if (g_ps2AbMode.load(std::memory_order_relaxed) != 15)
++    {
++        m_bands->requestBlocks.clear();
++        addRectBlocks(m_bands->requestBlocks, baseBlock, bw, psm, x0, y0, x1, y1);
++        m_bands->WaitForBlocks(m_bands->requestBlocks, false, reason);
++        return;
++    }
+     PageBits pages;
+     addRectPages(pages, baseBlock, bw, psm, x0, y0, x1, y1);
+     m_bands->WaitForPages(pages, false, reason);
+@@ -2884,6 +3204,15 @@ void GSCpuBackend::WaitBandsForWrite(int reason, uint32_t baseBlock, uint32_t bw
+     if (!m_bands)
+         return;
+     CloseBandVerification();
++    std::snprintf(m_bands->requestText, sizeof(m_bands->requestText), "escribe base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)",
++                  baseBlock, bw, psm, x0, y0, x1, y1);
++    if (g_ps2AbMode.load(std::memory_order_relaxed) != 15)
++    {
++        m_bands->requestBlocks.clear();
++        addRectBlocks(m_bands->requestBlocks, baseBlock, bw, psm, x0, y0, x1, y1);
++        m_bands->WaitForBlocks(m_bands->requestBlocks, true, reason);
++        return;
++    }
+     PageBits pages;
+     addRectPages(pages, baseBlock, bw, psm, x0, y0, x1, y1);
+     m_bands->WaitForPages(pages, true, reason);
+@@ -2895,10 +3224,19 @@ void GSCpuBackend::BandTransferBegin(const GSTransferCommand &command)
+     {
+         // Host to local: UploadImage waits for the pending jobs touching the destination.
+         m_bands->transferPages.clear();
++        m_bands->transferBlocks.clear();
++        std::snprintf(m_bands->transferText, sizeof(m_bands->transferText),
++                      "subida dbp=0x%x dbw=%u dpsm=0x%x (%u,%u) %ux%u", command.bitbltbuf.dbp, command.bitbltbuf.dbw,
++                      command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw,
++                      command.trxreg.rrh);
+         if (command.trxreg.rrw != 0u && command.trxreg.rrh != 0u)
+             addRectPages(m_bands->transferPages, command.bitbltbuf.dbp, std::max<uint32_t>(command.bitbltbuf.dbw, 1u),
+                          command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay,
+                          command.trxpos.dsax + command.trxreg.rrw - 1, command.trxpos.dsay + command.trxreg.rrh - 1);
++        if (command.trxreg.rrw != 0u && command.trxreg.rrh != 0u)
++            addRectBlocks(m_bands->transferBlocks, command.bitbltbuf.dbp, std::max<uint32_t>(command.bitbltbuf.dbw, 1u),
++                          command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay,
++                          command.trxpos.dsax + command.trxreg.rrw - 1, command.trxpos.dsay + command.trxreg.rrh - 1);
+     }
+     else if (command.direction == 1u || command.direction == 2u)
+     {
+@@ -2909,7 +3247,11 @@ void GSCpuBackend::BandTransferBegin(const GSTransferCommand &command)
+ void GSCpuBackend::BandTransferWait()
+ {
+     CloseBandVerification();
+-    m_bands->WaitForPages(m_bands->transferPages, true, kWaitTransfer);
++    std::memcpy(m_bands->requestText, m_bands->transferText, sizeof(m_bands->requestText));
++    if (g_ps2AbMode.load(std::memory_order_relaxed) != 15)
++        m_bands->WaitForBlocks(m_bands->transferBlocks, true, kWaitTransfer);
++    else
++        m_bands->WaitForPages(m_bands->transferPages, true, kWaitTransfer);
+ }
+ 
+ const uint32_t *GSCpuBackend::BandPalette(const GSDrawState &state, uint64_t jobIndex)
+@@ -2991,25 +3333,57 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+         return;
+     }
+ 
+-    // Wait for the pending jobs it conflicts with.
++    // Wait for the pending jobs it conflicts with. Reading what a pending job writes, and writing what a pending job
++    // reads as a texture, by blocks (A/B mode 15: by pages); writing a page a pending job writes with another layout,
++    // by pages (a pending job of the same layout as the last one may have written it with another).
++    const bool byBlocks = g_ps2AbMode.load(std::memory_order_relaxed) != 15;
++    bs.targetBlocks.clear();
++    if (byBlocks && ztest != 0u)
++    {
++        addRectBlocks(bs.targetBlocks, job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.minX, job.minY, job.maxX, job.maxY);
++        if (ztest >= 2u || !job.pp.zmask)
++            addRectBlocks(bs.targetBlocks, job.pp.zbp, job.pp.fbw, job.pp.zpsm, job.minX, job.minY, job.maxX, job.maxY);
++    }
+     uint64_t needTexture = 0u, needLayout = 0u, needRead = 0u;
+     if (texturePages != nullptr)
+-        texturePages->forEachCommon(bs.pendingWrites, [&](uint32_t page)
+-                                    { needTexture = std::max(needTexture, bs.pageWriteJob[page]); });
++    {
++        if (byBlocks)
++        {
++            for (const auto &[page, mask] : bs.textureBlocks)
++                if ((mask & bs.pendingWriteBlocks[page]) != 0u)
++                    needTexture = std::max(needTexture, bs.pageWriteJob[page]);
++        }
++        else
++            texturePages->forEachCommon(bs.pendingWrites, [&](uint32_t page)
++                                        { needTexture = std::max(needTexture, bs.pageWriteJob[page]); });
++    }
+     const auto checkTarget = [&](const PageBits &pages, uint32_t layout)
+     {
+         pages.forEachCommon(bs.pendingWrites, [&](uint32_t page)
+                             {
+                                 if (bs.pageWriteLayout[page] != layout)
+                                     needLayout = std::max(needLayout, bs.pageWriteJob[page]); });
+-        pages.forEachCommon(bs.pendingReads, [&](uint32_t page)
+-                            { needRead = std::max(needRead, bs.ReadJobOf(page)); });
++        if (!byBlocks)
++            pages.forEachCommon(bs.pendingReads, [&](uint32_t page)
++                                { needRead = std::max(needRead, bs.ReadJobOf(page)); });
+     };
+     checkTarget(colorPages, colorLayout);
+     checkTarget(depthPages, depthLayout);
++    if (byBlocks)
++        for (const auto &[page, mask] : bs.targetBlocks)
++            if ((mask & bs.pendingReadBlocks[page]) != 0u)
++                needRead = std::max(needRead, bs.ReadJobOf(page));
+     const uint64_t need = std::max({needTexture, needLayout, needRead});
+     if (need > bs.minDone)
+-        bs.WaitDone(need, need == needTexture ? kWaitTexture : need == needLayout ? kWaitLayout : kWaitTextureRead);
++    {
++        const int reason = need == needTexture ? kWaitTexture : need == needLayout ? kWaitLayout : kWaitTextureRead;
++        std::snprintf(bs.requestText, sizeof(bs.requestText),
++                      "dibuja fbp=0x%x fbw=%u fpsm=0x%x zbp=0x%x caja=(%d,%d)-(%d,%d) tex=0x%x tbw=%u tpsm=0x%x",
++                      job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.minX, job.minY, job.maxX, job.maxY,
++                      job.sampler.tbp0, job.sampler.tbw, job.sampler.psm);
++        bs.NoteWait(reason, 0u, need, reason == kWaitTextureRead);
++        bs.WaitDone(need, reason);
++    }
+ 
+     // F1_GS_VERIFICAR_BANDAS: a batch starts from local memory with nothing pending.
+     if (bs.verifyLeft != 0u &&
+@@ -3031,10 +3405,25 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+                        { bs.pageWriteJob[page] = tag; bs.pageWriteLayout[page] = depthLayout; });
+     bs.pendingWrites |= colorPages;
+     bs.pendingWrites |= depthPages;
++    if (byBlocks)
++        for (const auto &[page, mask] : bs.targetBlocks)
++            bs.pendingWriteBlocks[page] |= mask;
++    else
++    {
++        // A/B mode 15: every block of the pages, so that a switch back to blocks stays exact.
++        colorPages.forEach([&](uint32_t page) { bs.pendingWriteBlocks[page] = ~0u; });
++        depthPages.forEach([&](uint32_t page) { bs.pendingWriteBlocks[page] = ~0u; });
++    }
+     if (texturePages != nullptr)
+     {
+         bs.textureLastJob = tag;
+         bs.pendingReads |= *texturePages;
++        if (!bs.textureBlocksApplied)
++        {
++            for (const auto &[page, mask] : bs.textureBlocks)
++                bs.pendingReadBlocks[page] |= mask;
++            bs.textureBlocksApplied = true;
++        }
+     }
+     bs.prepared = tag;
+     if (tag - bs.published.load(std::memory_order_relaxed) >= BandState::kPublishBatch)
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 57a4eaa..5553026 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -8,11 +8,133 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <emmintrin.h>
++#include <algorithm>
+ #include <type_traits>
+ #include <utility>
+ 
+ std::atomic<int> g_ps2AbMode{0};
+ 
++#if defined(_WIN32)
++extern "C"
++{
++    __declspec(dllimport) void *__stdcall GetCurrentProcess(void);
++    __declspec(dllimport) unsigned long __stdcall GetCurrentProcessorNumber(void);
++    __declspec(dllimport) int __stdcall GetSystemCpuSetInformation(void *information, unsigned long length,
++                                                                   unsigned long *returned, void *process,
++                                                                   unsigned long flags);
++    __declspec(dllimport) int __stdcall SetThreadSelectedCpuSets(void *thread, const unsigned long *ids,
++                                                                 unsigned long count);
++    __declspec(dllimport) int __stdcall SetThreadInformation(void *thread, int informationClass, void *information,
++                                                             unsigned long length);
++}
++
++namespace
++{
++    struct HostCores
++    {
++        uint8_t efficiency[256] = {}; // EfficiencyClass by logical processor (group 0)
++        uint8_t best = 0u;
++        unsigned long performanceIds[256] = {}; // CPU set ids of the best class
++        unsigned long performanceCount = 0u;
++        unsigned long efficiencyIds[256] = {};  // ... and of the others
++        unsigned long efficiencyCount = 0u;
++        bool hybrid = false;
++    };
++
++    const HostCores &hostCores()
++    {
++        static const HostCores s_cores = []
++        {
++            HostCores c;
++            static uint8_t buffer[64 * 1024];
++            unsigned long length = 0u;
++            if (GetSystemCpuSetInformation(buffer, sizeof(buffer), &length, GetCurrentProcess(), 0u) == 0)
++                return c;
++            // SYSTEM_CPU_SET_INFORMATION: Size, Type, then Id (+8), Group (+12), LogicalProcessorIndex (+14) and
++            // EfficiencyClass (+18).
++            uint8_t worst = 255u;
++            for (int pass = 0; pass < 2; ++pass)
++                for (unsigned long pos = 0u; pos + 24u <= length;)
++                {
++                    uint32_t size = 0u, id = 0u;
++                    uint16_t group = 0u;
++                    std::memcpy(&size, buffer + pos, 4u);
++                    std::memcpy(&id, buffer + pos + 8u, 4u);
++                    std::memcpy(&group, buffer + pos + 12u, 2u);
++                    const uint8_t logical = buffer[pos + 14u];
++                    const uint8_t cls = buffer[pos + 18u];
++                    if (pass == 0)
++                    {
++                        if (group == 0u)
++                            c.efficiency[logical] = cls;
++                        c.best = std::max(c.best, cls);
++                        worst = std::min(worst, cls);
++                    }
++                    else if (cls == c.best && c.performanceCount < 256u)
++                        c.performanceIds[c.performanceCount++] = id;
++                    else if (cls != c.best && c.efficiencyCount < 256u)
++                        c.efficiencyIds[c.efficiencyCount++] = id;
++                    if (size == 0u)
++                        break;
++                    pos += size;
++                }
++            c.hybrid = worst != c.best;
++            return c;
++        }();
++        return s_cores;
++    }
++}
++
++bool ThreadNaming::OnEfficiencyCore()
++{
++    const HostCores &c = hostCores();
++    return c.hybrid && c.efficiency[GetCurrentProcessorNumber() & 255u] != c.best;
++}
++
++void ThreadNaming::SetCoreKind(int kind)
++{
++    const HostCores &c = hostCores();
++    // THREAD_POWER_THROTTLING_STATE {Version 1, ControlMask, StateMask}: execution speed (1) controlled and off.
++    unsigned long state[3] = {1u, kind == 1 ? 1u : 0u, 0u};
++    SetThreadInformation(GetCurrentThread(), 3 /* ThreadPowerThrottling */, state, sizeof(state));
++    if (!c.hybrid)
++        return;
++    if (kind == 1)
++        SetThreadSelectedCpuSets(GetCurrentThread(), c.performanceIds, c.performanceCount);
++    else if (kind == 2)
++        SetThreadSelectedCpuSets(GetCurrentThread(), c.efficiencyIds, c.efficiencyCount);
++    else
++        SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0u);
++}
++#else
++bool ThreadNaming::OnEfficiencyCore() { return false; }
++void ThreadNaming::SetCoreKind(int) {}
++#endif
++
++// Cores of the GS threads: as Windows decides by default. Keeping all five on the performance cores was 6 % slower
++// in race (A/B, logs/medida-ab-0044c.txt): with the EE thread there too, one of them shares its core (SMT).
++// PS2X_GS_NUCLEOS=1 keeps them on the performance cores, =2 the band workers on the efficiency cores; A/B mode 14:
++// the band workers on the efficiency cores. Called by each GS thread between chunks of work: applies a change.
++void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bool bandWorker)
++{
++    static const int s_kind = []
++    {
++        const char *value = std::getenv("PS2X_GS_NUCLEOS");
++        return value != nullptr ? std::atoi(value) : 0;
++    }();
++    int wanted = s_kind == 2 && !bandWorker ? 0 : s_kind;
++    if (bandWorker && g_ps2AbMode.load(std::memory_order_relaxed) == 14)
++        wanted = 2;
++    if (wanted != applied)
++    {
++        ThreadNaming::SetCoreKind(wanted);
++        applied = wanted;
++    }
++    ++chunks;
++    if (ThreadNaming::OnEfficiencyCore())
++        ++onEfficiency;
++}
++
+ namespace
+ {
+     constexpr uint32_t kCommandCost = 32u; // fixed cost of any command, in pixels
+@@ -231,6 +353,8 @@ void GSThreadedBackend::WorkerLoop()
+ 
+     uint64_t head = 0u;
+     uint64_t costOut = 0u;
++    int coresApplied = 0;
++    uint32_t coreChunks = 0u, coreOnEfficiency = 0u;
+     const auto publish = [&](uint64_t newHead)
+     {
+         m_costOut.store(costOut, std::memory_order_release);
+@@ -284,6 +408,7 @@ void GSThreadedBackend::WorkerLoop()
+         const uint64_t begin = head;
+         const uint64_t end = std::min<uint64_t>(tail, begin + kChunk);
+         m_workerBusy.store(true, std::memory_order_seq_cst);
++        ps2GsThreadCores(coresApplied, coreChunks, coreOnEfficiency, false);
+         const Clock::time_point chunkStart = Clock::now();
+         uint64_t unpublishedCost = 0u;
+         for (uint64_t index = begin; index < end; ++index)
+@@ -305,12 +430,14 @@ void GSThreadedBackend::WorkerLoop()
+         {
+             const double seconds = std::chrono::duration<double>(chunkEnd - reportStart).count();
+             const double producerWait = 1e-9 * static_cast<double>(m_producerWaitNs.exchange(0u, std::memory_order_relaxed));
+-            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu dormidas/s=%.0f\n",
++            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu dormidas/s=%.0f nucleosE=%u%%\n",
+                          100.0 * std::chrono::duration<double>(busyTime).count() / seconds, commandsRun / seconds,
+                          static_cast<unsigned long long>(m_fullWaits.exchange(0u, std::memory_order_relaxed)),
+                          100.0 * producerWait / seconds,
+                          static_cast<unsigned long long>(m_drains.exchange(0u, std::memory_order_relaxed)),
+-                         sleeps / seconds);
++                         sleeps / seconds, coreChunks != 0u ? 100u * coreOnEfficiency / coreChunks : 0u);
++            coreChunks = 0u;
++            coreOnEfficiency = 0u;
+             reportStart = chunkEnd;
+             busyTime = {};
+             commandsRun = 0u;

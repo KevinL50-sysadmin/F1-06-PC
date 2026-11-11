@@ -1,0 +1,2190 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e197f1a..876d081 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -593,7 +593,13 @@ endif()
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     target_sources(ps2EntryRunner PRIVATE
+         src/lib/ps2_debug_panel.cpp
++        src/lib/ps2_options_menu.cpp
+     )
++    # Phase 3 (T3): the options menu's Spanish texts are UTF-8 (accents), as ImGui expects.
++    if(MSVC)
++        set_source_files_properties(src/lib/ps2_options_menu.cpp PROPERTIES COMPILE_OPTIONS "/utf-8"
++                                    SKIP_PRECOMPILE_HEADERS ON)
++    endif()
+     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+ endif()
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index 7e146ab..f5a0253 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -81,7 +81,63 @@ namespace ps2x
+         const OptionsFile &options, const std::function<const char *(const char *)> &getEnvironment);
+ 
+     // Reads opciones.ini (creating it with the defaults of the mode if missing) and sets the variables it decides. The
+-    // lines for the log ("[opciones] ...") are appended to messages.
++    // lines for the log ("[opciones] ...") are appended to messages. It also leaves startupOptions() for the menu.
+     void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages,
+                           bool development = false);
++
++    // Phase 3 (T3): the in-game options menu (ps2_options_menu.h) changes these values while the game runs and saves
++    // them to opciones.ini.
++
++    // key -> the variable that fixes it: the options whose variable (or an alias's old variable) is set, which the file
++    // cannot change (the menu shows them disabled).
++    std::map<std::string, std::string> optionsForcedByEnvironment(
++        const std::function<const char *(const char *)> &getEnvironment);
++
++    // What applyOptionsFile saw: the file, the mode and the options forced by a variable set before it ran.
++    struct StartupOptions
++    {
++        std::filesystem::path file;
++        bool development = false;
++        std::map<std::string, std::string> forced;
++    };
++    const StartupOptions &startupOptions();
++
++    // The opciones.ini value of an option for a value of its variable: the choice whose variable value (or name) it
++    // is, case-insensitive, or the value itself when valid for an option without choices. Empty when none.
++    std::string optionValueFromEnvironment(const OptionSpec &spec, std::string_view value);
++
++    // The file the menu writes: defaultOptionsText(development) with values (missing keys: the defaults), then the
++    // lines of existing whose key is unknown, as written (aliases are replaced by their option). LF line ends.
++    std::string rewriteOptionsText(std::string_view existing, const std::map<std::string, std::string> &values,
++                                   bool development);
++
++    // Writes <file>.tmp next to file and renames it over file (creating the folder). False with the reason in error;
++    // the temporary file is removed.
++    bool writeTextFileAtomically(const std::filesystem::path &file, std::string_view text, std::string &error);
++
++    struct OptionsMenuModel
++    {
++        bool development = false;
++        std::map<std::string, std::string> saved;   // the file's values (every known key)
++        std::map<std::string, std::string> current; // what the menu shows and the game uses
++        std::map<std::string, std::string> forced;  // key -> variable (optionsForcedByEnvironment)
++    };
++
++    // From the file's text: saved and current are its values; a forced option's current value is its variable's.
++    OptionsMenuModel makeOptionsMenuModel(std::string_view fileText, bool development,
++                                          const std::map<std::string, std::string> &forced,
++                                          const std::function<const char *(const char *)> &getEnvironment);
++    // False (and nothing changes) for an unknown key, a forced option or a bad value. supersampling under 4 turns
++    // alta_resolucion off (the double resolution output needs 4 samples or more).
++    bool setMenuOption(OptionsMenuModel &model, const std::string &key, const std::string &value);
++    // Back to the saved values, or to the defaults of the mode (not saved yet); forced options do not change.
++    void discardMenuChanges(OptionsMenuModel &model);
++    void resetMenuToDefaults(OptionsMenuModel &model);
++    // The values to write: current, except the forced options, which keep the file's value.
++    std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model);
++    bool menuHasChanges(const OptionsMenuModel &model);
++    // alta_resolucion can be chosen: supersampling 4 or more and gs = gpu.
++    bool highResolutionAvailable(const OptionsMenuModel &model);
++    // rewriteOptionsText over the file's current text and writeTextFileAtomically; on success saved follows.
++    bool saveOptionsMenu(OptionsMenuModel &model, const std::filesystem::path &file, std::string &error);
+ }
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+new file mode 100644
+index 0000000..0c76c2d
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -0,0 +1,144 @@
++#pragma once
++
++#include "ps2_options.h"
++#include "ps2_user_paths.h"
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++class PS2Runtime;
++
++// Phase 3 (T3, F1 06): the in-game options menu (ImGui, in Spanish). F2, or L3+R3 held for half a second on the pad,
++// opens and closes it; Esc, circle or triangle close it. While it is open the game keeps running but its pad reads
++// neutral (keyboard, pad and wheel), until every button is released after closing. Its values come from opciones.ini
++// (ps2_options.h, OptionsMenuModel) and apply at once where the runtime can change them live; Guardar rewrites the file.
++namespace ps2x
++{
++    constexpr double kMenuComboSeconds = 0.5;
++    constexpr uint16_t kPadL3 = 1u << 1, kPadR3 = 1u << 2; // pressed-button bits, in the PS2's order
++
++    // Fires once when held has been true for holdSeconds without a break; then it needs a release to fire again.
++    class HoldComboDetector
++    {
++    public:
++        explicit HoldComboDetector(double holdSeconds = kMenuComboSeconds) : m_holdSeconds(holdSeconds) {}
++
++        bool update(bool held, double now)
++        {
++            if (!held)
++            {
++                m_since = -1.0;
++                m_fired = false;
++                return false;
++            }
++            if (m_since < 0.0)
++                m_since = now;
++            if (m_fired || now - m_since + 1e-9 < m_holdSeconds) // 1e-9: 4.1 - 3.6 is a hair under 0.5
++                return false;
++            m_fired = true;
++            return true;
++        }
++
++    private:
++        double m_holdSeconds;
++        double m_since = -1.0;
++        bool m_fired = false;
++    };
++
++    // pressed: pressed-button bits (1 = pressed). L3 and R3 held together are the menu's combo: the game sees neither.
++    inline uint16_t maskMenuCombo(uint16_t pressed)
++    {
++        constexpr uint16_t combo = kPadL3 | kPadR3;
++        return (pressed & combo) == combo ? static_cast<uint16_t>(pressed & ~combo) : pressed;
++    }
++
++    // The guest's pad: neutral while the menu is open and, after it closes, until no input is held (so the button that
++    // closed it does not reach the game).
++    class GuestInputGate
++    {
++    public:
++        bool passes(bool menuOpen, bool anyInputHeld)
++        {
++            if (menuOpen)
++            {
++                m_waitRelease = true;
++                return false;
++            }
++            if (m_waitRelease && anyInputHeld)
++                return false;
++            m_waitRelease = false;
++            return true;
++        }
++
++    private:
++        bool m_waitRelease = false;
++    };
++
++    // S4: the debug panel (F1) is for development runs only; the player's modes never draw it.
++    inline bool debugPanelAllowed(UserPathsMode mode)
++    {
++        return mode == UserPathsMode::Development;
++    }
++
++    // Esc in the player's modes opens and closes the menu, like a PC game, and never quits (one press too many would
++    // lose a race); the window's close button still quits. Development keeps raylib's Esc = quit.
++    inline bool escapeOpensMenu(UserPathsMode mode)
++    {
++        return mode != UserPathsMode::Development;
++    }
++
++    // PS2X_MENU_GUION (tests): "<seconds>:<action>,..." from the first frame of the window. Actions: abrir, cerrar,
++    // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido>, tecla=<arriba|abajo|izquierda|derecha|aceptar>
++    // or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
++    // ("<action>,...") run when it appears, and the file is deleted (scripts that wait for a screen of the game).
++    struct MenuScriptStep
++    {
++        double seconds = 0.0;
++        std::string action;
++    };
++    std::vector<MenuScriptStep> parseMenuScript(std::string_view text);
++
++    // The pad side (ps2_pad.cpp). setOptionsMenuOpen/optionsMenuOpen: any thread. readMenuPad: the main thread; the pad
++    // and wheel inputs of controles.ini (not the keys) as PS2 buttons, whatever the controller (raylib, the DualSense
++    // over HID, the wheel's last state).
++    void setOptionsMenuOpen(bool open);
++    bool optionsMenuOpen();
++    struct MenuPadState
++    {
++        uint16_t pressed = 0u; // PS2 button bits, 1 = pressed
++        float leftX = 0.0f;    // the left stick, -1 to 1 (up = -1)
++        float leftY = 0.0f;
++    };
++    MenuPadState readMenuPad();
++}
++
++// The menu window (ps2_options_menu.cpp, built with the ImGui UI). It owns the ImGui context, shared with the debug
++// panel: beginFrame/endFrame wrap whatever is drawn in a frame.
++class PS2OptionsMenu
++{
++public:
++    PS2OptionsMenu();
++    ~PS2OptionsMenu();
++
++    // file: opciones.ini; mode: the user paths' mode (development defaults, the ImGui .ini file).
++    void configure(const std::filesystem::path &file, ps2x::UserPathsMode mode);
++    void initialize();
++    void shutdown();
++
++    // F2, the pad combo, Esc / circle / triangle and PS2X_MENU_GUION; every frame, before drawing.
++    void update(PS2Runtime &runtime);
++    bool isVisible() const;
++    // F1 was pressed in development mode (debugPanelAllowed): the debug panel shows or hides. Player modes: never.
++    bool takeDebugPanelToggle();
++    void beginFrame();
++    void draw(PS2Runtime &runtime);
++    void endFrame();
++
++private:
++    struct State;
++    std::unique_ptr<State> m_state;
++};
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 844cacb..4887a98 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -315,6 +315,16 @@ public:
+     ps2x::DisplaySettings displaySettings() const;
+     void applyDisplaySettings(const ps2x::DisplaySettings &settings);
+ 
++    // Phase 3 (T3): what else the options menu changes live. setPresentAspect: the opciones.ini aspecto (auto, 4:3,
++    // 16:9, pixel), applied by the window before its next frame (auto: the game's own choice, as without
++    // PS2X_ASPECTO); presentAspectOption: the one in use (F10 included). setOutputVolume: volumen (0 to 100), the SPU2
++    // output scaled from the volume it started with (PS2X_VOLUMEN); false when it cannot change live (no audio device,
++    // or a start volume of 0, which the SPU2 already applied).
++    void setPresentAspect(const std::string &option);
++    std::string presentAspectOption() const;
++    bool setOutputVolume(int percent);
++    bool outputVolumeLive() const;
++
+     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
+     void setDebugUiCallbacks(DebugUiCallback initCallback,
+                              DebugUiCallback drawCallback,
+@@ -561,6 +571,8 @@ private:
+     ps2x::DisplaySettings m_displaySettings;
+     bool m_displaySettingsPending = false;
+     std::unique_ptr<ps2x::DisplayPresenter> m_displayPresenter; // created by initialize() (not on the Vita)
++    std::atomic<int> m_presentAspectRequest{-1}; // -1: none; else a PresentAspectOption (ps2_runtime.cpp)
++    std::atomic<int> m_presentAspectInUse{0};
+ 
+ public:
+     std::atomic<uint32_t> m_debugPc{0};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 76b438c..4877111 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -130,3 +130,7 @@ private:
+ // log the first time (ps2GsGpuFallbackWarnings counts those lines).
+ std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend();
+ uint32_t ps2GsGpuFallbackWarnings();
++
++// Phase 3 (T3): the backend ps2GsCreateRequestedGpuBackend made, while it lives (null with the CPU GS). The options
++// menu changes its quality (SetQuality) while the game runs.
++GSGpuBackend *ps2GsActiveGpuBackend();
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index e9235a2..13bbe36 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -101,6 +101,7 @@ namespace
+ 
+     std::atomic<uint32_t> g_fallbackWarnings{0u};
+     std::atomic<uint32_t> g_qualityIgnoredWarnings{0u};
++    std::atomic<GSGpuBackend *> g_activeGpuBackend{nullptr}; // phase 3 (T3): for the options menu
+ 
+     bool isOne(const char *value)
+     {
+@@ -980,6 +981,8 @@ GSGpuBackend::GSGpuBackend() : m_impl(std::make_unique<Impl>()) {}
+ 
+ GSGpuBackend::~GSGpuBackend()
+ {
++    GSGpuBackend *self = this;
++    g_activeGpuBackend.compare_exchange_strong(self, nullptr);
+     Impl &impl = *m_impl;
+     if (impl.worker.joinable())
+     {
+@@ -1247,9 +1250,15 @@ std::unique_ptr<GSGpuBackend> ps2GsCreateRequestedGpuBackend()
+     if (quality.highResolution && quality.superSampling < 4u)
+         std::fprintf(stderr, "[gs:gpu] alta_resolucion necesita supersampling = 4 o mas: la imagen sale a su "
+                              "resolucion nativa\n");
++    g_activeGpuBackend.store(backend.get());
+     return backend;
+ }
+ 
++GSGpuBackend *ps2GsActiveGpuBackend()
++{
++    return g_activeGpuBackend.load();
++}
++
+ uint32_t ps2GsGpuFallbackWarnings()
+ {
+     return g_fallbackWarnings.load(std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/ps2_debug_panel.cpp b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index c9aa2c6..ff56976 100644
+--- a/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -2176,48 +2176,30 @@ namespace
+ 
+ #endif
+ }
++// Phase 3 (T3): the ImGui context and frame belong to the options menu (ps2_options_menu.h), which draws this panel
++// inside its frame in development mode only (F1, main.cpp).
+ void PS2DebugPanel::initialize()
+ {
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+-    if (!m_initialized)
+-    {
+-        rlImGuiSetup(true);
+-        m_initialized = true;
+-    }
++    m_initialized = true;
+ #endif
+ }
+ 
+ void PS2DebugPanel::shutdown()
+ {
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+-    if (m_initialized)
+-    {
+-        rlImGuiShutdown();
+-        m_initialized = false;
+-    }
++    m_initialized = false;
+ #endif
+ }
+ 
+ void PS2DebugPanel::draw(PS2Runtime &runtime)
+ {
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+-    if (!m_initialized)
++    if (!m_initialized || !m_visible)
+     {
+         return;
+     }
+ 
+-    if (IsKeyPressed(KEY_F1))
+-    {
+-        toggleVisible();
+-    }
+-
+-    if (!m_visible)
+-    {
+-        return;
+-    }
+-
+-    rlImGuiBegin();
+-
+     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
+     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
+     {
+@@ -2302,8 +2284,6 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
+         }
+     }
+     ImGui::End();
+-
+-    rlImGuiEnd();
+ #else
+     (void)runtime;
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index c144744..fb0c273 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_options.h"
+ #include "ps2_display.h"
++#include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <cctype>
+@@ -72,6 +73,33 @@ namespace ps2x
+             int width = 0, height = 0;
+             return parseWindowSize(value, width, height);
+         }
++
++        const char *const kUnknownKeysHeader =
++            "\n# Opciones que este juego no conoce (escritas a mano o de otra version); se conservan tal cual:\n";
++
++        const OptionSpec *findSpec(std::string_view key)
++        {
++            for (const OptionSpec &spec : optionSpecs())
++                if (key == spec.key)
++                    return &spec;
++            return nullptr;
++        }
++
++        bool knownKey(std::string_view key)
++        {
++            if (findSpec(key) != nullptr)
++                return true;
++            for (const OptionAlias &alias : optionAliases())
++                if (key == alias.key)
++                    return true;
++            return false;
++        }
++
++        StartupOptions &startupRecord()
++        {
++            static StartupOptions record;
++            return record;
++        }
+     }
+ 
+     // One line per option. A new option needs its PS2X_* variable to be read by the runtime as usual.
+@@ -142,6 +170,12 @@ namespace ps2x
+     }
+ 
+     std::string defaultOptionsText(bool development)
++    {
++        return rewriteOptionsText({}, {}, development);
++    }
++
++    std::string rewriteOptionsText(std::string_view existing, const std::map<std::string, std::string> &values,
++                                   bool development)
+     {
+         std::string text = kOptionsHeader;
+         for (const OptionSpec &spec : optionSpecs())
+@@ -151,8 +185,35 @@ namespace ps2x
+             std::string line;
+             while (std::getline(comment, line))
+                 text += "# " + line + "\n";
+-            text += std::string(spec.key) + " = " + optionDefault(spec, development) + "\n";
++            const auto found = values.find(spec.key);
++            text += std::string(spec.key) + " = " +
++                    (found != values.end() ? found->second : std::string(optionDefault(spec, development))) + "\n";
++        }
++
++        if (existing.substr(0, 3) == "\xEF\xBB\xBF")
++            existing.remove_prefix(3);
++        std::string unknown;
++        size_t position = 0u;
++        while (position < existing.size())
++        {
++            const size_t newline = existing.find('\n', position);
++            std::string_view line = existing.substr(position, newline == std::string_view::npos ? std::string_view::npos
++                                                                                                 : newline - position);
++            position = newline == std::string_view::npos ? existing.size() : newline + 1u;
++            if (!line.empty() && line.back() == '\r')
++                line.remove_suffix(1);
++            std::string_view content = line;
++            if (const size_t hash = content.find('#'); hash != std::string_view::npos)
++                content = content.substr(0, hash);
++            const size_t equals = content.find('=');
++            if (equals == std::string_view::npos)
++                continue;
++            const std::string key = lower(trim(content.substr(0, equals)));
++            if (!key.empty() && !knownKey(key))
++                unknown += std::string(line) + "\n";
+         }
++        if (!unknown.empty())
++            text += kUnknownKeysHeader + unknown;
+         return text;
+     }
+ 
+@@ -293,8 +354,9 @@ namespace ps2x
+ 
+         const OptionsFile options = parseOptions(text, file.filename().string(), development);
+         messages.insert(messages.end(), options.warnings.begin(), options.warnings.end());
+-        for (const EnvironmentSetting &setting :
+-             optionsEnvironment(options, [](const char *name) { return static_cast<const char *>(std::getenv(name)); }))
++        const auto getEnvironment = [](const char *name) { return static_cast<const char *>(std::getenv(name)); };
++        startupRecord() = {file, development, optionsForcedByEnvironment(getEnvironment)};
++        for (const EnvironmentSetting &setting : optionsEnvironment(options, getEnvironment))
+         {
+ #if defined(_WIN32)
+             _putenv_s(setting.variable.c_str(), setting.value.c_str());
+@@ -303,4 +365,199 @@ namespace ps2x
+ #endif
+         }
+     }
++
++    std::map<std::string, std::string> optionsForcedByEnvironment(
++        const std::function<const char *(const char *)> &getEnvironment)
++    {
++        std::map<std::string, std::string> forced;
++        for (const OptionSpec &spec : optionSpecs())
++        {
++            if (getEnvironment(spec.environment) != nullptr)
++            {
++                forced[spec.key] = spec.environment;
++                continue;
++            }
++            for (const OptionAlias &alias : optionAliases())
++                if (std::string_view(alias.target) == spec.key && getEnvironment(alias.environment) != nullptr)
++                    forced[spec.key] = alias.environment;
++        }
++        return forced;
++    }
++
++    const StartupOptions &startupOptions()
++    {
++        return startupRecord();
++    }
++
++    std::string optionValueFromEnvironment(const OptionSpec &spec, std::string_view value)
++    {
++        const std::string text = lower(trim(value));
++        if (spec.choices.empty())
++            return validValue(spec, text) ? text : std::string();
++        for (const OptionChoice &choice : spec.choices)
++            if (choice.environment != nullptr && text == lower(choice.environment))
++                return choice.value;
++        for (const OptionChoice &choice : spec.choices)
++            if (text == choice.value)
++                return choice.value;
++        return {};
++    }
++
++    bool writeTextFileAtomically(const std::filesystem::path &file, std::string_view text, std::string &error)
++    {
++        std::error_code ignored;
++        if (file.has_parent_path())
++            std::filesystem::create_directories(file.parent_path(), ignored);
++        std::filesystem::path temporary = file;
++        temporary += ".tmp";
++        {
++            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++            if (out)
++            {
++                out.write(text.data(), static_cast<std::streamsize>(text.size()));
++                out.flush();
++            }
++            if (!out)
++            {
++                error = "no se pudo escribir " + pathForLog(temporary);
++                out.close();
++                std::filesystem::remove(temporary, ignored);
++                return false;
++            }
++        }
++        std::error_code renameError;
++        std::filesystem::rename(temporary, file, renameError);
++        if (renameError)
++        {
++            error = "no se pudo sustituir " + pathForLog(file) + ": " + renameError.message();
++            std::filesystem::remove(temporary, ignored);
++            return false;
++        }
++        error.clear();
++        return true;
++    }
++
++    OptionsMenuModel makeOptionsMenuModel(std::string_view fileText, bool development,
++                                          const std::map<std::string, std::string> &forced,
++                                          const std::function<const char *(const char *)> &getEnvironment)
++    {
++        OptionsMenuModel model;
++        model.development = development;
++        model.saved = parseOptions(fileText, "opciones.ini", development).values;
++        model.current = model.saved;
++        model.forced = forced;
++        for (const auto &[key, variable] : forced)
++        {
++            const OptionSpec *spec = findSpec(key);
++            const char *setting = getEnvironment(variable.c_str());
++            if (spec == nullptr || setting == nullptr)
++                continue;
++            std::string value;
++            if (variable == spec->environment)
++                value = optionValueFromEnvironment(*spec, setting);
++            else
++                for (const OptionAlias &alias : optionAliases())
++                    if (variable == alias.environment)
++                        for (const OptionChoice &choice : alias.values)
++                            if (lower(trim(setting)) == choice.value)
++                                value = choice.environment;
++            if (!value.empty())
++                model.current[key] = value;
++        }
++        return model;
++    }
++
++    bool setMenuOption(OptionsMenuModel &model, const std::string &key, const std::string &value)
++    {
++        const OptionSpec *spec = findSpec(key);
++        const std::string text = lower(trim(value));
++        if (spec == nullptr || model.forced.count(key) != 0u || !validValue(*spec, text))
++            return false;
++        model.current[key] = text;
++        if (key == "supersampling" && std::atoi(text.c_str()) < 4 && model.forced.count("alta_resolucion") == 0u)
++            model.current["alta_resolucion"] = "0";
++        return true;
++    }
++
++    void discardMenuChanges(OptionsMenuModel &model)
++    {
++        for (const OptionSpec &spec : optionSpecs())
++            if (model.forced.count(spec.key) == 0u)
++                model.current[spec.key] = model.saved[spec.key];
++    }
++
++    void resetMenuToDefaults(OptionsMenuModel &model)
++    {
++        for (const OptionSpec &spec : optionSpecs())
++            if (model.forced.count(spec.key) == 0u)
++                model.current[spec.key] = optionDefault(spec, model.development);
++    }
++
++    std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model)
++    {
++        std::map<std::string, std::string> values = model.current;
++        for (const auto &[key, variable] : model.forced)
++        {
++            (void)variable;
++            const auto saved = model.saved.find(key);
++            if (saved != model.saved.end())
++                values[key] = saved->second;
++        }
++        return values;
++    }
++
++    bool menuHasChanges(const OptionsMenuModel &model)
++    {
++        return menuValuesToSave(model) != model.saved;
++    }
++
++    bool highResolutionAvailable(const OptionsMenuModel &model)
++    {
++        const auto value = [&model](const char *key)
++        {
++            const auto found = model.current.find(key);
++            return found == model.current.end() ? std::string() : found->second;
++        };
++        return std::atoi(value("supersampling").c_str()) >= 4 && value("gs") == "gpu";
++    }
++
++    bool saveOptionsMenu(OptionsMenuModel &model, const std::filesystem::path &file, std::string &error)
++    {
++        std::string existing;
++        if (std::ifstream in(file, std::ios::binary); in)
++        {
++            std::stringstream content;
++            content << in.rdbuf();
++            existing = content.str();
++        }
++        const std::map<std::string, std::string> values = menuValuesToSave(model);
++        if (!writeTextFileAtomically(file, rewriteOptionsText(existing, values, model.development), error))
++            return false;
++        model.saved = values;
++        return true;
++    }
++
++    std::vector<MenuScriptStep> parseMenuScript(std::string_view text)
++    {
++        std::vector<MenuScriptStep> steps;
++        size_t position = 0u;
++        while (position <= text.size())
++        {
++            const size_t comma = text.find(',', position);
++            const std::string item =
++                trim(text.substr(position, comma == std::string_view::npos ? std::string_view::npos : comma - position));
++            position = comma == std::string_view::npos ? text.size() + 1u : comma + 1u;
++            const size_t colon = item.find(':');
++            if (colon == std::string::npos)
++                continue;
++            const std::string seconds = trim(std::string_view(item).substr(0, colon));
++            const std::string action = trim(std::string_view(item).substr(colon + 1u));
++            char *end = nullptr;
++            const double value = std::strtod(seconds.c_str(), &end);
++            if (seconds.empty() || end == nullptr || *end != '\0' || action.empty())
++                continue;
++            steps.push_back({value, action});
++        }
++        return steps;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+new file mode 100644
+index 0000000..fa0b9d2
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -0,0 +1,759 @@
++#include "ps2_options_menu.h"
++#include "ps2_display.h"
++#include "ps2_options.h"
++#include "ps2_runtime.h"
++#include "runtime/gs/gs_gpu_bridge.h"
++
++#include "imgui.h"
++#include "rlImGui.h"
++#include "raylib.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++// Phase 3 (T3): the options menu window. This file is built with /utf-8 (CMakeLists.txt): its Spanish texts carry
++// accents, drawn with Segoe UI from the Windows fonts folder (ImGui's own font when it is missing).
++namespace
++{
++    struct Choice
++    {
++        const char *value;
++        const char *label;
++    };
++
++    struct Row
++    {
++        const char *key;
++        const char *label;
++        std::vector<Choice> choices; // empty: volumen (0 to 100 in steps of 5)
++        const char *hint;
++    };
++
++    struct Section
++    {
++        const char *title;
++        std::vector<Row> rows;
++    };
++
++    const std::vector<Section> &sections()
++    {
++        static const std::vector<Section> list = {
++            {"Pantalla",
++             {{"pantalla", "Modo de pantalla",
++               {{"ventana", "Ventana"}, {"sin_bordes", "Sin bordes"}, {"completa", "Pantalla completa"}},
++               "Sin bordes: una ventana del tamaño del monitor. Pantalla completa: exclusiva, a la resolución del "
++               "escritorio. F11 cambia jugando entre la ventana y la pantalla completa."},
++              {"tamano_ventana", "Tamaño de la ventana",
++               {{"960x720", "960 x 720"},
++                {"1280x960", "1280 x 960"},
++                {"1440x1080", "1440 x 1080"},
++                {"1600x1200", "1600 x 1200"},
++                {"1920x1080", "1920 x 1080"},
++                {"2560x1440", "2560 x 1440"},
++                {"3840x2160", "3840 x 2160"}},
++               "Tamaño de la ventana en modo ventana, en píxeles."},
++              {"aspecto", "Forma de la imagen",
++               {{"auto", "Automática"}, {"4:3", "4:3"}, {"16:9", "16:9"}, {"pixel", "Píxeles cuadrados"}},
++               "Automática: la que se elija en las opciones del juego (4:3 o panorámica). F10 la cambia jugando."},
++              {"filtro", "Filtro de la imagen",
++               {{"cercano", "Cercano"}, {"bilineal", "Bilineal"}, {"nitido", "Nítido"}, {"fsr", "AMD FSR 1"},
++                {"crt", "CRT"}},
++               "Cercano: píxeles como bloques. Bilineal: suave. Nítido: píxeles limpios. FSR 1: amplía y enfoca. "
++               "CRT: aspecto de televisión antigua, con líneas."},
++              {"vsync", "Sincronización vertical", {{"0", "No"}, {"1", "Sí"}},
++               "Sí: la imagen cambia al ritmo del monitor, sin cortes horizontales. El juego va a la misma velocidad."},
++              {"mostrar_fps", "Contador de FPS", {{"0", "No"}, {"1", "Sí"}},
++               "Los fotogramas por segundo del juego y la frecuencia del monitor, en una esquina."}}},
++            {"Gráficos",
++             {{"gs", "Dibujo de los gráficos", {{"gpu", "GPU (Vulkan)"}, {"cpu", "CPU (Software)"}},
++               "GPU: en la tarjeta gráfica, lo normal. CPU: el modo Software, más lento. Se aplica al reiniciar el "
++               "juego."},
++              {"supersampling", "Supersampling",
++               {{"1", "No (x1)"}, {"2", "x2"}, {"4", "x4"}, {"8", "x8"}, {"16", "x16"}},
++               "Bordes más suaves. Cuanto más alto, más trabajo para la tarjeta gráfica; con una gráfica modesta, "
++               "baja a x1 o x2."},
++              {"alta_resolucion", "Doble resolución", {{"0", "No"}, {"1", "Sí"}},
++               "La imagen con el doble de ancho y de alto, más nítida. Necesita supersampling x4 o más."}}},
++            {"Sonido", {{"volumen", "Volumen", {}, "El volumen de todo el sonido del juego."}}},
++        };
++        return list;
++    }
++
++    constexpr const char *kDisplayKeys[] = {"pantalla", "tamano_ventana", "filtro", "vsync", "mostrar_fps"};
++
++    std::string valueOf(const std::map<std::string, std::string> &values, const char *key)
++    {
++        const auto found = values.find(key);
++        return found == values.end() ? std::string() : found->second;
++    }
++
++    std::string sizeLabel(const std::string &value)
++    {
++        int width = 0, height = 0;
++        return ps2x::parseWindowSize(value, width, height) ? std::to_string(width) + " x " + std::to_string(height)
++                                                           : value;
++    }
++
++    // The menu's colours: dark blue and white, like the game's menus.
++    ImGuiStyle menuStyle(float scale)
++    {
++        ImGuiStyle style;
++        ImGui::StyleColorsDark(&style);
++        style.WindowRounding = 6.0f;
++        style.FrameRounding = 4.0f;
++        style.WindowBorderSize = 2.0f;
++        style.FrameBorderSize = 0.0f;
++        style.WindowPadding = ImVec2(18.0f, 14.0f);
++        style.ItemSpacing = ImVec2(10.0f, 7.0f);
++        style.FramePadding = ImVec2(10.0f, 5.0f);
++        style.CellPadding = ImVec2(8.0f, 4.0f);
++        ImVec4 *c = style.Colors;
++        c[ImGuiCol_WindowBg] = ImVec4(0.03f, 0.07f, 0.20f, 0.86f); // the game shows through (the changes preview)
++        c[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
++        c[ImGuiCol_Border] = ImVec4(0.45f, 0.62f, 0.95f, 0.85f);
++        c[ImGuiCol_Text] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
++        c[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.62f, 0.78f, 1.0f);
++        c[ImGuiCol_Button] = ImVec4(0.10f, 0.25f, 0.58f, 1.0f);
++        c[ImGuiCol_ButtonHovered] = ImVec4(0.18f, 0.38f, 0.80f, 1.0f);
++        c[ImGuiCol_ButtonActive] = ImVec4(0.26f, 0.48f, 0.92f, 1.0f);
++        c[ImGuiCol_Header] = ImVec4(0.14f, 0.32f, 0.72f, 0.85f);
++        c[ImGuiCol_HeaderHovered] = ImVec4(0.18f, 0.38f, 0.80f, 0.85f);
++        c[ImGuiCol_HeaderActive] = ImVec4(0.26f, 0.48f, 0.92f, 1.0f);
++        c[ImGuiCol_Separator] = ImVec4(0.45f, 0.62f, 0.95f, 0.6f);
++        c[ImGuiCol_FrameBg] = ImVec4(0.06f, 0.14f, 0.36f, 1.0f);
++        c[ImGuiCol_PlotHistogram] = ImVec4(0.40f, 0.65f, 1.0f, 1.0f);
++        c[ImGuiCol_NavCursor] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
++        c[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
++        c[ImGuiCol_TableRowBgAlt] = ImVec4(1.0f, 1.0f, 1.0f, 0.03f);
++        style.ScaleAllSizes(scale);
++        return style;
++    }
++
++    ImFont *loadWindowsFont(const char *fileName)
++    {
++        const char *windows = std::getenv("WINDIR");
++        if (windows == nullptr)
++            return nullptr;
++        const std::filesystem::path path = std::filesystem::path(windows) / "Fonts" / fileName;
++        std::error_code error;
++        if (!std::filesystem::exists(path, error))
++            return nullptr;
++        return ImGui::GetIO().Fonts->AddFontFromFileTTF(path.string().c_str(), 18.0f);
++    }
++}
++
++struct PS2OptionsMenu::State
++{
++    std::filesystem::path file;
++    ps2x::UserPathsMode mode = ps2x::UserPathsMode::Development;
++    bool initialized = false;
++    bool open = false;
++    bool modelReady = false;
++    ps2x::OptionsMenuModel model;
++    std::map<std::string, std::string> applied; // the values the game uses now
++    std::string runningGs;                      // gpu or cpu, as the GS started
++    int section = 0;
++    bool focusFirstRow = false;
++    std::string status;
++    bool statusError = false;
++    const char *hint = nullptr;
++    std::string hintNote;
++
++    ps2x::HoldComboDetector combo;
++    uint16_t padPressed = 0u;
++    bool padDirection[4] = {}; // up, down, left, right
++    bool padActivate = false;
++    bool debugToggle = false;
++    bool exitKeyCleared = false;
++
++    std::vector<ps2x::MenuScriptStep> script;
++    size_t scriptNext = 0u;
++    double scriptStart = -1.0;
++    std::filesystem::path request;
++    unsigned requestPolls = 0u;
++
++    ImFont *font = nullptr;
++    ImFont *bold = nullptr;
++    float styleFontSize = 0.0f;
++    ImGuiStyle style;
++};
++
++PS2OptionsMenu::PS2OptionsMenu() : m_state(std::make_unique<State>()) {}
++PS2OptionsMenu::~PS2OptionsMenu() = default;
++
++void PS2OptionsMenu::configure(const std::filesystem::path &file, ps2x::UserPathsMode mode)
++{
++    m_state->file = file;
++    m_state->mode = mode;
++    if (const char *script = std::getenv("PS2X_MENU_GUION"))
++        m_state->script = ps2x::parseMenuScript(script);
++    if (const char *request = std::getenv("PS2X_MENU_PETICION"); request != nullptr && *request != '\0')
++        m_state->request = request;
++}
++
++void PS2OptionsMenu::initialize()
++{
++    State &s = *m_state;
++    if (s.initialized)
++        return;
++    rlImGuiSetup(true);
++    ImGuiIO &io = ImGui::GetIO();
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
++    // The player's modes leave no imgui.ini next to the game (the debug panel's layout is for development).
++    if (s.mode != ps2x::UserPathsMode::Development)
++        io.IniFilename = nullptr;
++    s.font = loadWindowsFont("segoeui.ttf");
++    s.bold = loadWindowsFont("segoeuib.ttf");
++    if (s.bold == nullptr)
++        s.bold = s.font;
++    s.initialized = true;
++}
++
++void PS2OptionsMenu::shutdown()
++{
++    State &s = *m_state;
++    if (!s.initialized)
++        return;
++    rlImGuiShutdown();
++    s.initialized = false;
++}
++
++bool PS2OptionsMenu::isVisible() const
++{
++    return m_state->open;
++}
++
++bool PS2OptionsMenu::takeDebugPanelToggle()
++{
++    const bool toggle = m_state->debugToggle;
++    m_state->debugToggle = false;
++    return toggle;
++}
++
++namespace
++{
++    // The values the game uses: those set live, a forced option's variable and the window mode and aspect F11 and F10
++    // may have changed.
++    void syncFromRuntime(ps2x::OptionsMenuModel &model, std::map<std::string, std::string> &applied, PS2Runtime &runtime)
++    {
++        const std::map<std::string, std::string> display = ps2x::displayOptionValues(runtime.displaySettings());
++        for (const char *key : {"pantalla", "aspecto"})
++        {
++            const std::string value =
++                std::string(key) == "pantalla" ? display.at("pantalla") : runtime.presentAspectOption();
++            applied[key] = value;
++            if (model.forced.count(key) == 0u)
++                model.current[key] = value;
++        }
++    }
++
++    // Applies what changed since the last time, where the runtime can do it live.
++    void applyLive(ps2x::OptionsMenuModel &model, std::map<std::string, std::string> &applied, PS2Runtime &runtime)
++    {
++        const auto changed = [&](const char *key) { return valueOf(model.current, key) != valueOf(applied, key); };
++        bool display = false;
++        for (const char *key : kDisplayKeys)
++            display = display || changed(key);
++        if (display)
++            runtime.applyDisplaySettings(ps2x::displaySettingsFromOptionValues(model.current));
++        if (changed("aspecto"))
++            runtime.setPresentAspect(valueOf(model.current, "aspecto"));
++        if (changed("supersampling") || changed("alta_resolucion"))
++            if (GSGpuBackend *gpu = ps2GsActiveGpuBackend())
++            {
++                GSGpuQuality quality = gpu->Quality();
++                quality.superSampling = static_cast<uint32_t>(std::atoi(valueOf(model.current, "supersampling").c_str()));
++                quality.highResolution = valueOf(model.current, "alta_resolucion") == "1" && quality.superSampling >= 4u;
++                gpu->SetQuality(quality);
++            }
++        if (changed("volumen"))
++            runtime.setOutputVolume(std::atoi(valueOf(model.current, "volumen").c_str()));
++        for (const auto &[key, value] : model.current)
++            if (key != "gs") // gs stays as the game started
++                applied[key] = value;
++    }
++
++    std::string readFile(const std::filesystem::path &file)
++    {
++        std::ifstream in(file, std::ios::binary);
++        std::stringstream text;
++        text << in.rdbuf();
++        return text.str();
++    }
++
++    // Guardar: the status line and one line in the log.
++    void saveAndReport(ps2x::OptionsMenuModel &model, const std::filesystem::path &file, std::string &status,
++                       bool &statusError)
++    {
++        std::string error;
++        statusError = !ps2x::saveOptionsMenu(model, file, error);
++        status = statusError ? "No se pudo guardar: " + error : std::string("Guardado en opciones.ini.");
++        if (statusError)
++            std::cerr << "[menu] no se pudo guardar: " << error << std::endl;
++        else
++            std::cout << "[menu] opciones guardadas en " << ps2x::pathForLog(file) << std::endl;
++    }
++}
++
++void PS2OptionsMenu::update(PS2Runtime &runtime)
++{
++    State &s = *m_state;
++    if (!s.initialized)
++        return;
++    const double now = GetTime();
++
++    const auto ensureModel = [&]()
++    {
++        if (s.modelReady)
++            return;
++        const ps2x::StartupOptions &startup = ps2x::startupOptions();
++        s.model = ps2x::makeOptionsMenuModel(readFile(s.file), s.mode == ps2x::UserPathsMode::Development,
++                                             startup.forced,
++                                             [](const char *name) { return static_cast<const char *>(std::getenv(name)); });
++        s.applied = s.model.current;
++        s.runningGs = ps2GsActiveGpuBackend() != nullptr ? "gpu" : "cpu";
++        s.applied["gs"] = s.runningGs;
++        s.modelReady = true;
++    };
++    const auto setOpen = [&](bool open)
++    {
++        if (open == s.open)
++            return;
++        s.open = open;
++        if (open)
++        {
++            ensureModel();
++            syncFromRuntime(s.model, s.applied, runtime);
++            s.focusFirstRow = true;
++            s.status.clear();
++            ImGui::GetIO().ClearInputKeys();
++            // Held buttons (the combo) must not act in the menu.
++            const ps2x::MenuPadState pad = ps2x::readMenuPad();
++            s.padPressed = pad.pressed;
++        }
++        std::cout << "[menu] " << (open ? "abierto" : "cerrado") << std::endl;
++    };
++
++    // The automated checks of the menu: PS2X_MENU_GUION (seconds from the first frame) and PS2X_MENU_PETICION (a file
++    // with steps "<action>,...", run when it appears and then deleted, like PS2X_CAPTURA_PETICION). tecla=<arriba|
++    // abajo|izquierda|derecha|aceptar> presses a key for ImGui, as the keyboard or the pad would.
++    const auto runAction = [&](const std::string &action)
++    {
++        bool done = true;
++        ensureModel();
++        if (action == "abrir")
++            setOpen(true);
++        else if (action == "cerrar")
++            setOpen(false);
++        else if (action == "guardar")
++            saveAndReport(s.model, s.file, s.status, s.statusError);
++        else if (action == "descartar")
++            ps2x::discardMenuChanges(s.model);
++        else if (action == "defecto")
++            ps2x::resetMenuToDefaults(s.model);
++        else if (action.rfind("seccion=", 0) == 0)
++        {
++            const std::string name = action.substr(8);
++            s.section = name == "graficos" ? 1 : name == "sonido" ? 2 : 0;
++        }
++        else if (action.rfind("tecla=", 0) == 0)
++        {
++            const std::string name = action.substr(6);
++            const ImGuiKey key = name == "arriba"      ? ImGuiKey_UpArrow
++                                 : name == "abajo"     ? ImGuiKey_DownArrow
++                                 : name == "izquierda" ? ImGuiKey_LeftArrow
++                                 : name == "derecha"   ? ImGuiKey_RightArrow
++                                 : name == "aceptar"   ? ImGuiKey_Space
++                                                       : ImGuiKey_None;
++            done = key != ImGuiKey_None && s.open;
++            if (done)
++            {
++                ImGui::GetIO().AddKeyEvent(key, true);
++                ImGui::GetIO().AddKeyEvent(key, false);
++            }
++        }
++        else if (const size_t equals = action.find('='); equals != std::string::npos)
++            done = ps2x::setMenuOption(s.model, action.substr(0, equals), action.substr(equals + 1u));
++        else
++            done = false;
++        applyLive(s.model, s.applied, runtime);
++        std::cout << "[menu] guion " << action << (done ? "" : " (no se pudo)") << std::endl;
++    };
++    if (!s.script.empty())
++    {
++        if (s.scriptStart < 0.0)
++            s.scriptStart = now;
++        while (s.scriptNext < s.script.size() && now - s.scriptStart >= s.script[s.scriptNext].seconds)
++            runAction(s.script[s.scriptNext++].action);
++    }
++    if (!s.request.empty() && ++s.requestPolls >= 10u)
++    {
++        s.requestPolls = 0u;
++        std::error_code error;
++        if (std::filesystem::exists(s.request, error))
++        {
++            std::stringstream items(readFile(s.request));
++            std::filesystem::remove(s.request, error);
++            std::string item;
++            while (std::getline(items, item, ','))
++            {
++                item.erase(0, item.find_first_not_of(" \t\r\n\xEF\xBB\xBF"));
++                item.erase(item.find_last_not_of(" \t\r\n") + 1u);
++                if (!item.empty())
++                    runAction(item);
++            }
++        }
++    }
++
++    // F1: the debug panel, in development mode only (S4).
++    if (ps2x::debugPanelAllowed(s.mode) && IsKeyPressed(KEY_F1))
++        s.debugToggle = true;
++
++    const ps2x::MenuPadState pad = ps2x::readMenuPad();
++    const uint16_t pressedNow = static_cast<uint16_t>(pad.pressed & ~s.padPressed);
++    s.padPressed = pad.pressed;
++    const bool comboFired = s.combo.update((pad.pressed & (ps2x::kPadL3 | ps2x::kPadR3)) == (ps2x::kPadL3 | ps2x::kPadR3), now);
++    const bool escapeToggles = ps2x::escapeOpensMenu(s.mode) && IsKeyPressed(KEY_ESCAPE);
++    if (IsKeyPressed(KEY_F2) || comboFired || escapeToggles)
++        setOpen(!s.open);
++    else if (s.open && (IsKeyPressed(KEY_ESCAPE) || (pressedNow & ((1u << 12) | (1u << 13))) != 0u)) // triangle, circle
++        setOpen(false);
++
++    if (s.open)
++    {
++        // The pad navigates as the arrow keys and Space (cross); L1 and R1 change the section.
++        ImGuiIO &io = ImGui::GetIO();
++        const bool direction[4] = {(pad.pressed & (1u << 4)) != 0u || pad.leftY < -0.5f,
++                                   (pad.pressed & (1u << 6)) != 0u || pad.leftY > 0.5f,
++                                   (pad.pressed & (1u << 7)) != 0u || pad.leftX < -0.5f,
++                                   (pad.pressed & (1u << 5)) != 0u || pad.leftX > 0.5f};
++        constexpr ImGuiKey kDirectionKeys[4] = {ImGuiKey_UpArrow, ImGuiKey_DownArrow, ImGuiKey_LeftArrow,
++                                                ImGuiKey_RightArrow};
++        for (int i = 0; i < 4; ++i)
++            if (direction[i] != s.padDirection[i])
++            {
++                io.AddKeyEvent(kDirectionKeys[i], direction[i]);
++                s.padDirection[i] = direction[i];
++            }
++        const bool activate = (pad.pressed & (1u << 14)) != 0u;
++        if (activate != s.padActivate)
++        {
++            io.AddKeyEvent(ImGuiKey_Space, activate);
++            s.padActivate = activate;
++        }
++        const int sectionCount = static_cast<int>(sections().size());
++        if ((pressedNow & (1u << 10)) != 0u)
++            s.section = (s.section + sectionCount - 1) % sectionCount;
++        if ((pressedNow & (1u << 11)) != 0u)
++            s.section = (s.section + 1) % sectionCount;
++    }
++    else
++    {
++        for (bool &direction : s.padDirection)
++            direction = false;
++        s.padActivate = false;
++    }
++
++    // Esc closes the menu, not the game, while it is open; in the player's modes Esc never quits (escapeOpensMenu).
++    const bool clearExitKey = s.open || ps2x::escapeOpensMenu(s.mode);
++    if (clearExitKey != s.exitKeyCleared)
++    {
++        SetExitKey(clearExitKey ? KEY_NULL : KEY_ESCAPE);
++        s.exitKeyCleared = clearExitKey;
++    }
++    ps2x::setOptionsMenuOpen(s.open);
++    if (s.modelReady)
++        applyLive(s.model, s.applied, runtime);
++}
++
++void PS2OptionsMenu::beginFrame()
++{
++    rlImGuiBegin();
++}
++
++void PS2OptionsMenu::endFrame()
++{
++    rlImGuiEnd();
++}
++
++void PS2OptionsMenu::draw(PS2Runtime &runtime)
++{
++    State &s = *m_state;
++    if (!s.initialized || !s.open)
++        return;
++
++    const float screenWidth = static_cast<float>(GetScreenWidth());
++    const float screenHeight = static_cast<float>(GetScreenHeight());
++    // Readable from 960x720 to 4K: the text follows the window's height.
++    const float fontSize = std::clamp(std::round(screenHeight / 32.0f), 14.0f, 96.0f);
++    if (fontSize != s.styleFontSize)
++    {
++        s.style = menuStyle(fontSize / 18.0f);
++        s.styleFontSize = fontSize;
++    }
++    const ImGuiStyle savedStyle = ImGui::GetStyle();
++    ImGui::GetStyle() = s.style;
++    ImGui::PushFont(s.font, fontSize);
++
++    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(screenWidth, screenHeight),
++                                                  IM_COL32(0, 0, 0, 110));
++    // A fixed width; the height follows the contents (the same for every section).
++    const float width = std::min(screenWidth * 0.94f, fontSize * 32.0f);
++    ImGui::SetNextWindowPos(ImVec2(screenWidth * 0.5f, screenHeight * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
++    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, screenHeight * 0.96f));
++    if (s.focusFirstRow)
++        ImGui::SetNextWindowFocus();
++    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
++                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
++                                   ImGuiWindowFlags_AlwaysAutoResize;
++    if (ImGui::Begin("##opciones", nullptr, flags))
++    {
++        ps2x::OptionsMenuModel &model = s.model;
++        ImGui::PushFont(s.bold, fontSize * 1.3f);
++        ImGui::TextUnformatted("OPCIONES");
++        ImGui::PopFont();
++
++        // The sections.
++        const std::vector<Section> &list = sections();
++        const float tabWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * (list.size() - 1)) /
++                               static_cast<float>(list.size());
++        for (size_t i = 0; i < list.size(); ++i)
++        {
++            if (i != 0u)
++                ImGui::SameLine();
++            const bool selected = static_cast<int>(i) == s.section;
++            ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]
++                                                            : ImVec4(0.06f, 0.14f, 0.36f, 1.0f));
++            if (ImGui::Button(list[i].title, ImVec2(tabWidth, 0.0f)))
++                s.section = static_cast<int>(i);
++            ImGui::PopStyleColor();
++        }
++        ImGui::Separator();
++
++        // The options of the section: "<label>   < value >". Up and down choose; left and right (or the arrows with
++        // the mouse) change; activating (Space, Enter, cross, a click) takes the next value.
++        s.hint = nullptr;
++        s.hintNote.clear();
++        {
++            size_t mostRows = 0u;
++            for (const Section &section : list)
++                mostRows = std::max(mostRows, section.rows.size());
++            const float rowHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().CellPadding.y * 2.0f;
++            const float tableTop = ImGui::GetCursorPosY();
++            if (ImGui::BeginTable("##tabla", 2, ImGuiTableFlags_RowBg))
++            {
++                ImGui::TableSetupColumn("##nombre", ImGuiTableColumnFlags_WidthStretch, 0.52f);
++                ImGui::TableSetupColumn("##valor", ImGuiTableColumnFlags_WidthStretch, 0.48f);
++                bool firstRow = true;
++                for (const Row &row : list[s.section].rows)
++                {
++                    const auto forced = model.forced.find(row.key);
++                    const bool isForced = forced != model.forced.end();
++                    const bool highResolution = std::string(row.key) == "alta_resolucion";
++                    const bool disabled = isForced || (highResolution && !ps2x::highResolutionAvailable(model));
++                    const std::string value = valueOf(model.current, row.key);
++
++                    // The value as shown, and its position among the choices.
++                    std::vector<Choice> choices = row.choices;
++                    std::string sizeText;
++                    if (std::string(row.key) == "tamano_ventana" &&
++                        std::none_of(choices.begin(), choices.end(), [&](const Choice &c) { return value == c.value; }))
++                    {
++                        sizeText = sizeLabel(value);
++                        choices.insert(choices.begin(), Choice{value.c_str(), sizeText.c_str()});
++                    }
++                    int index = 0;
++                    for (size_t i = 0; i < choices.size(); ++i)
++                        if (value == choices[i].value)
++                            index = static_cast<int>(i);
++                    const int volume = std::clamp(std::atoi(value.c_str()), 0, 100);
++
++                    ImGui::TableNextRow();
++                    ImGui::TableSetColumnIndex(0);
++                    ImGui::PushID(row.key);
++                    ImGui::BeginDisabled(disabled);
++                    if (firstRow && s.focusFirstRow)
++                    {
++                        ImGui::SetKeyboardFocusHere();
++                        s.focusFirstRow = false;
++                    }
++                    firstRow = false;
++                    const bool activated = ImGui::Selectable(row.label, false,
++                                                             ImGuiSelectableFlags_SpanAllColumns |
++                                                                 ImGuiSelectableFlags_AllowOverlap,
++                                                             ImVec2(0.0f, ImGui::GetFrameHeight()));
++                    const bool focused = ImGui::IsItemFocused();
++                    if (focused || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
++                    {
++                        s.hint = row.hint;
++                        if (isForced)
++                            s.hintNote = "Fijada por la variable de entorno " + forced->second +
++                                         ": el menú no la cambia.";
++                        else if (highResolution && disabled)
++                            s.hintNote = "Necesita supersampling x4 o más y gráficos por GPU.";
++                    }
++                    int step = activated ? (choices.empty() ? 1 : 2) : 0; // 2: the next value, wrapping
++                    if (focused && !disabled)
++                    {
++                        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
++                            step = -1;
++                        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow))
++                            step = 1;
++                    }
++
++                    ImGui::TableSetColumnIndex(1);
++                    const float arrow = ImGui::GetFrameHeight();
++                    const float valueWidth = ImGui::GetContentRegionAvail().x - 2.0f * arrow -
++                                             2.0f * ImGui::GetStyle().ItemSpacing.x;
++                    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
++                    if (isForced)
++                    {
++                        ImGui::AlignTextToFramePadding();
++                        const std::string shown = choices.empty() ? std::to_string(volume) + " %"
++                                                                  : std::string(choices[index].label);
++                        ImGui::TextDisabled("%s (fijado por %s)", shown.c_str(), forced->second.c_str());
++                    }
++                    else
++                    {
++                        if (ImGui::ArrowButton("##menos", ImGuiDir_Left))
++                            step = -1;
++                        ImGui::SameLine();
++                        if (choices.empty())
++                        {
++                            const std::string text = std::to_string(volume) + " %";
++                            ImGui::ProgressBar(static_cast<float>(volume) / 100.0f, ImVec2(valueWidth, 0.0f),
++                                               text.c_str());
++                        }
++                        else
++                        {
++                            std::string text = choices[index].label;
++                            if (std::string(row.key) == "gs" && value != s.runningGs)
++                                text += "  (al reiniciar)";
++                            const ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
++                            const ImVec2 start = ImGui::GetCursorScreenPos();
++                            ImGui::Dummy(ImVec2(valueWidth, ImGui::GetFrameHeight()));
++                            ImGui::GetWindowDrawList()->AddText(
++                                ImVec2(start.x + std::max(0.0f, (valueWidth - textSize.x) * 0.5f),
++                                       start.y + ImGui::GetStyle().FramePadding.y),
++                                ImGui::GetColorU32(ImGuiCol_Text), text.c_str());
++                        }
++                        ImGui::SameLine();
++                        if (ImGui::ArrowButton("##mas", ImGuiDir_Right))
++                            step = 1;
++                    }
++                    ImGui::PopItemFlag();
++                    ImGui::EndDisabled();
++                    ImGui::PopID();
++
++                    if (step != 0 && !disabled)
++                    {
++                        std::string next;
++                        if (choices.empty())
++                            next = std::to_string(std::clamp(volume + (step == 2 ? 5 : step * 5), 0, 100));
++                        else
++                        {
++                            const int count = static_cast<int>(choices.size());
++                            const int to = step == 2 ? (index + 1) % count : std::clamp(index + step, 0, count - 1);
++                            next = choices[to].value;
++                        }
++                        ps2x::setMenuOption(model, row.key, next);
++                    }
++                }
++                ImGui::EndTable();
++            }
++            // Room for the longest section, so the window keeps its height.
++            ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(),
++                                          tableTop + rowHeight * static_cast<float>(mostRows) +
++                                              ImGui::GetStyle().ItemSpacing.y));
++            // Notes for the section.
++            ImGui::PushFont(nullptr, fontSize * 0.85f);
++            if (s.section == 1 && s.runningGs == "cpu")
++                ImGui::TextDisabled("Con el dibujo por CPU no se usan el supersampling ni la doble resolución.");
++            else if (s.section == 2 && !runtime.outputVolumeLive())
++                ImGui::TextDisabled("El volumen se aplica al reiniciar el juego.");
++            else
++                ImGui::TextUnformatted(" ");
++            ImGui::PopFont();
++        }
++
++        // The hint of the option under the cursor (room for three lines).
++        ImGui::Separator();
++        ImGui::PushFont(nullptr, fontSize * 0.85f);
++        const float hintTop = ImGui::GetCursorPosY();
++        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.86f, 1.0f, 1.0f));
++        ImGui::PushTextWrapPos(0.0f);
++        ImGui::TextUnformatted(s.hint != nullptr ? s.hint : " ");
++        if (!s.hintNote.empty())
++            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "%s", s.hintNote.c_str());
++        ImGui::PopTextWrapPos();
++        ImGui::PopStyleColor();
++        ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), hintTop + ImGui::GetTextLineHeightWithSpacing() * 3.0f));
++        ImGui::PopFont();
++        ImGui::Separator();
++
++        // The buttons.
++        // Natural widths, the extra room shared out.
++        const char *const labels[] = {"Guardar", "Descartar", "Valores por defecto", "Cerrar"};
++        float textWidth = 0.0f;
++        for (const char *label : labels)
++            textWidth += ImGui::CalcTextSize(label).x;
++        const float extra = std::max(0.0f, (ImGui::GetContentRegionAvail().x - textWidth -
++                                            ImGui::GetStyle().ItemSpacing.x * 3.0f) / 4.0f);
++        bool pressed[4] = {};
++        for (int i = 0; i < 4; ++i)
++        {
++            if (i != 0)
++                ImGui::SameLine();
++            pressed[i] = ImGui::Button(labels[i], ImVec2(ImGui::CalcTextSize(labels[i]).x + extra, 0.0f));
++        }
++        if (pressed[0])
++            saveAndReport(model, s.file, s.status, s.statusError);
++        if (pressed[1])
++        {
++            ps2x::discardMenuChanges(model);
++            s.status = "Cambios descartados: vuelven los valores guardados.";
++            s.statusError = false;
++        }
++        if (pressed[2])
++        {
++            ps2x::resetMenuToDefaults(model);
++            s.status = "Valores por defecto (sin guardar todavía).";
++            s.statusError = false;
++        }
++        const bool close = pressed[3];
++
++        // Status and the file.
++        ImGui::PushFont(nullptr, fontSize * 0.8f);
++        if (!s.status.empty())
++            ImGui::TextColored(s.statusError ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f) : ImVec4(0.55f, 1.0f, 0.6f, 1.0f), "%s",
++                               s.status.c_str());
++        else if (ps2x::menuHasChanges(model))
++            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Hay cambios sin guardar (ya se ven en el juego).");
++        else
++            ImGui::TextUnformatted(" ");
++        ImGui::TextDisabled("F2 o L3+R3 (mantener): abrir y cerrar. Esc, círculo o triángulo: cerrar. L1/R1: sección.");
++        if (!model.forced.empty())
++            ImGui::TextDisabled("Las variables de entorno PS2X_* mandan sobre opciones.ini al arrancar.");
++        ImGui::TextDisabled("%s", ps2x::pathForLog(s.file).c_str());
++        ImGui::PopFont();
++
++        if (close)
++        {
++            s.open = false;
++            std::cout << "[menu] cerrado" << std::endl;
++        }
++    }
++    ImGui::End();
++
++    ImGui::PopFont();
++    ImGui::GetStyle() = savedStyle;
++    applyLive(s.model, s.applied, runtime);
++    ps2x::setOptionsMenuOpen(s.open);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 5bb5171..c6993a6 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,10 +1,12 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_win.h"
++#include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cctype>
+ #include <cmath>
+ #include <cstdio>
+@@ -481,6 +483,60 @@ namespace
+     }
+ 
+     std::once_flag g_wheelOnce;
++
++    // Phase 3 (T3): the options menu. While it is open the guest reads a neutral pad (g_guestGate); the main thread
++    // reads the pad for the menu (ps2x::readMenuPad) with the wheel's last state, read here on the game thread
++    // (DirectInput stays on the thread that opened it).
++    std::atomic<bool> g_optionsMenuOpen{false};
++    std::mutex g_guestGateMutex;
++    ps2x::GuestInputGate g_guestGate;
++    std::mutex g_lastWheelMutex;
++    ps2_pad_win::JoystickState g_lastWheel;
++
++    uint16_t pressedButtons(const float (&value)[kTargetCount], const Config &cfg)
++    {
++        uint16_t pressed = 0u;
++        for (int b = 0; b < 16; ++b)
++            if (value[b] >= cfg.buttonThreshold)
++                pressed |= static_cast<uint16_t>(1u << b);
++        return pressed;
++    }
++}
++
++namespace ps2x
++{
++    void setOptionsMenuOpen(bool open)
++    {
++        g_optionsMenuOpen.store(open, std::memory_order_relaxed);
++    }
++
++    bool optionsMenuOpen()
++    {
++        return g_optionsMenuOpen.load(std::memory_order_relaxed);
++    }
++
++    MenuPadState readMenuPad()
++    {
++        const Config &cfg = config();
++        Frame f;
++        f.pad = cfg.gamepad;
++        f.dualSense = cfg.gamepad >= 0 && ps2_pad_win::readDualSenseBluetooth(f.ds);
++        f.gamepad = f.dualSense || (cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad));
++        {
++            std::lock_guard<std::mutex> lock(g_lastWheelMutex);
++            f.wheel = g_lastWheel;
++        }
++        float value[kTargetCount] = {};
++        for (int t = 0; t < kTargetCount; ++t)
++            for (const Source &s : cfg.map[static_cast<size_t>(t)])
++                if (s.kind != SourceKind::Key) // the keyboard reaches the menu through ImGui
++                    value[t] = std::max(value[t], sourceValue(s, cfg, f));
++        MenuPadState state;
++        state.pressed = pressedButtons(value, cfg);
++        state.leftX = std::clamp(value[kLsRight] - value[kLsLeft], -1.0f, 1.0f);
++        state.leftY = std::clamp(value[kLsDown] - value[kLsUp], -1.0f, 1.0f);
++        return state;
++    }
+ }
+ 
+ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+@@ -514,16 +570,31 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     f.dualSense = cfg.gamepad >= 0 && ps2_pad_win::readDualSenseBluetooth(f.ds);
+     f.gamepad = f.dualSense || (cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad));
+     ps2_pad_win::readWheel(f.wheel);
++    {
++        std::lock_guard<std::mutex> lock(g_lastWheelMutex);
++        g_lastWheel = f.wheel;
++    }
+ 
+     float value[kTargetCount] = {};
+     for (int t = 0; t < kTargetCount; ++t)
+         for (const Source &s : cfg.map[static_cast<size_t>(t)])
+             value[t] = std::max(value[t], sourceValue(s, cfg, f));
+ 
+-    uint16_t buttons = 0xFFFFu;
+-    for (int b = 0; b < 16; ++b)
+-        if (value[b] >= cfg.buttonThreshold)
+-            buttons &= static_cast<uint16_t>(~(1u << b));
++    // Phase 3 (T3): the options menu open (or a button still held after closing it): the neutral pad above.
++    uint16_t pressed = pressedButtons(value, cfg);
++    {
++        std::lock_guard<std::mutex> lock(g_guestGateMutex);
++        if (!g_guestGate.passes(g_optionsMenuOpen.load(std::memory_order_relaxed), pressed != 0u))
++            return true;
++    }
++    // L3+R3 together open the menu: the game sees neither.
++    pressed = ps2x::maskMenuCombo(pressed);
++    if ((pressed & ps2x::kPadL3) == 0u)
++        value[kL3] = 0.0f;
++    if ((pressed & ps2x::kPadR3) == 0u)
++        value[kR3] = 0.0f;
++
++    const uint16_t buttons = static_cast<uint16_t>(~pressed);
+     data[2] = static_cast<uint8_t>(buttons & 0xFFu);
+     data[3] = static_cast<uint8_t>(buttons >> 8);
+ 
+@@ -574,3 +645,4 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     }
+     return true;
+ }
++
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 610537f..c91813e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -19,6 +19,7 @@
+ #include "ps2x/iop/iop_spu2_audio.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #include "ps2_user_paths.h"
++#include "ps2_options_menu.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -114,6 +115,19 @@ namespace
+     // Patch 0103: the game's own widescreen option, set by its overrides (-1 = unknown). It picks 4:3 or 16:9 while
+     // the user has not chosen an aspect (PS2X_ASPECTO or F10).
+     std::atomic<int> g_gameWidescreen{-1};
++
++    // Phase 3 (T3): the opciones.ini aspecto values, in PS2Runtime::m_presentAspectRequest / m_presentAspectInUse.
++    constexpr const char *kPresentAspectOptions[] = {"auto", "4:3", "16:9", "pixel"};
++    int presentAspectOptionIndex(PresentAspect aspect)
++    {
++        return aspect == PresentAspect::Tv4x3 ? 1 : aspect == PresentAspect::Wide16x9 ? 2 : 3;
++    }
++
++    // Phase 3 (T3): volumen live. The SPU2 already scales its output by the start volume (PS2X_VOLUMEN); the audio
++    // callback scales it again by new / start.
++    int g_startVolume = 100;
++    std::atomic<float> g_outputVolumeScale{1.0f};
++    std::atomic<bool> g_outputVolumeReady{false};
+ }
+ 
+ void ps2SetGameWidescreen(int on)
+@@ -574,8 +588,9 @@ namespace
+ // use it.
+ // With PS2X_CAPTURA_RAM=1 the capture also saves the EE RAM (32 MB) next to the PNG, as <path>.ram, taken at the same
+ // moment (to find game variables by what the screen shows).
+-// Phase 3 (T2): with PS2X_CAPTURA_VENTANA=1 the request saves the window as presented instead (the frame filter and
+-// the FPS counter, without the debug UI), to see the presentation in the automated runs: SaveRequestedCapture leaves
++// Phase 3 (T2): with PS2X_CAPTURA_VENTANA=1 the request saves the window as presented instead (the frame filter, the
++// FPS counter and, since T3, the options menu or the debug panel when open), to see the presentation in the automated
++// runs; the frame capture never has them. SaveRequestedCapture leaves
+ // the path in s_windowCapturePath and the frame loop saves the window after drawing (SaveWindowCapture).
+ // frame: rows of rowPixels pixels (the frame texture's width), the picture in its top left width x height pixels.
+ static const char *const s_captureRequest = std::getenv("PS2X_CAPTURA_PETICION");
+@@ -840,6 +855,32 @@ void PS2Runtime::applyDisplaySettings(const ps2x::DisplaySettings &settings)
+     m_displaySettingsPending = true;
+ }
+ 
++void PS2Runtime::setPresentAspect(const std::string &option)
++{
++    for (int i = 0; i < 4; ++i)
++        if (option == kPresentAspectOptions[i])
++            m_presentAspectRequest.store(i);
++}
++
++std::string PS2Runtime::presentAspectOption() const
++{
++    const int request = m_presentAspectRequest.load();
++    return kPresentAspectOptions[request >= 0 ? request : m_presentAspectInUse.load()];
++}
++
++bool PS2Runtime::setOutputVolume(int percent)
++{
++    if (!outputVolumeLive())
++        return false;
++    g_outputVolumeScale.store(static_cast<float>(std::clamp(percent, 0, 100)) / static_cast<float>(g_startVolume));
++    return true;
++}
++
++bool PS2Runtime::outputVolumeLive() const
++{
++    return g_outputVolumeReady.load() && g_startVolume > 0;
++}
++
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+                                      DebugUiCallback drawCallback,
+                                      DebugUiCallback shutdownCallback,
+@@ -1098,12 +1139,20 @@ bool PS2Runtime::initialize(const char *title)
+         {
+             SetAudioStreamBufferSizeDefault(1024);
+             static AudioStream s_spu2Stream = LoadAudioStream(48000, 16, 2);
++            if (const char *volume = std::getenv("PS2X_VOLUMEN"))
++                g_startVolume = std::clamp(std::atoi(volume), 0, 100);
++            g_outputVolumeReady.store(true);
+             SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames)
+                                    {
+                                        int16_t *out = static_cast<int16_t *>(buffer);
+                                        const size_t got = ps2x::iop::readSpu2Audio(out, frames);
+                                        if (got < frames)
+-                                           std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t)); });
++                                           std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
++                                       const float scale = g_outputVolumeScale.load(std::memory_order_relaxed);
++                                       if (scale != 1.0f)
++                                           for (size_t i = 0; i < got * 2u; ++i)
++                                               out[i] = static_cast<int16_t>(std::clamp(
++                                                   static_cast<int>(std::lround(out[i] * scale)), -32768, 32767)); });
+             const char *soundEnv = std::getenv("PS2X_SONIDO");
+             if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
+                 SetAudioStreamVolume(s_spu2Stream, 0.0f);
+@@ -2871,6 +2920,7 @@ void PS2Runtime::run()
+     ApplyFrameFilter(frameTex);
+     PresentAspect presentAspect = initialPresentAspect();
+     bool aspectChosenByUser = std::getenv("PS2X_ASPECTO") != nullptr;
++    m_presentAspectInUse.store(aspectChosenByUser ? presentAspectOptionIndex(presentAspect) : 0);
+ 
+     std::atomic<bool> gameThreadFinished{false};
+     ps2x::GameFrameCounter gameFrameRate; // the FPS counter
+@@ -2959,8 +3009,19 @@ void PS2Runtime::run()
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+         // Patch 0100: F11 full screen (borderless; phase 3: the full screen mode of pantalla), F10 the next aspect; the
+-        // picture in the largest rectangle of the aspect (presentAspect) centred in the window.
+-        if (IsKeyPressed(KEY_F11))
++        // picture in the largest rectangle of the aspect (presentAspect) centred in the window. Phase 3 (T3): not while
++        // the options menu is open (it shows both); its aspecto arrives in m_presentAspectRequest.
++        const bool optionsMenuOpen = ps2x::optionsMenuOpen();
++        if (const int request = m_presentAspectRequest.exchange(-1); request >= 0)
++        {
++            aspectChosenByUser = request != 0;
++            if (request != 0)
++                presentAspect = request == 1 ? PresentAspect::Tv4x3
++                                : request == 2 ? PresentAspect::Wide16x9
++                                               : PresentAspect::Pixel;
++            m_presentAspectInUse.store(request);
++        }
++        if (!optionsMenuOpen && IsKeyPressed(KEY_F11))
+         {
+             if (m_displayPresenter)
+             {
+@@ -2977,12 +3038,13 @@ void PS2Runtime::run()
+             if (gameWidescreen >= 0)
+                 presentAspect = gameWidescreen != 0 ? PresentAspect::Wide16x9 : PresentAspect::Tv4x3;
+         }
+-        if (IsKeyPressed(KEY_F10))
++        if (!optionsMenuOpen && IsKeyPressed(KEY_F10))
+         {
+             aspectChosenByUser = true;
+             presentAspect = presentAspect == PresentAspect::Tv4x3      ? PresentAspect::Wide16x9
+                             : presentAspect == PresentAspect::Wide16x9 ? PresentAspect::Pixel
+                                                                        : PresentAspect::Tv4x3;
++            m_presentAspectInUse.store(presentAspectOptionIndex(presentAspect));
+         }
+         const float pictureAspect = presentAspect == PresentAspect::Tv4x3      ? 4.0f / 3.0f
+                                     : presentAspect == PresentAspect::Wide16x9 ? 16.0f / 9.0f
+@@ -3007,12 +3069,14 @@ void PS2Runtime::run()
+         }
+         else
+             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+-        if (!s_windowCapturePath.empty())
+-            SaveWindowCapture();
++        // Phase 3 (T3): the UI (the options menu, and the debug panel in development) before the window capture, which
++        // shows the window as the player sees it.
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
++        if (!s_windowCapturePath.empty())
++            SaveWindowCapture();
+         EndDrawing();
+ 
+         if (WindowShouldClose())
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index a092fcc..f27beaf 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
++#include "ps2_options_menu.h"
+ #endif
+ 
+ #ifdef _DEBUG
+@@ -454,23 +455,49 @@ int main(int argc, char *argv[])
+         PS2Runtime runtime;
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+         // This hook is to prevent leak rlimgui deps to recompiler etc
+-        PS2DebugPanel debugPanel;
++        // Phase 3 (T3): the options menu (F2, every mode) owns the ImGui frame; the debug panel (F1) is drawn in it in
++        // development mode only (S4).
++        struct Ui
++        {
++            PS2OptionsMenu menu;
++            PS2DebugPanel debugPanel;
++            bool debugPanelAllowed = false;
++        };
++        Ui ui;
++        ui.debugPanelAllowed = ps2x::debugPanelAllowed(userPaths.mode);
++        ui.menu.configure(ps2x::startupOptions().file, userPaths.mode);
+         runtime.setDebugUiCallbacks(
+             [](PS2Runtime &rt, void *userData)
+             {
+                 (void)rt;
+-                static_cast<PS2DebugPanel *>(userData)->initialize();
++                Ui &ui = *static_cast<Ui *>(userData);
++                ui.menu.initialize();
++                if (ui.debugPanelAllowed)
++                    ui.debugPanel.initialize();
+             },
+             [](PS2Runtime &rt, void *userData)
+             {
+-                static_cast<PS2DebugPanel *>(userData)->draw(rt);
++                Ui &ui = *static_cast<Ui *>(userData);
++                ui.menu.update(rt);
++                if (ui.menu.takeDebugPanelToggle())
++                    ui.debugPanel.toggleVisible();
++                const bool debugPanel = ui.debugPanelAllowed && ui.debugPanel.isVisible();
++                if (!ui.menu.isVisible() && !debugPanel)
++                    return;
++                ui.menu.beginFrame();
++                if (debugPanel)
++                    ui.debugPanel.draw(rt);
++                ui.menu.draw(rt);
++                ui.menu.endFrame();
+             },
+             [](PS2Runtime &rt, void *userData)
+             {
+                 (void)rt;
+-                static_cast<PS2DebugPanel *>(userData)->shutdown();
++                Ui &ui = *static_cast<Ui *>(userData);
++                ui.debugPanel.shutdown();
++                ui.menu.shutdown();
+             },
+-            &debugPanel);
++            &ui);
+ #endif
+         if (!runtime.initialize(windowTitle.c_str()))
+         {
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 748f526..1397b3f 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -41,6 +41,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_expansion_tests.cpp
+     src/ps2_user_paths_tests.cpp
+     src/ps2_display_tests.cpp
++    src/ps2_options_menu_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index b8e6e33..c809c1d 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -22,6 +22,7 @@ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_ps2_user_paths_tests();
+ void register_ps2_display_tests();
++void register_ps2_options_menu_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -48,6 +49,7 @@ int main()
+     register_ps2_runtime_expansion_tests();
+     register_ps2_user_paths_tests();
+     register_ps2_display_tests();
++    register_ps2_options_menu_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+new file mode 100644
+index 0000000..875a168
+--- /dev/null
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -0,0 +1,321 @@
++#include "MiniTest.h"
++#include "ps2_options.h"
++#include "ps2_options_menu.h"
++#include "ps2_user_paths.h"
++
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <map>
++#include <sstream>
++#include <string>
++
++// Phase 3 (T3): the in-game options menu. Its pure parts: rewriting opciones.ini, the menu's values and the variables
++// that fix some of them, the pad combo that opens it, the guest's input while it is open and the debug panel's mode.
++namespace
++{
++    namespace fs = std::filesystem;
++    using Environment = std::map<std::string, std::string>;
++
++    struct TempDir
++    {
++        fs::path path;
++
++        TempDir()
++        {
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            path = fs::temp_directory_path() / ("ps2x-options-menu-" + std::to_string(stamp));
++            fs::create_directories(path);
++        }
++
++        ~TempDir()
++        {
++            std::error_code error;
++            fs::remove_all(path, error);
++        }
++    };
++
++    std::function<const char *(const char *)> environmentOf(const Environment &environment)
++    {
++        return [&environment](const char *name) -> const char *
++        {
++            const auto found = environment.find(name);
++            return found == environment.end() ? nullptr : found->second.c_str();
++        };
++    }
++
++    std::string readText(const fs::path &path)
++    {
++        std::ifstream in(path, std::ios::binary);
++        std::stringstream text;
++        text << in.rdbuf();
++        return text.str();
++    }
++
++    void writeText(const fs::path &path, const std::string &text)
++    {
++        std::ofstream out(path, std::ios::binary);
++        out << text;
++    }
++
++    // The value of key in an opciones.ini text, as the game reads it.
++    std::string fileValue(const std::string &text, const char *key, bool development = false)
++    {
++        return ps2x::parseOptions(text, "opciones.ini", development).values.at(key);
++    }
++
++    bool contains(const std::string &text, const std::string &part)
++    {
++        return text.find(part) != std::string::npos;
++    }
++}
++
++void register_ps2_options_menu_tests()
++{
++    MiniTest::Case("OptionsMenu", [](TestCase &tc)
++    {
++        tc.Run("rewriteOptionsText replaces the values and keeps the template's comments", [](TestCase &t)
++        {
++            std::map<std::string, std::string> values = ps2x::parseOptions("").values;
++            values["filtro"] = "crt";
++            values["supersampling"] = "1";
++            values["alta_resolucion"] = "0";
++            const std::string text = ps2x::rewriteOptionsText("", values, false);
++            t.IsTrue(contains(text, "filtro = crt\n"), "filtro written");
++            t.IsTrue(contains(text, "supersampling = 1\n"), "supersampling written");
++            t.IsTrue(!contains(text, "filtro = fsr"), "the old value is gone");
++            t.Equals(fileValue(text, "filtro"), std::string("crt"), "the game reads crt");
++            t.Equals(fileValue(text, "volumen"), std::string("100"), "the other options keep their values");
++            // Every comment line of the template is still there, in order.
++            const std::string defaults = ps2x::defaultOptionsText(false);
++            std::istringstream lines(defaults);
++            std::string line;
++            size_t position = 0u;
++            bool inOrder = true;
++            while (std::getline(lines, line))
++            {
++                if (line.empty() || line[0] != '#')
++                    continue;
++                const size_t found = text.find(line + "\n", position);
++                inOrder = inOrder && found != std::string::npos;
++                if (found != std::string::npos)
++                    position = found + line.size();
++            }
++            t.IsTrue(inOrder, "the template's comments are kept, in order");
++            t.Equals(ps2x::rewriteOptionsText("", ps2x::parseOptions("").values, false), defaults,
++                     "the default values give the default file");
++        });
++
++        tc.Run("rewriteOptionsText keeps the keys the game does not know, at the end", [](TestCase &t)
++        {
++            const std::string existing =
++                "# my notes\r\nfiltro = nitido\r\nmi_opcion = 7   # mine\r\npantalla_completa = 1\r\nOtra=si\r\n";
++            const ps2x::OptionsFile parsed = ps2x::parseOptions(existing);
++            const std::string text = ps2x::rewriteOptionsText(existing, parsed.values, false);
++            t.IsTrue(contains(text, "filtro = nitido\n"), "the known value is written in its place");
++            const size_t mine = text.find("mi_opcion = 7   # mine\n");
++            const size_t other = text.find("Otra=si\n");
++            t.IsTrue(mine != std::string::npos && other != std::string::npos && mine < other,
++                     "unknown keys kept as written, in order");
++            t.IsTrue(mine > text.find("alta_resolucion = "), "after every known option");
++            t.IsTrue(!contains(text, "pantalla_completa"), "the old alias is replaced by pantalla");
++            t.Equals(fileValue(text, "pantalla"), std::string("sin_bordes"), "with the value it stood for");
++            t.IsTrue(!contains(text, "\r"), "the file is written with LF");
++            t.IsTrue(!contains(text, "# my notes"), "comments outside the template are not kept");
++            t.Equals(ps2x::rewriteOptionsText(text, ps2x::parseOptions(text).values, false), text,
++                     "rewriting the rewritten file changes nothing");
++        });
++
++        tc.Run("writeTextFileAtomically replaces the file and leaves no temporary file", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path file = dir.path / "config" / "opciones.ini";
++            std::string error;
++            t.IsTrue(ps2x::writeTextFileAtomically(file, "a = 1\n", error), "a new file in a new folder");
++            t.Equals(readText(file), std::string("a = 1\n"), "its text");
++            t.IsTrue(ps2x::writeTextFileAtomically(file, "b = 2\n", error), "over the existing file");
++            t.Equals(readText(file), std::string("b = 2\n"), "replaced");
++            size_t entries = 0u;
++            for (const auto &entry : fs::directory_iterator(file.parent_path()))
++            {
++                (void)entry;
++                ++entries;
++            }
++            t.Equals(entries, static_cast<size_t>(1u), "only opciones.ini in the folder");
++            t.IsTrue(error.empty(), "no error");
++
++            fs::create_directories(dir.path / "carpeta.ini");
++            t.IsFalse(ps2x::writeTextFileAtomically(dir.path / "carpeta.ini", "c = 3\n", error),
++                      "a folder in the way fails");
++            t.IsTrue(!error.empty(), "with the reason");
++            t.IsTrue(!fs::exists(dir.path / "carpeta.ini.tmp"), "and removes its temporary file");
++        });
++
++        tc.Run("the menu starts from the file and shows the forced options with their variable's value", [](TestCase &t)
++        {
++            const Environment environment = {{"PS2X_FILTRO", "0"}, {"PS2X_GS", "GPU"}};
++            const std::map<std::string, std::string> forced =
++                ps2x::optionsForcedByEnvironment(environmentOf(environment));
++            t.Equals(forced.size(), static_cast<size_t>(2u), "two forced options");
++            t.Equals(forced.at("filtro"), std::string("PS2X_FILTRO"), "filtro by PS2X_FILTRO");
++            t.Equals(forced.at("gs"), std::string("PS2X_GS"), "gs by PS2X_GS");
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                "filtro = crt\nvolumen = 40\ngs = cpu\n", false, forced, environmentOf(environment));
++            t.Equals(model.saved.at("filtro"), std::string("crt"), "saved: the file's value");
++            t.Equals(model.current.at("filtro"), std::string("cercano"), "current: PS2X_FILTRO=0 is cercano");
++            t.Equals(model.current.at("gs"), std::string("gpu"), "PS2X_GS=GPU is gpu");
++            t.Equals(model.current.at("volumen"), std::string("40"), "the file's volume");
++            t.IsFalse(ps2x::setMenuOption(model, "filtro", "bilineal"), "a forced option does not change");
++            t.Equals(model.current.at("filtro"), std::string("cercano"), "still cercano");
++            t.IsFalse(ps2x::menuHasChanges(model), "the forced values are not changes");
++            const std::map<std::string, std::string> saved = ps2x::menuValuesToSave(model);
++            t.Equals(saved.at("filtro"), std::string("crt"), "the file keeps its filtro");
++            t.Equals(saved.at("gs"), std::string("cpu"), "and its gs");
++
++            const std::map<std::string, std::string> alias =
++                ps2x::optionsForcedByEnvironment(environmentOf({{"PS2X_PANTALLA_COMPLETA", "1"}}));
++            t.Equals(alias.at("pantalla"), std::string("PS2X_PANTALLA_COMPLETA"), "the old variable fixes pantalla");
++            const Environment old = {{"PS2X_PANTALLA_COMPLETA", "1"}};
++            const ps2x::OptionsMenuModel oldModel =
++                ps2x::makeOptionsMenuModel("pantalla = ventana\n", false, alias, environmentOf(old));
++            t.Equals(oldModel.current.at("pantalla"), std::string("sin_bordes"), "PS2X_PANTALLA_COMPLETA=1 is sin_bordes");
++            t.IsTrue(ps2x::optionsForcedByEnvironment(environmentOf({})).empty(), "no variables, nothing forced");
++        });
++
++        tc.Run("setMenuOption validates the value and supersampling under 4 turns alta_resolucion off", [](TestCase &t)
++        {
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.Equals(model.current.at("supersampling"), std::string("4"), "the player's x4");
++            t.Equals(model.current.at("alta_resolucion"), std::string("1"), "and double resolution");
++            t.IsTrue(ps2x::highResolutionAvailable(model), "available with x4 and the GPU GS");
++            t.IsFalse(ps2x::setMenuOption(model, "filtro", "borroso"), "an invalid value is refused");
++            t.IsFalse(ps2x::setMenuOption(model, "no_existe", "1"), "an unknown key is refused");
++            t.IsFalse(ps2x::menuHasChanges(model), "nothing changed");
++            t.IsTrue(ps2x::setMenuOption(model, "supersampling", "2"), "x2");
++            t.Equals(model.current.at("alta_resolucion"), std::string("0"), "alta_resolucion goes off under x4");
++            t.IsFalse(ps2x::highResolutionAvailable(model), "and is not available");
++            t.IsTrue(ps2x::setMenuOption(model, "supersampling", "8"), "x8");
++            t.Equals(model.current.at("alta_resolucion"), std::string("0"), "it stays off when going back up");
++            t.IsTrue(ps2x::highResolutionAvailable(model), "available again");
++            t.IsTrue(ps2x::setMenuOption(model, "gs", "cpu"), "the CPU GS");
++            t.IsFalse(ps2x::highResolutionAvailable(model), "not available with gs = cpu");
++            t.IsTrue(ps2x::setMenuOption(model, "tamano_ventana", "1920x1080"), "a window size");
++            t.IsFalse(ps2x::setMenuOption(model, "tamano_ventana", "10x10"), "too small");
++            t.IsTrue(ps2x::setMenuOption(model, "volumen", "35"), "a volume");
++            t.IsFalse(ps2x::setMenuOption(model, "volumen", "101"), "over 100");
++            t.IsTrue(ps2x::menuHasChanges(model), "changes to save");
++        });
++
++        tc.Run("discard goes back to the saved values and defaults to the mode's defaults", [](TestCase &t)
++        {
++            const Environment environment = {{"PS2X_VOLUMEN", "10"}};
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                "filtro = nitido\nvsync = 0\n", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)),
++                environmentOf(environment));
++            ps2x::setMenuOption(model, "filtro", "crt");
++            ps2x::resetMenuToDefaults(model);
++            t.Equals(model.current.at("filtro"), std::string("fsr"), "the player's default filter");
++            t.Equals(model.current.at("vsync"), std::string("1"), "the player's VSync");
++            t.Equals(model.current.at("volumen"), std::string("10"), "a forced option keeps its variable's value");
++            ps2x::discardMenuChanges(model);
++            t.Equals(model.current.at("filtro"), std::string("nitido"), "discard: the saved filter");
++            t.Equals(model.current.at("vsync"), std::string("0"), "and VSync");
++            t.IsFalse(ps2x::menuHasChanges(model), "no changes");
++
++            ps2x::OptionsMenuModel development = ps2x::makeOptionsMenuModel("", true, {}, environmentOf({}));
++            ps2x::setMenuOption(development, "gs", "gpu");
++            ps2x::resetMenuToDefaults(development);
++            t.Equals(development.current.at("gs"), std::string("cpu"), "development: its own defaults");
++        });
++
++        tc.Run("saveOptionsMenu writes the menu's values, keeps unknown keys and the forced options' file values", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path file = dir.path / "opciones.ini";
++            writeText(file, "filtro = fsr\nvolumen = 70\nmi_opcion = 1\n");
++            const Environment environment = {{"PS2X_VOLUMEN", "5"}};
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                readText(file), false, ps2x::optionsForcedByEnvironment(environmentOf(environment)),
++                environmentOf(environment));
++            ps2x::setMenuOption(model, "filtro", "crt");
++            ps2x::setMenuOption(model, "supersampling", "1");
++            std::string error;
++            t.IsTrue(ps2x::saveOptionsMenu(model, file, error), "saved");
++            const std::string text = readText(file);
++            t.Equals(fileValue(text, "filtro"), std::string("crt"), "filtro = crt");
++            t.Equals(fileValue(text, "supersampling"), std::string("1"), "supersampling = 1");
++            t.Equals(fileValue(text, "alta_resolucion"), std::string("0"), "alta_resolucion = 0");
++            t.Equals(fileValue(text, "volumen"), std::string("70"), "the forced volume keeps the file's value");
++            t.IsTrue(contains(text, "mi_opcion = 1\n"), "the unknown key is kept");
++            t.IsTrue(contains(text, "# Filtro al ampliar la imagen"), "with the template's comments");
++            t.IsFalse(ps2x::menuHasChanges(model), "saved: no changes left");
++            t.Equals(model.saved.at("filtro"), std::string("crt"), "the saved values follow");
++            t.IsTrue(!fs::exists(dir.path / "opciones.ini.tmp"), "no temporary file left");
++        });
++
++        tc.Run("the pad combo fires once after being held for its time", [](TestCase &t)
++        {
++            ps2x::HoldComboDetector combo(0.5);
++            t.IsFalse(combo.update(false, 0.0), "not held");
++            t.IsFalse(combo.update(true, 1.0), "held: starts");
++            t.IsFalse(combo.update(true, 1.49), "not yet at 0.49 s");
++            t.IsTrue(combo.update(true, 1.5), "fires at 0.5 s");
++            t.IsFalse(combo.update(true, 3.0), "only once while held");
++            t.IsFalse(combo.update(false, 3.1), "released");
++            t.IsFalse(combo.update(true, 3.2), "held again: starts over");
++            t.IsFalse(combo.update(false, 3.5), "released before the time");
++            t.IsFalse(combo.update(true, 3.6), "held again");
++            t.IsFalse(combo.update(true, 4.0), "0.4 s");
++            t.IsTrue(combo.update(true, 4.1), "fires at 0.5 s from the new press");
++        });
++
++        tc.Run("maskMenuCombo hides L3 and R3 from the game only while both are held", [](TestCase &t)
++        {
++            constexpr uint16_t l3 = 1u << 1, r3 = 1u << 2, cross = 1u << 14;
++            t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | r3 | cross)), static_cast<int>(cross), "both: hidden");
++            t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | cross)), static_cast<int>(l3 | cross), "L3 alone stays");
++            t.Equals(static_cast<int>(ps2x::maskMenuCombo(r3)), static_cast<int>(r3), "R3 alone stays");
++        });
++
++        tc.Run("the guest gets no input while the menu is open, nor until everything is released", [](TestCase &t)
++        {
++            ps2x::GuestInputGate gate;
++            t.IsTrue(gate.passes(false, true), "menu closed: the input passes");
++            t.IsFalse(gate.passes(true, false), "menu open: neutral");
++            t.IsFalse(gate.passes(true, true), "menu open and held: neutral");
++            t.IsFalse(gate.passes(false, true), "closed with a button still held (the one that closed it): neutral");
++            t.IsTrue(gate.passes(false, false), "everything released: passes");
++            t.IsTrue(gate.passes(false, true), "a new press passes");
++        });
++
++        tc.Run("the debug panel only in development mode", [](TestCase &t)
++        {
++            t.IsTrue(ps2x::debugPanelAllowed(ps2x::UserPathsMode::Development), "development: F1 opens it");
++            t.IsFalse(ps2x::debugPanelAllowed(ps2x::UserPathsMode::Portable), "portable: no");
++            t.IsFalse(ps2x::debugPanelAllowed(ps2x::UserPathsMode::Installed), "installed: no");
++        });
++
++        tc.Run("Esc opens the menu for the player and never quits; development keeps Esc = quit", [](TestCase &t)
++        {
++            t.IsTrue(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Portable), "portable: Esc opens the menu");
++            t.IsTrue(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Installed), "installed: Esc opens the menu");
++            t.IsFalse(ps2x::escapeOpensMenu(ps2x::UserPathsMode::Development), "development: Esc quits as before");
++        });
++
++        tc.Run("parseMenuScript reads the steps of PS2X_MENU_GUION", [](TestCase &t)
++        {
++            const std::vector<ps2x::MenuScriptStep> steps =
++                ps2x::parseMenuScript(" 40:abrir, 41.5:filtro=crt,42:supersampling=1 ,43:guardar,44:cerrar,x:mal,45");
++            t.Equals(steps.size(), static_cast<size_t>(5u), "five valid steps");
++            if (steps.size() == 5u)
++            {
++                t.IsTrue(steps[0].seconds == 40.0 && steps[0].action == "abrir", "40 s: abrir");
++                t.IsTrue(steps[1].seconds == 41.5 && steps[1].action == "filtro=crt", "41.5 s: filtro=crt");
++                t.Equals(steps[2].action, std::string("supersampling=1"), "trimmed");
++                t.Equals(steps[4].action, std::string("cerrar"), "44 s: cerrar");
++            }
++            t.IsTrue(ps2x::parseMenuScript("").empty(), "empty: no steps");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 8f89e70..84ae9c3 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -459,5 +459,24 @@ void register_ps2_user_paths_tests()
+             t.Equals(std::string(std::getenv("PS2X_GS") ? std::getenv("PS2X_GS") : ""), std::string("gpu"),
+                      "a player's new file selects the GPU GS");
+         });
++
++        tc.Run("applyOptionsFile records the file, the mode and the options fixed by a variable", [](TestCase &t)
++        {
++            EnvironmentGuard environment;
++            for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                environment.set(spec.environment, nullptr);
++            environment.set("PS2X_PANTALLA_COMPLETA", nullptr);
++            environment.set("PS2X_VSYNC", "0");
++            TempDir dir;
++            const fs::path file = dir.path / "opciones.ini";
++            std::vector<std::string> messages;
++            ps2x::applyOptionsFile(file, messages, true);
++            const ps2x::StartupOptions &startup = ps2x::startupOptions();
++            t.Equals(normal(startup.file), normal(file), "the file");
++            t.IsTrue(startup.development, "development mode");
++            t.Equals(startup.forced.size(), static_cast<size_t>(1u), "one forced option");
++            t.IsTrue(startup.forced.count("vsync") == 1u, "vsync, by PS2X_VSYNC");
++            t.IsTrue(startup.forced.count("filtro") == 0u, "the variables set from the file are not forced");
++        });
+     });
+ }

@@ -1,0 +1,494 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 95e5849..fcb0eac 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -58,13 +58,26 @@
+ // compared pair by pair after a code change, 66 the VU run timing with steady_clock, 67 the GS upload copies without
+ // the pool, 69 modes 65, 66 and 67 together (all before patch 0078), 70 (VU1 and VU0) the compiled
+ // schedules with MAX/MINI, ITOF, FTOI, ABS and CLIP through calls (before patch 0080; like 40, 43 and 44 it keeps
+-// the VU modes of runBlocks).
++// the VU modes of runBlocks), 71 (VU1 and VU0) every compiled schedule returning to runBlocks, without chains (before
++// patch 0081; also kept by runBlocks), 72 the XGKICK transfer of the VU1 blocks brought up to date and waited for
++// cycle by cycle (before patch 0081), 73 everything of patch 0081 off at once (71, 72 and 74; kept by runBlocks), 74
++// (VU1 and VU0) the compiled schedules with the late upper results (jitUpperLate, jitUpperDst) through calls (before
++// patch 0081; kept by runBlocks), 75 the GIF packets processed on the EE thread (before patch 0082), 76 modes 73 and
++// 75 together (patches 0081 and 0082 off at once; kept by runBlocks).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+ 
++// Patch 0082 (gs_frontend.cpp): the GIF packets the arbiter lets through, processed by GS::processGIFPacket on a
++// thread of their own, in order (PS2X_GS_GIF_HILO=0, A/B modes 75 and 76: on the calling thread, as before). The GS
++// methods wait for the packets queued before them. ps2GsGifOnWorker: the calling thread is the GIF thread (its waits
++// for the rasterizer are not the EE thread's).
++class GS;
++void ps2GsGifSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes);
++bool ps2GsGifOnWorker();
++
+ // Diagnostics the game hook reads at each A/B window (patch 0069): host time of the VU1 runs and their instruction
+ // pairs (EE thread), and time the EE thread spent waiting for the GS thread (queue full, drains).
+ extern std::atomic<uint64_t> g_ps2Vu1HostNs;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 7f440ce..0f442eb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -6,12 +6,21 @@
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
++#include <memory>
++#include <mutex>
+ #include <sstream>
++#include <thread>
++#include <immintrin.h>
++#include "ThreadNaming.h"
++
++void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bool bandWorker); // gs_threaded_backend.cpp
+ 
+ namespace
+ {
+@@ -123,6 +132,250 @@ namespace
+     std::atomic<uint32_t> s_debugLocalCopyCount{0};
+ }
+ 
++namespace
++{
++    // Patch 0082: the GIF packets that the arbiter lets through (PATH1 from XGKICK, PATH2, PATH3), processed by
++    // GS::processGIFPacket on a thread of their own. In a race that work (register writes, vertex kicks, the draw
++    // batches and the queueing for the rasterizer) was ~12 % of the EE thread. The packets keep their order: the EE
++    // thread copies each one into a ring (one producer, one consumer) and the "GS GIF" thread processes them in turn.
++    // Everything else that reads or changes the GS state from the EE thread waits until the ring is empty first:
++    // every GS method that takes the state mutex (gifSyncBeforeAccess). The privileged GS registers do not wait: the
++    // packets only set CSR's FINISH and SIGNAL bits and SIGLBLID (atomic or word writes), and the EE's writes do not
++    // change how a packet is processed; as on the console, those bits show up when the GS gets to them. (Waiting there
++    // made the EE wait ~12 % in a race, where the game polls CSR, and most of the loading screens.) Other threads
++    // (the window's presentation) do not wait, as before. PS2X_GS_GIF_HILO=0 or A/B mode 75: on the EE thread, as
++    // before.
++    thread_local bool t_gifWorker = false;   // this thread is the GIF thread
++    thread_local bool t_gifProducer = false; // this thread has queued packets (the EE thread)
++
++    const bool s_gifThreadEnabled = []()
++    {
++        const char *value = std::getenv("PS2X_GS_GIF_HILO");
++        return value == nullptr || value[0] != '0';
++    }();
++
++    // PS2X_GS_GIF_ESPERAS=1 (diagnostic): every 10 s, "[gs:gif]" with the EE thread's waits for the GIF thread by
++    // what made it wait (the GS method, or "registro" for a privileged register): count and milliseconds.
++    const bool s_gifWaitNotes = []()
++    {
++        const char *value = std::getenv("PS2X_GS_GIF_ESPERAS");
++        return value != nullptr && value[0] != '0';
++    }();
++
++    void noteGifWait(const char *why, uint64_t ns, std::chrono::steady_clock::time_point now)
++    {
++        struct Reason
++        {
++            const char *why;
++            uint64_t count;
++            uint64_t ns;
++        };
++        static Reason s_reasons[32] = {};
++        static std::chrono::steady_clock::time_point s_report = now;
++        size_t i = 0u;
++        while (i < 31u && s_reasons[i].why != nullptr && std::strcmp(s_reasons[i].why, why) != 0)
++            ++i;
++        s_reasons[i].why = why;
++        ++s_reasons[i].count;
++        s_reasons[i].ns += ns;
++        if (now - s_report < std::chrono::seconds(10))
++            return;
++        std::fprintf(stderr, "[gs:gif] esperas del EE en 10 s:");
++        for (Reason &r : s_reasons)
++        {
++            if (r.why == nullptr)
++                break;
++            std::fprintf(stderr, " %s=%llu/%.1fms", r.why, static_cast<unsigned long long>(r.count),
++                         static_cast<double>(r.ns) / 1e6);
++            r.count = 0u;
++            r.ns = 0u;
++        }
++        std::fprintf(stderr, "\n");
++        s_report = now;
++    }
++
++    class GifPacketThread
++    {
++    public:
++        static constexpr uint64_t kRingBytes = 8ull << 20;
++        static constexpr uint64_t kMaxRecord = kRingBytes / 4u; // larger packets go on the caller's thread
++        static constexpr uint32_t kSkip = 0xFFFFFFFFu;            // the rest of the ring is empty: go on at 0
++
++        // False: not queued (too big); the caller processes it.
++        bool submit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
++        {
++            const uint64_t need = 16u + ((static_cast<uint64_t>(sizeBytes) + 15u) & ~15ull);
++            if (need > kMaxRecord)
++                return false;
++            if (!m_started)
++                start();
++            t_gifProducer = true;
++            uint64_t tail = m_tail.load(std::memory_order_relaxed);
++            uint64_t pos = tail % kRingBytes;
++            const uint64_t skip = pos + need > kRingBytes ? kRingBytes - pos : 0u;
++            waitForRoom(tail + skip + need);
++            if (skip != 0u)
++            {
++                writeHeader(pos, kSkip, nullptr);
++                tail += skip;
++                pos = 0u;
++            }
++            writeHeader(pos, sizeBytes, &gs);
++            std::memcpy(m_ring.get() + pos + 16u, data, sizeBytes);
++            m_tail.store(tail + need, std::memory_order_seq_cst);
++            if (m_sleeping.load(std::memory_order_seq_cst))
++                wake();
++            return true;
++        }
++
++        // Until every packet queued so far has been processed. why: who asks (PS2X_GS_GIF_ESPERAS).
++        void sync(const char *why)
++        {
++            const uint64_t target = m_tail.load(std::memory_order_relaxed);
++            if (m_done.load(std::memory_order_acquire) >= target)
++                return;
++            const auto start = std::chrono::steady_clock::now();
++            for (uint32_t spins = 0u; m_done.load(std::memory_order_acquire) < target; ++spins)
++            {
++                if (m_sleeping.load(std::memory_order_seq_cst))
++                    wake();
++                if (spins < 2000u)
++                    _mm_pause();
++                else
++                    std::this_thread::yield();
++            }
++            const auto end = std::chrono::steady_clock::now();
++            const uint64_t ns =
++                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
++            g_ps2GsEeWaitNs.fetch_add(ns, std::memory_order_relaxed);
++            if (s_gifWaitNotes)
++                noteGifWait(why, ns, end);
++        }
++
++    private:
++        void start()
++        {
++            m_ring = std::make_unique<uint8_t[]>(kRingBytes);
++            m_started = true;
++            std::thread([this]() { workerLoop(); }).detach();
++        }
++
++        void writeHeader(uint64_t pos, uint32_t size, GS *gs)
++        {
++            uint8_t *const header = m_ring.get() + pos;
++            std::memcpy(header, &size, sizeof(size));
++            std::memcpy(header + 8u, &gs, sizeof(gs));
++        }
++
++        void waitForRoom(uint64_t end)
++        {
++            if (end - m_done.load(std::memory_order_acquire) <= kRingBytes)
++                return;
++            const auto start = std::chrono::steady_clock::now();
++            for (uint32_t spins = 0u; end - m_done.load(std::memory_order_acquire) > kRingBytes; ++spins)
++            {
++                if (m_sleeping.load(std::memory_order_seq_cst))
++                    wake();
++                if (spins < 2000u)
++                    _mm_pause();
++                else
++                    std::this_thread::yield();
++            }
++            g_ps2GsEeWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                std::chrono::steady_clock::now() - start)
++                                                                .count()),
++                                      std::memory_order_relaxed);
++        }
++
++        void wake()
++        {
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++            }
++            m_wake.notify_one();
++        }
++
++        void workerLoop()
++        {
++            t_gifWorker = true;
++            ThreadNaming::SetCurrentThreadName("GS GIF");
++            int coresApplied = 0;
++            uint32_t coreChunks = 0u, coreOnEfficiency = 0u;
++            uint64_t head = 0u;
++            for (;;)
++            {
++                ps2GsThreadCores(coresApplied, coreChunks, coreOnEfficiency, false); // off the EE's own core
++                uint64_t tail = m_tail.load(std::memory_order_acquire);
++                if (head == tail)
++                {
++                    // Spin a while (the EE sends packets in bursts), then sleep until submit wakes it.
++                    for (uint32_t spins = 0u; spins < 4000u && head == tail; ++spins)
++                    {
++                        _mm_pause();
++                        tail = m_tail.load(std::memory_order_acquire);
++                    }
++                    if (head == tail)
++                    {
++                        std::unique_lock<std::mutex> lock(m_mutex);
++                        m_sleeping.store(true, std::memory_order_seq_cst);
++                        if (m_tail.load(std::memory_order_seq_cst) == head)
++                            m_wake.wait_for(lock, std::chrono::milliseconds(1));
++                        m_sleeping.store(false, std::memory_order_seq_cst);
++                        continue;
++                    }
++                }
++                while (head != tail)
++                {
++                    const uint64_t pos = head % kRingBytes;
++                    const uint8_t *const header = m_ring.get() + pos;
++                    uint32_t size = 0u;
++                    GS *gs = nullptr;
++                    std::memcpy(&size, header, sizeof(size));
++                    std::memcpy(&gs, header + 8u, sizeof(gs));
++                    if (size == kSkip)
++                        head += kRingBytes - pos;
++                    else
++                    {
++                        gs->processGIFPacket(header + 16u, size);
++                        head += 16u + ((static_cast<uint64_t>(size) + 15u) & ~15ull);
++                    }
++                    m_done.store(head, std::memory_order_release);
++                }
++            }
++        }
++
++        std::unique_ptr<uint8_t[]> m_ring;
++        bool m_started = false;
++        alignas(64) std::atomic<uint64_t> m_tail{0u}; // written by the EE thread
++        alignas(64) std::atomic<uint64_t> m_done{0u}; // by the GIF thread: processed up to here
++        alignas(64) std::atomic<bool> m_sleeping{false};
++        std::mutex m_mutex;
++        std::condition_variable m_wake;
++    };
++    GifPacketThread s_gifThread;
++
++    // Before a GS method takes the state mutex: on the EE thread, the queued packets first.
++    inline void gifSyncBeforeAccess(const char *why)
++    {
++        if (t_gifProducer && !t_gifWorker)
++            s_gifThread.sync(why);
++    }
++}
++
++void ps2GsGifSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
++{
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (s_gifThreadEnabled && mode != 75 && mode != 76 && !t_gifWorker && s_gifThread.submit(gs, data, sizeBytes))
++        return;
++    gs.processGIFPacket(data, sizeBytes); // after the queued ones (gifSyncBeforeAccess)
++}
++
++bool ps2GsGifOnWorker()
++{
++    return t_gifWorker;
++}
++
++
+ 
+ GS::GS()
+     : m_backend(CreateDefaultGSRasterBackend())
+@@ -143,6 +396,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ 
+ void GS::reset()
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::memset(m_ctx, 0, sizeof(m_ctx));
+     m_prim = {};
+@@ -245,6 +499,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
+ 
+ GSDebugSnapshot GS::getDebugSnapshot() const
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+ 
+     GSDebugSnapshot snapshot{};
+@@ -285,6 +540,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
+ 
+ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+ 
+     std::vector<GSDebugHistoryEntry> out;
+@@ -299,6 +555,7 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
+ 
+ void GS::clearDebugHistory()
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     m_debugHistoryWrite = 0;
+     m_debugHistoryCount = 0;
+@@ -309,12 +566,14 @@ void GS::clearDebugHistory()
+ 
+ bool GS::isDebugHistoryPaused() const
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_debugHistoryPaused;
+ }
+ 
+ void GS::setDebugHistoryPaused(bool paused)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     m_debugHistoryPaused = paused;
+ }
+@@ -495,6 +754,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
+ 
+ bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!m_hasPreferredDisplaySource)
+     {
+@@ -682,6 +942,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+@@ -780,6 +1041,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+@@ -825,6 +1087,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            const uint8_t *data,
+                            uint32_t sizeBytes)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+@@ -1103,6 +1366,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     writeRegisterUnlocked(regAddr, value);
+ }
+@@ -1725,18 +1989,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+@@ -1746,6 +2013,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+     if (!backend)
+         backend = CreateDefaultGSRasterBackend();
+ 
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+     if (m_backend)
+@@ -1773,12 +2041,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
+ }
+ 
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    gifSyncBeforeAccess(__func__);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (m_backend)
+         m_backend->WriteVram(psm, base, bw, x, y, value);
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index bd0c3d8..09415d7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -432,9 +432,10 @@ void GSThreadedBackend::Push(T &&command, uint32_t cost)
+         m_producerWaitNs.fetch_add(
+             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+             std::memory_order_relaxed);
+-        g_ps2GsEeWaitNs.fetch_add(
+-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+-            std::memory_order_relaxed);
++        if (!ps2GsGifOnWorker()) // patch 0082: the GIF thread's waits are not the EE's
++            g_ps2GsEeWaitNs.fetch_add(
++                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
++                std::memory_order_relaxed);
+     }
+     Publish(std::forward<T>(command), cost, false);
+ }
+@@ -476,10 +477,11 @@ void GSThreadedBackend::Drain() const
+             m_idle.wait_for(lock, std::chrono::microseconds(200));
+         }
+     }
+-    g_ps2GsEeWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                                                        std::chrono::steady_clock::now() - waitStart)
+-                                                        .count()),
+-                              std::memory_order_relaxed);
++    if (!ps2GsGifOnWorker()) // patch 0082
++        g_ps2GsEeWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                            std::chrono::steady_clock::now() - waitStart)
++                                                            .count()),
++                                  std::memory_order_relaxed);
+ }
+ 
+ void GSThreadedBackend::WorkerLoop()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0ffcc24..134afbb 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "runtime/ps2_ab.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -759,7 +760,7 @@ bool PS2Runtime::syncCoreSubsystems()
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+-                                    { m_gs.processGIFPacket(data, size); });
++                                    { ps2GsGifSubmit(m_gs, data, size); }); // patch 0082: on the GIF thread
+     m_memory.setGifArbiter(&m_gifArbiter);
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {

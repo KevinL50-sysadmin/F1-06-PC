@@ -1,0 +1,475 @@
+diff --git a/ps2xRuntime/include/ps2_high_ram.h b/ps2xRuntime/include/ps2_high_ram.h
+new file mode 100644
+index 0000000..6c2730e
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_high_ram.h
+@@ -0,0 +1,127 @@
++#ifndef PS2_HIGH_RAM_H
++#define PS2_HIGH_RAM_H
++
++#include <algorithm>
++#include <cstdint>
++#include <iterator>
++#include <map>
++#include <mutex>
++#include <ostream>
++
++namespace ps2x
++{
++    // RAM extra (F1 06, parche 0181): allocator for a region of the reserved RAM that the game does not see (the game
++    // sees PS2_GUEST_RAM_SIZE; the region above it, up to PS2_RAM_SIZE, belongs to the port). First fit over a list of
++    // holes sorted by address, blocks rounded up to 64 bytes, holes merged with both neighbours on release. The
++    // bookkeeping lives on the PC (nothing is written to guest RAM). `base` must be non-zero and 64-byte aligned:
++    // allocate returns 0 when nothing fits, so the caller can fall back to the game's own allocator.
++    class HighRamAllocator
++    {
++    public:
++        static constexpr uint32_t kAlignment = 64u;
++
++        struct Stats
++        {
++            uint32_t used = 0u;        // bytes in blocks (rounded sizes)
++            uint32_t peak = 0u;        // maximum of `used`
++            uint32_t blocks = 0u;      // live blocks
++            uint32_t holes = 0u;       // free holes
++            uint32_t largestFree = 0u; // largest hole
++        };
++
++        HighRamAllocator(uint32_t base, uint32_t size) : m_base(base), m_end(base + size)
++        {
++            if (size != 0u)
++                m_free.emplace(base, size);
++        }
++
++        [[nodiscard]] bool contains(uint32_t address) const
++        {
++            return address >= m_base && address < m_end;
++        }
++
++        // A block of at least `size` bytes, or 0 when it does not fit (nothing changes then).
++        uint32_t allocate(uint32_t size)
++        {
++            if (size == 0u || size > m_end - m_base)
++                return 0u;
++            const uint32_t rounded = (size + kAlignment - 1u) & ~(kAlignment - 1u);
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (auto it = m_free.begin(); it != m_free.end(); ++it)
++            {
++                if (it->second < rounded)
++                    continue;
++                const uint32_t start = it->first, rest = it->second - rounded;
++                m_free.erase(it);
++                if (rest != 0u)
++                    m_free.emplace(start + rounded, rest);
++                m_used.emplace(start, rounded);
++                m_usedBytes += rounded;
++                m_peak = std::max(m_peak, m_usedBytes);
++                return start;
++            }
++            return 0u;
++        }
++
++        // Releases the block that starts at `address`; false (and nothing changes) when it is not a live block of
++        // this allocator: an unknown or interior pointer, or a block already released.
++        bool release(uint32_t address)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            const auto it = m_used.find(address);
++            if (it == m_used.end())
++                return false;
++            uint32_t start = it->first, size = it->second;
++            m_used.erase(it);
++            m_usedBytes -= size;
++            auto next = m_free.lower_bound(start);
++            if (next != m_free.end() && start + size == next->first)
++            {
++                size += next->second;
++                next = m_free.erase(next);
++            }
++            if (next != m_free.begin())
++            {
++                const auto previous = std::prev(next);
++                if (previous->first + previous->second == start)
++                {
++                    previous->second += size;
++                    return true;
++                }
++            }
++            m_free.emplace(start, size);
++            return true;
++        }
++
++        [[nodiscard]] Stats stats() const
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            Stats s;
++            s.used = m_usedBytes;
++            s.peak = m_peak;
++            s.blocks = static_cast<uint32_t>(m_used.size());
++            s.holes = static_cast<uint32_t>(m_free.size());
++            for (const auto &hole : m_free)
++                s.largestFree = std::max(s.largestFree, hole.second);
++            return s;
++        }
++
++        // The stats as the port's log lines print them: "usados=.. pico=.. bloques=.. mayor_libre=..".
++        void report(std::ostream &out) const
++        {
++            const Stats s = stats();
++            out << "usados=" << s.used << " pico=" << s.peak << " bloques=" << s.blocks << " mayor_libre=" << s.largestFree;
++        }
++
++    private:
++        const uint32_t m_base;
++        const uint32_t m_end;
++        mutable std::mutex m_mutex;
++        std::map<uint32_t, uint32_t> m_free; // start -> size
++        std::map<uint32_t, uint32_t> m_used; // start -> rounded size
++        uint32_t m_usedBytes = 0u;
++        uint32_t m_peak = 0u;
++    };
++}
++
++#endif // PS2_HIGH_RAM_H
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 2a81e19..17009dc 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -375,12 +375,14 @@ namespace ps2_syscalls
+             {
+                 return true;
+             }
++            // RAM extra (parche 0181): the game only sees PS2_GUEST_RAM_SIZE of the reserved RAM, so a pointer or a
++            // size beyond it is not a guest one.
+             const uint32_t normalized = value & 0x1FFFFFFFu;
+-            return normalized >= 0x10000u && normalized < PS2_RAM_SIZE;
++            return normalized >= 0x10000u && normalized < PS2_GUEST_RAM_SIZE;
+         };
+         const auto looksLikeSize = [](uint32_t value)
+         {
+-            return value <= 0x02000000u;
++            return value <= PS2_GUEST_RAM_SIZE;
+         };
+         const auto plausiblePack = [&](uint32_t sendSize,
+                                        uint32_t receiveBuffer,
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 6bb6494..7b093dd 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -173,7 +173,8 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
+             {
+                 uint32_t cand = 0;
+                 std::memcpy(&cand, sendBuf + off, sizeof(cand));
+-                if (cand >= kMinPlausibleAddr && (cand <= PS2_RAM_MASK || (cand & ~PS2_RAM_MASK) == 0))
++                // RAM extra (parche 0181): a sample address is a guest pointer, inside what the game sees.
++                if (cand >= kMinPlausibleAddr && cand < PS2_GUEST_RAM_SIZE)
+                     sampleAddr = cand;
+             }
+         }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 1171658..41e44dc 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -44,6 +44,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_options_menu_tests.cpp
+     src/ps2_netplay_tests.cpp
+     src/ps2_netplay_audio_tests.cpp
++    src/ps2_high_ram_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 1efbb79..64a9e57 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -25,6 +25,7 @@ void register_ps2_display_tests();
+ void register_ps2_options_menu_tests();
+ void register_ps2_netplay_tests();
+ void register_ps2_netplay_audio_tests();
++void register_ps2_high_ram_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -54,6 +55,7 @@ int main()
+     register_ps2_options_menu_tests();
+     register_ps2_netplay_tests();
+     register_ps2_netplay_audio_tests();
++    register_ps2_high_ram_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_high_ram_tests.cpp b/ps2xTest/src/ps2_high_ram_tests.cpp
+new file mode 100644
+index 0000000..7cb65fc
+--- /dev/null
++++ b/ps2xTest/src/ps2_high_ram_tests.cpp
+@@ -0,0 +1,179 @@
++#include "MiniTest.h"
++#include "ps2_high_ram.h"
++#include "runtime/ps2_memory.h"
++
++#include <sstream>
++#include <string>
++
++// RAM extra (parche 0181): the allocator of the high region (above what the game sees), tested on a small region.
++namespace
++{
++    using ps2x::HighRamAllocator;
++
++    constexpr uint32_t kBase = 0x00001000u;
++    constexpr uint32_t kSize = 0x00000400u; // 16 blocks of 64 bytes
++
++    std::string reportOf(const HighRamAllocator &allocator)
++    {
++        std::ostringstream out;
++        allocator.report(out);
++        return out.str();
++    }
++
++    // Three 0x100-byte blocks A, B, C at the start of the region and a 0x100-byte hole after C.
++    struct ThreeBlocks
++    {
++        HighRamAllocator allocator{kBase, kSize};
++        uint32_t a = allocator.allocate(0x100u);
++        uint32_t b = allocator.allocate(0x100u);
++        uint32_t c = allocator.allocate(0x100u);
++    };
++}
++
++void register_ps2_high_ram_tests()
++{
++    MiniTest::Case("HighRamAllocator", [](TestCase &tc)
++    {
++        tc.Run("a fresh region is one hole with nothing used", [](TestCase &t)
++        {
++            const HighRamAllocator allocator{kBase, kSize};
++            const HighRamAllocator::Stats s = allocator.stats();
++            t.Equals(s.used, 0u, "used");
++            t.Equals(s.peak, 0u, "peak");
++            t.Equals(s.blocks, 0u, "blocks");
++            t.Equals(s.holes, 1u, "holes");
++            t.Equals(s.largestFree, kSize, "largest hole");
++            t.Equals(reportOf(allocator), std::string("usados=0 pico=0 bloques=0 mayor_libre=1024"), "report");
++        });
++
++        tc.Run("blocks are 64-byte aligned and sizes round up to 64 bytes", [](TestCase &t)
++        {
++            HighRamAllocator allocator{kBase, kSize};
++            t.Equals(allocator.allocate(1u), kBase, "1 byte at the base");
++            t.Equals(allocator.allocate(65u), kBase + 0x40u, "65 bytes after one block");
++            t.Equals(allocator.allocate(64u), kBase + 0xC0u, "65 bytes took two blocks");
++            const HighRamAllocator::Stats s = allocator.stats();
++            t.Equals(s.used, 0x100u, "used counts the rounded sizes");
++            t.Equals(s.blocks, 3u, "blocks");
++            t.Equals(s.largestFree, kSize - 0x100u, "largest hole");
++        });
++
++        tc.Run("allocation is first fit", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.IsTrue(r.allocator.release(r.b), "release B");
++            t.Equals(r.allocator.allocate(0x40u), r.b, "the first hole (B) wins over the tail hole");
++            t.Equals(r.allocator.allocate(0x40u), r.b + 0x40u, "then the rest of B");
++            t.Equals(r.allocator.allocate(0x100u), r.c + 0x100u, "a block that does not fit in B goes to the tail");
++        });
++
++        tc.Run("a released block merges with the next hole", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.IsTrue(r.allocator.release(r.c), "release C");
++            const HighRamAllocator::Stats s = r.allocator.stats();
++            t.Equals(s.holes, 1u, "C and the tail are one hole");
++            t.Equals(s.largestFree, 0x200u, "largest hole");
++            t.Equals(r.allocator.allocate(0x200u), r.c, "the merged hole holds 0x200 bytes at C");
++        });
++
++        tc.Run("a released block merges with the previous hole", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.IsTrue(r.allocator.release(r.a), "release A");
++            t.IsTrue(r.allocator.release(r.b), "release B");
++            const HighRamAllocator::Stats s = r.allocator.stats();
++            t.Equals(s.holes, 2u, "A+B and the tail");
++            t.Equals(s.largestFree, 0x200u, "largest hole");
++            t.Equals(r.allocator.allocate(0x200u), r.a, "the merged hole holds 0x200 bytes at A");
++        });
++
++        tc.Run("a released block merges with both neighbours", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.IsTrue(r.allocator.release(r.a), "release A");
++            t.IsTrue(r.allocator.release(r.c), "release C");
++            t.Equals(r.allocator.stats().holes, 2u, "A and C+tail before B");
++            t.IsTrue(r.allocator.release(r.b), "release B");
++            const HighRamAllocator::Stats s = r.allocator.stats();
++            t.Equals(s.holes, 1u, "the whole region is one hole again");
++            t.Equals(s.largestFree, kSize, "largest hole");
++            t.Equals(s.used, 0u, "used");
++            t.Equals(s.blocks, 0u, "blocks");
++            t.Equals(r.allocator.allocate(kSize), kBase, "the whole region fits again");
++        });
++
++        tc.Run("a double free is not owned and changes nothing", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.IsTrue(r.allocator.release(r.b), "first release");
++            const std::string before = reportOf(r.allocator);
++            const uint32_t holes = r.allocator.stats().holes;
++            t.IsFalse(r.allocator.release(r.b), "second release is not owned");
++            t.Equals(reportOf(r.allocator), before, "stats unchanged");
++            t.Equals(r.allocator.stats().holes, holes, "holes unchanged");
++        });
++
++        tc.Run("interior and unknown pointers are not owned and change nothing", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            const std::string before = reportOf(r.allocator);
++            t.IsFalse(r.allocator.release(r.a + 0x40u), "interior of A");
++            t.IsFalse(r.allocator.release(r.c + 0x100u), "start of the tail hole");
++            t.IsFalse(r.allocator.release(kBase + kSize), "end of the region");
++            t.IsFalse(r.allocator.release(0u), "null");
++            t.Equals(reportOf(r.allocator), before, "stats unchanged");
++            t.IsTrue(r.allocator.release(r.a), "A is still owned");
++        });
++
++        tc.Run("exhaustion returns 0 and changes nothing", [](TestCase &t)
++        {
++            HighRamAllocator allocator{kBase, kSize};
++            t.Equals(allocator.allocate(kSize + HighRamAllocator::kAlignment), 0u, "size + one block");
++            t.Equals(allocator.allocate(kSize + 1u), 0u, "size + one byte");
++            t.Equals(allocator.allocate(0xFFFFFFFFu), 0u, "huge size does not wrap");
++            t.Equals(allocator.allocate(0u), 0u, "zero bytes");
++            t.Equals(reportOf(allocator), std::string("usados=0 pico=0 bloques=0 mayor_libre=1024"), "nothing used");
++            t.Equals(allocator.allocate(kSize - 0x40u), kBase, "all but one block");
++            t.Equals(allocator.allocate(0x80u), 0u, "two blocks do not fit in the last one");
++            t.Equals(allocator.allocate(0x40u), kBase + kSize - 0x40u, "the last block");
++            const std::string full = reportOf(allocator);
++            t.Equals(allocator.allocate(1u), 0u, "a full region");
++            t.Equals(reportOf(allocator), full, "a failed allocation changes nothing");
++            t.Equals(allocator.stats().holes, 0u, "no holes");
++        });
++
++        tc.Run("contains covers exactly the region", [](TestCase &t)
++        {
++            const HighRamAllocator allocator{kBase, kSize};
++            t.IsFalse(allocator.contains(kBase - 1u), "below");
++            t.IsTrue(allocator.contains(kBase), "base");
++            t.IsTrue(allocator.contains(kBase + kSize - 1u), "last byte");
++            t.IsFalse(allocator.contains(kBase + kSize), "end");
++        });
++
++        tc.Run("stats keep the peak and the largest hole", [](TestCase &t)
++        {
++            ThreeBlocks r;
++            t.Equals(r.allocator.stats().peak, 0x300u, "peak after three blocks");
++            t.IsTrue(r.allocator.release(r.b), "release B");
++            t.IsTrue(r.allocator.release(r.c), "release C");
++            const HighRamAllocator::Stats s = r.allocator.stats();
++            t.Equals(s.used, 0x100u, "used");
++            t.Equals(s.peak, 0x300u, "the peak stays");
++            t.Equals(s.blocks, 1u, "blocks");
++            t.Equals(s.largestFree, 0x300u, "B+C+tail");
++            t.Equals(reportOf(r.allocator), std::string("usados=256 pico=768 bloques=1 mayor_libre=768"), "report");
++        });
++
++        tc.Run("the game's high region is 0x2000000-0x3FFFFFF", [](TestCase &t)
++        {
++            HighRamAllocator allocator{PS2_GUEST_RAM_SIZE, PS2_RAM_SIZE - PS2_GUEST_RAM_SIZE};
++            t.IsFalse(allocator.contains(0x01FFFFFFu), "below 32 MB");
++            t.IsTrue(allocator.contains(0x02000000u), "32 MB");
++            t.IsTrue(allocator.contains(0x03FFFFFFu), "last byte");
++            t.Equals(allocator.allocate(0x00200000u), 0x02000000u, "first block at 32 MB");
++            t.Equals(allocator.stats().largestFree, 0x01E00000u, "the rest");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index ee296c9..ec6f86b 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -628,5 +628,85 @@ void register_ps2_sif_rpc_tests()
+                      "recv payload should match stack-selected transfer size");
+         });
+ 
++        tc.Run("SifCallRpc treats a register receive buffer above the game's 32 MB as implausible", [](TestCase &t)
++        {
++            // RAM extra (parche 0181): the reserved RAM is 64 MB but the game only sees PS2_GUEST_RAM_SIZE, so a
++            // receive buffer in 0x2000000-0x3FFFFFF is not a guest pointer and the stack pack wins.
++            TestEnv env;
++
++            constexpr uint32_t kQdAddr = 0x0002B000u;
++            constexpr uint32_t kSdAddr = 0x0002B100u;
++            constexpr uint32_t kClientAddr = 0x0002B200u;
++            constexpr uint32_t kServerBufAddr = 0x0002B300u;
++            constexpr uint32_t kSendAddr = 0x0002B400u;
++            constexpr uint32_t kRecvAddr = 0x0002B500u;
++            constexpr uint32_t kHighRecvAddr = PS2_GUEST_RAM_SIZE + 0x100000u;
++            constexpr uint32_t kSid = 0x20000134u;
++
++            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
++
++            setRegU32(env.ctx, 4, kQdAddr);
++            setRegU32(env.ctx, 5, 0x67u);
++            SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
++
++            setRegU32(env.ctx, 29, K_STACK_ADDR);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
++
++            setRegU32(env.ctx, 4, kSdAddr);
++            setRegU32(env.ctx, 5, kSid);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, kServerBufAddr);
++            SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
++
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, kSid);
++            setRegU32(env.ctx, 6, 0u);
++            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed");
++
++            std::array<uint8_t, 12> payload{};
++            for (size_t i = 0; i < payload.size(); ++i)
++            {
++                payload[i] = static_cast<uint8_t>(0xB0u + i);
++            }
++            std::memcpy(env.rdram.data() + kSendAddr, payload.data(), payload.size());
++            std::memset(env.rdram.data() + kRecvAddr, 0, payload.size());
++            std::memset(env.rdram.data() + kHighRecvAddr, 0, payload.size());
++
++            constexpr uint32_t kStackSize = 8u;
++            setRegU32(env.ctx, 29, K_STACK_ADDR);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, kStackSize);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kRecvAddr);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kStackSize);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x1Cu, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x20u, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
++
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, 0x99u);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, kSendAddr);
++            setRegU32(env.ctx, 8, static_cast<uint32_t>(payload.size()));
++            setRegU32(env.ctx, 9, kHighRecvAddr); // inside the reserved RAM, outside what the game sees
++            setRegU32(env.ctx, 10, static_cast<uint32_t>(payload.size()));
++            setRegU32(env.ctx, 11, 0u);
++
++            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed with the stack pack");
++
++            const SifRpcServerData sdAfterCall = readGuestStruct<SifRpcServerData>(env.rdram.data(), kSdAddr);
++            t.Equals(static_cast<uint32_t>(sdAfterCall.size), kStackSize, "stack sendSize should be selected");
++            t.Equals(sdAfterCall.recvbuf, kRecvAddr, "stack recvBuf should be selected, not the high one");
++            t.IsTrue(std::memcmp(env.rdram.data() + kRecvAddr, payload.data(), kStackSize) == 0,
++                     "recv payload should land in the stack receive buffer");
++            const std::array<uint8_t, 12> zeros{};
++            t.IsTrue(std::memcmp(env.rdram.data() + kHighRecvAddr, zeros.data(), zeros.size()) == 0,
++                     "the high receive buffer should stay untouched");
++        });
++
+     });
+ }

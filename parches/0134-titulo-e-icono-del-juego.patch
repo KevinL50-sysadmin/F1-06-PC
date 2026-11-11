@@ -1,0 +1,104 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 910eae1..1ec0780 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -492,6 +492,31 @@ else()
+     )
+ endif()
+ 
++# F1 06: icon and file properties of the player's .exe (src/runner_resources.rc). The icon is made from the player's
++# game data by scripts/hacer-icono.ps1 and is not in the repository: without it the .exe keeps the default icon.
++if(WIN32 AND NOT PS2X_IS_ANDROID)
++    get_filename_component(PS2X_F1_PROJECT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
++    set(PS2X_RUNNER_ICON "${PS2X_F1_PROJECT_DIR}/build/icono/F1-06.ico" CACHE FILEPATH
++        "Icon embedded in ps2EntryRunner (GLFW_ICON); ignored if the file does not exist")
++    set(PS2X_RUNNER_RC "${CMAKE_CURRENT_SOURCE_DIR}/src/runner_resources.rc")
++    target_sources(ps2EntryRunner PRIVATE "${PS2X_RUNNER_RC}")
++    set(PS2X_RUNNER_RC_DEFINES
++        PS2X_RUNNER_VERSION_MAJOR=${PS2Runtime_VERSION_MAJOR}
++        PS2X_RUNNER_VERSION_MINOR=${PS2Runtime_VERSION_MINOR}
++        PS2X_RUNNER_VERSION_PATCH=${PS2Runtime_VERSION_PATCH}
++        "PS2X_RUNNER_VERSION_STRING=\"${PS2Runtime_VERSION}\""
++    )
++    if(EXISTS "${PS2X_RUNNER_ICON}")
++        file(TO_CMAKE_PATH "${PS2X_RUNNER_ICON}" PS2X_RUNNER_ICON_PATH)
++        list(APPEND PS2X_RUNNER_RC_DEFINES "PS2X_RUNNER_ICON=\"${PS2X_RUNNER_ICON_PATH}\"")
++        set_source_files_properties("${PS2X_RUNNER_RC}" PROPERTIES OBJECT_DEPENDS "${PS2X_RUNNER_ICON_PATH}")
++        message(STATUS "ps2EntryRunner icon: ${PS2X_RUNNER_ICON_PATH}")
++    else()
++        message(STATUS "ps2EntryRunner icon: none (${PS2X_RUNNER_ICON} does not exist)")
++    endif()
++    set_source_files_properties("${PS2X_RUNNER_RC}" PROPERTIES COMPILE_DEFINITIONS "${PS2X_RUNNER_RC_DEFINES}")
++endif()
++
+ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     set_target_properties(ps2EntryRunner PROPERTIES
+         UNITY_BUILD ON
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 7777116..966e8eb 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <iostream>
+ #include <string>
++#include <string_view>
+ #include <filesystem>
+ #include <exception>
+ #include <algorithm>
+@@ -440,6 +441,13 @@ int main(int argc, char *argv[])
+         {
+             windowTitle += elfName;
+         }
++        // F1 06: the player's modes (portable, installed) show only the game's name, like a PC game.
++        if (userPaths.mode != ps2x::UserPathsMode::Development)
++        {
++            constexpr std::string_view kPlayerTitle = "Formula One 06";
++            windowTitle = gameName && std::string_view(gameName).starts_with(kPlayerTitle) ? std::string(gameName)
++                                                                                           : std::string(kPlayerTitle);
++        }
+ 
+         PS2Runtime runtime;
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+diff --git a/ps2xRuntime/src/runner_resources.rc b/ps2xRuntime/src/runner_resources.rc
+new file mode 100644
+index 0000000..45fe146
+--- /dev/null
++++ b/ps2xRuntime/src/runner_resources.rc
+@@ -0,0 +1,36 @@
++// F1 06: Windows resources of ps2EntryRunner (the player's F1-06.exe): the game's icon and the file properties.
++// PS2X_RUNNER_ICON (the .ico path) and PS2X_RUNNER_VERSION_* come from ps2xRuntime/CMakeLists.txt; without the icon
++// (scripts/hacer-icono.ps1 makes it from the player's game data) the .exe keeps the default Windows icon.
++#include <winver.h>
++
++#ifdef PS2X_RUNNER_ICON
++// GLFW loads the icon named GLFW_ICON for its window class: the window and the taskbar use it too.
++GLFW_ICON ICON PS2X_RUNNER_ICON
++#endif
++
++VS_VERSION_INFO VERSIONINFO
++FILEVERSION PS2X_RUNNER_VERSION_MAJOR, PS2X_RUNNER_VERSION_MINOR, PS2X_RUNNER_VERSION_PATCH, 0
++PRODUCTVERSION PS2X_RUNNER_VERSION_MAJOR, PS2X_RUNNER_VERSION_MINOR, PS2X_RUNNER_VERSION_PATCH, 0
++FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
++FILEFLAGS 0
++FILEOS VOS_NT_WINDOWS32
++FILETYPE VFT_APP
++FILESUBTYPE VFT2_UNKNOWN
++BEGIN
++    BLOCK "StringFileInfo"
++    BEGIN
++        BLOCK "040904B0"
++        BEGIN
++            VALUE "FileDescription", "Formula One 06"
++            VALUE "ProductName", "Formula One 06"
++            VALUE "FileVersion", PS2X_RUNNER_VERSION_STRING
++            VALUE "ProductVersion", PS2X_RUNNER_VERSION_STRING
++            VALUE "OriginalFilename", "F1-06.exe"
++            VALUE "InternalName", "F1-06"
++        END
++    END
++    BLOCK "VarFileInfo"
++    BEGIN
++        VALUE "Translation", 0x0409, 1200
++    END
++END

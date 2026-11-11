@@ -1,0 +1,80 @@
+#version 450
+// pgs_puente: merges the circuits paraLLEl-GS scanned out alone (PGS_SCANOUT_COMPOSE) the way our CPU presenter
+// (GSCpuBackend::PresentFromLocalMemory) does, so that only the final frame is read back: BGCOLOR, circuit 2 under
+// circuit 1 unless SLBG, circuit 1 blended with ALP (MMOD 1) or min(255, 2 * its alpha) (MMOD 0),
+// dst + (src - dst) * factor / 255 truncated toward zero, 16-bit colours widened as (c << 3) | (c >> 2), alpha 0xFF.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The circuit images, packed RGBA8 rows, one after the other (offsets in pixels).
+layout(std430, set = 0, binding = 0) readonly buffer Circuits { uint circuits[]; };
+// The frame: out_width * out_height packed RGBA8 pixels.
+layout(std430, set = 0, binding = 1) writeonly buffer Frame { uint frame[]; };
+
+layout(push_constant) uniform Registers
+{
+    uint out_width;
+    uint out_height;
+    uint flags; // 1, 2: circuit 1, 2 shown; 4, 8: circuit 1, 2 is 16-bit; 16: MMOD; 32: SLBG
+    uint alp;
+    uint bgcolor;
+    uint offset1;
+    uint offset2;
+    uint image_width1;
+    uint image_height1;
+    uint image_width2;
+    uint image_height2;
+    uint width1;
+    uint height1;
+    uint width2;
+    uint height2;
+} regs;
+
+uvec4 unpack(uint value)
+{
+    return uvec4(value & 0xFFu, (value >> 8u) & 0xFFu, (value >> 16u) & 0xFFu, value >> 24u);
+}
+
+uvec4 pixelOf(uint offset, uint image_width, uint image_height, bool ct16, uvec2 pos)
+{
+    if (pos.x >= image_width || pos.y >= image_height)
+        return uvec4(0u);
+    uvec4 pixel = unpack(circuits[offset + pos.y * image_width + pos.x]);
+    if (ct16)
+        pixel.rgb |= pixel.rgb >> 5u;
+    return pixel;
+}
+
+uint blendChannel(uint src, uint dst, uint factor)
+{
+    uint scaled = ((src >= dst ? src - dst : dst - src) * factor) / 255u;
+    return src >= dst ? dst + scaled : dst - scaled;
+}
+
+void main()
+{
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= regs.out_width || pos.y >= regs.out_height)
+        return;
+    bool en1 = (regs.flags & 1u) != 0u;
+    bool en2 = (regs.flags & 2u) != 0u;
+    uvec4 dst;
+    if (en1 && en2)
+    {
+        dst = uvec4(unpack(regs.bgcolor).rgb, 0u);
+        if ((regs.flags & 32u) == 0u && pos.x < regs.width2 && pos.y < regs.height2)
+            dst = pixelOf(regs.offset2, regs.image_width2, regs.image_height2, (regs.flags & 8u) != 0u, pos);
+        if (pos.x < regs.width1 && pos.y < regs.height1)
+        {
+            uvec4 src = pixelOf(regs.offset1, regs.image_width1, regs.image_height1, (regs.flags & 4u) != 0u, pos);
+            uint factor = (regs.flags & 16u) != 0u ? regs.alp : min(255u, src.a * 2u);
+            dst.r = blendChannel(src.r, dst.r, factor);
+            dst.g = blendChannel(src.g, dst.g, factor);
+            dst.b = blendChannel(src.b, dst.b, factor);
+        }
+    }
+    else if (en1)
+        dst = pixelOf(regs.offset1, regs.image_width1, regs.image_height1, (regs.flags & 4u) != 0u, pos);
+    else
+        dst = pixelOf(regs.offset2, regs.image_width2, regs.image_height2, (regs.flags & 8u) != 0u, pos);
+    frame[pos.y * regs.out_width + pos.x] = dst.r | (dst.g << 8u) | (dst.b << 16u) | (0xFFu << 24u);
+}

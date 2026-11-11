@@ -1,0 +1,1418 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 520fafd..5ad1fc3 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -417,6 +417,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_options.cpp
+     src/lib/ps2_display.cpp
+     src/lib/ps2_host_overlay.cpp
++    src/lib/ps2_game_font.cpp
+     src/lib/ps2_user_paths.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+diff --git a/ps2xRuntime/include/ps2_display.h b/ps2xRuntime/include/ps2_display.h
+index 4a2187f..bd4b0fc 100644
+--- a/ps2xRuntime/include/ps2_display.h
++++ b/ps2xRuntime/include/ps2_display.h
+@@ -224,7 +224,7 @@ namespace ps2x
+         // pixels) with the filter; between BeginDrawing and EndDrawing.
+         void drawFrame(unsigned int textureId, int textureWidth, int textureHeight, float sourceWidth, float sourceHeight,
+                        float x, float y, float width, float height);
+-        // The FPS counter, when showFps: the game's frames per second and the monitor's refresh rate.
++        // The FPS counter, when showFps: only the game's frames per second ("50 FPS", drawHostFpsCounter).
+         void drawOverlay(double gameRate);
+         // Before CloseWindow: the shaders and the render texture.
+         void unload();
+diff --git a/ps2xRuntime/include/ps2_host_overlay.h b/ps2xRuntime/include/ps2_host_overlay.h
+index 34ea7c4..ae73061 100644
+--- a/ps2xRuntime/include/ps2_host_overlay.h
++++ b/ps2xRuntime/include/ps2_host_overlay.h
+@@ -70,6 +70,39 @@ namespace ps2x
+     HostOverlayBox hostOverlayBox(const std::string &text, HostOverlayPlace place, int windowWidth, int windowHeight,
+                                   const HostTextMeasure &measure, const HostOverlayBox *avoid = nullptr);
+ 
++    // Aspecto T3: the FPS counter as a row of the game's position tower (the race HUD): the number white on the tower's
++    // blue, then FPS black on white, a grey edge under both; at the counter's size, top right in the band above the
++    // HUD.
++    struct HostOverlayRect
++    {
++        float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
++    };
++    struct HostFpsCounterLayout
++    {
++        HostOverlayRect value, label;
++        float fontSize = 10.0f;
++        float padding = 2.0f; // from a box to its text
++        float edge = 1.0f;    // the grey line at the bottom of the boxes
++        float textY = 0.0f;   // the top of the text's line
++    };
++    // A letter's ink at a size, in pixels from the top of its line: the rows its digits and capitals cover.
++    struct HostTextInk
++    {
++        float fontSize = 0.0f;
++        float top = 0.0f, bottom = 0.0f;
++    };
++    // ink: the counter at that letter size (the race tower's), its ink centred in the boxes (smaller if it would not
++    // fit them); without it, at the band's size with the text at the padding.
++    HostFpsCounterLayout hostFpsCounterLayout(const std::string &value, const std::string &label, int windowWidth,
++                                              int windowHeight, const HostTextMeasure &measure,
++                                              const HostTextInk *ink = nullptr);
++    inline constexpr HostOverlayColor kHostTowerBlue{0x4E, 0x4F, 0x70, 0xFF};  // logs/aspecto-t2/hud-torre-x6.png
++    inline constexpr HostOverlayColor kHostTowerWhite{0xFC, 0xFC, 0xFC, 0xFF};
++    inline constexpr HostOverlayColor kHostTowerText{0x00, 0x00, 0x00, 0xFF};
++    inline constexpr HostOverlayColor kHostTowerEdge{0x80, 0x80, 0x80, 0xFF};
++    // Draws the counter with the game's frames per second (drawing rules as drawHostOverlay).
++    void drawHostFpsCounter(double gameFramesPerSecond);
++
+     // A TrueType blob raylib (stb_truetype, which does not check bounds) can read: the 0x00010000 or "true" tag, its
+     // table directory inside the blob and the tables a TrueType letter needs. Otherwise the default font is used.
+     bool hostFontBlobUsable(const unsigned char *data, size_t size);
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+index 73866b4..d0b9b55 100644
+--- a/ps2xRuntime/src/lib/ps2_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_display.h"
+ #include "ps2_color_vision.h"
++#include "ps2_game_font.h"
+ #include "ps2_host_overlay.h"
+ #include "shaders/ps2_display_shaders.h"
+ 
+@@ -13,6 +14,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ 
+ #if !defined(PLATFORM_VITA)
+ // The GLFW calls raylib does not wrap (the work area, the window frame) or wraps without checking the video mode,
+@@ -639,6 +641,7 @@ namespace ps2x
+                                      float sourceHeight, float x, float y, float width, float height)
+     {
+         State &s = *m_state;
++        noteGamePicture(width, height); // the host's notices draw the game's letters at its scale
+         // The picture scaled with the filter into the destination rectangle, of the window or of target (the colour
+         // blindness filter's render texture, which an inner render texture pass must bind again).
+         const auto drawScaled = [&](float x, float y, RenderTexture2D *target)
+@@ -792,13 +795,25 @@ namespace ps2x
+                 SetTargetFPS(targetFps(s.settings.vsync, refresh));
+             }
+         }
++        // Tests: PS2X_AVISO_PRUEBA=<a UTF-8 text file> shows its first line as the host's bottom line (the letter,
++        // accents included).
++        static const std::string s_testNotice = []
++        {
++            std::string line;
++            if (const char *path = std::getenv("PS2X_AVISO_PRUEBA"); path != nullptr && *path != '\0')
++            {
++                std::ifstream file(path, std::ios::binary);
++                std::getline(file, line);
++            }
++            return line;
++        }();
++        if (!s_testNotice.empty())
++            drawHostOverlay(s_testNotice, HostOverlayPlace::BottomCentre);
+         if (!s.settings.showFps)
+             return;
+-        // Nativizacion T11: with the game's look, top right (the position tower is on the left).
+-        char line[160];
+-        std::snprintf(line, sizeof(line), "Juego: %.1f fps  |  Monitor: %d Hz%s, ventana: %d fps", gameRate,
+-                      s.refreshRate, s.settings.vsync ? " (vsync)" : "", GetFPS());
+-        drawHostOverlay(line, HostOverlayPlace::TopRight);
++        // Aspecto T3: only the game's frames per second ("50 FPS"), with the game's letter, as a row of its position
++        // tower; top right (the tower is on the left).
++        drawHostFpsCounter(gameRate);
+     }
+ 
+     void DisplayPresenter::unload()
+diff --git a/ps2xRuntime/src/lib/ps2_game_font.cpp b/ps2xRuntime/src/lib/ps2_game_font.cpp
+new file mode 100644
+index 0000000..96d22be
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_game_font.cpp
+@@ -0,0 +1,366 @@
++#include "ps2_game_font.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include "runtime/gs/ps2_gs_psmt4.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <map>
++#include <mutex>
++
++namespace ps2x
++{
++    const GameFontGlyph *GameFont::glyph(uint32_t codepoint) const
++    {
++        for (const GameFontGlyph &g : glyphs)
++            if (g.codepoint == codepoint)
++                return &g;
++        return nullptr;
++    }
++
++    namespace
++    {
++        constexpr size_t kGlyphRecord = 0x48u;
++        constexpr size_t kPairRecord = 0x28u;
++        constexpr size_t kPageHeader = 7u * 4u;
++        constexpr uint32_t kMaxRecords = 0x10000u;
++
++        struct Reader
++        {
++            const uint8_t *data;
++            size_t size;
++
++            bool has(size_t at, size_t n) const
++            {
++                return at <= size && n <= size - at;
++            }
++            uint32_t u32(size_t at) const
++            {
++                uint32_t v = 0;
++                std::memcpy(&v, data + at, 4);
++                return v;
++            }
++            uint64_t u64(size_t at) const
++            {
++                uint64_t v = 0;
++                std::memcpy(&v, data + at, 8);
++                return v;
++            }
++            float f32(size_t at) const
++            {
++                float v = 0.0f;
++                std::memcpy(&v, data + at, 4);
++                return v;
++            }
++        };
++
++        // A page: 7 u32 (records - 2 first), the (records) u32 pointers, then (records) records. Its end, or 0.
++        size_t skipPage(const Reader &r, size_t at, size_t recordSize, uint32_t &records)
++        {
++            if (!r.has(at, kPageHeader))
++                return 0u;
++            const uint32_t count = r.u32(at);
++            if (count > kMaxRecords)
++                return 0u;
++            records = count + 2u;
++            const size_t bytes = kPageHeader + size_t(records) * (4u + recordSize);
++            return r.has(at, bytes) ? at + bytes : 0u;
++        }
++
++        struct Upload
++        {
++            uint32_t width = 0, height = 0;
++            size_t data = 0, bytes = 0, end = 0;
++        };
++
++        // The next GS upload from `from` on: the A+D writes of TRXREG (0x52) and TRXDIR (0x53, host to local) and the
++        // IMAGE GIF tag right after them, with exactly the bytes of a width x height CT32 rectangle.
++        bool nextUpload(const Reader &r, size_t from, Upload &upload)
++        {
++            for (size_t at = from; r.has(at, 48u); ++at)
++            {
++                // at: TRXREG's data; +8 its address; +16 TRXDIR's data; +24 its address; +32 the IMAGE tag.
++                if (r.u64(at + 8u) != 0x52u || r.u64(at + 24u) != 0x53u || r.u64(at + 16u) != 0u)
++                    continue;
++                const uint64_t trxreg = r.u64(at), tag = r.u64(at + 32u);
++                if (((tag >> 58) & 3u) != 2u)
++                    continue;
++                upload.width = static_cast<uint32_t>(trxreg & 0xFFFu);
++                upload.height = static_cast<uint32_t>((trxreg >> 32) & 0xFFFu);
++                upload.data = at + 48u;
++                upload.bytes = size_t(tag & 0x7FFFu) * 16u;
++                upload.end = upload.data + upload.bytes;
++                return upload.width != 0u && upload.height != 0u &&
++                       upload.bytes == size_t(upload.width) * upload.height * 4u && r.has(upload.data, upload.bytes);
++            }
++            return false;
++        }
++    }
++
++    bool decodeGameFont(const uint8_t *data, size_t size, GameFont &font)
++    {
++        if (data == nullptr)
++            return false;
++        const Reader r{data, size};
++        if (!r.has(0u, 8u))
++            return false;
++        GameFont out;
++        out.lineHeight = static_cast<int>(r.u32(4u));
++        if (out.lineHeight <= 0 || out.lineHeight > 256)
++            return false;
++
++        // The glyph page.
++        uint32_t records = 0u;
++        size_t at = skipPage(r, 8u, kGlyphRecord, records);
++        if (at == 0u)
++            return false;
++        const size_t glyphsAt = 8u + kPageHeader + size_t(records) * 4u;
++        struct Raw
++        {
++            uint32_t code;
++            float width, height, u0, v1, advance, offsetX;
++        };
++        std::vector<Raw> raw;
++        for (uint32_t i = 0; i < records; ++i)
++        {
++            const size_t g = glyphsAt + size_t(i) * kGlyphRecord;
++            if ((r.u32(g + 0x44u) & 0xFFu) != 0u) // a sentinel
++                continue;
++            raw.push_back({r.u32(g) & 0xFFFFu, r.f32(g + 4u), r.f32(g + 8u), r.f32(g + 12u), r.f32(g + 24u),
++                           r.f32(g + 28u), r.f32(g + 32u)});
++            // Its pair adjustment page (not used: the pen moves by the advance).
++            if (static_cast<int32_t>(r.u32(g + 0x24u)) != -1)
++            {
++                uint32_t pairs = 0u;
++                at = skipPage(r, at, kPairRecord, pairs);
++                if (at == 0u)
++                    return false;
++            }
++        }
++        if (raw.empty())
++            return false;
++
++        // The texture: the picture and then its 16 colour palette.
++        Upload picture, palette;
++        if (!nextUpload(r, at, picture) || !nextUpload(r, picture.end, palette))
++            return false;
++        if (picture.width % 64u != 0u || picture.height % 32u != 0u || picture.width > 1024u ||
++            picture.height > 1024u || palette.width * palette.height != 16u)
++            return false;
++
++        // GS memory as the game leaves it: the CT32 rectangle (buffer width in 64 pixel units), read back as PSMT4,
++        // twice as wide and four times as high (the same pages).
++        const uint32_t cw = picture.width, ch = picture.height;
++        std::vector<uint8_t> gs(size_t(cw) * ch * 4u, 0u);
++        for (uint32_t y = 0; y < ch; ++y)
++            for (uint32_t x = 0; x < cw; ++x)
++            {
++                const uint32_t address = GSPSMCT32::addrPSMCT32(0u, cw / 64u, x, y);
++                if (address + 4u > gs.size())
++                    return false;
++                std::memcpy(&gs[address], data + picture.data + (size_t(y) * cw + x) * 4u, 4u);
++            }
++        uint8_t colours[16][4];
++        for (int i = 0; i < 16; ++i)
++        {
++            const uint32_t c = r.u32(palette.data + size_t(i) * 4u);
++            const uint32_t alpha = c >> 24;
++            colours[i][0] = static_cast<uint8_t>(c);
++            colours[i][1] = static_cast<uint8_t>(c >> 8);
++            colours[i][2] = static_cast<uint8_t>(c >> 16);
++            colours[i][3] = static_cast<uint8_t>(alpha >= 0x80u ? 255u : alpha * 2u);
++        }
++        out.width = static_cast<int>(cw * 2u);
++        out.height = static_cast<int>(ch * 4u);
++        out.rgba.resize(size_t(out.width) * out.height * 4u);
++        for (int y = 0; y < out.height; ++y)
++            for (int x = 0; x < out.width; ++x)
++            {
++                const uint32_t nibble = GSPSMT4::addrPSMT4(0u, static_cast<uint32_t>(out.width) / 64u, x, y);
++                if ((nibble >> 1) >= gs.size())
++                    return false;
++                const uint8_t b = gs[nibble >> 1];
++                const uint8_t index = (nibble & 1u) ? static_cast<uint8_t>(b >> 4) : static_cast<uint8_t>(b & 0x0Fu);
++                std::memcpy(&out.rgba[(size_t(y) * out.width + x) * 4u], colours[index], 4u);
++            }
++
++        // The glyphs' rectangles in the atlas.
++        for (const Raw &g : raw)
++        {
++            if (!std::isfinite(g.width) || !std::isfinite(g.height) || !std::isfinite(g.u0) || !std::isfinite(g.v1) ||
++                !std::isfinite(g.advance) || !std::isfinite(g.offsetX))
++                continue;
++            GameFontGlyph glyph;
++            glyph.codepoint = g.code;
++            glyph.x = static_cast<int>(std::lround(g.u0 * out.width));
++            glyph.y = static_cast<int>(std::lround((1.0f - g.v1) * out.height));
++            glyph.width = static_cast<int>(std::lround(g.width));
++            glyph.height = static_cast<int>(std::lround(g.height));
++            glyph.offsetX = static_cast<int>(std::lround(g.offsetX));
++            glyph.advance = g.advance;
++            if (glyph.x < 0 || glyph.y < 0 || glyph.width < 0 || glyph.height < 0 ||
++                glyph.x + glyph.width > out.width || glyph.y + glyph.height > out.height ||
++                out.glyph(glyph.codepoint) != nullptr)
++                continue;
++            out.glyphs.push_back(glyph);
++        }
++        if (out.glyphs.empty())
++            return false;
++        // The rows of the line the digits and capitals cover (the cells hang from the top of the line).
++        out.inkTop = out.lineHeight;
++        out.inkBottom = -1;
++        for (const GameFontGlyph &g : out.glyphs)
++        {
++            const bool digitOrCapital = (g.codepoint >= '0' && g.codepoint <= '9') || (g.codepoint >= 'A' && g.codepoint <= 'Z');
++            if (!digitOrCapital)
++                continue;
++            for (int row = 0; row < g.height; ++row)
++                for (int col = 0; col < g.width; ++col)
++                    if (out.rgba[(size_t(g.y + row) * out.width + g.x + col) * 4u + 3u] != 0u)
++                    {
++                        out.inkTop = std::min(out.inkTop, row);
++                        out.inkBottom = std::max(out.inkBottom, row);
++                    }
++        }
++        if (out.inkBottom < out.inkTop) // no digit nor capital: the whole line
++        {
++            out.inkTop = 0;
++            out.inkBottom = out.lineHeight - 1;
++        }
++        font = std::move(out);
++        return true;
++    }
++
++    namespace
++    {
++        struct StoredFont
++        {
++            std::vector<uint8_t> bytes;
++            uint32_t version = 0u;
++        };
++        std::mutex g_storeMutex;
++        std::map<std::string, StoredFont, std::less<>> g_store;
++    }
++
++    bool storeGameFontFile(std::string_view name, std::vector<uint8_t> bytes)
++    {
++        std::lock_guard<std::mutex> lock(g_storeMutex);
++        auto it = g_store.find(name);
++        if (it == g_store.end())
++            it = g_store.emplace(std::string(name), StoredFont{}).first;
++        if (it->second.version != 0u && it->second.bytes == bytes)
++            return false;
++        it->second.bytes = std::move(bytes);
++        ++it->second.version;
++        return true;
++    }
++
++    bool gameFontFile(std::string_view name, std::vector<uint8_t> &bytes, uint32_t &version)
++    {
++        std::lock_guard<std::mutex> lock(g_storeMutex);
++        const auto it = g_store.find(name);
++        if (it == g_store.end())
++            return false;
++        bytes = it->second.bytes;
++        version = it->second.version;
++        return true;
++    }
++
++    int nearestGameFont(const std::vector<int> &lineHeights, float size)
++    {
++        int best = -1;
++        for (int i = 0; i < static_cast<int>(lineHeights.size()); ++i)
++        {
++            if (best < 0)
++            {
++                best = i;
++                continue;
++            }
++            const float d = std::fabs(lineHeights[i] - size), bestD = std::fabs(lineHeights[best] - size);
++            if (d < bestD || (d == bestD && lineHeights[i] > lineHeights[best]))
++                best = i;
++        }
++        return best;
++    }
++
++    HostFontKind hostFontKind(bool raceOnScreen, bool raceFontReady, bool menuFontReady, bool builtInReady)
++    {
++        if (raceOnScreen ? raceFontReady : !menuFontReady && raceFontReady)
++            return HostFontKind::RaceHud;
++        if (menuFontReady)
++            return HostFontKind::Menu;
++        return builtInReady ? HostFontKind::BuiltIn : HostFontKind::Default;
++    }
++
++    bool raceCameraRecent(double lastCameraAt, double now)
++    {
++        return lastCameraAt >= 0.0 && now >= lastCameraAt && now - lastCameraAt <= kRaceCameraWindow;
++    }
++
++    namespace
++    {
++        const auto g_raceClockStart = std::chrono::steady_clock::now();
++        std::atomic<double> g_lastRaceCamera{-1.0};
++
++        double raceClock()
++        {
++            return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_raceClockStart).count();
++        }
++    }
++
++    void noteRaceCameraFrame()
++    {
++        g_lastRaceCamera.store(raceClock(), std::memory_order_relaxed);
++    }
++
++    bool raceOnScreen()
++    {
++        return raceCameraRecent(g_lastRaceCamera.load(std::memory_order_relaxed), raceClock());
++    }
++
++    GamePictureScale gamePictureScale(float pictureWidth, float pictureHeight, int windowHeight)
++    {
++        if (!(pictureWidth > 0.0f) || !(pictureHeight > 0.0f))
++        {
++            pictureHeight = static_cast<float>(std::max(windowHeight, 1));
++            pictureWidth = pictureHeight * 4.0f / 3.0f;
++        }
++        return {pictureWidth / kGameFrameWidth, pictureHeight / kGameFrameHeight};
++    }
++
++    namespace
++    {
++        std::atomic<float> g_pictureWidth{0.0f}, g_pictureHeight{0.0f};
++    }
++
++    void noteGamePicture(float width, float height)
++    {
++        g_pictureWidth.store(width, std::memory_order_relaxed);
++        g_pictureHeight.store(height, std::memory_order_relaxed);
++    }
++
++    GamePictureScale currentGamePictureScale(int windowHeight)
++    {
++        return gamePictureScale(g_pictureWidth.load(std::memory_order_relaxed),
++                                g_pictureHeight.load(std::memory_order_relaxed), windowHeight);
++    }
++
++    float gameFontPixelSize(int lineHeight, int windowHeight)
++    {
++        return lineHeight > 0 && windowHeight > 0 ? static_cast<float>(lineHeight) * windowHeight / kGameFrameHeight
++                                                  : 0.0f;
++    }
++
++    std::string gameFpsValue(double framesPerSecond)
++    {
++        const double fps = std::isfinite(framesPerSecond) ? std::clamp(framesPerSecond, 0.0, 999.0) : 0.0;
++        return std::to_string(std::lround(fps));
++    }
++
++    std::string gameFpsText(double framesPerSecond)
++    {
++        return gameFpsValue(framesPerSecond) + " " + kGameFpsLabel;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_game_font.h b/ps2xRuntime/src/lib/ps2_game_font.h
+new file mode 100644
+index 0000000..2ce6ee3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_game_font.h
+@@ -0,0 +1,105 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// Aspecto T2: the game's own letters (Fonts/eurostyle*Px.bft) for the host's notices. The port copies each .bft as the
++// game reads it from the user's disc (func_264888 in src/f1_overrides.cpp); nothing of the game goes in the package.
++//
++// The .bft format (little endian), as the game's reader func_264888 takes it:
++//   u32 0, u32 line height in pixels
++//   glyph page: 7 u32 (count, count, first = 2, last, 'A', -1, last), (count + 2) u32 (the tool's pointers, unused),
++//     (count + 2) glyphs of 0x48 bytes: u32 code (low 16 bits: the Unicode character, Latin-1 and a few more),
++//     8 float (width, height, u0, u1, v0, v1, advance, x offset), 8 int32 (+0x24: its pair adjustment page or -1),
++//     u32 (+0x44, low byte: 0 for a glyph, 1 for the two sentinels at 0 and 1)
++//   for every glyph with a pair adjustment page: 7 u32 (n, ...), (n + 2) u32, (n + 2) records of 0x28 bytes
++//   the texture, as the GS packets that load it: A+D (BITBLTBUF, TRXPOS, TRXREG, TRXDIR) and an IMAGE GIF tag, first
++//     the picture (PSMT4 sent as CT32, w x h: the atlas is 2w x 4h) and then its palette (8 x 2 CT32, 16 colours;
++//     white with the PS2 alpha, 0x80 = opaque).
++// A glyph is the atlas rectangle (u0 * atlas width, (1 - v1) * atlas height, width, height): cells hang from the top of
++// the line, and the pen moves by the advance (the x offset moves the picture only).
++namespace ps2x
++{
++    struct GameFontGlyph
++    {
++        uint32_t codepoint = 0u;
++        int x = 0, y = 0, width = 0, height = 0; // in the atlas
++        int offsetX = 0;                         // from the pen to the picture
++        float advance = 0.0f;                    // of the pen
++    };
++
++    struct GameFont
++    {
++        int lineHeight = 0;
++        int inkTop = 0, inkBottom = -1; // the rows of the line the digits and capitals cover (first and last)
++        int width = 0, height = 0;  // of the atlas
++        std::vector<uint8_t> rgba;  // the atlas, width * height RGBA (alpha 0-255)
++        std::vector<GameFontGlyph> glyphs;
++
++        const GameFontGlyph *glyph(uint32_t codepoint) const;
++    };
++
++    // The font in a .bft, or false (font untouched) if the bytes are not one (cut, damaged or another format).
++    bool decodeGameFont(const uint8_t *data, size_t size, GameFont &font);
++
++    // The .bft files the game read, by name ("Fonts/eurostyleSmallPx.bft"): stored by the EE thread, read by the
++    // window's. version: changes only when the bytes stored under that name change (1 for the first ones); the store
++    // says whether they changed (the game reads its letters again on many screens).
++    bool storeGameFontFile(std::string_view name, std::vector<uint8_t> bytes);
++    bool gameFontFile(std::string_view name, std::vector<uint8_t> &bytes, uint32_t &version);
++    // The game's letters the notices use, from the smallest to the largest: the menus' (italic Eurostile) and the race
++    // HUD's (straight Frutiger; the position tower and "Current" use fruitigerMedium: 9 row capitals in the 512 row
++    // frame, 12-13 rows in a 720 row window, logs/aspecto-t2/carrera-torre-x3.png).
++    inline constexpr std::string_view kMenuFontFiles[] = {"Fonts/eurostyleSmallPx.bft", "Fonts/eurostyleMediumPx.bft",
++                                                          "Fonts/eurostyleLargePx.bft"};
++    inline constexpr std::string_view kRaceFontFiles[] = {"Fonts/fruitigerTiny.bft", "Fonts/fruitigerSmall.bft",
++                                                          "Fonts/fruitigerMedium.bft", "Fonts/fruitigerLarge.bft"};
++    inline constexpr std::string_view kRaceTowerFontFile = "Fonts/fruitigerMedium.bft";
++
++    // Of the fonts' line heights, the one closest to a text size in pixels (the larger on a tie); -1 if none.
++    int nearestGameFont(const std::vector<int> &lineHeights, float size);
++
++    // The letter of the host's notices: the game's own for what is on screen (the race HUD's in a race, the menus'
++    // elsewhere), the other game letter if that one has not been read, else the one built into the .exe, else raylib's.
++    enum class HostFontKind
++    {
++        RaceHud,
++        Menu,
++        BuiltIn,
++        Default,
++    };
++    HostFontKind hostFontKind(bool raceOnScreen, bool raceFontReady, bool menuFontReady, bool builtInReady);
++
++    // A race is on screen while its cameras draw: the game calls func_2C5948 for every race (and replay) camera each
++    // frame (src/f1_overrides.cpp, the same signal as the photo mode), also behind the pause menu (the race and its HUD
++    // stay on screen, dimmed); not in the front end's menus. noteRaceCameraFrame: from the EE thread; raceOnScreen:
++    // from the window's.
++    inline constexpr double kRaceCameraWindow = 0.5;
++    bool raceCameraRecent(double lastCameraAt, double now); // lastCameraAt < 0: never
++    void noteRaceCameraFrame();
++    bool raceOnScreen();
++
++    // The game draws its HUD in a 512 row frame: a letter of lineHeight rows there is this many pixels high in a
++    // windowHeight row window.
++    inline constexpr int kGameFrameHeight = 512;
++    float gameFontPixelSize(int lineHeight, int windowHeight);
++    // The game's 512 x 512 frame is stretched to the picture on screen (4:3 in a 960 x 720 window: 1.875 times across,
++    // 1.406 down), and so are its letters. The picture's size is noted by the window each frame (notePicture); before
++    // the first one, a 4:3 picture as high as the window.
++    inline constexpr int kGameFrameWidth = 512;
++    struct GamePictureScale
++    {
++        float x = 1.0f, y = 1.0f;
++    };
++    GamePictureScale gamePictureScale(float pictureWidth, float pictureHeight, int windowHeight);
++    void noteGamePicture(float width, float height);
++    GamePictureScale currentGamePictureScale(int windowHeight);
++
++    // The FPS counter (S1): only the game's frames per second, whole, as "50 FPS"; its two parts.
++    std::string gameFpsValue(double framesPerSecond);
++    inline constexpr const char *kGameFpsLabel = "FPS";
++    std::string gameFpsText(double framesPerSecond);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_host_overlay.cpp b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+index 2d55b17..4194094 100644
+--- a/ps2xRuntime/src/lib/ps2_host_overlay.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+@@ -1,11 +1,13 @@
+ #include "ps2_host_overlay.h"
+ #include "ps2_display.h"
++#include "ps2_game_font.h"
+ #include "fonts/michroma_regular_ttf.h"
+ 
+ #include "raylib.h"
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstring>
+ #include <cstdio>
+ #include <iostream>
+ #include <iterator>
+@@ -228,6 +230,196 @@ namespace ps2x
+             return s;
+         }
+ 
++        // Aspecto T2: the game's letters (ps2_game_font.h), from the .bft files the game read: the menus' and the
++        // race HUD's; rebuilt when it reads one again with other bytes. Looked at twice a second.
++        struct GameLetter
++        {
++            std::string_view file;
++            bool race = false; // a race HUD letter (kRaceFontFiles)
++            uint32_t version = 0u;
++            bool ready = false;
++            int lineHeight = 0, inkTop = 0, inkBottom = 0;
++            Font font{};
++        };
++        std::vector<GameLetter> &gameLetters()
++        {
++            static std::vector<GameLetter> letters = []
++            {
++                std::vector<GameLetter> out;
++                for (std::string_view file : kMenuFontFiles)
++                    out.push_back(GameLetter{file, false});
++                for (std::string_view file : kRaceFontFiles)
++                    out.push_back(GameLetter{file, true});
++                return out;
++            }();
++            return letters;
++        }
++        double g_gameLettersCheckedAt = -1.0;
++
++        Font raylibFont(const GameFont &game)
++        {
++            Font font{};
++            Image atlas{};
++            atlas.data = MemAlloc(static_cast<unsigned int>(game.rgba.size()));
++            std::memcpy(atlas.data, game.rgba.data(), game.rgba.size());
++            atlas.width = game.width;
++            atlas.height = game.height;
++            atlas.mipmaps = 1;
++            atlas.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++            font.texture = LoadTextureFromImage(atlas);
++            UnloadImage(atlas);
++            if (font.texture.id == 0u)
++                return font;
++            // Scaled to the window like the game's own picture: smooth, not blocky.
++            SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
++            const unsigned int count = static_cast<unsigned int>(game.glyphs.size());
++            font.baseSize = game.lineHeight;
++            font.glyphCount = static_cast<int>(count);
++            font.glyphPadding = 0;
++            font.recs = static_cast<Rectangle *>(MemAlloc(count * static_cast<unsigned int>(sizeof(Rectangle))));
++            font.glyphs = static_cast<GlyphInfo *>(MemAlloc(count * static_cast<unsigned int>(sizeof(GlyphInfo))));
++            for (size_t i = 0; i < game.glyphs.size(); ++i)
++            {
++                const GameFontGlyph &g = game.glyphs[i];
++                font.recs[i] = Rectangle{static_cast<float>(g.x), static_cast<float>(g.y), static_cast<float>(g.width),
++                                         static_cast<float>(g.height)};
++                font.glyphs[i].value = static_cast<int>(g.codepoint);
++                font.glyphs[i].offsetX = g.offsetX;
++                font.glyphs[i].offsetY = 0; // the cells hang from the top of the line
++                font.glyphs[i].advanceX = static_cast<int>(std::lround(g.advance));
++            }
++            return font;
++        }
++
++        void refreshGameLetters()
++        {
++            const double now = GetTime();
++            if (g_gameLettersCheckedAt >= 0.0 && now - g_gameLettersCheckedAt < 0.5)
++                return;
++            g_gameLettersCheckedAt = now;
++            for (GameLetter &letter : gameLetters())
++            {
++                std::vector<uint8_t> bytes;
++                uint32_t version = 0u;
++                if (!gameFontFile(letter.file, bytes, version) || version == letter.version)
++                    continue;
++                letter.version = version;
++                GameFont game;
++                if (!decodeGameFont(bytes.data(), bytes.size(), game))
++                {
++                    std::cerr << "[avisos] no se pudo leer la letra del juego " << letter.file << " ("
++                              << bytes.size() << " bytes)" << (letter.ready ? ": sigue la de antes" : "") << std::endl;
++                    continue;
++                }
++                Font font = raylibFont(game);
++                if (font.texture.id == 0u || font.glyphCount <= 0)
++                {
++                    UnloadFont(font);
++                    continue;
++                }
++                if (letter.ready)
++                    UnloadFont(letter.font);
++                letter.font = font;
++                letter.lineHeight = game.lineHeight;
++                letter.inkTop = game.inkTop;
++                letter.inkBottom = game.inkBottom;
++                letter.ready = true;
++                std::cout << "[avisos] letra del juego " << letter.file << ": " << font.glyphCount
++                          << " glifos, atlas " << game.width << "x" << game.height << ", linea de " << game.lineHeight
++                          << " px" << std::endl;
++            }
++        }
++
++        struct LetterFor
++        {
++            Font font{};
++            float spacingPerSize = 0.0f;
++            float stretch = 1.0f; // across, over the size: the game's letters as its picture stretches them
++        };
++
++        const GameLetter *readyLetter(std::string_view file)
++        {
++            for (const GameLetter &letter : gameLetters())
++                if (letter.ready && letter.file == file)
++                    return &letter;
++            return nullptr;
++        }
++
++        // The letter for a text size: the game's for what is on screen (hostFontKind), the closest in size of that
++        // family; else Michroma, else raylib's.
++        LetterFor letterFor(float size, HostFontKind *kindOut = nullptr)
++        {
++            refreshGameLetters();
++            std::vector<int> heights[2];
++            std::vector<const Font *> fonts[2];
++            for (const GameLetter &letter : gameLetters())
++                if (letter.ready)
++                {
++                    heights[letter.race].push_back(letter.lineHeight);
++                    fonts[letter.race].push_back(&letter.font);
++                }
++            OverlayFont &builtIn = overlayFont();
++            const HostFontKind kind = hostFontKind(raceOnScreen(), !fonts[1].empty(), !fonts[0].empty(), builtIn.own);
++            if (kindOut != nullptr)
++                *kindOut = kind;
++            switch (kind)
++            {
++            case HostFontKind::RaceHud:
++            case HostFontKind::Menu:
++            {
++                const bool race = kind == HostFontKind::RaceHud;
++                return {*fonts[race][static_cast<size_t>(nearestGameFont(heights[race], size))], 0.0f};
++            }
++            case HostFontKind::BuiltIn:
++                return {builtIn.font, 0.0f};
++            default:
++                return {GetFontDefault(), 0.1f}; // as DrawText (a pixel of spacing every 10 of size)
++            }
++        }
++
++        // A stretched letter is drawn glyph by glyph (raylib's DrawTextEx scales both ways alike).
++        float measureWith(const LetterFor &letter, const std::string &text, float size)
++        {
++            if (letter.stretch == 1.0f)
++                return MeasureTextEx(letter.font, text.c_str(), size, size * letter.spacingPerSize).x;
++            const float scale = size / static_cast<float>(letter.font.baseSize) * letter.stretch;
++            float width = 0.0f;
++            for (size_t i = 0; i < text.size();)
++            {
++                int bytes = 0;
++                const int codepoint = GetCodepointNext(text.c_str() + i, &bytes);
++                i += static_cast<size_t>(std::max(bytes, 1));
++                width += letter.font.glyphs[GetGlyphIndex(letter.font, codepoint)].advanceX * scale;
++            }
++            return width;
++        }
++
++        void drawWith(const LetterFor &letter, const std::string &text, Vector2 at, float size, Color colour)
++        {
++            if (letter.stretch == 1.0f)
++            {
++                DrawTextEx(letter.font, text.c_str(), at, size, size * letter.spacingPerSize, colour);
++                return;
++            }
++            const float down = size / static_cast<float>(letter.font.baseSize), across = down * letter.stretch;
++            float pen = at.x;
++            for (size_t i = 0; i < text.size();)
++            {
++                int bytes = 0;
++                const int codepoint = GetCodepointNext(text.c_str() + i, &bytes);
++                i += static_cast<size_t>(std::max(bytes, 1));
++                const int g = GetGlyphIndex(letter.font, codepoint);
++                const Rectangle source = letter.font.recs[g];
++                const GlyphInfo &info = letter.font.glyphs[g];
++                if (codepoint != ' ')
++                    DrawTexturePro(letter.font.texture, source,
++                                   Rectangle{pen + info.offsetX * across, at.y + info.offsetY * down,
++                                             source.width * across, source.height * down},
++                                   Vector2{0.0f, 0.0f}, 0.0f, colour);
++                pen += info.advanceX * across;
++            }
++        }
++
+         Color toColor(HostOverlayColor c, float alpha)
+         {
+             return Color{c.r, c.g, c.b, static_cast<unsigned char>(std::lround(c.a * std::clamp(alpha, 0.0f, 1.0f)))};
+@@ -242,12 +434,9 @@ namespace ps2x
+     {
+         if (!(alpha > 0.0f) || text.empty())
+             return {};
+-        OverlayFont &loaded = overlayFont();
+-        const Font font = loaded.own ? loaded.font : GetFontDefault();
+-        // The default font is drawn as DrawText does (a pixel of spacing every 10 of size); Michroma is wide already.
+-        const float spacingPerSize = loaded.own ? 0.0f : 0.1f;
+-        const HostTextMeasure measure = [&](const std::string &line, float size)
+-        { return MeasureTextEx(font, line.c_str(), size, size * spacingPerSize).x; };
++        const OverlayLayout band = fpsOverlayLayout(GetScreenHeight());
++        const LetterFor letter = letterFor(static_cast<float>(band.fontSize));
++        const HostTextMeasure measure = [&](const std::string &line, float size) { return measureWith(letter, line, size); };
+         HostOverlayBox avoid;
+         const bool avoiding = place == HostOverlayPlace::TopLeft && recentHostOverlayBox(HostOverlayPlace::TopRight, avoid);
+         const HostOverlayBox box = hostOverlayBox(hostOverlayCaps(text, keepCaseFrom), place, GetScreenWidth(),
+@@ -263,10 +452,9 @@ namespace ps2x
+         {
+             const Vector2 at{std::round(box.x + box.stripe + box.padding),
+                              std::round(box.y + box.padding + i * box.fontSize)};
+-            const float spacing = box.fontSize * spacingPerSize;
+-            DrawTextEx(font, box.lines[i].c_str(), Vector2{at.x + shadow, at.y + shadow}, box.fontSize, spacing,
+-                       toColor(HostOverlayColor{0, 0, 0, 0xA0}, alpha));
+-            DrawTextEx(font, box.lines[i].c_str(), at, box.fontSize, spacing, toColor(kHostOverlayText, alpha));
++            drawWith(letter, box.lines[i], Vector2{at.x + shadow, at.y + shadow}, box.fontSize,
++                     toColor(HostOverlayColor{0, 0, 0, 0xA0}, alpha));
++            drawWith(letter, box.lines[i], at, box.fontSize, toColor(kHostOverlayText, alpha));
+         }
+         if (place == HostOverlayPlace::TopRight)
+         {
+@@ -276,6 +464,83 @@ namespace ps2x
+         return box;
+     }
+ 
++    HostFpsCounterLayout hostFpsCounterLayout(const std::string &value, const std::string &label, int windowWidth,
++                                              int windowHeight, const HostTextMeasure &measure, const HostTextInk *ink)
++    {
++        const OverlayLayout band = fpsOverlayLayout(windowHeight);
++        HostFpsCounterLayout c;
++        c.fontSize = static_cast<float>(band.fontSize);
++        c.padding = static_cast<float>(band.padding);
++        c.edge = std::max(1.0f, std::round(c.fontSize / 10.0f));
++        // In a race: the tower's letter size, smaller only if its ink would not fit above the edge.
++        float inkTop = 0.0f, inkHeight = 0.0f;
++        if (ink != nullptr && ink->fontSize > 0.0f && ink->bottom > ink->top)
++        {
++            const float room = static_cast<float>(band.height) - c.edge - 2.0f;
++            const float shrink = std::min(1.0f, room / (ink->bottom - ink->top));
++            c.fontSize = ink->fontSize * shrink;
++            inkTop = ink->top * shrink;
++            inkHeight = (ink->bottom - ink->top) * shrink;
++        }
++        c.label.width = std::ceil(measure(label, c.fontSize) + 2.0f * c.padding);
++        c.value.width = std::ceil(measure(value, c.fontSize) + 2.0f * c.padding);
++        c.label.height = c.value.height = static_cast<float>(band.height);
++        c.label.y = c.value.y = static_cast<float>(band.margin);
++        c.label.x = windowWidth - static_cast<float>(band.margin) - c.label.width;
++        c.value.x = c.label.x - c.value.width;
++        if (c.value.x < 0.0f) // a window too narrow: from its left edge
++        {
++            c.label.x -= c.value.x;
++            c.value.x = 0.0f;
++        }
++        c.textY = inkHeight > 0.0f ? std::round(c.label.y + (c.label.height - c.edge - inkHeight) / 2.0f - inkTop)
++                                   : std::round(c.label.y + c.padding - c.edge / 2.0f);
++        return c;
++    }
++
++    void drawHostFpsCounter(double gameFramesPerSecond)
++    {
++        const std::string value = gameFpsValue(gameFramesPerSecond);
++        // In a race, the position tower's letter at the size it has on screen; elsewhere, the notices' letter.
++        const int height = GetScreenHeight();
++        HostFontKind kind = HostFontKind::Default;
++        LetterFor letter = letterFor(static_cast<float>(fpsOverlayLayout(height).fontSize), &kind);
++        HostTextInk ink;
++        const GameLetter *tower = kind == HostFontKind::RaceHud ? readyLetter(kRaceTowerFontFile) : nullptr;
++        if (tower != nullptr)
++        {
++            const GamePictureScale picture = currentGamePictureScale(height);
++            letter = LetterFor{tower->font, 0.0f, picture.x / picture.y};
++            ink.fontSize = tower->lineHeight * picture.y; // as gameFontPixelSize, for the picture's height
++            const float scale = ink.fontSize / static_cast<float>(tower->lineHeight);
++            ink.top = tower->inkTop * scale;
++            ink.bottom = (tower->inkBottom + 1) * scale;
++        }
++        const HostTextMeasure measure = [&](const std::string &text, float size) { return measureWith(letter, text, size); };
++        const HostFpsCounterLayout c = hostFpsCounterLayout(value, kGameFpsLabel, GetScreenWidth(), height, measure,
++                                                            tower != nullptr ? &ink : nullptr);
++        const auto box = [&](const HostOverlayRect &r, HostOverlayColor fill)
++        {
++            DrawRectangle(static_cast<int>(r.x), static_cast<int>(r.y), static_cast<int>(r.width),
++                          static_cast<int>(r.height), toColor(fill, 1.0f));
++            DrawRectangle(static_cast<int>(r.x), static_cast<int>(r.y + r.height - c.edge), static_cast<int>(r.width),
++                          static_cast<int>(c.edge), toColor(kHostTowerEdge, 1.0f));
++        };
++        box(c.value, kHostTowerBlue);
++        box(c.label, kHostTowerWhite);
++        drawWith(letter, value, Vector2{std::round(c.value.x + c.padding), c.textY}, c.fontSize,
++                 toColor(kHostOverlayText, 1.0f));
++        drawWith(letter, kGameFpsLabel, Vector2{std::round(c.label.x + c.padding), c.textY}, c.fontSize,
++                 toColor(kHostTowerText, 1.0f));
++        g_recentTopRight = HostOverlayBox{};
++        g_recentTopRight.x = c.value.x;
++        g_recentTopRight.y = c.value.y;
++        g_recentTopRight.width = c.label.x + c.label.width - c.value.x;
++        g_recentTopRight.height = c.value.height;
++        g_recentTopRight.fontSize = c.fontSize;
++        g_recentTopRightAt = GetTime();
++    }
++
+     bool recentHostOverlayBox(HostOverlayPlace place, HostOverlayBox &box)
+     {
+         if (place != HostOverlayPlace::TopRight || g_recentTopRightAt < 0.0 || GetTime() - g_recentTopRightAt > 0.25)
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index e668e37..f4b7954 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -132,8 +132,8 @@ namespace ps2x
+              "El juego va a la misma velocidad con las dos.",
+              "0"},
+             {"mostrar_fps", "PS2X_MOSTRAR_FPS", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
+-             "Contador de fotogramas por segundo en una esquina (los del juego y la frecuencia del monitor): 1 = si,\n"
+-             "0 = no."},
++             "Contador de fotogramas por segundo del juego, arriba a la derecha (p. ej. 50 FPS, con la letra del\n"
++             "juego): 1 = si, 0 = no."},
+             {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
+             {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 7a23886..2337b32 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -82,7 +82,7 @@ namespace
+               {"vsync", "Sincronización vertical", {{"0", "No"}, {"1", "Sí"}},
+                "Sí: la imagen cambia al ritmo del monitor, sin cortes horizontales. El juego va a la misma velocidad."},
+               {"mostrar_fps", "Contador de FPS", {{"0", "No"}, {"1", "Sí"}},
+-               "Los fotogramas por segundo del juego y la frecuencia del monitor, en una esquina."}}},
++               "Los fotogramas por segundo del juego (p. ej. 50 FPS), con la letra del juego, arriba a la derecha."}}},
+             {"Gráficos",
+              {{"gs", "Dibujo de los gráficos", {{"gpu", "GPU (Vulkan)"}, {"cpu", "CPU (Software)"}},
+                "GPU: en la tarjeta gráfica, lo normal. CPU: el modo Software, más lento. Se aplica al reiniciar el "
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 41e44dc..32de1a6 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -45,6 +45,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_netplay_tests.cpp
+     src/ps2_netplay_audio_tests.cpp
+     src/ps2_high_ram_tests.cpp
++    src/ps2_game_font_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 64a9e57..d00b07b 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -26,6 +26,7 @@ void register_ps2_options_menu_tests();
+ void register_ps2_netplay_tests();
+ void register_ps2_netplay_audio_tests();
+ void register_ps2_high_ram_tests();
++void register_ps2_game_font_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -56,6 +57,7 @@ int main()
+     register_ps2_netplay_tests();
+     register_ps2_netplay_audio_tests();
+     register_ps2_high_ram_tests();
++    register_ps2_game_font_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_game_font_tests.cpp b/ps2xTest/src/ps2_game_font_tests.cpp
+new file mode 100644
+index 0000000..3ad3a95
+--- /dev/null
++++ b/ps2xTest/src/ps2_game_font_tests.cpp
+@@ -0,0 +1,413 @@
++#include "MiniTest.h"
++#include "ps2_display.h"
++#include "ps2_game_font.h"
++#include "ps2_host_overlay.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include "runtime/gs/ps2_gs_psmt4.h"
++
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <string>
++#include <vector>
++
++// Aspecto T2-T3: the game's letters (.bft) for the host's notices and the "50 FPS" counter. The samples are built here
++// (a small made-up font with the layout of the game's files); no byte of the game is in the tests.
++namespace
++{
++    struct SampleGlyph
++    {
++        uint32_t codepoint;
++        int x, y, width, height;
++        float advance, offsetX;
++        int pairPage; // records in its pair adjustment page, or -1
++    };
++
++    constexpr int kAtlasWidth = 128, kAtlasHeight = 128; // PSMT4: one GS page, sent as 64 x 32 CT32
++    constexpr int kLineHeight = 10;
++
++    const std::vector<SampleGlyph> &sampleGlyphs()
++    {
++        static const std::vector<SampleGlyph> glyphs = {
++            {0x41u, 4, 0, 6, 8, 7.0f, 1.0f, 1},       // A, with a pair adjustment page
++            {0xD1u, 20, 16, 7, 10, 8.0f, 0.0f, -1},   // N with tilde
++            {0x35u, 100, 40, 5, 9, 6.0f, -1.0f, 3},   // 5
++            {0x20u, 0, 0, 0, 10, 3.0f, 0.0f, -1},     // space
++        };
++        return glyphs;
++    }
++
++    // The palette index of an atlas pixel: inside a glyph, below its two clear top rows (the game's cells have room
++    // above the capitals), a pattern of 15 colours; elsewhere, 0 (clear).
++    constexpr int kClearTopRows = 2;
++    uint8_t sampleIndex(int x, int y)
++    {
++        for (const SampleGlyph &g : sampleGlyphs())
++            if (x >= g.x && x < g.x + g.width && y >= g.y + kClearTopRows && y < g.y + g.height)
++                return static_cast<uint8_t>(1 + (x * 3 + y * 5) % 15);
++        return 0u;
++    }
++
++    // White with the PS2 alpha: entry i, i * 8; the last one, 0x80 (opaque).
++    uint32_t samplePalette(int i)
++    {
++        const uint32_t alpha = i == 15 ? 0x80u : static_cast<uint32_t>(i) * 8u;
++        return 0x00FFFFFFu | (alpha << 24);
++    }
++
++    void put32(std::vector<uint8_t> &out, uint32_t v)
++    {
++        for (int i = 0; i < 4; ++i)
++            out.push_back(static_cast<uint8_t>(v >> (8 * i)));
++    }
++
++    void put64(std::vector<uint8_t> &out, uint64_t v)
++    {
++        for (int i = 0; i < 8; ++i)
++            out.push_back(static_cast<uint8_t>(v >> (8 * i)));
++    }
++
++    void putFloat(std::vector<uint8_t> &out, float f)
++    {
++        uint32_t v = 0;
++        std::memcpy(&v, &f, 4);
++        put32(out, v);
++    }
++
++    // A+D (BITBLTBUF, TRXPOS, TRXREG, TRXDIR) and an IMAGE tag with the CT32 data of a w x h rectangle.
++    void putUpload(std::vector<uint8_t> &out, uint32_t w, uint32_t h, const std::vector<uint8_t> &data)
++    {
++        put64(out, (1ull << 60) | (0ull << 58) | 4u); // GIF tag: 4 loops of A+D
++        put64(out, 0xEu);
++        put64(out, 0u);
++        put64(out, 0x50u);
++        put64(out, 0u);
++        put64(out, 0x51u);
++        put64(out, (uint64_t(h) << 32) | w);
++        put64(out, 0x52u);
++        put64(out, 0u);
++        put64(out, 0x53u);
++        put64(out, (2ull << 58) | (1ull << 15) | (data.size() / 16u)); // IMAGE, end of packet
++        put64(out, 0u);
++        out.insert(out.end(), data.begin(), data.end());
++    }
++
++    std::vector<uint8_t> sampleFont()
++    {
++        const std::vector<SampleGlyph> &glyphs = sampleGlyphs();
++        const uint32_t count = static_cast<uint32_t>(glyphs.size()), records = count + 2u;
++        std::vector<uint8_t> out;
++        put32(out, 0u);
++        put32(out, kLineHeight);
++        for (uint32_t v : {count, count, 2u, count + 1u, 0x41u, 0xFFFFFFFFu, count + 1u})
++            put32(out, v);
++        for (uint32_t i = 0; i < records; ++i)
++            put32(out, 0x00A44790u + i * 16u); // the tool's pointers
++        for (uint32_t i = 0; i < 2u; ++i)      // the two sentinels: junk, low byte of +0x44 = 1
++        {
++            for (int k = 0; k < 17; ++k)
++                put32(out, 0x00FFFFFFu);
++            put32(out, 0x00FFFF01u);
++        }
++        for (const SampleGlyph &g : glyphs)
++        {
++            put32(out, 0x00FF0000u | g.codepoint);
++            putFloat(out, static_cast<float>(g.width));
++            putFloat(out, static_cast<float>(g.height));
++            putFloat(out, g.x / float(kAtlasWidth));
++            putFloat(out, (g.x + g.width) / float(kAtlasWidth));
++            putFloat(out, 1.0f - (g.y + g.height) / float(kAtlasHeight));
++            putFloat(out, 1.0f - g.y / float(kAtlasHeight));
++            putFloat(out, g.advance);
++            putFloat(out, g.offsetX);
++            for (int v : {g.pairPage < 0 ? -1 : 0, 1, -1, 2, -1, 1, -2, 1})
++                put32(out, static_cast<uint32_t>(v));
++            put32(out, 0x00FFFF00u);
++        }
++        for (const SampleGlyph &g : glyphs) // pair adjustment pages (skipped by the decoder)
++        {
++            if (g.pairPage < 0)
++                continue;
++            const uint32_t n = static_cast<uint32_t>(g.pairPage);
++            for (uint32_t v : {n, n, 2u, n + 1u, 3u, 0xFFFFFFFFu, n + 1u})
++                put32(out, v);
++            for (uint32_t i = 0; i < (n + 2u) * (4u + 0x28u); ++i)
++                out.push_back(static_cast<uint8_t>(i * 7u));
++        }
++        // The texture: a header of an odd length (in the game's files the packets are not aligned either) ...
++        for (int i = 0; i < 0x2D; ++i)
++            out.push_back(static_cast<uint8_t>(0x78 + i));
++        // ... the picture: the PSMT4 atlas in GS memory, sent as 64 x 32 CT32 ...
++        std::vector<uint8_t> gs(8192u, 0u);
++        for (int y = 0; y < kAtlasHeight; ++y)
++            for (int x = 0; x < kAtlasWidth; ++x)
++            {
++                const uint32_t nibble = GSPSMT4::addrPSMT4(0u, 2u, x, y);
++                uint8_t &b = gs[nibble >> 1];
++                b = (nibble & 1u) ? static_cast<uint8_t>((b & 0x0Fu) | (sampleIndex(x, y) << 4))
++                                  : static_cast<uint8_t>((b & 0xF0u) | sampleIndex(x, y));
++            }
++        std::vector<uint8_t> picture;
++        for (uint32_t y = 0; y < 32u; ++y)
++            for (uint32_t x = 0; x < 64u; ++x)
++            {
++                const uint32_t at = GSPSMCT32::addrPSMCT32(0u, 1u, x, y);
++                picture.insert(picture.end(), gs.begin() + at, gs.begin() + at + 4);
++            }
++        putUpload(out, 64u, 32u, picture);
++        // ... and the palette, 8 x 2 CT32.
++        std::vector<uint8_t> palette;
++        for (int i = 0; i < 16; ++i)
++            put32(palette, samplePalette(i));
++        putUpload(out, 8u, 2u, palette);
++        return out;
++    }
++
++    bool decode(const std::vector<uint8_t> &bytes, ps2x::GameFont &font)
++    {
++        return ps2x::decodeGameFont(bytes.data(), bytes.size(), font);
++    }
++}
++
++void register_ps2_game_font_tests()
++{
++    MiniTest::Case("GameFont", [](TestCase &tc)
++    {
++        tc.Run("a .bft: line height, atlas and every glyph", [](TestCase &t)
++        {
++            ps2x::GameFont font;
++            t.IsTrue(decode(sampleFont(), font), "the sample decodes");
++            t.Equals(font.lineHeight, kLineHeight, "line height");
++            t.Equals(font.width, kAtlasWidth, "atlas width: twice the CT32 upload's");
++            t.Equals(font.height, kAtlasHeight, "atlas height: four times the CT32 upload's");
++            t.Equals(font.rgba.size(), static_cast<size_t>(kAtlasWidth * kAtlasHeight * 4), "RGBA atlas");
++            t.Equals(font.glyphs.size(), sampleGlyphs().size(), "the sentinels are not glyphs");
++            for (const SampleGlyph &s : sampleGlyphs())
++            {
++                const ps2x::GameFontGlyph *g = font.glyph(s.codepoint);
++                const std::string name = "glyph " + std::to_string(s.codepoint);
++                t.IsTrue(g != nullptr, name + " found");
++                if (g == nullptr)
++                    continue;
++                t.Equals(g->codepoint, s.codepoint, name + " codepoint (the low 16 bits)");
++                t.Equals(g->x, s.x, name + " x");
++                t.Equals(g->y, s.y, name + " y (from v1, the top of the atlas is v = 1)");
++                t.Equals(g->width, s.width, name + " width");
++                t.Equals(g->height, s.height, name + " height");
++                t.Equals(g->advance, s.advance, name + " advance");
++                t.Equals(g->offsetX, static_cast<int>(s.offsetX), name + " x offset");
++            }
++            t.IsTrue(font.glyph(0x42u) == nullptr, "no B in the sample");
++            // The rows the digits and capitals cover (A: 8 high, 5: 9 high; N with tilde is not one of them).
++            t.Equals(font.inkTop, kClearTopRows, "ink of the digits and capitals: from the first row with colour");
++            t.Equals(font.inkBottom, 8, "to the last one (the 5, 9 rows high)");
++        });
++
++        tc.Run("the atlas pixels: PSMT4 out of the CT32 upload, through the palette", [](TestCase &t)
++        {
++            ps2x::GameFont font;
++            t.IsTrue(decode(sampleFont(), font), "decodes");
++            if (font.rgba.size() != static_cast<size_t>(kAtlasWidth * kAtlasHeight * 4))
++                return;
++            int wrong = 0;
++            for (int y = 0; y < kAtlasHeight; ++y)
++                for (int x = 0; x < kAtlasWidth; ++x)
++                {
++                    const uint32_t c = samplePalette(sampleIndex(x, y));
++                    const uint32_t alpha = c >> 24;
++                    const uint8_t expected[4] = {0xFF, 0xFF, 0xFF,
++                                                 static_cast<uint8_t>(alpha >= 0x80u ? 255u : alpha * 2u)};
++                    if (std::memcmp(&font.rgba[(y * kAtlasWidth + x) * 4], expected, 4) != 0)
++                        ++wrong;
++                }
++            t.Equals(wrong, 0, "every pixel: white, PS2 alpha doubled (0x80 = 255)");
++            t.Equals(static_cast<int>(font.rgba[(0 * kAtlasWidth + 0) * 4 + 3]), 0, "outside the glyphs: clear");
++        });
++
++        tc.Run("bytes after the palette do not matter", [](TestCase &t)
++        {
++            std::vector<uint8_t> bytes = sampleFont();
++            bytes.insert(bytes.end(), 0x60, 0u);
++            ps2x::GameFont font;
++            t.IsTrue(decode(bytes, font), "decodes");
++            t.Equals(font.glyphs.size(), sampleGlyphs().size(), "all the glyphs");
++        });
++
++        tc.Run("a cut or damaged file is refused and the font is left as it was", [](TestCase &t)
++        {
++            const std::vector<uint8_t> whole = sampleFont();
++            int accepted = 0;
++            for (size_t size = 0; size < whole.size(); ++size)
++            {
++                ps2x::GameFont font;
++                font.lineHeight = 77;
++                if (ps2x::decodeGameFont(whole.data(), size, font) || font.lineHeight != 77 || !font.glyphs.empty())
++                    ++accepted;
++            }
++            t.Equals(accepted, 0, "every cut of the file refused, font untouched");
++
++            std::vector<uint8_t> huge = whole;
++            huge[8] = huge[9] = huge[10] = 0xFF; // count 0xFFFFFF glyphs
++            ps2x::GameFont font;
++            t.IsFalse(decode(huge, font), "a glyph count past the end");
++
++            std::vector<uint8_t> badPicture = whole;
++            const size_t image = whole.size() - (16u * 6u + 64u) - (16u * 6u + 8192u) + 16u * 5u;
++            badPicture[image] = 0x03; // IMAGE tag: 3 qwords instead of the 512 of a 64 x 32 CT32 picture
++            badPicture[image + 1] = 0x80;
++            t.IsFalse(decode(badPicture, font), "a picture of the wrong size");
++
++            t.IsFalse(ps2x::decodeGameFont(nullptr, 0u, font), "nothing");
++            const std::vector<uint8_t> noise(4096u, 0xA5u);
++            t.IsFalse(decode(noise, font), "noise");
++        });
++
++        tc.Run("the font files the game read: by name, with a version that changes with the bytes", [](TestCase &t)
++        {
++            std::vector<uint8_t> bytes;
++            uint32_t version = 99u;
++            t.IsFalse(ps2x::gameFontFile("Fonts/test-none.bft", bytes, version), "not read yet");
++            t.Equals(version, 99u, "version untouched");
++
++            t.IsTrue(ps2x::storeGameFontFile("Fonts/test-a.bft", {1u, 2u, 3u}), "new: stored");
++            t.IsTrue(ps2x::gameFontFile("Fonts/test-a.bft", bytes, version), "stored");
++            t.IsTrue(bytes == std::vector<uint8_t>{1u, 2u, 3u}, "its bytes");
++            t.Equals(version, 1u, "first version");
++
++            t.IsFalse(ps2x::storeGameFontFile("Fonts/test-a.bft", {1u, 2u, 3u}), "the same bytes: no change");
++            t.IsTrue(ps2x::gameFontFile("Fonts/test-a.bft", bytes, version), "read again by the game");
++            t.Equals(version, 1u, "the same bytes: the same version");
++
++            t.IsTrue(ps2x::storeGameFontFile("Fonts/test-a.bft", {4u}), "other bytes: a change");
++            t.IsTrue(ps2x::gameFontFile("Fonts/test-a.bft", bytes, version), "changed");
++            t.IsTrue(bytes == std::vector<uint8_t>{4u}, "the new bytes");
++            t.Equals(version, 2u, "a new version");
++            t.IsFalse(ps2x::gameFontFile("Fonts/test-b.bft", bytes, version), "another name is apart");
++        });
++
++        tc.Run("which game letter for a text size, and the fallback", [](TestCase &t)
++        {
++            const std::vector<int> heights = {15, 20, 25}; // Small, Medium, Large
++            t.Equals(ps2x::nearestGameFont(heights, 18.0f), 1, "18 px: Medium");
++            t.Equals(ps2x::nearestGameFont(heights, 17.5f), 1, "a tie: the larger");
++            t.Equals(ps2x::nearestGameFont(heights, 12.0f), 0, "small text: Small");
++            t.Equals(ps2x::nearestGameFont(heights, 54.0f), 2, "large text: Large");
++            t.Equals(ps2x::nearestGameFont({}, 18.0f), -1, "none read yet");
++
++            using K = ps2x::HostFontKind;
++            // hostFontKind(race on screen, race HUD letter read, menu letter read, built-in letter loaded)
++            t.IsTrue(ps2x::hostFontKind(true, true, true, true) == K::RaceHud, "in a race: the race HUD's letter");
++            t.IsTrue(ps2x::hostFontKind(false, true, true, true) == K::Menu, "in the menus: the menus' letter");
++            t.IsTrue(ps2x::hostFontKind(true, false, true, true) == K::Menu,
++                     "in a race before the HUD's letter is read: the menus' (still the game's)");
++            t.IsTrue(ps2x::hostFontKind(false, true, false, true) == K::RaceHud,
++                     "in the menus without the menus' letter: the HUD's (still the game's)");
++            t.IsTrue(ps2x::hostFontKind(true, false, false, true) == K::BuiltIn,
++                     "before the game reads any (or if none decodes): the built-in one");
++            t.IsTrue(ps2x::hostFontKind(false, false, false, true) == K::BuiltIn, "the same in the menus");
++            t.IsTrue(ps2x::hostFontKind(true, false, false, false) == K::Default, "else raylib's");
++            t.IsTrue(ps2x::hostFontKind(false, false, false, false) == K::Default, "else raylib's (menus)");
++        });
++
++        tc.Run("a race is on screen while its cameras draw", [](TestCase &t)
++        {
++            t.IsFalse(ps2x::raceCameraRecent(-1.0, 10.0), "no race camera yet");
++            t.IsTrue(ps2x::raceCameraRecent(10.0, 10.0), "a camera this frame");
++            t.IsTrue(ps2x::raceCameraRecent(10.0, 10.0 + ps2x::kRaceCameraWindow), "within the window");
++            t.IsFalse(ps2x::raceCameraRecent(10.0, 10.01 + ps2x::kRaceCameraWindow), "after it: back in the menus");
++            t.IsTrue(ps2x::kRaceCameraWindow >= 0.1 && ps2x::kRaceCameraWindow <= 1.0,
++                     "a short window (a few frames at 25-60 fps)");
++            ps2x::noteRaceCameraFrame();
++            t.IsTrue(ps2x::raceOnScreen(), "a camera noted now: a race on screen");
++        });
++
++        tc.Run("the game's letters at the game picture's scale", [](TestCase &t)
++        {
++            t.Equals(ps2x::gameFontPixelSize(16, ps2x::kGameFrameHeight), 16.0f, "the game's own frame: its size");
++            t.Equals(ps2x::gameFontPixelSize(16, 720), 22.5f, "a 720 row window: 720 / 512 times");
++            t.Equals(ps2x::gameFontPixelSize(16, 1440), 45.0f, "twice the window, twice the letter");
++            t.Equals(ps2x::gameFontPixelSize(0, 720), 0.0f, "no letter");
++
++            const ps2x::GamePictureScale four3 = ps2x::gamePictureScale(960.0f, 720.0f, 720);
++            t.Equals(four3.x, 1.875f, "4:3 in 960 x 720: 960 / 512 across");
++            t.Equals(four3.y, 1.40625f, "and 720 / 512 down");
++            const ps2x::GamePictureScale wide = ps2x::gamePictureScale(1280.0f, 720.0f, 720);
++            t.Equals(wide.x, 2.5f, "16:9: wider across");
++            t.Equals(wide.y, 1.40625f, "the same down");
++            const ps2x::GamePictureScale none = ps2x::gamePictureScale(0.0f, 0.0f, 720);
++            t.Equals(none.x, 1.875f, "no picture yet: 4:3 as high as the window");
++            t.Equals(none.y, 1.40625f, "no picture yet: the window's height");
++            ps2x::noteGamePicture(1280.0f, 720.0f);
++            t.Equals(ps2x::currentGamePictureScale(1080).x, 2.5f, "the picture noted, not the window");
++        });
++
++        tc.Run("the FPS counter: only the game's frames per second, as 50 FPS", [](TestCase &t)
++        {
++            t.Equals(ps2x::gameFpsText(50.0), std::string("50 FPS"), "50");
++            t.Equals(ps2x::gameFpsText(49.6), std::string("50 FPS"), "rounded");
++            t.Equals(ps2x::gameFpsText(59.94), std::string("60 FPS"), "NTSC");
++            t.Equals(ps2x::gameFpsText(30.4), std::string("30 FPS"), "rounded down");
++            t.Equals(ps2x::gameFpsText(0.0), std::string("0 FPS"), "stopped");
++            t.Equals(ps2x::gameFpsText(-3.0), std::string("0 FPS"), "never negative");
++            t.Equals(ps2x::gameFpsText(std::numeric_limits<double>::quiet_NaN()), std::string("0 FPS"), "not a number");
++            t.Equals(ps2x::gameFpsText(1e9), std::string("999 FPS"), "three digits at most");
++            t.Equals(ps2x::gameFpsValue(49.6), std::string("50"), "the number apart");
++            t.Equals(std::string(ps2x::kGameFpsLabel), std::string("FPS"), "and the label");
++        });
++
++        tc.Run("the FPS counter's boxes: the number, then FPS, top right, above the game's HUD", [](TestCase &t)
++        {
++            const ps2x::HostTextMeasure measure = [](const std::string &text, float size)
++            { return static_cast<float>(text.size()) * size * 0.6f; };
++            for (int height : {240, 480, 720, 1080, 2160})
++            {
++                const int width = height * 4 / 3;
++                const ps2x::OverlayLayout band = ps2x::fpsOverlayLayout(height);
++                const ps2x::HostFpsCounterLayout c = ps2x::hostFpsCounterLayout("50", "FPS", width, height, measure);
++                const std::string at = " (" + std::to_string(height) + " rows)";
++                t.Equals(c.fontSize, static_cast<float>(band.fontSize), "the counter's text size" + at);
++                t.Equals(c.label.y, static_cast<float>(band.margin), "at the top" + at);
++                t.Equals(c.label.height, static_cast<float>(band.height), "the band's height" + at);
++                t.Equals(c.value.y, c.label.y, "both boxes on one line" + at);
++                t.Equals(c.value.height, c.label.height, "both boxes as high" + at);
++                t.Equals(c.label.x + c.label.width, static_cast<float>(width - band.margin), "on the right" + at);
++                t.Equals(c.value.x + c.value.width, c.label.x, "the number just left of FPS" + at);
++                t.IsTrue(c.value.width >= measure("50", c.fontSize) + 2.0f * c.padding, "the number fits" + at);
++                t.IsTrue(c.label.width >= measure("FPS", c.fontSize) + 2.0f * c.padding, "FPS fits" + at);
++                t.IsTrue(c.value.x >= 0.0f, "inside the window" + at);
++                if (height >= 480) // fpsOverlayLayout: a 10 pixel letter at least, so 4 % from 480 rows up
++                    t.IsTrue(c.label.y + c.label.height <= height * 4 / 100 + 1, "above the game's HUD (4 %)" + at);
++                t.IsTrue(c.edge >= 1.0f && c.edge < c.label.height / 2.0f, "a thin edge under the boxes" + at);
++                t.Equals(c.textY, std::round(c.label.y + c.padding - c.edge / 2.0f), "text at the padding" + at);
++            }
++        });
++
++        tc.Run("the FPS counter in a race: the tower's letter size, its ink centred in the boxes", [](TestCase &t)
++        {
++            const ps2x::HostTextMeasure measure = [](const std::string &text, float size)
++            { return static_cast<float>(text.size()) * size * 0.45f; };
++            // fruitigerMedium: a 16 row line, capitals from row 4 to row 12 (9 rows), at the scale of a 720 row window.
++            const float size = ps2x::gameFontPixelSize(16, 720), scale = size / 16.0f;
++            const ps2x::HostTextInk ink{size, 4.0f * scale, 13.0f * scale};
++            const ps2x::OverlayLayout band = ps2x::fpsOverlayLayout(720);
++            const ps2x::HostFpsCounterLayout c = ps2x::hostFpsCounterLayout("50", "FPS", 960, 720, measure, &ink);
++            t.Equals(c.fontSize, size, "the tower's letter size");
++            t.Equals(c.label.height, static_cast<float>(band.height), "the band's height");
++            t.Equals(c.label.x + c.label.width, static_cast<float>(960 - band.margin), "on the right");
++            t.IsTrue(c.value.width >= measure("50", size) + 2.0f * c.padding, "the number fits at that size");
++            const float inkTop = c.textY + ink.top, inkBottom = c.textY + ink.bottom;
++            const float boxBottom = c.label.y + c.label.height - c.edge;
++            t.IsTrue(inkTop >= c.label.y && inkBottom <= boxBottom, "the ink inside the boxes, above the edge");
++            t.IsTrue(std::fabs((inkTop - c.label.y) - (boxBottom - inkBottom)) <= 1.0f, "centred (to a pixel)");
++            t.Equals(c.textY, std::round(c.textY), "on a whole pixel");
++
++            const ps2x::HostTextInk tall{60.0f, 10.0f, 50.0f}; // ink 40 rows high: more than the box
++            const ps2x::HostFpsCounterLayout s = ps2x::hostFpsCounterLayout("50", "FPS", 960, 720, measure, &tall);
++            const float shrink = s.fontSize / tall.fontSize;
++            t.IsTrue(s.fontSize < tall.fontSize, "too tall for the band: smaller");
++            t.IsTrue(s.textY + tall.top * shrink >= s.label.y - 0.5f &&
++                         s.textY + tall.bottom * shrink <= s.label.y + s.label.height - s.edge + 0.5f,
++                     "and then its ink fits");
++        });
++    });
++}

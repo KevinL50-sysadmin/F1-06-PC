@@ -1,0 +1,111 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c09970c..03e3103 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -414,22 +416,25 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     // parallel (software GS rasterisation, VU1 interpretation, waits) also takes wall time. Without
+     // this the EE timers fall thousands of times behind real time and games whose clock is T0
+     // overflow-driven (F1 06) never finish their time-based fades. Catch the EE clock up to wall time
+-    // (it never runs ahead of it: deadlines are already paced by host time). The IOP keeps counting
+-    // executed cycles only, so it is not flooded with a large catch-up slice.
++    // (it never runs ahead of it: deadlines are already paced by host time).
+     uint64_t catchUp = 0u;
++    bool report = false;
+     {
+         static std::chrono::steady_clock::time_point s_hostStart{};
+         static uint64_t s_cycleStart = 0u;
+         static uint32_t s_callsSinceCheck = 0u;
++        static std::chrono::steady_clock::time_point s_reportStart{};
+         if (s_hostStart == std::chrono::steady_clock::time_point{})
+         {
+             s_hostStart = std::chrono::steady_clock::now();
++            s_reportStart = s_hostStart;
+             s_cycleStart = m_eeCycle;
+         }
+         else if (++s_callsSinceCheck >= 64u)
+         {
+             s_callsSinceCheck = 0u;
+-            const auto hostElapsed = std::chrono::steady_clock::now() - s_hostStart;
++            const auto now = std::chrono::steady_clock::now();
++            const auto hostElapsed = now - s_hostStart;
+             const uint64_t hostMicros = static_cast<uint64_t>(
+                 std::chrono::duration_cast<std::chrono::microseconds>(hostElapsed).count());
+             const uint64_t hostCycle = s_cycleStart + microsecondsToEeCycles(hostMicros);
+@@ -438,11 +443,67 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+                 catchUp = hostCycle - m_eeCycle;
+                 m_eeCycle = hostCycle;
+             }
++            if (now - s_reportStart >= std::chrono::seconds(10))
++            {
++                s_reportStart = now;
++                report = true;
++            }
+         }
+     }
+ 
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed + catchUp);
+-    m_runtime.advanceIopEeCycles(elapsed);
++
++    // The IOP gets the wall-time catch-up too, spread over the following calls (at most about 2 ms of it per call).
++    // With only the executed EE cycles it ran 25-35 times slower than real time in a race, where the EE spends most of
++    // its wall time in the VU1 and the GS: every file or stream read over the IOP took tens of seconds and the race
++    // stood still meanwhile. An idle IOP jumps straight to its next event, so the catch-up only costs host time when it
++    // has work; if it cannot keep up, the debt is capped at 100 ms. PS2X_IOP_TIEMPO_REAL=0: executed cycles only.
++    // "[iop:ritmo]" (every 10 s): IOP cycles per second (36.8 MHz on the real console) and the time dropped.
++    {
++        static const bool s_iopRealTime = []
++        {
++            const char *value = std::getenv("PS2X_IOP_TIEMPO_REAL");
++            return value == nullptr || value[0] != '0';
++        }();
++        constexpr uint64_t kIopCatchUpPerCall = microsecondsToEeCycles(2000u);
++        constexpr uint64_t kMaxIopDebt = microsecondsToEeCycles(100000u);
++        static uint64_t s_iopDebt = 0u;
++        static uint64_t s_iopGiven = 0u;
++        static uint64_t s_iopDropped = 0u;
++        static std::chrono::steady_clock::time_point s_iopReportStart = std::chrono::steady_clock::now();
++        uint64_t iopCycles = elapsed;
++        if (s_iopRealTime)
++        {
++            s_iopDebt += catchUp;
++            if (s_iopDebt > kMaxIopDebt)
++            {
++                s_iopDropped += s_iopDebt - kMaxIopDebt;
++                s_iopDebt = kMaxIopDebt;
++            }
++            const uint64_t extra = std::min(s_iopDebt, kIopCatchUpPerCall);
++            s_iopDebt -= extra;
++            iopCycles += extra;
++        }
++        else
++        {
++            s_iopDropped += catchUp;
++        }
++        m_runtime.advanceIopEeCycles(iopCycles);
++        s_iopGiven += iopCycles;
++        if (report)
++        {
++            const auto now = std::chrono::steady_clock::now();
++            const double seconds = std::chrono::duration<double>(now - s_iopReportStart).count();
++            const double total = static_cast<double>(s_iopGiven + s_iopDropped);
++            std::fprintf(stderr, "[iop:ritmo] ciclosIOP/s=%.0f deuda=%.1fms descartado=%.0f%%\n",
++                         static_cast<double>(s_iopGiven) / 8.0 / seconds,
++                         1000.0 * static_cast<double>(s_iopDebt) / static_cast<double>(EeScheduler::kEeClockHz),
++                         total > 0.0 ? 100.0 * static_cast<double>(s_iopDropped) / total : 0.0);
++            s_iopReportStart = now;
++            s_iopGiven = 0u;
++            s_iopDropped = 0u;
++        }
++    }
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);

@@ -1,0 +1,345 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index f5037a9..042812c 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -356,9 +356,57 @@ namespace
+     {
+         bool gamepad = false;
+         int pad = 0;
++        bool dualSense = false; // DualSense por Bluetooth leido por HID (parche 0117): sustituye al mando de raylib
++        ps2_pad_win::DualSenseInput ds;
+         ps2_pad_win::JoystickState wheel;
+     };
+ 
++    bool padButtonDown(const Frame &f, int code)
++    {
++        if (!f.dualSense)
++            return IsGamepadButtonDown(f.pad, code);
++        const ps2_pad_win::DualSenseInput &d = f.ds;
++        switch (code)
++        {
++        case GAMEPAD_BUTTON_RIGHT_FACE_DOWN: return d.cross;
++        case GAMEPAD_BUTTON_RIGHT_FACE_RIGHT: return d.circle;
++        case GAMEPAD_BUTTON_RIGHT_FACE_LEFT: return d.square;
++        case GAMEPAD_BUTTON_RIGHT_FACE_UP: return d.triangle;
++        case GAMEPAD_BUTTON_LEFT_TRIGGER_1: return d.l1;
++        case GAMEPAD_BUTTON_RIGHT_TRIGGER_1: return d.r1;
++        case GAMEPAD_BUTTON_LEFT_TRIGGER_2: return d.l2Button;
++        case GAMEPAD_BUTTON_RIGHT_TRIGGER_2: return d.r2Button;
++        case GAMEPAD_BUTTON_LEFT_THUMB: return d.l3;
++        case GAMEPAD_BUTTON_RIGHT_THUMB: return d.r3;
++        case GAMEPAD_BUTTON_MIDDLE_LEFT: return d.create;
++        case GAMEPAD_BUTTON_MIDDLE: return d.ps;
++        case GAMEPAD_BUTTON_MIDDLE_RIGHT: return d.options;
++        case GAMEPAD_BUTTON_LEFT_FACE_UP: return d.up;
++        case GAMEPAD_BUTTON_LEFT_FACE_DOWN: return d.down;
++        case GAMEPAD_BUTTON_LEFT_FACE_LEFT: return d.left;
++        case GAMEPAD_BUTTON_LEFT_FACE_RIGHT: return d.right;
++        default: return false;
++        }
++    }
++
++    // Como GetGamepadAxisMovement: sticks de -1 a 1, gatillos de -1 (suelto) a 1 (a fondo).
++    float padAxis(const Frame &f, int code)
++    {
++        if (!f.dualSense)
++            return GetGamepadAxisMovement(f.pad, code);
++        const ps2_pad_win::DualSenseInput &d = f.ds;
++        switch (code)
++        {
++        case GAMEPAD_AXIS_LEFT_X: return d.lx;
++        case GAMEPAD_AXIS_LEFT_Y: return d.ly;
++        case GAMEPAD_AXIS_RIGHT_X: return d.rx;
++        case GAMEPAD_AXIS_RIGHT_Y: return d.ry;
++        case GAMEPAD_AXIS_LEFT_TRIGGER: return d.l2 * 2.0f - 1.0f;
++        case GAMEPAD_AXIS_RIGHT_TRIGGER: return d.r2 * 2.0f - 1.0f;
++        default: return 0.0f;
++        }
++    }
++
+     float sourceValue(const Source &s, const Config &cfg, const Frame &f)
+     {
+         switch (s.kind)
+@@ -366,16 +414,15 @@ namespace
+         case SourceKind::Key:
+             return IsKeyDown(s.code) ? 1.0f : 0.0f;
+         case SourceKind::PadButton:
+-            return f.gamepad && IsGamepadButtonDown(f.pad, s.code) ? 1.0f : 0.0f;
++            return f.gamepad && padButtonDown(f, s.code) ? 1.0f : 0.0f;
+         case SourceKind::PadTrigger:
+             // raylib: -1 suelto, 1 a fondo.
+-            return f.gamepad ? deadzoned(std::clamp((GetGamepadAxisMovement(f.pad, s.code) + 1.0f) * 0.5f, 0.0f, 1.0f), 0.05f)
+-                             : 0.0f;
++            return f.gamepad ? deadzoned(std::clamp((padAxis(f, s.code) + 1.0f) * 0.5f, 0.0f, 1.0f), 0.05f) : 0.0f;
+         case SourceKind::PadAxis:
+         {
+             if (!f.gamepad)
+                 return 0.0f;
+-            const float v = GetGamepadAxisMovement(f.pad, s.code) * (s.mode == '-' ? -1.0f : 1.0f);
++            const float v = padAxis(f, s.code) * (s.mode == '-' ? -1.0f : 1.0f);
+             return v > 0.0f ? deadzoned(v, cfg.deadzone) : 0.0f;
+         }
+         case SourceKind::WheelAxis:
+@@ -439,7 +486,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+ 
+     Frame f;
+     f.pad = cfg.gamepad;
+-    f.gamepad = cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad);
++    f.dualSense = cfg.gamepad >= 0 && ps2_pad_win::readDualSenseBluetooth(f.ds);
++    f.gamepad = f.dualSense || (cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad));
+     ps2_pad_win::readWheel(f.wheel);
+ 
+     float value[kTargetCount] = {};
+@@ -495,7 +543,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+                          data[7], data[4], data[5]);
+             for (int i = 8; i < 20; ++i)
+                 std::fprintf(stderr, "%s%u", i == 8 ? "" : ",", data[i]);
+-            std::fprintf(stderr, " mando=%d volante=%d\n", f.gamepad ? 1 : 0, f.wheel.present ? 1 : 0);
++            std::fprintf(stderr, " mando=%d%s volante=%d\n", f.gamepad ? 1 : 0, f.dualSense ? " (DualSense HID)" : "",
++                         f.wheel.present ? 1 : 0);
+         }
+     }
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+index 6ac517b..b05d9a8 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -118,18 +118,17 @@ namespace
+     // solo cuando cambian (WriteFile puede tardar ~1 ms y la llamada viene del hilo del EE). USB: informe 0x02 de 48
+     // bytes; Bluetooth: informe 0x31 de 78 bytes con CRC32 (semilla 0xA2), como SDL (hidapi_ps5). Bits de efectos:
+     // 0x01 vibracion compatible, 0x02 sin hapticos de audio; motor derecho = agudo (pequeno), izquierdo = grave.
+-    class DualSenseRumble
++    // Parche 0117: por Bluetooth, el primer informe 0x31 pasa el mando a enviar sus entradas en el informe completo
++    // 0x31 y raylib deja de verlas; un segundo hilo las lee por HID (informe simple 0x01 o completo 0x31). El mando se
++    // busca cada 5 s aunque no haya vibracion, y si el lector pierde el mando se vuelve a buscar.
++    class DualSenseHid
+     {
+     public:
+         void set(uint8_t agudo, uint8_t grave)
+         {
+             {
+                 std::lock_guard<std::mutex> lock(m_mutex);
+-                if (!m_started)
+-                {
+-                    m_started = true;
+-                    std::thread([this] { loop(); }).detach();
+-                }
++                startLocked();
+                 m_small = agudo;
+                 m_large = grave;
+                 m_pending = true;
+@@ -137,7 +136,108 @@ namespace
+             m_cv.notify_one();
+         }
+ 
++        bool readInput(ps2_pad_win::DualSenseInput &out)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            startLocked();
++            if (!m_inputValid)
++                return false;
++            out = m_input;
++            return true;
++        }
++
+     private:
++        void startLocked()
++        {
++            if (m_started)
++                return;
++            m_started = true;
++            std::thread([this] { loop(); }).detach();
++        }
++
++        // Informe simple 0x01 (Bluetooth sin activar) o completo 0x31 (Bluetooth activado), como SDL (hidapi_ps5).
++        static bool parseInput(const uint8_t *r, DWORD size, ps2_pad_win::DualSenseInput &o)
++        {
++            uint8_t lx, ly, rx, ry, l2, r2, b0, b1, b2;
++            if (r[0] == 0x31 && size >= 13u)
++            {
++                const uint8_t *p = r + 2; // r[1]: secuencia y banderas
++                lx = p[0], ly = p[1], rx = p[2], ry = p[3], l2 = p[4], r2 = p[5]; // p[6]: contador
++                b0 = p[7], b1 = p[8], b2 = p[9];
++            }
++            else if (r[0] == 0x01 && size >= 10u)
++            {
++                const uint8_t *p = r + 1;
++                lx = p[0], ly = p[1], rx = p[2], ry = p[3];
++                b0 = p[4], b1 = p[5], b2 = p[6], l2 = p[7], r2 = p[8];
++            }
++            else
++                return false;
++            auto stick = [](uint8_t v) { return std::clamp((static_cast<float>(v) - 128.0f) / 127.0f, -1.0f, 1.0f); };
++            o.lx = stick(lx);
++            o.ly = stick(ly);
++            o.rx = stick(rx);
++            o.ry = stick(ry);
++            o.l2 = static_cast<float>(l2) / 255.0f;
++            o.r2 = static_cast<float>(r2) / 255.0f;
++            const unsigned hat = b0 & 0x0Fu; // 0 arriba, en el sentido del reloj; 8 suelta
++            o.up = hat == 0u || hat == 1u || hat == 7u;
++            o.right = hat >= 1u && hat <= 3u;
++            o.down = hat >= 3u && hat <= 5u;
++            o.left = hat >= 5u && hat <= 7u;
++            o.square = (b0 & 0x10u) != 0u;
++            o.cross = (b0 & 0x20u) != 0u;
++            o.circle = (b0 & 0x40u) != 0u;
++            o.triangle = (b0 & 0x80u) != 0u;
++            o.l1 = (b1 & 0x01u) != 0u;
++            o.r1 = (b1 & 0x02u) != 0u;
++            o.l2Button = (b1 & 0x04u) != 0u;
++            o.r2Button = (b1 & 0x08u) != 0u;
++            o.create = (b1 & 0x10u) != 0u;
++            o.options = (b1 & 0x20u) != 0u;
++            o.l3 = (b1 & 0x40u) != 0u;
++            o.r3 = (b1 & 0x80u) != 0u;
++            o.ps = (b2 & 0x01u) != 0u;
++            return true;
++        }
++
++        // Hilo lector (solo Bluetooth), con su propio handle: en un handle sin OVERLAPPED un ReadFile bloqueado
++        // pararia los WriteFile de la vibracion.
++        void readLoop(std::wstring path, DWORD reportSize)
++        {
++            HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                                        OPEN_EXISTING, 0, nullptr);
++            std::vector<uint8_t> buffer(std::max<DWORD>(reportSize, 78u));
++            bool first = true;
++            while (handle != INVALID_HANDLE_VALUE)
++            {
++                DWORD read = 0;
++                if (!ReadFile(handle, buffer.data(), reportSize, &read, nullptr))
++                    break;
++                ps2_pad_win::DualSenseInput input;
++                if (!parseInput(buffer.data(), read, input))
++                    continue;
++                if (first)
++                {
++                    first = false;
++                    std::fprintf(stderr, "[pad] DualSense por Bluetooth: entradas por HID (informe 0x%02x)\n", buffer[0]);
++                }
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_input = input;
++                m_inputValid = true;
++            }
++            if (handle != INVALID_HANDLE_VALUE)
++                CloseHandle(handle);
++            std::fprintf(stderr, "[pad] DualSense por Bluetooth: se dejan de leer sus entradas (desconectado)\n");
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_inputValid = false;
++                m_readerRunning = false;
++                m_lost = true;
++            }
++            m_cv.notify_one();
++        }
++
+         static uint32_t crc32(uint32_t crc, const uint8_t *data, size_t size)
+         {
+             crc = ~crc;
+@@ -193,6 +293,18 @@ namespace
+                     m_bluetooth = caps.OutputReportByteLength != 48u;
+                     std::fprintf(stderr, "[pad] DualSense por %s (HID %04x:%04x): vibracion por HID\n",
+                                  m_bluetooth ? "Bluetooth" : "USB", attributes.VendorID, attributes.ProductID);
++                    if (m_bluetooth)
++                    {
++                        std::lock_guard<std::mutex> lock(m_mutex);
++                        if (!m_readerRunning)
++                        {
++                            m_readerRunning = true;
++                            std::thread([this, path = std::wstring(detail->DevicePath),
++                                         size = static_cast<DWORD>(caps.InputReportByteLength)]
++                                        { readLoop(path, size); })
++                                .detach();
++                        }
++                    }
+                 }
+                 else
+                     CloseHandle(handle);
+@@ -234,13 +346,22 @@ namespace
+             for (;;)
+             {
+                 uint8_t agudo = 0, grave = 0;
++                bool lost = false;
+                 {
++                    // Sin peticiones tambien despierta cada segundo: el mando se busca aunque no haya vibracion.
+                     std::unique_lock<std::mutex> lock(m_mutex);
+-                    m_cv.wait(lock, [this] { return m_pending; });
++                    m_cv.wait_for(lock, std::chrono::seconds(1), [this] { return m_pending || m_lost; });
+                     m_pending = false;
++                    lost = m_lost;
++                    m_lost = false;
+                     agudo = m_small;
+                     grave = m_large;
+                 }
++                if (lost && m_handle != INVALID_HANDLE_VALUE)
++                {
++                    CloseHandle(m_handle); // el lector lo perdio: se vuelve a buscar
++                    m_handle = INVALID_HANDLE_VALUE;
++                }
+                 if (m_handle == INVALID_HANDLE_VALUE)
+                 {
+                     // Se busca como mucho cada 5 s (se puede conectar con el juego en marcha).
+@@ -271,14 +392,16 @@ namespace
+         std::mutex m_mutex;
+         std::condition_variable m_cv;
+         bool m_started = false, m_pending = false, m_bluetooth = false;
++        bool m_readerRunning = false, m_lost = false, m_inputValid = false;
+         uint8_t m_small = 0, m_large = 0;
+         uint32_t m_sentAgudo = 0xFFFFu, m_sentGrave = 0xFFFFu;
+         HANDLE m_handle = INVALID_HANDLE_VALUE;
++        ps2_pad_win::DualSenseInput m_input;
+     };
+ 
+-    DualSenseRumble &dualSense()
++    DualSenseHid &dualSense()
+     {
+-        static DualSenseRumble *s_instance = new DualSenseRumble(); // nunca se destruye: su hilo vive hasta el final
++        static DualSenseHid *s_instance = new DualSenseHid(); // nunca se destruye: sus hilos viven hasta el final
+         return *s_instance;
+     }
+ 
+@@ -481,6 +604,11 @@ namespace ps2_pad_win
+         dualSense().set(static_cast<uint8_t>(std::clamp(smallMotor, 0.0f, 1.0f) * 255.0f),
+                         static_cast<uint8_t>(std::clamp(largeMotor, 0.0f, 1.0f) * 255.0f));
+     }
++
++    bool readDualSenseBluetooth(DualSenseInput &out)
++    {
++        return dualSense().readInput(out);
++    }
+ }
+ 
+ #else
+@@ -494,6 +622,7 @@ namespace ps2_pad_win
+     std::string wheelName() { return {}; }
+     void setRumbleEnabled(bool) {}
+     void setRumble(float, float) {}
++    bool readDualSenseBluetooth(DualSenseInput &) { return false; }
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.h b/ps2xRuntime/src/lib/ps2_pad_win.h
+index fc4be5e..38f48af 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.h
++++ b/ps2xRuntime/src/lib/ps2_pad_win.h
+@@ -29,4 +29,19 @@ namespace ps2_pad_win
+     // Vibracion del mando XInput 0 (motor pequeno y grande, de 0 a 1).
+     void setRumbleEnabled(bool enabled);
+     void setRumble(float smallMotor, float largeMotor);
++
++    // DualSense por Bluetooth leido por HID (parche 0117). Al mandarle la vibracion (informe 0x31) pasa a enviar sus
++    // entradas en el informe completo 0x31, que raylib no entiende: se quedaba con lo ultimo que leyo. Mientras haya un
++    // DualSense por Bluetooth, sus entradas salen de aqui en vez de raylib.
++    struct DualSenseInput
++    {
++        float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f; // de -1 a 1 (arriba = -1, como raylib)
++        float l2 = 0.0f, r2 = 0.0f;                       // gatillos, de 0 a 1
++        bool cross = false, circle = false, square = false, triangle = false;
++        bool l1 = false, r1 = false, l2Button = false, r2Button = false, l3 = false, r3 = false;
++        bool create = false, options = false, ps = false;
++        bool up = false, down = false, left = false, right = false;
++    };
++    // true si hay un DualSense por Bluetooth mandando entradas (y deja en out las ultimas).
++    bool readDualSenseBluetooth(DualSenseInput &out);
+ }

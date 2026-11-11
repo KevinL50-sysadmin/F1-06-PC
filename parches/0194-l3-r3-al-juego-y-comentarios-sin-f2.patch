@@ -1,0 +1,172 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index 827e9f9..93bfa7d 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -140,8 +140,8 @@ namespace ps2x
+     // the main menu, 2 PC SETTINGS, 3 PC DISPLAY, 4 PC NETPLAY; src/f1_overrides.cpp); empty for any other page.
+     const std::vector<std::string> &gameOptionsPageKeys(int page);
+     // Nativizacion T6: red_puerto, red_calidad and red_publicas apply when the host starts, so they are fixed while it
+-    // runs or is asked to start (hosting): the F2 menu shows them disabled and the game's OPTIONS > PC NETPLAY page
+-    // cannot change them (PS2OptionsMenu::setGameOptionNumber, setGameOptionText, resetGameOptions).
++    // runs or is asked to start (hosting): the game's OPTIONS > PC NETPLAY page cannot change them (nor the test-only
++    // ImGui window, which shows them disabled; PS2OptionsMenu::setGameOptionNumber, setGameOptionText, resetGameOptions).
+     bool netplayOptionLocked(std::string_view key, bool hosting);
+     // The values to write: current, except the forced options, which keep the file's value.
+     std::map<std::string, std::string> menuValuesToSave(const OptionsMenuModel &model);
+@@ -157,6 +157,6 @@ namespace ps2x
+     // an unknown key or a value of another form (tamano_ventana).
+     bool menuOptionNumber(const OptionsMenuModel &model, const std::string &key, float &number);
+     // The value a number stands for (rounded to the nearest integer), through setMenuOption. alta_resolucion = 1 also
+-    // needs highResolutionAvailable, as the F2 menu's row.
++    // needs highResolutionAvailable, as the ImGui window's row.
+     bool setMenuOptionNumber(OptionsMenuModel &model, const std::string &key, float number);
+ }
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index d557324..dde5f02 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -24,14 +24,6 @@ namespace ps2x
+ {
+     constexpr uint16_t kPadL3 = 1u << 1, kPadR3 = 1u << 2; // pressed-button bits, in the PS2's order
+ 
+-    // pressed: pressed-button bits (1 = pressed). L3 and R3 held together: the game sees neither (they opened the menu
+-    // until Nativizacion T17; ps2_pad.cpp still hides them).
+-    inline uint16_t maskMenuCombo(uint16_t pressed)
+-    {
+-        constexpr uint16_t combo = kPadL3 | kPadR3;
+-        return (pressed & combo) == combo ? static_cast<uint16_t>(pressed & ~combo) : pressed;
+-    }
+-
+     // Foto y repeticion T3: L3 or R3 pressed alone (the photo mode's buttons, ps2_photo_mode.h). It acts when let go, and
+     // only if the other one was not held at any moment of the press: L3+R3 held together triggers neither. cancel:
+     // forget the press in progress (the options menu opened).
+diff --git a/ps2xRuntime/src/lib/ps2_camera_fov.h b/ps2xRuntime/src/lib/ps2_camera_fov.h
+index 7ac2ac9..9100ba5 100644
+--- a/ps2xRuntime/src/lib/ps2_camera_fov.h
++++ b/ps2xRuntime/src/lib/ps2_camera_fov.h
+@@ -4,7 +4,7 @@
+ #include <cmath>
+ 
+ // Fase 5 (T12, F1 06): the race cameras' field of view (opciones.ini fov: 0 = the game's, 5 to 30 = that percent
+-// wider; AJUSTES PC and the F2 menu). The game gives every race camera a half angle (vertical, in radians) through
++// wider; OPTIONS > PC OPTIONS > PC SETTINGS). The game gives every race camera a half angle (vertical, in radians) through
+ // func_2C5948; src/f1_overrides.cpp widens it there on every frame, so a change shows on the next frame.
+ namespace ps2x
+ {
+diff --git a/ps2xRuntime/src/lib/ps2_hud.h b/ps2xRuntime/src/lib/ps2_hud.h
+index e716366..d48ce63 100644
+--- a/ps2xRuntime/src/lib/ps2_hud.h
++++ b/ps2xRuntime/src/lib/ps2_hud.h
+@@ -4,7 +4,7 @@
+ #include <string>
+ #include <string_view>
+ 
+-// Fase 5 (T9, F1 06): the race HUD (opciones.ini hud: completo, minimo or oculto; AJUSTES PC and the F2 menu). The game
++// Fase 5 (T9, F1 06): the race HUD (opciones.ini hud: completo, minimo or oculto; OPTIONS > PC OPTIONS > PC SETTINGS). The game
+ // draws it in src/f1_overrides.cpp (func_1F6BB0), which reads the mode every frame; tecla_hud (h, f7, f6 or no) moves it
+ // to the next mode while playing (ps2_options_menu.cpp).
+ namespace ps2x
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+index e83aec2..0c94ae6 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -11,7 +11,7 @@
+ #include <vector>
+ 
+ // Fase 5 (T15, netplay N4): the netplay without the command line. The host starts and stops from the game (OPTIONS >
+-// PC NETPLAY, Nativizacion T6, a row of AJUSTES PC before; F2 menu section "Juego en red") while the game runs; the
++// PC OPTIONS > PC NETPLAY, Nativizacion T6, a row of AJUSTES PC before) while the game runs; the
+ // guest fills a small form in its window (F1-06.exe --invitado with no address), which remembers the last address and
+ // port in config\red.ini (never the password).
+ namespace ps2x::netplay
+@@ -22,7 +22,7 @@ namespace ps2x::netplay
+     // Empty when the random source fails. Each character is uniform over kPasswordAlphabet (rejection sampling).
+     std::string generatePassword(const RandomSource &random = randomBytes);
+ 
+-    // The picture quality presets of the F2 menu and opciones.ini red_calidad.
++    // The picture quality presets of opciones.ini red_calidad (the PC NETPLAY page's PICTURE QUALITY row).
+     enum class PictureQuality
+     {
+         Low,    // baja: 4 Mbit/s, 360 lines
+@@ -87,7 +87,7 @@ namespace ps2x::netplay
+     std::string hostStatusText(const HostSessionStatus &status);
+ 
+     // Nativizacion T6: the read-only rows of the game's OPTIONS > PC NETPLAY page (numbers only: the page's Lua gets no
+-    // text from the host). request: a start (1) or stop (0) asked for and not taken by the F2 menu's update() yet, or
++    // text from the host). request: a start (1) or stop (0) asked for and not taken by the options menu's update() yet, or
+     // -1. A stop asked for is off already; a start asked for is starting, also while an older session runs.
+     enum class HostPageState
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 065e96c..2898d45 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1213,10 +1213,11 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+                                 pressed != 0u))
+             return true;
+     }
+-    // L3+R3 together open the menu: the game sees neither. Foto y repeticion T3: nor R3 where it turns the photo mode
+-    // on (ps2_runtime.cpp) nor L3 in the replay, where it shows or hides the help bar.
++    // Foto y repeticion T3: the game does not see R3 where it turns the photo mode on (ps2_runtime.cpp) nor L3 in the
++    // replay, where it shows or hides the help bar. Nativizacion T18: L3+R3 held together open nothing (T17), so they
++    // reach the game as any other buttons.
+     const bool replay = ps2x::replayScrubActive();
+-    pressed = ps2x::hidePhotoModeStickButtons(ps2x::maskMenuCombo(pressed), ps2x::photoModeReady(), replay);
++    pressed = ps2x::hidePhotoModeStickButtons(pressed, ps2x::photoModeReady(), replay);
+     if ((pressed & ps2x::kPadL3) == 0u)
+         value[kL3] = 0.0f;
+     if ((pressed & ps2x::kPadR3) == 0u)
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 108068d..9964cb1 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -399,7 +399,7 @@ namespace
+ //   F1-06.exe --invitado <address>[:port] [--puerto N] --clave <password>
+ //       does not run the game: a window that sends this PC's pad (player 1 of controles.ini) as the host's player 2.
+ // Without --clave the password comes from PS2X_RED_CLAVE. N4: --invitado without an address or a password opens the
+-// guest's form; the host can also start from the game (F2 > Juego en red, OPCIONES > AJUSTES PC > JUEGO EN RED).
++// guest's form; the host can also start from the game (OPTIONS > PC OPTIONS > PC NETPLAY).
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+@@ -517,8 +517,9 @@ int main(int argc, char *argv[])
+         PS2Runtime runtime;
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+         // This hook is to prevent leak rlimgui deps to recompiler etc
+-        // Phase 3 (T3): the options menu (F2, every mode) owns the ImGui frame; the debug panel (F1) is drawn in it in
+-        // development mode only (S4).
++        // Phase 3 (T3): the options menu owns the ImGui frame (Nativizacion T17: its window only opens through the
++        // PS2X_MENU_GUION / PS2X_MENU_PETICION test hooks; players use the game's PC pages); the debug panel (F1) is
++        // drawn in it in development mode only (S4).
+         struct Ui
+         {
+             PS2OptionsMenu menu;
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 98f0677..9700271 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -2055,14 +2055,18 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(ps2x::nextHudMode(ps2x::HudMode::Hidden) == ps2x::HudMode::Full, "oculto -> completo");
+         });
+ 
+-        tc.Run("maskMenuCombo hides L3 and R3 from the game only while both are held", [](TestCase &t)
++        // Nativizacion T18: L3+R3 held together open nothing since T17, so the game sees them as any other buttons; only
++        // the photo mode's stick buttons are hidden (ps2_pad.cpp is built into the runner only: checked in the source).
++        tc.Run("L3 and R3 held together reach the game", [](TestCase &t)
+         {
+             constexpr uint16_t l3 = 1u << 1, r3 = 1u << 2, cross = 1u << 14;
+-            t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | r3 | cross)), static_cast<int>(cross), "both: hidden");
+-            t.Equals(static_cast<int>(ps2x::maskMenuCombo(l3 | cross)), static_cast<int>(l3 | cross), "L3 alone stays");
+-            t.Equals(static_cast<int>(ps2x::maskMenuCombo(r3)), static_cast<int>(r3), "R3 alone stays");
+-            t.Equals(static_cast<int>(ps2x::hidePhotoModeStickButtons(ps2x::maskMenuCombo(l3 | r3 | cross), false, false)),
+-                     static_cast<int>(cross), "both, out of a race: still hidden");
++            t.Equals(static_cast<int>(ps2x::hidePhotoModeStickButtons(l3 | r3 | cross, false, false)),
++                     static_cast<int>(l3 | r3 | cross), "both, out of a race: they pass");
++            const std::string source = readText(PS2X_TEST_SOURCE_DIR "/../ps2xRuntime/src/lib/ps2_pad.cpp");
++            t.IsFalse(source.empty(), "ps2_pad.cpp read");
++            t.IsFalse(contains(source, "maskMenuCombo"), "ps2_pad.cpp no longer hides L3+R3");
++            t.IsTrue(contains(source, "ps2x::hidePhotoModeStickButtons(pressed, ps2x::photoModeReady(), replay)"),
++                     "the pad's buttons go straight to the photo mode's filter");
+         });
+ 
+         tc.Run("the guest gets no input while the menu is open, nor until everything is released", [](TestCase &t)

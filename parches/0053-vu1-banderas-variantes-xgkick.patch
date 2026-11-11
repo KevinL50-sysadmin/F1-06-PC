@@ -1,0 +1,148 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 903dc4d..4e35d91 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -126,7 +126,35 @@ namespace
+         e.kind = kind;
+     }
+ 
++    // The entry read once into locals and the status written once (patch 0051): the stores to the VU1 state may alias
++    // the entry for the compiler (kind is a byte), so it read kind again from memory before each test (~4 % of the EE
++    // thread in race was this commit inside runBlocks).
+     PS2_VU_FORCEINLINE void applyFlagSlot(const FlagSlot &e, VU1State &s)
++    {
++        const uint8_t kind = e.kind;
++        const uint32_t mac = e.mac;
++        const uint32_t entryStatus = e.status;
++        const uint32_t sticky = e.sticky;
++        const uint32_t clip = e.clip;
++        if ((kind & (kFlagStatus | kFlagSticky)) != 0u)
++        {
++            uint32_t status = s.status;
++            if ((kind & kFlagStatus) != 0u)
++            {
++                const uint32_t current = entryStatus & 0xFu;
++                status = (status & 0xFF0u) | current | ((current | sticky) << 6);
++            }
++            if ((kind & kFlagSticky) != 0u)
++                status = (status & 0x03Fu) | (entryStatus & 0xFC0u);
++            s.status = status;
++        }
++        if ((kind & kFlagMac) != 0u)
++            s.mac = mac;
++        if ((kind & kFlagClip) != 0u)
++            s.clip = clip;
++    }
++    // Before patch 0051 (A/B mode 26).
++    PS2_VU_FORCEINLINE void applyFlagSlotReloading(const FlagSlot &e, VU1State &s)
+     {
+         if ((e.kind & kFlagMac) != 0u)
+             s.mac = e.mac;
+@@ -1598,7 +1626,10 @@ namespace
+                 blendLanes(vu.vf[c.reg], st.pendingVf[c.reg], c.lanes);
+                 break;
+             case CommitFlag:
+-                applyFlagSlot(st.flags[(entry + c.due) & 7u][c.reg], vu);
++                if (abMode == 26)
++                    applyFlagSlotReloading(st.flags[(entry + c.due) & 7u][c.reg], vu);
++                else
++                    applyFlagSlot(st.flags[(entry + c.due) & 7u][c.reg], vu);
+                 break;
+             case CommitQ:
+             {
+@@ -1617,10 +1648,11 @@ namespace
+         };
+ 
+         size_t nextCommit = 0u;
++        const BlockCommit *const commits = s.commits.data(); // in a local: reloaded on every commit otherwise
+         for (const BlockPair &p : s.pairs)
+         {
+             for (; nextCommit < p.commitEnd; ++nextCommit)
+-                commit(s.commits[nextCommit]);
++                commit(commits[nextCommit]);
+             const uint64_t issue = entry + p.issue;
+ 
+             // Upper instruction, on the registers as they were before the pair: FMAC (with its flag entry, unless it
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 7ddf0be..6272381 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1056,7 +1056,15 @@ namespace
+     // of the EE thread in race). Each pair index keeps its last kPairVariants versions (a pair decodes from its own 8
+     // bytes alone, and its plan and PairInfo from the decoded pair). A template because the decoded pair is a private
+     // type of VU1Interpreter, named from its member functions. A/B mode 9: decode and plan again, as before.
+-    constexpr uint32_t kPairVariants = 4u;
++    // 8 versions since patch 0051 (with 4, the pairs where more than four of the six programs differ kept being
++    // replaced, decoded and planned again: buildPairPlan was ~0.8 % of the EE thread in race), and the codes kept
++    // apart so that a lookup reads one cache line instead of jumping over entries of hundreds of bytes. A/B mode 25:
++    // 4 versions.
++    constexpr uint32_t kPairVariants = 8u;
++    inline uint32_t pairVariantsInUse()
++    {
++        return g_ps2AbMode.load(std::memory_order_relaxed) == 25 ? 4u : kPairVariants;
++    }
+     template <typename Decoded>
+     struct PairVariantTable
+     {
+@@ -1069,20 +1077,30 @@ namespace
+             PairInfo info{};
+         };
+         Entry entries[0x4000u / 8u][kPairVariants];
++        uint64_t codes[0x4000u / 8u][kPairVariants]; // entries[i][k].code
+         uint8_t next[0x4000u / 8u] = {};
+ 
++        PairVariantTable()
++        {
++            for (auto &row : codes)
++                for (uint64_t &c : row)
++                    c = ~0ull;
++        }
+         Entry *find(uint32_t index, uint64_t code)
+         {
+-            for (Entry &e : entries[index])
+-                if (e.code == code)
+-                    return &e;
++            const uint32_t inUse = pairVariantsInUse();
++            for (uint32_t k = 0u; k < inUse; ++k)
++                if (codes[index][k] == code)
++                    return &entries[index][k];
+             return nullptr;
+         }
+         Entry &add(uint32_t index, uint64_t code)
+         {
+-            Entry &e = entries[index][next[index]++ % kPairVariants];
++            const uint32_t k = next[index]++ % pairVariantsInUse();
++            Entry &e = entries[index][k];
+             e.code = code;
+             e.planned = false;
++            codes[index][k] = code;
+             return e;
+         }
+     };
+@@ -2052,7 +2070,11 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        const uint32_t firstSource = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        // A mask for the usual power-of-two data memory (patch 0051: the division was the hottest line here).
++        const uint32_t dataSize = m_activeVuDataSize;
++        const uint32_t sourceOffset = m_xgkick.sourceAddress + m_xgkick.copiedBytes;
++        const uint32_t firstSource =
++            (dataSize & (dataSize - 1u)) == 0u ? (sourceOffset & (dataSize - 1u)) : sourceOffset % dataSize;
+         if (firstSource + 16u <= m_activeVuDataSize)
+         {
+             std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + firstSource, 16u);
+@@ -3254,6 +3276,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                     blockState.xgkickThrough = cycle;
+                     break;
+                 }
++                // A cycle that only earns credit (a qword every two cycles), as progressXgkick would, without the
++                // call (patch 0051).
++                if (vu.m_xgkick.cycleCredit == 0u && vu.m_activeVuData != nullptr && vu.m_activeVuDataSize != 0u)
++                {
++                    vu.m_xgkick.cycleCredit = 1u;
++                    continue;
++                }
+                 vu.progressXgkick();
+             }
+         }

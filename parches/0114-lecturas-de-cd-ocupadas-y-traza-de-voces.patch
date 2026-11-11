@@ -1,0 +1,343 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 480e79f..2451269 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2x/iop/iop_spu2_audio.h"
+ 
+ #include <algorithm>
++#include <cstdarg>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -26,6 +27,43 @@ namespace ps2x::iop::detail
+     namespace
+     {
+         constexpr uint32_t kQueueSize = 1u << 16;
++
++        // F1_SPU2_VOZ=<core>:<voice> (debugging): trace of that voice (register writes and reads from the IOP, KON,
++        // KOFF, ENDX, loop flags and stops in the synthesis thread, DMA to the SPU2 outside the input areas), at most
++        // 40.000 lines of "[spu2:voz]" in stderr. s= is the 48 kHz sample (IOP clock / 768, or the thread's chunk).
++        struct TracedVoice
++        {
++            int core = -1;
++            int voice = -1;
++        };
++        const TracedVoice &tracedVoice()
++        {
++            static const TracedVoice traced = []
++            {
++                TracedVoice t;
++                if (const char *value = std::getenv("F1_SPU2_VOZ"))
++                    (void)std::sscanf(value, "%d:%d", &t.core, &t.voice);
++                return t;
++            }();
++            return traced;
++        }
++        bool voiceTraced(int core, int voice)
++        {
++            const TracedVoice &t = tracedVoice();
++            return t.core == core && t.voice == voice;
++        }
++        void voiceTrace(const char *format, ...)
++        {
++            static std::atomic<uint32_t> lines{0};
++            if (lines.fetch_add(1u, std::memory_order_relaxed) >= 40000u)
++                return;
++            char text[256];
++            va_list args;
++            va_start(args, format);
++            std::vsnprintf(text, sizeof(text), format, args);
++            va_end(args);
++            std::fprintf(stderr, "[spu2:voz] %s\n", text);
++        }
+         constexpr uint32_t kChunk = 64u;
+         constexpr uint32_t kRamMask = Spu2::RamWords - 1u;
+ 
+@@ -136,6 +174,7 @@ namespace ps2x::iop::detail
+             int32_t inL = 0, inR = 0;
+             int32_t outL = 0, outR = 0, prevOutL = 0, prevOutR = 0;
+             bool odd = false;
++            uint32_t tracedStart = ~0u, tracedEnd = ~0u; // F1_SPU2_VOZ: last area traced
+         };
+ 
+         struct Core
+@@ -228,6 +267,8 @@ namespace ps2x::iop::detail
+                 voice.envCounter = 0;
+                 cores[core].endx &= ~(1u << v);
+                 ++keyOns;
++                if (voiceTraced(core, v))
++                    voiceTrace("hilo s=%llu KON nax=%x lsa=%x", static_cast<unsigned long long>(sample), voice.nax, voice.lsa);
+             }
+         }
+ 
+@@ -236,6 +277,9 @@ namespace ps2x::iop::detail
+             for (int v = 0; v < 24; ++v)
+             {
+                 Voice &voice = cores[core].voices[v];
++                if ((bits & (1u << v)) != 0u && voiceTraced(core, v))
++                    voiceTrace("hilo s=%llu KOFF fase=%u nivel=%d nax=%x", static_cast<unsigned long long>(sample),
++                               voice.phase, voice.level, voice.nax);
+                 if ((bits & (1u << v)) != 0u && voice.phase != 0u)
+                 {
+                     voice.phase = 4;
+@@ -285,6 +329,9 @@ namespace ps2x::iop::detail
+             voice.flags = static_cast<uint8_t>(header >> 8);
+             if ((voice.flags & 4u) != 0u)
+                 voice.lsa = base;
++            if (voice.flags != 0u && voice.phase != 0u && voiceTraced(core, v))
++                voiceTrace("hilo s=%llu bloque %x flags=%x lsa=%x fase=%u", static_cast<unsigned long long>(sample), base,
++                           voice.flags, voice.lsa, voice.phase);
+             for (int c = 0; c < 2; ++c)
+             {
+                 if ((reg(c, kAttr) & 0x40u) == 0u)
+@@ -338,6 +385,9 @@ namespace ps2x::iop::detail
+                     voice.phase = 0;
+                     voice.level = 0;
+                 }
++                if (voiceTraced(core, v) && (voice.phase != 0u || (voice.flags & 2u) == 0u))
++                    voiceTrace("hilo s=%llu fin de bloque flags=%x -> nax=%x fase=%u", static_cast<unsigned long long>(sample),
++                               voice.flags, voice.nax, voice.phase);
+             }
+             else
+             {
+@@ -389,6 +439,8 @@ namespace ps2x::iop::detail
+                 {
+                     voice.level = 0;
+                     voice.phase = 0;
++                    if (voiceTraced(core, v))
++                        voiceTrace("hilo s=%llu fin del release nax=%x", static_cast<unsigned long long>(sample), voice.nax);
+                 }
+                 break;
+             default:
+@@ -531,6 +583,12 @@ namespace ps2x::iop::detail
+                 outL = outR = 0;
+                 return;
+             }
++            if ((start != rv.tracedStart || end != rv.tracedEnd) && tracedVoice().core >= 0)
++            {
++                rv.tracedStart = start;
++                rv.tracedEnd = end;
++                voiceTrace("hilo s=%llu reverb nucleo=%d area=%x-%x", static_cast<unsigned long long>(sample), core, start, end);
++            }
+             const uint32_t size = end - start + 1u;
+             if (rv.position >= size)
+                 rv.position = 0;
+@@ -913,6 +971,25 @@ namespace ps2x::iop::detail
+     }
+ 
+     uint16_t Spu2::read16(uint32_t phys)
++    {
++        const uint16_t value = read16Impl(phys);
++        if (tracedVoice().core >= 0)
++        {
++            const uint32_t offset = (phys - RegBase) & 0x7FEu;
++            const int core = static_cast<int>((offset >> 10) & 1u);
++            const uint32_t local = offset & 0x3FFu;
++            const int v = tracedVoice().voice;
++            const bool envx = local == static_cast<uint32_t>(v) * 0x10u + 0xAu;
++            const bool nax = local == kVoiceAddr + static_cast<uint32_t>(v) * 0xCu + 8u ||
++                             local == kVoiceAddr + static_cast<uint32_t>(v) * 0xCu + 0xAu;
++            const bool endx = local == (v < 16 ? kEndx : kEndx + 2u);
++            if (offset < kCommon && core == tracedVoice().core && (envx || nax || endx))
++                voiceTrace("iop s=%llu r %03x=%04x", static_cast<unsigned long long>(now() / 768u), local, value);
++        }
++        return value;
++    }
++
++    uint16_t Spu2::read16Impl(uint32_t phys)
+     {
+         const uint32_t offset = (phys - RegBase) & 0x7FEu;
+         if (offset == kIrqInfo)
+@@ -978,6 +1055,20 @@ namespace ps2x::iop::detail
+         }
+         const int core = static_cast<int>((offset >> 10) & 1u);
+         const uint32_t local = offset & 0x3FFu;
++        if (core == tracedVoice().core)
++        {
++            const int v = tracedVoice().voice;
++            const uint32_t bit = 1u << v;
++            const bool params = (local >> 4) == static_cast<uint32_t>(v) && local < 0x180u;
++            const bool addresses = local >= kVoiceAddr + static_cast<uint32_t>(v) * 0xCu &&
++                                   local < kVoiceAddr + static_cast<uint32_t>(v) * 0xCu + 0xCu;
++            const bool keys = ((local == kKon || local == kKoff || local == kEndx) && (value & bit) != 0u) ||
++                              ((local == kKon + 2u || local == kKoff + 2u || local == kEndx + 2u) &&
++                               ((static_cast<uint32_t>(value) << 16) & bit) != 0u);
++            const bool effect = local == kEsa || local == kEsa + 2u || local == kEea || local == kAttr;
++            if (params || addresses || keys || effect)
++                voiceTrace("iop s=%llu w %03x=%04x", static_cast<unsigned long long>(now() / 768u), local, value);
++        }
+         if (local == kData)
+         {
+             // Manual transfer: one halfword at TSA.
+@@ -1038,6 +1129,22 @@ namespace ps2x::iop::detail
+         bytes = std::min(bytes, iopRamSize - source);
+         const uint32_t words = bytes / 2u;
+         const uint32_t start = tsa(core);
++        if (tracedVoice().core >= 0 &&
++            (start < kInputAreaBegin || start + words > kInputAreaBegin + 0x800u))
++        {
++            // Sum of the words copied (the source in IOP RAM): tells whether two runs uploaded the same data.
++            uint32_t sum = 0u, nonZero = 0u;
++            for (uint32_t i = 0; i < words; ++i)
++            {
++                uint16_t word;
++                std::memcpy(&word, toSpu ? iopRam + source + i * 2u : reinterpret_cast<const uint8_t *>(&m_ram[(start + i) & kRamMask]), 2u);
++                sum = sum * 31u + word;
++                nonZero += word != 0u ? 1u : 0u;
++            }
++            voiceTrace("iop s=%llu dma nucleo=%d %s tsa=%x palabras=%x madr=%x suma=%08x noCero=%x",
++                       static_cast<unsigned long long>(now() / 768u), core, toSpu ? "->spu" : "<-spu", start, words, source,
++                       sum, nonZero);
++        }
+         for (uint32_t i = 0; i < words; ++i)
+         {
+             uint16_t *spu = &m_ram[(start + i) & kRamMask];
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index 47b3320..5d42d7c 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -37,6 +37,7 @@ namespace ps2x::iop::detail
+         void setClock(const uint64_t *iopCycles) noexcept { m_clock = iopCycles; }
+ 
+         [[nodiscard]] uint16_t read16(uint32_t phys);
++        [[nodiscard]] uint16_t read16Impl(uint32_t phys);
+         void write16(uint32_t phys, uint16_t value);
+ 
+         // IOP DMA channel 4 (core 0) or 7 (core 1) started: copies between IOP RAM and SPU2 RAM at the core's TSA.
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..9e73a9a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -1,5 +1,8 @@
+ #include "iop_cdvd.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_kernel.h"
+ #include "../core/iop_memory.h"
+@@ -199,11 +202,34 @@ namespace ps2x::iop::detail
+             virtualIsoBuilt = false;
+             virtualIsoValid = false;
+             completionCallback.reset();
++            busyUntil = 0u;
+             nodes.clear();
+             metadataSectors.clear();
+             imageHandle = 0u;
+         }
+ 
++        void setClock(const uint64_t *iopCycles) noexcept { clock = iopCycles; }
++
++        // Patch 0114: ~56 us of IOP time (2048 cycles) per read: one DelayThread(100) of CORE.IRX's reader.
++        // PS2X_CDVD_INSTANTANEO=1: every read done at once, as before.
++        static constexpr uint64_t kReadBusyCycles = 2048u;
++
++        void startBusy()
++        {
++            static const bool s_instant = []
++            {
++                const char *value = std::getenv("PS2X_CDVD_INSTANTANEO");
++                return value != nullptr && std::atoi(value) != 0;
++            }();
++            if (clock != nullptr && !s_instant)
++                busyUntil = *clock + kReadBusyCycles;
++        }
++
++        [[nodiscard]] bool busy() const
++        {
++            return clock != nullptr && *clock < busyUntil;
++        }
++
+         bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -230,6 +256,7 @@ namespace ps2x::iop::detail
+             case 6: // sceCdRead
+                 if (readSectors(a0, a1, a2))
+                 {
++                    startBusy();
+                     signalCommandComplete();
+                     if (callback.address != 0u)
+                     {
+@@ -269,7 +296,14 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 11: // sceCdSync
+-                cpu.gpr[2] = 0u;
++                // Patch 0114: mode 1 (poll) answers "busy" for a moment after a read, as the drive does (the data is
++                // already there). Code that polls (CORE.IRX's CD reader: sceCdSync(1) and DelayThread(100) until it
++                // is done) then lets the other threads run, as on the console. With every read done at once, CORE.IRX
++                // read the second sector of a sound through its one-sector read-ahead cache before the file position
++                // had moved: it read the first sector again and the sound's end (its end-of-sample block) came from
++                // whatever was in the buffer before. F1 06's boot sound then played on through SPU2 memory and,
++                // about one boot in ten, into a loop of another sound, for ever. Mode 0 (wait) still returns at once.
++                cpu.gpr[2] = (a0 == 1u && busy()) ? 1u : 0u;
+                 return true;
+ 
+             case 12: // sceCdGetDiskType
+@@ -659,6 +693,17 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
++            // F1_CDVD_TRAZA=1 (debugging, patch 0114): every read, with its file and offset, and whether it is refused.
++            static const bool s_traced = std::getenv("F1_CDVD_TRAZA") != nullptr;
++            if (s_traced)
++            {
++                const IsoNode *node = buildVirtualIso() ? fileForSector(lsn) : nullptr;
++                std::fprintf(stderr, "[cdvd:leer] lsn=%u sectores=%u destino=%x propio=%d archivo=%s desde=%llu\n", lsn,
++                             sectors, destination,
++                             byteCount64 <= IopMemory::RamSize && memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)) ? 1 : 0,
++                             node ? node->hostPath.string().c_str() : "?",
++                             node ? static_cast<unsigned long long>(lsn - node->lsn) * kSectorSize : 0ull);
++            }
+             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
+             {
+                 lastError = kCdvdErrorRead;
+@@ -718,6 +763,8 @@ namespace ps2x::iop::detail
+         uint32_t lastError = kCdvdErrorNone;
+         uint32_t streamFlag = 0u;
+         uint32_t lastReadTimeout = 0u;
++        const uint64_t *clock = nullptr; // patch 0114
++        uint64_t busyUntil = 0u;
+         int interruptEventFlagId = 0;
+         uint64_t imageHandle = 0u;
+         bool virtualIsoBuilt = false;
+@@ -739,6 +786,11 @@ namespace ps2x::iop::detail
+         m_impl->reset();
+     }
+ 
++    void IopCdvd::setClock(const uint64_t *iopCycles) noexcept
++    {
++        m_impl->setClock(iopCycles);
++    }
++
+     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         return m_impl->dispatchImport(ordinal, cpu);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 2ca6048..bc2b42f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -32,6 +32,8 @@ namespace ps2x::iop::detail
+         IopCdvd &operator=(const IopCdvd &) = delete;
+ 
+         void reset() noexcept;
++        // Patch 0114: the IOP cycle counter (sceCdSync reports a read busy for a while, as the drive does).
++        void setClock(const uint64_t *iopCycles) noexcept;
+ 
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 21dd867..ada14cd 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -122,6 +122,7 @@ namespace ps2x::iop::detail
+               loadcore(memory, imports)
+         {
+             memory.spu2().setClock(&totalCycles);
++            cdvd.setClock(&totalCycles); // patch 0114
+             reset();
+         }
+ 

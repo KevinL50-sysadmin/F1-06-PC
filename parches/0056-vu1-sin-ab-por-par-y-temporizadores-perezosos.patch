@@ -1,0 +1,352 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index c108e24..d03f800 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -22,7 +22,9 @@
+ // checkpoint (before patch 0049), 23 the GS frontend building the whole draw state of every primitive and the threaded
+ // backend comparing it with memcmp (before patch 0051), 24 the VIF1 UNPACKs through the general loop, the masked and
+ // adding ones field by field (before patch 0051), 25 the VU1 pairs cached by content in 4 versions per address instead of 8 (before patch 0051), 26 the VU1 block flag
+-// commits reading their entry again before each test (before patch 0051). A
++// commits reading their entry again before each test (before patch 0051), 27 the VU1 schedules run by the copy that
++// tests the A/B mode on every pair (before patch 0056; mode 0 runs one without the tests), 28 the EE
++// timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e1bb281..61d078e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -5,12 +5,16 @@
+ #include "runtime/ps2_ab.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
+ #include <stdexcept>
+ #include <algorithm>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace
+@@ -19,6 +23,15 @@ namespace
+     uint32_t *s_gifStatWord = nullptr;
+     const void *s_gifStatMap = nullptr;
+ 
++    // EE timers advanced lazily (patch 0056): EE cycles not yet applied to them, the cycles from their last update to
++    // their next possible interrupt (0: unknown, update on the next call) and an interrupt found while bringing them
++    // up to date for a register access (it cannot happen while the pending cycles stay below that distance). Here and
++    // not in PS2Memory so that ps2_memory.h, which every recompiled file includes, does not change.
++    uint64_t s_eeTimerPendingCycles = 0u;
++    uint64_t s_eeTimerFlushAt = 0u;
++    uint32_t s_eeTimerCarriedInterrupts = 0u;
++    bool s_eeTimerVerifySynced = false; // PS2X_EE_TEMPORIZADORES_VERIFICAR: the copy matches the timers
++
+     // The throw out of line (patch 0051), so that inRange is inlined: it was a call of its own on every access.
+     [[noreturn]] __declspec(noinline) void throwOutOfRange(const char *op, uint32_t address)
+     {
+@@ -441,12 +454,131 @@ void PS2Memory::resetEeTimers() noexcept
+     // measures GPU time in scanlines and busy-waits for the next one (func_2D5560), so it hung with
+     // a stopped T3. Start it like the BIOS does, without compare/overflow interrupts.
+     m_eeTimers[3].mode = kEeTimerModeCue | 3u;
++    s_eeTimerPendingCycles = 0u;
++    s_eeTimerFlushAt = 0u;
++    s_eeTimerCarriedInterrupts = 0u;
++    s_eeTimerVerifySynced = false;
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ {
++    // Called on every EE checkpoint (millions of times per second in a race), and the timers only matter when the guest
++    // reads or writes one of their registers or one of them can raise an interrupt. Since patch 0056 the cycles pile up
++    // in s_eeTimerPendingCycles until they reach the distance to the next possible interrupt (cyclesUntilNextEeTimer-
++    // Interrupt, exact: the timers count the same in one step as in many, their remainder carries the fraction), and
++    // a timer register access first brings them up to date (eeCycles = 0, below). The interrupt shows up at the same
++    // checkpoint as before. A/B mode 28: every call, as before.
++    // The timers moved on by eeCycles at once.
++    const auto advanceTimers = [](decltype(m_eeTimers) &timers, uint64_t eeCycles) noexcept -> uint32_t
++    {
++        uint32_t interruptMask = 0u;
++        for (size_t index = 0; index < timers.size(); ++index)
++        {
++            EeTimer &timer = timers[index];
++            if ((timer.mode & kEeTimerModeCue) == 0u)
++            {
++                continue;
++            }
++
++            const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++            const uint64_t wholeSeconds = eeCycles / kEeClockHz;
++            const uint64_t remainingCycles = eeCycles % kEeClockHz;
++            const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
++            const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
++            timer.clockRemainder = scaled % kEeClockHz;
++            if (ticks == 0u)
++            {
++                continue;
++            }
++
++            const uint32_t oldCount = timer.count & 0xFFFFu;
++            const uint32_t compare = timer.compare & 0xFFFFu;
++            const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
++            const uint64_t overflowDistance = 0x10000ull - oldCount;
++            const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
++            const bool compareReached = ticks >= compareDistance;
++            bool overflowReached = false;
++
++            if (zeroReturn)
++            {
++                overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
++                if (compareReached)
++                {
++                    const uint64_t remaining = ticks - compareDistance;
++                    timer.count = compare == 0u
++                                      ? static_cast<uint32_t>(remaining & 0xFFFFu)
++                                      : static_cast<uint32_t>(remaining % compare);
++                }
++                else
++                {
++                    timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
++                }
++            }
++            else
++            {
++                overflowReached = ticks >= overflowDistance;
++                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
++            }
++
++            if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
++            {
++                timer.mode |= kEeTimerModeEquf;
++                interruptMask |= 1u << index;
++            }
++            if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
++            {
++                timer.mode |= kEeTimerModeOvff;
++                interruptMask |= 1u << index;
++            }
++        }
++        return interruptMask;
++    };
++    const auto advanceNow = [&](uint64_t cycles) noexcept { return advanceTimers(m_eeTimers, cycles); };
++    const bool eager = g_ps2AbMode.load(std::memory_order_relaxed) == 28;
++
++    // PS2X_EE_TEMPORIZADORES_VERIFICAR=1: a copy of the timers advanced on every call, as before patch 0056, compared
++    // with the real ones: the interrupt mask of every call, and the whole state whenever no cycles are pending.
++    // "[ee:temporizadores] comprobadas=<calls> estados=<states> distintas=<n>" every 10 s; the first differences in
++    // detail. A register write re-copies the timers on the next call (s_eeTimerVerifySynced).
++    static const bool s_verify = []
++    {
++        const char *value = std::getenv("PS2X_EE_TEMPORIZADORES_VERIFICAR");
++        return value != nullptr && value[0] != '0';
++    }();
++    static decltype(m_eeTimers) s_verifyTimers{};
++    static uint64_t s_verifyCalls = 0u, s_verifyStates = 0u, s_verifyDifferent = 0u;
++    static auto s_verifyReport = std::chrono::steady_clock::now();
++    const auto verifyStates = [&](const char *where)
++    {
++        ++s_verifyStates;
++        for (size_t index = 0; index < m_eeTimers.size(); ++index)
++        {
++            const EeTimer &a = m_eeTimers[index];
++            const EeTimer &b = s_verifyTimers[index];
++            if (a.count != b.count || a.mode != b.mode || a.compare != b.compare || a.hold != b.hold ||
++                a.clockRemainder != b.clockRemainder)
++            {
++                if (++s_verifyDifferent <= 16u)
++                    std::fprintf(stderr, "[ee:temporizadores] distinto (%s) T%zu: count %u/%u mode 0x%x/0x%x resto %llu/%llu\n",
++                                 where, index, a.count, b.count, a.mode, b.mode,
++                                 static_cast<unsigned long long>(a.clockRemainder),
++                                 static_cast<unsigned long long>(b.clockRemainder));
++                s_verifyTimers = m_eeTimers;
++                return;
++            }
++        }
++    };
+     if (eeCycles == 0u)
+     {
++        if (s_eeTimerPendingCycles == 0u)
++            return 0u;
++        eeCycles = s_eeTimerPendingCycles;
++        s_eeTimerPendingCycles = 0u;
++        s_eeTimerCarriedInterrupts |= advanceNow(eeCycles);
++        // The next interrupt is as many cycles nearer (0, unknown, stays unknown).
++        s_eeTimerFlushAt = s_eeTimerFlushAt > eeCycles ? s_eeTimerFlushAt - eeCycles : 0u;
++        if (s_verify && s_eeTimerVerifySynced)
++            verifyStates("acceso");
+         return 0u;
+     }
+ 
+@@ -469,67 +601,56 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+     if (s_gifStatWord != nullptr)
+         *s_gifStatWord &= ~kGifFqcMask;
+ 
+-    uint32_t interruptMask = 0u;
+-    for (size_t index = 0; index < m_eeTimers.size(); ++index)
++    uint32_t verifyMask = 0u;
++    if (s_verify)
+     {
+-        EeTimer &timer = m_eeTimers[index];
+-        if ((timer.mode & kEeTimerModeCue) == 0u)
+-        {
+-            continue;
+-        }
+-
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+-        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+-        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+-        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+-        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+-        timer.clockRemainder = scaled % kEeClockHz;
+-        if (ticks == 0u)
++        if (!s_eeTimerVerifySynced && s_eeTimerPendingCycles == 0u)
+         {
+-            continue;
++            s_verifyTimers = m_eeTimers;
++            s_eeTimerVerifySynced = true;
+         }
+-
+-        const uint32_t oldCount = timer.count & 0xFFFFu;
+-        const uint32_t compare = timer.compare & 0xFFFFu;
+-        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+-        const uint64_t overflowDistance = 0x10000ull - oldCount;
+-        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+-        const bool compareReached = ticks >= compareDistance;
+-        bool overflowReached = false;
+-
+-        if (zeroReturn)
++        if (s_eeTimerVerifySynced)
++            verifyMask = advanceTimers(s_verifyTimers, eeCycles);
++    }
++    const auto verifyCall = [&](uint32_t mask)
++    {
++        if (!s_verify || !s_eeTimerVerifySynced)
++            return mask;
++        ++s_verifyCalls;
++        if (mask != verifyMask && ++s_verifyDifferent <= 16u)
++            std::fprintf(stderr, "[ee:temporizadores] interrupciones distintas: 0x%x (antes 0x%x) pendientes=%llu\n", mask,
++                         verifyMask, static_cast<unsigned long long>(s_eeTimerPendingCycles));
++        if (s_eeTimerPendingCycles == 0u)
++            verifyStates("punto de control");
++        if ((s_verifyCalls & 0xFFFFu) == 0u)
+         {
+-            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+-            if (compareReached)
++            const auto now = std::chrono::steady_clock::now();
++            if (now - s_verifyReport >= std::chrono::seconds(10))
+             {
+-                const uint64_t remaining = ticks - compareDistance;
+-                timer.count = compare == 0u
+-                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
+-                                  : static_cast<uint32_t>(remaining % compare);
++                s_verifyReport = now;
++                std::fprintf(stderr, "[ee:temporizadores] comprobadas=%llu estados=%llu distintas=%llu\n",
++                             static_cast<unsigned long long>(s_verifyCalls),
++                             static_cast<unsigned long long>(s_verifyStates),
++                             static_cast<unsigned long long>(s_verifyDifferent));
+             }
+-            else
+-            {
+-                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+-            }
+-        }
+-        else
+-        {
+-            overflowReached = ticks >= overflowDistance;
+-            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+         }
++        return mask;
++    };
+ 
+-        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+-        {
+-            timer.mode |= kEeTimerModeEquf;
+-            interruptMask |= 1u << index;
+-        }
+-        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+-        {
+-            timer.mode |= kEeTimerModeOvff;
+-            interruptMask |= 1u << index;
+-        }
++    if (eager)
++    {
++        s_eeTimerFlushAt = 0u;
++        return verifyCall(advanceNow(eeCycles + std::exchange(s_eeTimerPendingCycles, 0u)) |
++                          std::exchange(s_eeTimerCarriedInterrupts, 0u));
+     }
+-    return interruptMask;
++    s_eeTimerPendingCycles += eeCycles;
++    if (s_eeTimerPendingCycles < s_eeTimerFlushAt)
++        return verifyCall(0u);
++    eeCycles = s_eeTimerPendingCycles;
++    s_eeTimerPendingCycles = 0u;
++    const uint32_t interruptMask = advanceNow(eeCycles) | std::exchange(s_eeTimerCarriedInterrupts, 0u);
++    s_eeTimerFlushAt = cyclesUntilNextEeTimerInterrupt();
++    return verifyCall(interruptMask);
+ }
+ 
+ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+@@ -571,6 +692,10 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+     }
++    // Counted from the timers' last update: the cycles still pending have gone by already (patch 0056; they stay below
++    // this distance, see advanceEeTimers).
++    if (nearest != std::numeric_limits<uint64_t>::max())
++        nearest = nearest > s_eeTimerPendingCycles ? nearest - s_eeTimerPendingCycles : 1u;
+     return nearest;
+ }
+ 
+@@ -1180,6 +1305,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        advanceEeTimers(0u); // the cycles still pending first (patch 0056)
++        s_eeTimerFlushAt = 0u; // and the distance to the next interrupt again on the next checkpoint
++        s_eeTimerVerifySynced = false;
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -2469,6 +2597,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        advanceEeTimers(0u); // the cycles still pending first (patch 0056)
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 4e35d91..1acbe70 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1609,9 +1609,12 @@ namespace
+     // Runs one schedule. Host gives what needs the interpreter's private members (see run()).
+     // Expanded in runBlocks: as a call of its own, every block saved and restored eight XMM registers, loaded the
+     // constants and checked the stack cookie (Old: that call, as A/B mode 18).
+-    template <typename Host, bool Old>
+-    PS2_VU_FORCEINLINE void runScheduleBody(const Schedule &s, BlockState &st, Host &host, int abMode)
++    // AbChecks: false for A/B mode 0, so the compiler drops the mode tests done on every pair and commit (patch 0056;
++    // A/B mode 27: the copy with the tests, as before).
++    template <typename Host, bool Old, bool AbChecks = true>
++    PS2_VU_FORCEINLINE void runScheduleBody(const Schedule &s, BlockState &st, Host &host, int abModeIn)
+     {
++        const int abMode = AbChecks ? abModeIn : 0;
+         VU1State &vu = host.state();
+         const uint64_t entry = st.cycle;
+         const bool oldDispatch = abMode == 5;
+@@ -1919,7 +1922,9 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            if (abMode == 18)
++            if (abMode == 0)
++                runScheduleBody<Host, false, false>(*s, st, host, 0);
++            else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+             else
+                 runScheduleBody<Host, false>(*s, st, host, abMode);

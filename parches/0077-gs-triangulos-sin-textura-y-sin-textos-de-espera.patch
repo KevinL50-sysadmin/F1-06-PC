@@ -1,0 +1,249 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 75c4e98..946a5f8 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -52,7 +52,9 @@
+ // perspective-textured triangles without rasterTriangleSpan4Tex and CT16 textures through the sampler pointer, 60 the
+ // GS textured sprites without spriteTexRows (both before patch 0075), 61 those two fast paths writing through
+ // writePixelBody, with the frame and Z addresses worked out for each access and the blend per channel (before patch
+-// 0076), 62 modes 59 and 60 together (patches 0075 and 0076 off at once).
++// 0076), 62 modes 59 and 60 together (patches 0075 and 0076 off at once; with 0077, also
++// the untextured triangles of mode 64), 63 the GS diagnostic texts of the waits (requestText) written always, 64 the GS
++// untextured CT32/Z24 triangles through rasterTriangleSpan4 (both before patch 0077).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 8aa7eb8..f99e630 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2896,6 +2896,113 @@ namespace
+         }
+     }
+ 
++    // Patch 0077: rasterTriangleSpan4 for an untextured triangle of a job whose pixels may be drawn in any order, written
++    // by writePixelTyped<C32, Z24>: as rasterTriangleSpan4Tex without the texture (the depth test first for the
++    // covered pixels, the frame and Z addresses once per pixel, writePixelCt32Z24At).
++    PS2_GS_INLINE void rasterTriangleSpan4Flat(const BandJob &job, const TriangleSetup &t, int y, int spanX0, int spanX1,
++                                               float row0, float row1, const FastWrite &fw)
++    {
++        const PixelPipeline &pp = job.pp;
++        uint8_t *const vram = pp.vram;
++        const uint32_t ztest = pp.ztestMethod; // 1, 2 or 3
++        const __m128 eps = _mm_set1_ps(-1.0e-4f);
++        const __m128 one = _mm_set1_ps(1.0f);
++        const __m128 half = _mm_set1_ps(0.5f);
++        const __m128 fx2 = _mm_set1_ps(t.fx2);
++        const __m128 e0 = _mm_set1_ps(t.e0), e1 = _mm_set1_ps(t.e1);
++        const __m128 r0v = _mm_set1_ps(row0), r1v = _mm_set1_ps(row1);
++        const __m128 winding = _mm_set1_ps(t.winding), inv = _mm_set1_ps(t.invAbsDenom);
++        const __m128i lanes = _mm_setr_epi32(0, 1, 2, 3);
++        auto lerp = [](float a0, float a1, float a2, __m128 w0, __m128 w1, __m128 w2)
++        {
++            return _mm_add_ps(_mm_add_ps(_mm_mul_ps(_mm_set1_ps(a0), w0), _mm_mul_ps(_mm_set1_ps(a1), w1)),
++                              _mm_mul_ps(_mm_set1_ps(a2), w2));
++        };
++        auto lerpD = [](double a0, double a1, double a2, __m128d w0, __m128d w1, __m128d w2)
++        {
++            return _mm_add_pd(_mm_add_pd(_mm_mul_pd(_mm_set1_pd(a0), w0), _mm_mul_pd(_mm_set1_pd(a1), w1)),
++                              _mm_mul_pd(_mm_set1_pd(a2), w2));
++        };
++        alignas(16) uint32_t rgbaL[4];
++        alignas(16) uint32_t fogL[4];
++        alignas(16) double zL[4];
++        alignas(16) uint32_t bufPre[4], bufIdx[4];
++        uint32_t zi[4], zByte[4];
++        const __m128i rowY = _mm_set1_epi32(y);
++        for (int x = spanX0; x <= spanX1; x += 4)
++        {
++            const __m128i xs = _mm_add_epi32(_mm_set1_epi32(x), lanes);
++            const __m128 px = _mm_add_ps(_mm_cvtepi32_ps(xs), half);
++            const __m128 dx = _mm_sub_ps(px, fx2);
++            const __m128 w0 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e0, dx), r0v), winding), inv);
++            const __m128 w1 = _mm_mul_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(e1, dx), r1v), winding), inv);
++            const __m128 w2 = _mm_sub_ps(_mm_sub_ps(one, w0), w1);
++            const __m128 out = _mm_or_ps(_mm_or_ps(_mm_cmplt_ps(w0, eps), _mm_cmplt_ps(w1, eps)), _mm_cmplt_ps(w2, eps));
++            const int count = std::min(4, spanX1 - x + 1);
++            unsigned live = ~static_cast<unsigned>(_mm_movemask_ps(out)) & ((1u << count) - 1u);
++            if (live == 0u)
++                continue;
++
++            const __m128d w0lo = _mm_cvtps_pd(w0), w0hi = _mm_cvtps_pd(_mm_movehl_ps(w0, w0));
++            const __m128d w1lo = _mm_cvtps_pd(w1), w1hi = _mm_cvtps_pd(_mm_movehl_ps(w1, w1));
++            const __m128d w2lo = _mm_cvtps_pd(w2), w2hi = _mm_cvtps_pd(_mm_movehl_ps(w2, w2));
++            _mm_store_pd(zL, lerpD(t.z0, t.z1, t.z2, w0lo, w1lo, w2lo));
++            _mm_store_pd(zL + 2, lerpD(t.z0, t.z1, t.z2, w0hi, w1hi, w2hi));
++
++            texelLanes<GSMem::Z24>(xs, rowY, fw.depth.basePage, fw.depth.rowPages, bufPre, bufIdx);
++            {
++                unsigned pass = 0u;
++                for (unsigned m = live; m != 0u; m &= m - 1u)
++                {
++                    const unsigned i = static_cast<unsigned>(std::countr_zero(m));
++                    zi[i] = static_cast<u32>(zL[i] + 0.5);
++                    zByte[i] = pixelByteAddr<GSMem::Z24>(fw.depth.blockTable, bufPre[i], bufIdx[i]);
++                    if (ztest == 1u)
++                        pass |= 1u << i;
++                    else
++                    {
++                        uint32_t storedZ;
++                        std::memcpy(&storedZ, vram + zByte[i], sizeof(u32)); // PixelStorageTraits<Z24>::Read
++                        storedZ &= 0x00FFFFFFu;
++                        if (ztest == 2u ? zi[i] >= storedZ : zi[i] > storedZ)
++                            pass |= 1u << i;
++                    }
++                }
++                live = pass;
++                if (live == 0u)
++                    continue;
++            }
++            texelLanes<GSMem::C32>(xs, rowY, fw.frame.basePage, fw.frame.rowPages, bufPre, bufIdx);
++
++            if (t.iip)
++            {
++                const __m128i r = _mm_cvttps_epi32(lerp(t.r0, t.r1, t.r2, w0, w1, w2));
++                const __m128i g = _mm_cvttps_epi32(lerp(t.g0, t.g1, t.g2, w0, w1, w2));
++                const __m128i b = _mm_cvttps_epi32(lerp(t.b0, t.b1, t.b2, w0, w1, w2));
++                const __m128i a = _mm_cvttps_epi32(lerp(t.a0, t.a1, t.a2, w0, w1, w2));
++                const __m128i bytes = _mm_packus_epi16(_mm_packs_epi32(r, g), _mm_packs_epi32(b, a));
++                const __m128i rg = _mm_unpacklo_epi8(bytes, _mm_srli_si128(bytes, 4));
++                const __m128i ba = _mm_unpacklo_epi8(_mm_srli_si128(bytes, 8), _mm_srli_si128(bytes, 12));
++                _mm_store_si128(reinterpret_cast<__m128i *>(rgbaL), _mm_unpacklo_epi16(rg, ba));
++            }
++            {
++                const __m128i f = _mm_cvttps_epi32(lerp(t.fog0, t.fog1, t.fog2, w0, w1, w2));
++                const __m128i f16 = _mm_packs_epi32(f, f);
++                const __m128i f8 = _mm_packus_epi16(f16, f16);
++                _mm_store_si128(reinterpret_cast<__m128i *>(fogL),
++                                _mm_unpacklo_epi16(_mm_unpacklo_epi8(f8, _mm_setzero_si128()), _mm_setzero_si128()));
++            }
++
++            do
++            {
++                const unsigned i = static_cast<unsigned>(std::countr_zero(live));
++                live &= live - 1u;
++                writePixelCt32Z24At(pp, fw.blend, pixelByteAddr<GSMem::C32>(fw.frame.blockTable, bufPre[i], bufIdx[i]),
++                                    zByte[i], zi[i], t.iip ? rgbaL[i] : t.flatRgba, static_cast<uint8_t>(fogL[i]));
++            } while (live != 0u);
++        }
++    }
++
+     // The rows of the triangle in the band set. W and S, when not null, are the job's pixel writer and texture sampler
+     // known at compile time, so they inline into the pixel loop (patch 0044; the calls through the job's pointers were
+     // two indirect calls per pixel). Same arithmetic either way. TP, when not PixelStorageMode::Max, is the format of S:
+@@ -2933,6 +3040,16 @@ namespace
+                 fastWrite = makeFastWrite(pp);
+         }
+         const FastWrite *const fw = fastTex && abMode != 61 ? &fastWrite : nullptr;
++        // Patch 0077: untextured triangles of CT32/Z24 (A/B mode 64: not). W == kCt32Z24 and S == nullptr only for them
++        // and the textures without their own loop (tme then).
++        bool fastFlat = false;
++        if constexpr (W == &writePixelTyped<GSMem::C32, GSMem::Z24> && S == nullptr)
++        {
++            fastFlat = simd && abMode != 64 && abMode != 62 && job.unordered && !t.tme && pp.ztestMethod != 0u &&
++                       pp.scissorX0 <= pp.scissorX1 && pp.scissorY0 <= pp.scissorY1;
++            if (fastFlat)
++                fastWrite = makeFastWrite(pp);
++        }
+         const int skip = static_cast<int>(count - 1u) << shift;
+         for (int y = firstBandRow(t.minY, shift, count, index); y <= t.maxY; y = nextBandRow(y, shift, skip))
+         {
+@@ -2961,6 +3078,14 @@ namespace
+                     continue;
+                 }
+             }
++            if constexpr (W == &writePixelTyped<GSMem::C32, GSMem::Z24> && S == nullptr)
++            {
++                if (fastFlat)
++                {
++                    rasterTriangleSpan4Flat(job, t, y, spanX0, spanX1, row0, row1, fastWrite);
++                    continue;
++                }
++            }
+             if (simd)
+             {
+                 rasterTriangleSpan4<W, S>(job, t, y, spanX0, spanX1, row0, row1);
+@@ -4198,14 +4323,25 @@ struct GSCpuBackend::BandState
+     // PS2X_GS_ESPERAS=<s> (diagnostic): the first waits of each reason with what was asked for (requestText, set by
+     // the caller) and the pending job it waits for.
+     char requestText[160] = {};
+-    void NoteWait(int reason, uint32_t page, uint64_t tag, bool readConflict)
++    // PS2X_GS_ESPERAS=<s>: from that many seconds after the band workers start (negative: off).
++    static double WaitNotesFrom()
+     {
+-        // PS2X_GS_ESPERAS=<s>: from that many seconds after the band workers start.
+         static const double s_from = []
+         {
+             const char *value = std::getenv("PS2X_GS_ESPERAS");
+             return value != nullptr ? std::atof(value) : -1.0;
+         }();
++        return s_from;
++    }
++    // Patch 0077: requestText and transferText are only read by NoteWait, so they are only written with
++    // PS2X_GS_ESPERAS (the snprintf of each deferred job was ~1.7 % of the coordinator; A/B mode 63: always).
++    static bool WaitNotesOn()
++    {
++        return WaitNotesFrom() >= 0.0 || g_ps2AbMode.load(std::memory_order_relaxed) == 63;
++    }
++    void NoteWait(int reason, uint32_t page, uint64_t tag, bool readConflict)
++    {
++        const double s_from = WaitNotesFrom();
+         static const auto s_start = std::chrono::steady_clock::now();
+         static uint32_t s_count[kWaitReasonCount] = {};
+         if (s_from < 0.0 || tag == 0u ||
+@@ -4498,8 +4634,9 @@ void GSCpuBackend::WaitBandsForRead(int reason, uint32_t baseBlock, uint32_t bw,
+     if (!m_bands)
+         return;
+     CloseBandVerification();
+-    std::snprintf(m_bands->requestText, sizeof(m_bands->requestText), "lee base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)",
+-                  baseBlock, bw, psm, x0, y0, x1, y1);
++    if (BandState::WaitNotesOn())
++        std::snprintf(m_bands->requestText, sizeof(m_bands->requestText), "lee base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)",
++                      baseBlock, bw, psm, x0, y0, x1, y1);
+     if (g_ps2AbMode.load(std::memory_order_relaxed) != 15)
+     {
+         m_bands->requestBlocks.clear();
+@@ -4518,8 +4655,9 @@ void GSCpuBackend::WaitBandsForWrite(int reason, uint32_t baseBlock, uint32_t bw
+     if (!m_bands)
+         return;
+     CloseBandVerification();
+-    std::snprintf(m_bands->requestText, sizeof(m_bands->requestText), "escribe base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)",
+-                  baseBlock, bw, psm, x0, y0, x1, y1);
++    if (BandState::WaitNotesOn())
++        std::snprintf(m_bands->requestText, sizeof(m_bands->requestText),
++                      "escribe base=0x%x bw=%u psm=0x%x (%d,%d)-(%d,%d)", baseBlock, bw, psm, x0, y0, x1, y1);
+     if (g_ps2AbMode.load(std::memory_order_relaxed) != 15)
+     {
+         m_bands->requestBlocks.clear();
+@@ -4539,10 +4677,11 @@ void GSCpuBackend::BandTransferBegin(const GSTransferCommand &command)
+         // Host to local: UploadImage waits for the pending jobs touching the destination.
+         m_bands->transferPages.clear();
+         m_bands->transferBlocks.clear();
+-        std::snprintf(m_bands->transferText, sizeof(m_bands->transferText),
+-                      "subida dbp=0x%x dbw=%u dpsm=0x%x (%u,%u) %ux%u", command.bitbltbuf.dbp, command.bitbltbuf.dbw,
+-                      command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw,
+-                      command.trxreg.rrh);
++        if (BandState::WaitNotesOn())
++            std::snprintf(m_bands->transferText, sizeof(m_bands->transferText),
++                          "subida dbp=0x%x dbw=%u dpsm=0x%x (%u,%u) %ux%u", command.bitbltbuf.dbp,
++                          command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay,
++                          command.trxreg.rrw, command.trxreg.rrh);
+         if (command.trxreg.rrw != 0u && command.trxreg.rrh != 0u)
+             addRectPages(m_bands->transferPages, command.bitbltbuf.dbp, std::max<uint32_t>(command.bitbltbuf.dbw, 1u),
+                          command.bitbltbuf.dpsm, command.trxpos.dsax, command.trxpos.dsay,
+@@ -4729,10 +4868,11 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     if (need > bs.minDone)
+     {
+         const int reason = need == needTexture ? kWaitTexture : need == needLayout ? kWaitLayout : kWaitTextureRead;
+-        std::snprintf(bs.requestText, sizeof(bs.requestText),
+-                      "dibuja fbp=0x%x fbw=%u fpsm=0x%x zbp=0x%x caja=(%d,%d)-(%d,%d) tex=0x%x tbw=%u tpsm=0x%x",
+-                      job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.minX, job.minY, job.maxX, job.maxY,
+-                      job.sampler.tbp0, job.sampler.tbw, job.sampler.psm);
++        if (BandState::WaitNotesOn())
++            std::snprintf(bs.requestText, sizeof(bs.requestText),
++                          "dibuja fbp=0x%x fbw=%u fpsm=0x%x zbp=0x%x caja=(%d,%d)-(%d,%d) tex=0x%x tbw=%u tpsm=0x%x",
++                          job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.pp.zbp, job.minX, job.minY, job.maxX, job.maxY,
++                          job.sampler.tbp0, job.sampler.tbw, job.sampler.psm);
+         bs.NoteWait(reason, 0u, need, reason == kWaitTextureRead);
+         // Patch 0063: the band workers wait for it before drawing this job, so this thread goes on preparing the
+         // next ones (A/B mode 36: here, as before).

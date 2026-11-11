@@ -1,0 +1,419 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index d5d030b..b06435f 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -132,6 +132,7 @@ private:
+     uint64_t m_seenHead = 0u;    // m_head and m_costOut as producers last read them
+     uint64_t m_seenCostOut = 0u;
+     uint32_t m_unnotified = 0u;  // commands queued since the waiting worker was last woken (producers)
++    uint32_t m_wokenTicket = 0u; // m_sleepTicket of the wait the producers last woke the worker from (patch 0069)
+     GSDrawState m_queuedState{};  // draw state of the last GSPrimitiveBatch queued (Submit, EE thread)
+     bool m_queuedStateValid = false;
+     GSPrimitiveBatch m_workerBatch{}; // the worker's: the last batch it ran, with the vertices of a PrimitiveCommand
+@@ -140,6 +141,7 @@ private:
+     std::atomic<uint64_t> m_costOut{0u};               // ... and their total cost
+     std::atomic<bool> m_workerBusy{false};
+     alignas(64) std::atomic<bool> m_workerWaiting{false};
++    std::atomic<uint32_t> m_sleepTicket{0u}; // worker: one more before each wait (patch 0069)
+     std::atomic<uint32_t> m_producersWaiting{0u};
+     std::atomic<bool> m_stop{false};
+     mutable std::mutex m_mutex;
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 61b1b12..17374ab 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <cstdint>
+ 
+ // A/B switch for performance work. Optimized paths that keep their previous implementation check it: 0 runs the
+ // current code, 1 the previous one (GS: drawing on the EE thread with the reference rasterizer), 2 the GS without its
+@@ -38,7 +39,26 @@
+ // (before patch 0066), 42 the presentation copy of the GS local memory made by the GS thread after waiting for
+ // every band job (before patch 0067), 43 the compiled VU1 schedules with IADDIU, MOVE, B, IBEQ, IBNE, the
+ // branch backup and the pending branch of the pc through calls (before patch 0068), 44 modes 41, 42 and 43 together
+-// (everything of patches 0066 to 0068 off at once). A
++// (everything of patches 0066 to 0068 off at once), 46 (experiment, not exact) the GS CLUT loads without waiting for
++// the band jobs, 47 (game hook) the EE thread on a core of its own (ps2EeOwnCore; with F1_EE_PROPIO=1, the other
++// way round), 48 the GS
++// band workers, the GS coordinator and the GS thread sleeping at once instead of spinning first, 49 the EE thread
++// waking the sleeping GS thread as before patch 0069 (again on every command while the pending cost it last saw stays
++// over the bound). Since patch 0069 the modes of
++// other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
++
++// Diagnostics the game hook reads at each A/B window (patch 0069): host time of the VU1 runs and their instruction
++// pairs (EE thread), and time the EE thread spent waiting for the GS thread (queue full, drains).
++extern std::atomic<uint64_t> g_ps2Vu1HostNs;
++extern std::atomic<uint64_t> g_ps2Vu1HostPairs;
++extern std::atomic<uint64_t> g_ps2GsEeWaitNs;
++extern std::atomic<uint64_t> g_ps2Vu1GsWaitNs; // ... of it, inside the VU1 runs (XGKICK)
++extern std::atomic<uint64_t> g_ps2GsWakes; // times the producers woke the GS thread
++
++// Called by the EE thread (patch 0069): own = true keeps it on a performance core of its own (both of its
++// hyper-threads) and every other thread of the process off that core, with 7 cores or more; false undoes it (the EE
++// thread on every performance core). Returns the core index used, or -1.
++int ps2EeOwnCore(bool own);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index c6ac7c8..1453b38 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -726,10 +726,12 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+         return;
+     }
+ 
+-    // It reads the CLUT from local memory: pending jobs drawing there must be done.
+-    if (tex0.csm == 0u)
++    // It reads the CLUT from local memory: pending jobs drawing there must be done (A/B mode 46, an experiment that is
++    // not exact: it does not wait).
++    const bool wait = g_ps2AbMode.load(std::memory_order_relaxed) != 46;
++    if (wait && tex0.csm == 0u)
+         WaitBandsForRead(kWaitClut, tex0.cbp, 1u, tex0.cpsm, 0, 0, 15, 15);
+-    else
++    else if (wait)
+         WaitBandsForRead(kWaitClut, tex0.cbp, texclut.cbw != 0u ? texclut.cbw : 1u, tex0.cpsm, texclut.cou * 16,
+                          texclut.cov, texclut.cou * 16 + 255, texclut.cov);
+     LoadClutUnlocked(tex0, texclut);
+@@ -3262,12 +3264,13 @@ struct GSCpuBackend::BandState
+         if (std::max(target, first) > published.load(std::memory_order_relaxed))
+             Publish(prepared);
+         const auto start = std::chrono::steady_clock::now();
++        const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kCoordinatorSpin;
+         for (unsigned k = 0; k < threads; ++k)
+         {
+             std::atomic<uint64_t> &done = worker[k].done;
+             const uint64_t goal = k == 0u && first != 0u ? first : target;
+             uint64_t value = done.load(std::memory_order_acquire);
+-            for (int i = 0; value < goal && i < kCoordinatorSpin; ++i)
++            for (int i = 0; value < goal && i < spin; ++i)
+             {
+                 spinPause();
+                 value = done.load(std::memory_order_acquire);
+@@ -3298,6 +3301,7 @@ struct GSCpuBackend::BandState
+     {
+         std::chrono::steady_clock::time_point start{};
+         bool waited = false;
++        const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kCoordinatorSpin;
+         for (unsigned k = 0; k < threads; ++k)
+         {
+             if (k == self)
+@@ -3312,7 +3316,7 @@ struct GSCpuBackend::BandState
+                 waited = true;
+                 start = std::chrono::steady_clock::now();
+             }
+-            for (int i = 0; value < target && i < kCoordinatorSpin; ++i)
++            for (int i = 0; value < target && i < spin; ++i)
+             {
+                 spinPause();
+                 value = done.load(std::memory_order_acquire);
+@@ -3515,7 +3519,8 @@ struct GSCpuBackend::BandState
+             uint64_t available = published.load(std::memory_order_acquire);
+             if (available == next)
+             {
+-                for (int i = 0; i < kWorkerSpin && available == next; ++i)
++                const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kWorkerSpin;
++                for (int i = 0; i < spin && available == next; ++i)
+                 {
+                     spinPause();
+                     available = published.load(std::memory_order_acquire);
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index cd9c1ac..912054a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -13,6 +13,17 @@
+ #include <utility>
+ 
+ std::atomic<int> g_ps2AbMode{0};
++std::atomic<uint64_t> g_ps2Vu1HostNs{0u};
++std::atomic<uint64_t> g_ps2Vu1HostPairs{0u};
++std::atomic<uint64_t> g_ps2GsEeWaitNs{0u};
++std::atomic<uint64_t> g_ps2Vu1GsWaitNs{0u};
++std::atomic<uint64_t> g_ps2GsWakes{0u};
++
++namespace
++{
++    // Core index (CoreIndex of SYSTEM_CPU_SET_INFORMATION) the EE thread keeps for itself (ps2EeOwnCore), or -1.
++    std::atomic<int> s_eeOwnCore{-1};
++}
+ 
+ #if defined(_WIN32)
+ extern "C"
+@@ -26,6 +37,8 @@ extern "C"
+                                                                  unsigned long count);
+     __declspec(dllimport) int __stdcall SetThreadInformation(void *thread, int informationClass, void *information,
+                                                              unsigned long length);
++    __declspec(dllimport) int __stdcall SetProcessDefaultCpuSets(void *process, const unsigned long *ids,
++                                                                 unsigned long count);
+ }
+ 
+ namespace
+@@ -38,6 +51,11 @@ namespace
+         unsigned long performanceCount = 0u;
+         unsigned long efficiencyIds[256] = {};  // ... and of the others
+         unsigned long efficiencyCount = 0u;
++        unsigned long allIds[256] = {}; // every CPU set: id, core index and class
++        uint8_t allCore[256] = {};
++        uint8_t allClass[256] = {};
++        unsigned long allCount = 0u;
++        uint8_t coreOf[256] = {}; // CoreIndex by logical processor (group 0)
+         bool hybrid = false;
+     };
+ 
+@@ -62,11 +80,22 @@ namespace
+                     std::memcpy(&id, buffer + pos + 8u, 4u);
+                     std::memcpy(&group, buffer + pos + 12u, 2u);
+                     const uint8_t logical = buffer[pos + 14u];
++                    const uint8_t core = buffer[pos + 15u];
+                     const uint8_t cls = buffer[pos + 18u];
+                     if (pass == 0)
+                     {
+                         if (group == 0u)
++                        {
+                             c.efficiency[logical] = cls;
++                            c.coreOf[logical] = core;
++                        }
++                        if (c.allCount < 256u)
++                        {
++                            c.allIds[c.allCount] = id;
++                            c.allCore[c.allCount] = core;
++                            c.allClass[c.allCount] = cls;
++                            ++c.allCount;
++                        }
+                         c.best = std::max(c.best, cls);
+                         worst = std::min(worst, cls);
+                     }
+@@ -97,6 +126,18 @@ void ThreadNaming::SetCoreKind(int kind)
+     // THREAD_POWER_THROTTLING_STATE {Version 1, ControlMask, StateMask}: execution speed (1) controlled and off.
+     unsigned long state[3] = {1u, kind == 1 ? 1u : 0u, 0u};
+     SetThreadInformation(GetCurrentThread(), 3 /* ThreadPowerThrottling */, state, sizeof(state));
++    if (kind == 3)
++    {
++        // Every CPU set except the core the EE thread keeps (ps2EeOwnCore).
++        const int own = s_eeOwnCore.load(std::memory_order_relaxed);
++        unsigned long ids[256];
++        unsigned long count = 0u;
++        for (unsigned long i = 0u; i < c.allCount; ++i)
++            if (static_cast<int>(c.allCore[i]) != own)
++                ids[count++] = c.allIds[i];
++        SetThreadSelectedCpuSets(GetCurrentThread(), own >= 0 ? ids : nullptr, own >= 0 ? count : 0u);
++        return;
++    }
+     if (!c.hybrid)
+         return;
+     if (kind == 1)
+@@ -106,9 +147,61 @@ void ThreadNaming::SetCoreKind(int kind)
+     else
+         SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0u);
+ }
++
++int ps2EeOwnCore(bool own)
++{
++    const HostCores &c = hostCores();
++    if (!own)
++    {
++        s_eeOwnCore.store(-1, std::memory_order_relaxed);
++        SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0u);
++        if (c.hybrid)
++            SetThreadSelectedCpuSets(GetCurrentThread(), c.performanceIds, c.performanceCount);
++        else
++            SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0u);
++        return -1;
++    }
++    // Only with enough cores for the EE thread, the GS thread and its four band workers on cores of their own.
++    uint8_t seen[256] = {};
++    unsigned cores = 0u;
++    for (unsigned long i = 0u; i < c.allCount; ++i)
++        if (seen[c.allCore[i]]++ == 0u)
++            ++cores;
++    if (cores < 7u)
++        return -1;
++    // The core the EE thread is on, if it is a performance one other than core 0 (where most interrupts go);
++    // otherwise the last performance core.
++    int core = -1;
++    const uint8_t logical = static_cast<uint8_t>(GetCurrentProcessorNumber() & 255u);
++    if (c.efficiency[logical] == c.best && c.coreOf[logical] != 0u)
++        core = c.coreOf[logical];
++    for (unsigned long i = 0u; core < 0 && i < c.allCount; ++i)
++        if (c.allClass[c.allCount - 1u - i] == c.best)
++            core = c.allCore[c.allCount - 1u - i];
++    if (core < 0)
++        return -1;
++    // The EE thread on both hyper-threads of that core (it may move between them, nobody else of the process uses
++    // them), everything else of the process off it.
++    unsigned long mine[8];
++    unsigned long mineCount = 0u;
++    unsigned long others[256];
++    unsigned long count = 0u;
++    for (unsigned long i = 0u; i < c.allCount; ++i)
++    {
++        if (static_cast<int>(c.allCore[i]) != core)
++            others[count++] = c.allIds[i];
++        else if (mineCount < 8u)
++            mine[mineCount++] = c.allIds[i];
++    }
++    s_eeOwnCore.store(core, std::memory_order_relaxed);
++    SetProcessDefaultCpuSets(GetCurrentProcess(), others, count);
++    SetThreadSelectedCpuSets(GetCurrentThread(), mine, mineCount);
++    return core;
++}
+ #else
+ bool ThreadNaming::OnEfficiencyCore() { return false; }
+ void ThreadNaming::SetCoreKind(int) {}
++int ps2EeOwnCore(bool) { return -1; }
+ #endif
+ 
+ // Cores of the GS threads: as Windows decides by default. Keeping all five on the performance cores was 6 % slower
+@@ -125,6 +218,8 @@ void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bo
+     int wanted = s_kind == 2 && !bandWorker ? 0 : s_kind;
+     if (bandWorker && g_ps2AbMode.load(std::memory_order_relaxed) == 14)
+         wanted = 2;
++    if (wanted == 0 && s_eeOwnCore.load(std::memory_order_relaxed) >= 0)
++        wanted = 3; // off the core the EE thread keeps (the process default may not reach running threads)
+     if (wanted != applied)
+     {
+         ThreadNaming::SetCoreKind(wanted);
+@@ -264,12 +359,35 @@ void GSThreadedBackend::Publish(T &&command, uint32_t cost, bool wakeNow)
+             std::atomic_thread_fence(std::memory_order_seq_cst);
+     }
+     // A waiting worker is woken once per kNotifyBatch commands or kNotifyCost pixels (it also looks at the queue every
+-    // kWorkerPollUs, and Drain() wakes it at once).
+-    if (m_workerWaiting.load(std::memory_order_seq_cst) &&
+-        (wakeNow || ++m_unnotified >= kNotifyBatch || m_costIn - m_seenCostOut >= kNotifyCost))
++    // kWorkerPollUs, and Drain() wakes it at once), and only once per wait (patch 0069): the pending cost used to be
++    // measured from m_seenCostOut, which only moves when the queue is full, so with the GS keeping up it stayed over
++    // kNotifyCost and every command queued while the worker slept woke it again (a mutex and a kernel call each). In a
++    // race now that is ~250 more wake-ups/s and no measurable time (A/B mode 49: as before, +2 % +-2), but with the
++    // EE thread slower (the VU1 without its JIT) it was ~3,900/s.
++    if (m_workerWaiting.load(std::memory_order_seq_cst))
+     {
+-        m_unnotified = 0u;
+-        WakeWorker();
++        if (g_ps2AbMode.load(std::memory_order_relaxed) == 49)
++        {
++            if (wakeNow || ++m_unnotified >= kNotifyBatch || m_costIn - m_seenCostOut >= kNotifyCost)
++            {
++                m_unnotified = 0u;
++                g_ps2GsWakes.fetch_add(1u, std::memory_order_relaxed);
++                WakeWorker();
++            }
++        }
++        else
++        {
++            const uint32_t ticket = m_sleepTicket.load(std::memory_order_seq_cst);
++            if (wakeNow || (ticket != m_wokenTicket &&
++                            (++m_unnotified >= kNotifyBatch ||
++                             m_costIn - m_costOut.load(std::memory_order_acquire) >= kNotifyCost)))
++            {
++                m_wokenTicket = ticket;
++                m_unnotified = 0u;
++                g_ps2GsWakes.fetch_add(1u, std::memory_order_relaxed);
++                WakeWorker();
++            }
++        }
+     }
+ }
+ 
+@@ -314,6 +432,9 @@ void GSThreadedBackend::Push(T &&command, uint32_t cost)
+         m_producerWaitNs.fetch_add(
+             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+             std::memory_order_relaxed);
++        g_ps2GsEeWaitNs.fetch_add(
++            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
++            std::memory_order_relaxed);
+     }
+     Publish(std::forward<T>(command), cost, false);
+ }
+@@ -345,13 +466,20 @@ void GSThreadedBackend::Drain() const
+     if (done())
+         return;
+     m_drains.fetch_add(1u, std::memory_order_relaxed);
+-    std::unique_lock<std::mutex> lock(m_mutex);
+-    while (!done())
++    const auto waitStart = std::chrono::steady_clock::now();
+     {
+-        if (m_workerWaiting.load(std::memory_order_seq_cst))
+-            m_notEmpty.notify_one(); // the commands since the last wake-up
+-        m_idle.wait_for(lock, std::chrono::microseconds(200));
++        std::unique_lock<std::mutex> lock(m_mutex);
++        while (!done())
++        {
++            if (m_workerWaiting.load(std::memory_order_seq_cst))
++                m_notEmpty.notify_one(); // the commands since the last wake-up
++            m_idle.wait_for(lock, std::chrono::microseconds(200));
++        }
+     }
++    g_ps2GsEeWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                        std::chrono::steady_clock::now() - waitStart)
++                                                        .count()),
++                              std::memory_order_relaxed);
+ }
+ 
+ void GSThreadedBackend::WorkerLoop()
+@@ -389,7 +517,8 @@ void GSThreadedBackend::WorkerLoop()
+             // Out of commands: the band workers get the jobs prepared so far, then this thread watches the queue
+             // for a moment before sleeping (A/B mode 8: sleep at once, as before).
+             m_cpu->FlushBands();
+-            if (g_ps2AbMode.load(std::memory_order_relaxed) != 8)
++            const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++            if (abMode != 8 && abMode != 48)
+             {
+                 const Clock::time_point spinEnd = Clock::now() + std::chrono::microseconds(kWorkerSpinUs);
+                 while ((tail = m_published.load(std::memory_order_acquire)) == head &&
+@@ -402,6 +531,7 @@ void GSThreadedBackend::WorkerLoop()
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 for (;;)
+                 {
++                    m_sleepTicket.fetch_add(1u, std::memory_order_seq_cst);
+                     m_workerWaiting.store(true, std::memory_order_seq_cst);
+                     tail = m_published.load(std::memory_order_seq_cst);
+                     if (tail != head || m_stop.load(std::memory_order_seq_cst))
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index f10a2ab..48ae88b 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1871,7 +1871,11 @@ namespace
+         BlockState &st = engine.state;
+         VU1State &vu = host.state();
+         const uint64_t generation = host.generation();
+-        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++        // The A/B modes of other parts (36 and up, except 40, 43 and 44, which include VU1 ones) run the current VU1
++        // code. Until patch 0069 they ran the schedules without their compiled code (only mode 0 used it), so their B
++        // windows were also slower by the whole JIT: the A/B of patches 0063-0067 (modes 36-39, 41, 42) came out too big.
++        const int abModeAll = g_ps2AbMode.load(std::memory_order_relaxed);
++        const int abMode = abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 ? abModeAll : 0;
+         if (engine.storage.size() > 200000u)
+         {
+             // Too many schedules (code that keeps changing): start again, keeping the current timing state.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 8b195b3..ba7baef 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3003,6 +3003,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const uint64_t cicloInicioTraza = m_cycle;
+     const uint32_t pcInicioTraza = m_state.pc;
+     const auto inicioRitmo = std::chrono::steady_clock::now();
++    const uint64_t esperaGsAntes = g_ps2GsEeWaitNs.load(std::memory_order_relaxed);
+     uint64_t paresEjecutados = 0u;
+     if (m_unit == Unit::VU1)
+     {
+@@ -3878,6 +3879,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const auto finRitmo = std::chrono::steady_clock::now();
+         s_ritmoTiempo += finRitmo - inicioRitmo;
+         s_ritmoPares += paresEjecutados;
++        g_ps2Vu1HostNs.store(g_ps2Vu1HostNs.load(std::memory_order_relaxed) +
++                                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                           finRitmo - inicioRitmo)
++                                                           .count()),
++                             std::memory_order_relaxed);
++        g_ps2Vu1HostPairs.store(g_ps2Vu1HostPairs.load(std::memory_order_relaxed) + paresEjecutados,
++                                std::memory_order_relaxed);
++        g_ps2Vu1GsWaitNs.store(g_ps2Vu1GsWaitNs.load(std::memory_order_relaxed) +
++                                   (g_ps2GsEeWaitNs.load(std::memory_order_relaxed) - esperaGsAntes),
++                               std::memory_order_relaxed);
+         const double segundos = std::chrono::duration<double>(finRitmo - s_ritmoDesde).count();
+         if (segundos >= 10.0)
+         {

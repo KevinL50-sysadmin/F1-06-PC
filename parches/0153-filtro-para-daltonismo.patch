@@ -1,0 +1,571 @@
+diff --git a/ps2xRuntime/src/lib/ps2_color_vision.h b/ps2xRuntime/src/lib/ps2_color_vision.h
+new file mode 100644
+index 0000000..19d48ab
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_color_vision.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <array>
++#include <functional>
++#include <string_view>
++
++// Fase 5 (T7, F1 06): the colour blindness filter of the presentation (opciones.ini: daltonismo). A 3x3 matrix on
++// the picture after the scaling filter (ps2_display.cpp). Apart from ps2_display.h because ps2_runtime.h includes that
++// one (changing it rebuilds the 14,000 recompiled functions).
++namespace ps2x
++{
++    enum class ColorVision
++    {
++        Normal,       // no: no filter
++        Protanopia,   // no red cones
++        Deuteranopia, // no green cones
++        Tritanopia,   // no blue cones
++    };
++
++    // The opciones.ini names (no, protanopia, deuteranopia, tritanopia), case-insensitive.
++    const char *colorVisionName(ColorVision vision);
++    bool parseColorVision(std::string_view text, ColorVision &vision);
++    // PS2X_DALTONISMO (set from opciones.ini); unset or bad: Normal.
++    ColorVision colorVisionFromEnvironment(const std::function<const char *(const char *)> &getEnvironment);
++
++    // Row-major 3x3 matrices on RGB in 0..1. Simulation: how a dichromat of that kind sees the colours (Machado,
++    // Oliveira and Fernandes 2009, severity 1). Correction: daltonize (Fidaner, Lin and Ozguven 2005), the colours the
++    // eye cannot tell apart moved into those it can, I + E (I - simulation). Normal: the identity.
++    std::array<float, 9> colorVisionSimulation(ColorVision vision);
++    std::array<float, 9> colorVisionCorrection(ColorVision vision);
++    // matrix * rgb, clamped to 0..1 (as the shader writes it).
++    std::array<float, 3> applyColorMatrix(const std::array<float, 9> &matrix, const std::array<float, 3> &rgb);
++
++    // The filter the window uses; any thread (the options menus), applied from the next window frame.
++    void setColorVision(ColorVision vision);
++    ColorVision colorVision();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+index f3574e1..dd66106 100644
+--- a/ps2xRuntime/src/lib/ps2_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -1,10 +1,13 @@
+ #include "ps2_display.h"
++#include "ps2_color_vision.h"
+ #include "shaders/ps2_display_shaders.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cctype>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -413,6 +416,11 @@ namespace ps2x
+             SetShaderValue(shader, GetShaderLocation(shader, name), value, SHADER_UNIFORM_VEC2);
+         }
+ 
++        void setVec3(const Shader &shader, const char *name, const float *value)
++        {
++            SetShaderValue(shader, GetShaderLocation(shader, name), value, SHADER_UNIFORM_VEC3);
++        }
++
+         void setFloat(const Shader &shader, const char *name, float value)
+         {
+             SetShaderValue(shader, GetShaderLocation(shader, name), &value, SHADER_UNIFORM_FLOAT);
+@@ -481,6 +489,11 @@ namespace ps2x
+         RenderTexture2D upscaled{};
+         bool upscaledValid = false;
+         float crtCurvature = 0.0f;
++        // Fase 5 (T7): the scaled picture, for the colour blindness filter.
++        LoadedShader colorVision;
++        RenderTexture2D corrected{};
++        bool correctedValid = false;
++        ColorVision shownVision = ColorVision::Normal;
+     };
+ 
+     DisplayPresenter::DisplayPresenter() : m_state(std::make_unique<State>()) {}
+@@ -496,6 +509,7 @@ namespace ps2x
+         State &s = *m_state;
+         s.background = backgroundWindow;
+         s.refreshRate = monitorRefreshRate(GetCurrentMonitor(), 60);
++        setColorVision(colorVisionFromEnvironment([](const char *name) { return static_cast<const char *>(std::getenv(name)); }));
+         const char *curvature = std::getenv("PS2X_CRT_CURVATURA");
+         s.crtCurvature = curvature != nullptr && curvature[0] == '1' ? 1.0f : 0.0f;
+         // The window starts as a window of the settings' size, without VSync (raylib's default) and capped at 60.
+@@ -599,93 +613,141 @@ namespace ps2x
+                                      float sourceHeight, float x, float y, float width, float height)
+     {
+         State &s = *m_state;
+-        const Texture2D frame{textureId, textureWidth, textureHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-        FrameFilter filter = s.settings.filter;
+-        if ((filter == FrameFilter::Sharp && !ensureShader(s.sharp, shaders::kSharpBilinear, "nitido")) ||
+-            (filter == FrameFilter::Crt && !ensureShader(s.crt, shaders::kCrt, "crt")) ||
+-            (filter == FrameFilter::Fsr && (!ensureShader(s.easu, shaders::kFsrEasu, "fsr (EASU)") ||
+-                                            !ensureShader(s.rcas, shaders::kFsrRcas, "fsr (RCAS)"))))
+-            filter = FrameFilter::Bilinear;
+-        const int textureFilter = textureFilterOf(filter);
+-        if (textureId != s.filteredTexture || textureFilter != s.textureFilter)
+-        {
+-            SetTextureFilter(frame, textureFilter);
+-            s.filteredTexture = textureId;
+-            s.textureFilter = textureFilter;
+-        }
+-        const Rectangle source{0.0f, 0.0f, sourceWidth, sourceHeight};
+-        const Rectangle destination{x, y, width, height};
+-
+-        switch (filter)
+-        {
+-        case FrameFilter::Nearest:
+-        case FrameFilter::Bilinear:
+-            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+-            return;
+-        case FrameFilter::Sharp:
++        // The picture scaled with the filter into the destination rectangle, of the window or of target (the colour
++        // blindness filter's render texture, which an inner render texture pass must bind again).
++        const auto drawScaled = [&](float x, float y, RenderTexture2D *target)
+         {
+-            const Prescale prescale = sharpPrescale(sourceWidth, sourceHeight, width, height);
+-            BeginShaderMode(s.sharp.shader);
+-            setVec2(s.sharp.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
+-            setVec2(s.sharp.shader, "prescale", static_cast<float>(prescale.x), static_cast<float>(prescale.y));
+-            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+-            EndShaderMode();
+-            return;
+-        }
+-        case FrameFilter::Crt:
+-            BeginShaderMode(s.crt.shader);
+-            setVec2(s.crt.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
+-            setVec2(s.crt.shader, "sourceSize", sourceWidth, sourceHeight);
+-            setFloat(s.crt.shader, "scanlines",
+-                     static_cast<float>(crtScanlines(static_cast<int>(sourceHeight), height)));
+-            setFloat(s.crt.shader, "curvature", s.crtCurvature);
+-            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+-            EndShaderMode();
+-            return;
+-        case FrameFilter::Fsr:
+-            break;
+-        }
++            const Texture2D frame{textureId, textureWidth, textureHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            FrameFilter filter = s.settings.filter;
++            if ((filter == FrameFilter::Sharp && !ensureShader(s.sharp, shaders::kSharpBilinear, "nitido")) ||
++                (filter == FrameFilter::Crt && !ensureShader(s.crt, shaders::kCrt, "crt")) ||
++                (filter == FrameFilter::Fsr && (!ensureShader(s.easu, shaders::kFsrEasu, "fsr (EASU)") ||
++                                                !ensureShader(s.rcas, shaders::kFsrRcas, "fsr (RCAS)"))))
++                filter = FrameFilter::Bilinear;
++            const int textureFilter = textureFilterOf(filter);
++            if (textureId != s.filteredTexture || textureFilter != s.textureFilter)
++            {
++                SetTextureFilter(frame, textureFilter);
++                s.filteredTexture = textureId;
++                s.textureFilter = textureFilter;
++            }
++            const Rectangle source{0.0f, 0.0f, sourceWidth, sourceHeight};
++            const Rectangle destination{x, y, width, height};
+ 
+-        // FSR: the picture at the window's size in a render texture (EASU when it grows on some axis; plain bilinear
+-        // when the window is smaller than the frame on both, which EASU is not made for), then RCAS to the window
+-        // pixel for pixel.
+-        const int outWidth = std::max(1, static_cast<int>(std::lround(width)));
+-        const int outHeight = std::max(1, static_cast<int>(std::lround(height)));
+-        if (!s.upscaledValid || s.upscaled.texture.width != outWidth || s.upscaled.texture.height != outHeight)
+-        {
+-            if (s.upscaledValid)
+-                UnloadRenderTexture(s.upscaled);
+-            s.upscaled = LoadRenderTexture(outWidth, outHeight);
+-            s.upscaledValid = IsRenderTextureValid(s.upscaled);
+-            if (!s.upscaledValid)
++            switch (filter)
+             {
++            case FrameFilter::Nearest:
++            case FrameFilter::Bilinear:
++                DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++                return;
++            case FrameFilter::Sharp:
++            {
++                const Prescale prescale = sharpPrescale(sourceWidth, sourceHeight, width, height);
++                BeginShaderMode(s.sharp.shader);
++                setVec2(s.sharp.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++                setVec2(s.sharp.shader, "prescale", static_cast<float>(prescale.x), static_cast<float>(prescale.y));
++                DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++                EndShaderMode();
++                return;
++            }
++            case FrameFilter::Crt:
++                BeginShaderMode(s.crt.shader);
++                setVec2(s.crt.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++                setVec2(s.crt.shader, "sourceSize", sourceWidth, sourceHeight);
++                setFloat(s.crt.shader, "scanlines",
++                         static_cast<float>(crtScanlines(static_cast<int>(sourceHeight), height)));
++                setFloat(s.crt.shader, "curvature", s.crtCurvature);
+                 DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++                EndShaderMode();
+                 return;
++            case FrameFilter::Fsr:
++                break;
++            }
++
++            // FSR: the picture at the window's size in a render texture (EASU when it grows on some axis; plain bilinear
++            // when the window is smaller than the frame on both, which EASU is not made for), then RCAS to the window
++            // pixel for pixel.
++            const int outWidth = std::max(1, static_cast<int>(std::lround(width)));
++            const int outHeight = std::max(1, static_cast<int>(std::lround(height)));
++            if (!s.upscaledValid || s.upscaled.texture.width != outWidth || s.upscaled.texture.height != outHeight)
++            {
++                if (s.upscaledValid)
++                    UnloadRenderTexture(s.upscaled);
++                s.upscaled = LoadRenderTexture(outWidth, outHeight);
++                s.upscaledValid = IsRenderTextureValid(s.upscaled);
++                if (!s.upscaledValid)
++                {
++                    DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++                    return;
++                }
++                SetTextureFilter(s.upscaled.texture, TEXTURE_FILTER_POINT);
++            }
++            const bool upscale =
++                static_cast<float>(outWidth) >= sourceWidth || static_cast<float>(outHeight) >= sourceHeight;
++            BeginTextureMode(s.upscaled);
++            ClearBackground(BLACK);
++            if (upscale)
++            {
++                BeginShaderMode(s.easu.shader);
++                setVec2(s.easu.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++                setVec2(s.easu.shader, "sourceSize", sourceWidth, sourceHeight);
+             }
+-            SetTextureFilter(s.upscaled.texture, TEXTURE_FILTER_POINT);
++            DrawTexturePro(frame, source, Rectangle{0.0f, 0.0f, static_cast<float>(outWidth), static_cast<float>(outHeight)},
++                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            if (upscale)
++                EndShaderMode();
++            EndTextureMode();
++            if (target != nullptr)
++                BeginTextureMode(*target);
++
++            BeginShaderMode(s.rcas.shader);
++            setVec2(s.rcas.shader, "textureSize", static_cast<float>(outWidth), static_cast<float>(outHeight));
++            setFloat(s.rcas.shader, "sharpness", std::exp2(-kRcasSharpnessStops));
++            // Render textures are stored upside down: a negative source height flips them back.
++            const float w = static_cast<float>(outWidth), h = static_cast<float>(outHeight);
++            DrawTexturePro(s.upscaled.texture, Rectangle{0.0f, 0.0f, w, -h}, Rectangle{std::round(x), std::round(y), w, h},
++                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            EndShaderMode();
++        };
++
++        // Fase 5 (T7): with a colour blindness filter, the scaled picture goes to a render texture of the destination's
++        // size and from there to the window through the correction matrix (after the scaling filter, pixel for pixel).
++        const ColorVision vision = colorVision();
++        if (vision != s.shownVision)
++        {
++            s.shownVision = vision;
++            std::fprintf(stderr, "[ventana] daltonismo=%s\n", colorVisionName(vision));
+         }
+-        const bool upscale =
+-            static_cast<float>(outWidth) >= sourceWidth || static_cast<float>(outHeight) >= sourceHeight;
+-        BeginTextureMode(s.upscaled);
+-        ClearBackground(BLACK);
+-        if (upscale)
++        const int outWidth = std::max(1, static_cast<int>(std::lround(width)));
++        const int outHeight = std::max(1, static_cast<int>(std::lround(height)));
++        bool correct = vision != ColorVision::Normal && ensureShader(s.colorVision, shaders::kColorVision, "daltonismo");
++        if (correct &&
++            (!s.correctedValid || s.corrected.texture.width != outWidth || s.corrected.texture.height != outHeight))
+         {
+-            BeginShaderMode(s.easu.shader);
+-            setVec2(s.easu.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
+-            setVec2(s.easu.shader, "sourceSize", sourceWidth, sourceHeight);
++            if (s.correctedValid)
++                UnloadRenderTexture(s.corrected);
++            s.corrected = LoadRenderTexture(outWidth, outHeight);
++            s.correctedValid = IsRenderTextureValid(s.corrected);
++            if (s.correctedValid)
++                SetTextureFilter(s.corrected.texture, TEXTURE_FILTER_POINT);
++            correct = s.correctedValid;
+         }
+-        DrawTexturePro(frame, source, Rectangle{0.0f, 0.0f, static_cast<float>(outWidth), static_cast<float>(outHeight)},
+-                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+-        if (upscale)
+-            EndShaderMode();
++        if (!correct)
++        {
++            drawScaled(x, y, nullptr);
++            return;
++        }
++        BeginTextureMode(s.corrected);
++        ClearBackground(BLACK);
++        drawScaled(0.0f, 0.0f, &s.corrected);
+         EndTextureMode();
+-
+-        BeginShaderMode(s.rcas.shader);
+-        setVec2(s.rcas.shader, "textureSize", static_cast<float>(outWidth), static_cast<float>(outHeight));
+-        setFloat(s.rcas.shader, "sharpness", std::exp2(-kRcasSharpnessStops));
+-        // Render textures are stored upside down: a negative source height flips them back.
++        const std::array<float, 9> matrix = colorVisionCorrection(vision);
++        BeginShaderMode(s.colorVision.shader);
++        setVec3(s.colorVision.shader, "row0", matrix.data());
++        setVec3(s.colorVision.shader, "row1", matrix.data() + 3);
++        setVec3(s.colorVision.shader, "row2", matrix.data() + 6);
+         const float w = static_cast<float>(outWidth), h = static_cast<float>(outHeight);
+-        DrawTexturePro(s.upscaled.texture, Rectangle{0.0f, 0.0f, w, -h}, Rectangle{std::round(x), std::round(y), w, h},
++        DrawTexturePro(s.corrected.texture, Rectangle{0.0f, 0.0f, w, -h}, Rectangle{std::round(x), std::round(y), w, h},
+                        Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+         EndShaderMode();
+     }
+@@ -729,5 +791,121 @@ namespace ps2x
+         if (s.upscaledValid)
+             UnloadRenderTexture(s.upscaled);
+         s.upscaledValid = false;
++        unloadShader(s.colorVision);
++        if (s.correctedValid)
++            UnloadRenderTexture(s.corrected);
++        s.correctedValid = false;
++    }
++}
++
++// ---- Fase 5 (T7): the colour blindness filter ----
++
++namespace ps2x
++{
++    namespace
++    {
++        struct ColorVisionName
++        {
++            ColorVision vision;
++            const char *name;
++        };
++        constexpr ColorVisionName kColorVisionNames[] = {
++            {ColorVision::Normal, "no"},
++            {ColorVision::Protanopia, "protanopia"},
++            {ColorVision::Deuteranopia, "deuteranopia"},
++            {ColorVision::Tritanopia, "tritanopia"},
++        };
++
++        std::atomic<int> g_colorVision{static_cast<int>(ColorVision::Normal)};
++    }
++
++    const char *colorVisionName(ColorVision vision)
++    {
++        for (const ColorVisionName &entry : kColorVisionNames)
++            if (entry.vision == vision)
++                return entry.name;
++        return "no";
++    }
++
++    bool parseColorVision(std::string_view text, ColorVision &vision)
++    {
++        std::string lowered(text);
++        for (char &c : lowered)
++            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        for (const ColorVisionName &entry : kColorVisionNames)
++            if (lowered == entry.name)
++            {
++                vision = entry.vision;
++                return true;
++            }
++        return false;
++    }
++
++    ColorVision colorVisionFromEnvironment(const std::function<const char *(const char *)> &getEnvironment)
++    {
++        ColorVision vision = ColorVision::Normal;
++        if (const char *value = getEnvironment("PS2X_DALTONISMO"))
++            parseColorVision(value, vision);
++        return vision;
++    }
++
++    // Machado, G. M., Oliveira, M. M. and Fernandes, L. A. F. (2009), "A Physiologically-based Model for Simulation of
++    // Color Vision Deficiency", IEEE TVCG 15(6): the matrices for severity 1.0 published with the paper
++    // (https://www.inf.ufrgs.br/~oliveira/pubs_files/CVD_Simulation/CVD_Simulation.html), applied to the picture's
++    // values as they are (as most games and daltonize.js do).
++    std::array<float, 9> colorVisionSimulation(ColorVision vision)
++    {
++        switch (vision)
++        {
++        case ColorVision::Protanopia:
++            return {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f};
++        case ColorVision::Deuteranopia:
++            return {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f};
++        case ColorVision::Tritanopia:
++            return {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f};
++        case ColorVision::Normal:
++            break;
++        }
++        return {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
++    }
++
++    // Daltonize (Fidaner, O., Lin, P. and Ozguven, N. (2005), "Analysis of Color Blindness", Stanford; the method of
++    // daltonize.org): the error the eye loses, colour - simulation(colour), shifted into the channels it still sees by
++    // E = {{0, 0, 0}, {0.7, 1, 0}, {0.7, 0, 1}} and added back: correction = I + E (I - S). The simulation rows add up
++    // to 1, so greys stay grey.
++    std::array<float, 9> colorVisionCorrection(ColorVision vision)
++    {
++        std::array<float, 9> correction = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
++        if (vision == ColorVision::Normal)
++            return correction;
++        const std::array<float, 9> simulation = colorVisionSimulation(vision);
++        constexpr float shift[9] = {0.0f, 0.0f, 0.0f, 0.7f, 1.0f, 0.0f, 0.7f, 0.0f, 1.0f};
++        float lost[9];
++        for (int i = 0; i < 9; ++i)
++            lost[i] = (i % 4 == 0 ? 1.0f : 0.0f) - simulation[i];
++        for (int row = 0; row < 3; ++row)
++            for (int column = 0; column < 3; ++column)
++                for (int k = 0; k < 3; ++k)
++                    correction[row * 3 + column] += shift[row * 3 + k] * lost[k * 3 + column];
++        return correction;
++    }
++
++    std::array<float, 3> applyColorMatrix(const std::array<float, 9> &matrix, const std::array<float, 3> &rgb)
++    {
++        std::array<float, 3> result{};
++        for (int row = 0; row < 3; ++row)
++            result[row] = std::clamp(matrix[row * 3] * rgb[0] + matrix[row * 3 + 1] * rgb[1] + matrix[row * 3 + 2] * rgb[2],
++                                     0.0f, 1.0f);
++        return result;
++    }
++
++    void setColorVision(ColorVision vision)
++    {
++        g_colorVision.store(static_cast<int>(vision), std::memory_order_relaxed);
++    }
++
++    ColorVision colorVision()
++    {
++        return static_cast<ColorVision>(g_colorVision.load(std::memory_order_relaxed));
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h b/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h
+index a604c22..0e42027 100644
+--- a/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h
++++ b/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h
+@@ -246,5 +246,23 @@ void main()
+     float rcpL = 1.0 / (4.0 * lobe + 1.0);
+     finalColor = vec4(clamp((lobe * (b + d + h + f) + e) * rcpL, 0.0, 1.0), 1.0);
+ }
++)glsl";
++
++    // Fase 5 (T7): the colour blindness filter (daltonismo), on the picture already scaled to the window (a render
++    // texture of the destination's size, read pixel for pixel). The rows of ps2x::colorVisionCorrection.
++    inline constexpr const char *kColorVision = R"glsl(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec3 row0;
++uniform vec3 row1;
++uniform vec3 row2;
++out vec4 finalColor;
++
++void main()
++{
++    vec3 c = texture(texture0, fragTexCoord).rgb;
++    finalColor = vec4(clamp(vec3(dot(row0, c), dot(row1, c), dot(row2, c)), 0.0, 1.0), 1.0);
++}
+ )glsl";
+ }
+diff --git a/ps2xTest/src/ps2_display_tests.cpp b/ps2xTest/src/ps2_display_tests.cpp
+index 82440d4..67f908b 100644
+--- a/ps2xTest/src/ps2_display_tests.cpp
++++ b/ps2xTest/src/ps2_display_tests.cpp
+@@ -1,8 +1,10 @@
+ #include "MiniTest.h"
+ #include "ps2_display.h"
++#include "ps2_color_vision.h"
+ #include "ps2_options.h"
+ #include "ps2_runtime.h"
+ 
++#include <array>
+ #include <cmath>
+ #include <map>
+ #include <string>
+@@ -15,6 +17,11 @@ namespace
+     using ps2x::WindowMode;
+     using ps2x::WindowStep;
+ 
++    bool near(float a, float b)
++    {
++        return std::fabs(a - b) < 1e-4f;
++    }
++
+     // The player's filter (chosen from the window captures of fase3 T2); development keeps bilineal.
+     const std::string kPlayerFilter = "fsr";
+ 
+@@ -518,4 +525,82 @@ void register_ps2_display_tests()
+             t.Equals(meter.rate(), 25.0, "25 per second");
+         });
+     });
++
++    // Fase 5 (T7): the colour blindness filter (opciones.ini: daltonismo), a matrix on the scaled picture.
++    MiniTest::Case("ColorVision", [](TestCase &tc)
++    {
++        using ps2x::ColorVision;
++
++        tc.Run("the opciones.ini names and the variable", [](TestCase &t)
++        {
++            ColorVision vision = ColorVision::Normal;
++            t.IsTrue(ps2x::parseColorVision("protanopia", vision) && vision == ColorVision::Protanopia, "protanopia");
++            t.IsTrue(ps2x::parseColorVision("Deuteranopia", vision) && vision == ColorVision::Deuteranopia, "any case");
++            t.IsTrue(ps2x::parseColorVision("tritanopia", vision) && vision == ColorVision::Tritanopia, "tritanopia");
++            t.IsTrue(ps2x::parseColorVision("no", vision) && vision == ColorVision::Normal, "no");
++            vision = ColorVision::Tritanopia;
++            t.IsFalse(ps2x::parseColorVision("rojo", vision), "an unknown name");
++            t.IsTrue(vision == ColorVision::Tritanopia, "leaves the value alone");
++            t.Equals(std::string(ps2x::colorVisionName(ColorVision::Deuteranopia)), std::string("deuteranopia"), "name");
++            const std::map<std::string, std::string> environment = {{"PS2X_DALTONISMO", "protanopia"}};
++            const auto getEnvironment = [&environment](const char *name) -> const char *
++            {
++                const auto found = environment.find(name);
++                return found == environment.end() ? nullptr : found->second.c_str();
++            };
++            t.IsTrue(ps2x::colorVisionFromEnvironment(getEnvironment) == ColorVision::Protanopia, "PS2X_DALTONISMO");
++            t.IsTrue(ps2x::colorVisionFromEnvironment([](const char *) -> const char * { return nullptr; }) ==
++                         ColorVision::Normal,
++                     "unset: no filter");
++        });
++
++        tc.Run("no filter is the identity and every filter keeps greys grey", [](TestCase &t)
++        {
++            const std::array<float, 9> identity = ps2x::colorVisionCorrection(ColorVision::Normal);
++            const std::array<float, 9> expected = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
++            t.IsTrue(identity == expected, "no: the identity");
++            for (ColorVision vision : {ColorVision::Protanopia, ColorVision::Deuteranopia, ColorVision::Tritanopia})
++            {
++                const std::array<float, 3> grey = ps2x::applyColorMatrix(ps2x::colorVisionCorrection(vision), {0.5f, 0.5f, 0.5f});
++                t.IsTrue(near(grey[0], 0.5f) && near(grey[1], 0.5f) && near(grey[2], 0.5f),
++                         std::string(ps2x::colorVisionName(vision)) + ": grey stays grey");
++                const std::array<float, 3> white = ps2x::applyColorMatrix(ps2x::colorVisionCorrection(vision), {1.0f, 1.0f, 1.0f});
++                t.IsTrue(near(white[0], 1.0f) && near(white[1], 1.0f) && near(white[2], 1.0f),
++                         std::string(ps2x::colorVisionName(vision)) + ": white stays white");
++            }
++        });
++
++        tc.Run("the correction is daltonize (Fidaner) over the Machado 2009 simulation", [](TestCase &t)
++        {
++            const std::array<float, 9> m = ps2x::colorVisionCorrection(ColorVision::Protanopia);
++            t.IsTrue(near(m[0], 1.0f) && near(m[1], 0.0f) && near(m[2], 0.0f), "protanopia: red is kept");
++            t.IsTrue(near(m[3], 0.4788968f) && near(m[4], 0.4769109f) && near(m[5], 0.0441916f), "green row");
++            t.IsTrue(near(m[6], 0.5972818f) && near(m[7], -0.6886921f) && near(m[8], 1.0914096f), "blue row");
++            const std::array<float, 9> s = ps2x::colorVisionSimulation(ColorVision::Deuteranopia);
++            t.IsTrue(near(s[0], 0.367322f) && near(s[4], 0.672501f) && near(s[8], 0.968881f),
++                     "deuteranopia simulation, severity 1");
++            const std::array<float, 3> clamped = ps2x::applyColorMatrix(m, {0.0f, 1.0f, 0.0f});
++            t.IsTrue(clamped[2] == 0.0f, "the result is clamped to 0..1");
++        });
++
++        tc.Run("after the correction a protanope tells red from green better", [](TestCase &t)
++        {
++            for (ColorVision vision : {ColorVision::Protanopia, ColorVision::Deuteranopia})
++            {
++                const std::array<float, 9> seen = ps2x::colorVisionSimulation(vision);
++                const std::array<float, 9> fixed = ps2x::colorVisionCorrection(vision);
++                const auto distance = [](const std::array<float, 3> &a, const std::array<float, 3> &b)
++                {
++                    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) +
++                                     (a[2] - b[2]) * (a[2] - b[2]));
++                };
++                const std::array<float, 3> red = {0.8f, 0.2f, 0.2f}, green = {0.2f, 0.6f, 0.2f};
++                const float before = distance(ps2x::applyColorMatrix(seen, red), ps2x::applyColorMatrix(seen, green));
++                const float after = distance(ps2x::applyColorMatrix(seen, ps2x::applyColorMatrix(fixed, red)),
++                                             ps2x::applyColorMatrix(seen, ps2x::applyColorMatrix(fixed, green)));
++                t.IsTrue(after > before * 1.2f, std::string(ps2x::colorVisionName(vision)) + ": " +
++                                                    std::to_string(before) + " -> " + std::to_string(after));
++            }
++        });
++    });
+ }

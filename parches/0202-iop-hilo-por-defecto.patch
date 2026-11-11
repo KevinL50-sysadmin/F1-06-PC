@@ -1,0 +1,450 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index f527f58..fc978db 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -92,11 +92,14 @@ namespace ps2x::iop::detail
+             // destinations before committing any write so a bad chain cannot
+             // partially update guest memory, but maybe we could skip this check if we trust the EE-side SIF driver to validate the chain ?!
+             // TODO check later
++            // Patch 0202: a null destination asks the host only to check the range (the runtime's host does, without
++            // copying EE RAM from the IOP worker thread); a host that refuses it gets the copy as before.
+             std::vector<uint8_t> scratch(largestTransfer);
+             for (uint32_t i = 0u; i < pendingCount; ++i)
+             {
+                 const PendingTransfer &transfer = pending[i];
+-                if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
++                if (!m_host.readGuest(transfer.destination, nullptr, transfer.size) &&
++                    !m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
+                 {
+                     setV0(0u);
+                     return true;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 609bb84..836303a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -322,8 +322,8 @@ void EeScheduler::run()
+                 // Patch 0147: and all its real-time debt. Paid at 2 ms per call, it stayed pinned near the 100 ms cap
+                 // through the boot (the EE sleeps 69 % of the time there), the IOP dropped 5-80 % of its time and the
+                 // SPU2 output ring ran dry; an idle IOP jumps to its next event, so this costs only the work it has.
+-                // Patch 0201: first the batch on the IOP worker (mode 178) and the effects it left for the EE (a SIF
+-                // command queues its handler); the rest runs here, on the idle EE thread.
++                // Patch 0201: first the batch on the IOP worker (the default since patch 0202) and the effects it left
++                // for the EE (a SIF command queues its handler); the rest runs here, on the idle EE thread.
+                 if (PS2IopTransport::iopSync(&m_runtime))
+                 {
+                     continue;
+@@ -800,10 +800,14 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     // and whether 1 ms of IOP latency behind the EE is harmless (the step before moving the IOP to a worker thread).
+     // It only stretches the batches made of executed EE cycles: a call that pays real-time debt adds up to 2 ms to the
+     // batch, which then runs at once as with 32 us, and run() still hands the IOP the rest before the EE goes idle.
+-    // A/B mode 178 (patch 0201): the same 1 ms batches (debt included), run by the IOP worker thread in parallel with
+-    // the EE (PS2IopHostAdapter::handOffBatch): the EE waits only if the previous batch is still running, and before
+-    // touching the IOP. "[iop:hilo]" (every 10 s, with a worker): batches handed off per second, the EE's waits for
+-    // the worker (count and ms per second) and the worker's busy time (ms per second).
++    // Patch 0201 (A/B mode 178 then): the same 1 ms batches (debt included), run by the IOP worker thread in parallel
++    // with the EE (PS2IopHostAdapter::handOffBatch): the EE waits only if the previous batch is still running, and
++    // before touching the IOP. "[iop:hilo]" (every 10 s, with a worker): batches handed off per second, the EE's waits
++    // for the worker (count and ms per second) and the worker's busy time (ms per second).
++    // Patch 0202: the worker is the default (-2.4 % +- 1.0 % of EE time per frame in the A/B race of 0201); mode 178
++    // stays as its name. A/B mode 179 and PS2X_IOP_HILO=0 (read once) run the batches of before, PS2X_IOP_PASO_US on
++    // this thread; modes 177 and 4 also run on this thread. Switching back to this thread is safe at any time:
++    // advanceIopEeCycles first waits for the batch on the worker and applies its effects (iopSync).
+     {
+         static const bool s_iopRealTime = []
+         {
+@@ -815,7 +819,12 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             const char *value = std::getenv("PS2X_IOP_PASO_US");
+             return microsecondsToEeCycles(value != nullptr ? std::strtoull(value, nullptr, 10) : 32u);
+         }();
+-        constexpr uint64_t kIopBatchMode177 = microsecondsToEeCycles(1000u);
++        static const bool s_iopWorker = []
++        {
++            const char *value = std::getenv("PS2X_IOP_HILO");
++            return value == nullptr || value[0] != '0';
++        }();
++        constexpr uint64_t kIopLongBatch = microsecondsToEeCycles(1000u);
+         constexpr uint64_t kIopCatchUpPerCall = microsecondsToEeCycles(2000u);
+         constexpr uint64_t kMaxIopDebt = microsecondsToEeCycles(100000u);
+         static uint64_t s_iopDropped = 0u;
+@@ -838,12 +847,13 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             s_iopDropped += catchUp;
+         }
+         g_iopBatchCycles += iopCycles;
+-        int mode = 0;
++        bool onWorker = false;
+         bool iopDue = false;
+         if (g_iopBatchCycles >= s_iopBatch)
+         {
+-            mode = g_ps2AbMode.load(std::memory_order_relaxed);
+-            iopDue = g_iopBatchCycles >= kIopBatchMode177 || (mode != 177 && mode != 178);
++            const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++            onWorker = mode == 178 || (s_iopWorker && mode != 179 && mode != 177 && mode != 4);
++            iopDue = g_iopBatchCycles >= kIopLongBatch || (!onWorker && mode != 177);
+         }
+         else
+         {
+@@ -854,7 +864,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             const uint64_t batch = g_iopBatchCycles;
+             g_iopBatchCycles = 0u;
+             g_iopGivenCycles += batch;
+-            if (mode == 178)
++            if (onWorker)
+                 PS2IopTransport::handOffIopBatch(&m_runtime, batch);
+             else
+                 m_runtime.advanceIopEeCycles(batch);
+@@ -871,11 +881,14 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+             const PS2IopHostAdapter::WorkerStats worker = PS2IopTransport::takeIopWorkerStats(&m_runtime);
+             if (worker.handOffs != 0u || worker.waits != 0u)
+             {
+-                std::fprintf(stderr, "[iop:hilo] entregas/s=%.0f esperas/s=%.0f esperaEE=%.2fms/s trabajo=%.1fms/s\n",
++                std::fprintf(stderr, "[iop:hilo] entregas/s=%.0f esperas/s=%.0f esperaEE=%.2fms/s trabajo=%.1fms/s",
+                              static_cast<double>(worker.handOffs) / seconds,
+                              static_cast<double>(worker.waits) / seconds,
+                              static_cast<double>(worker.waitNs) / 1e6 / seconds,
+                              static_cast<double>(worker.busyNs) / 1e6 / seconds);
++                if (worker.foreignSyncs != 0u)
++                    std::fprintf(stderr, " ajenas=%llu", static_cast<unsigned long long>(worker.foreignSyncs));
++                std::fputc('\n', stderr);
+             }
+             s_iopReportStart = now;
+             g_iopGivenCycles = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 892d9cd..9fb99f2 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -140,8 +140,9 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
+ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
+ {
+     begin = nullptr;
+-    // Patch 0201: m_activeRdram belongs to the EE thread's calls; the worker uses the runtime's RDRAM.
+-    uint8_t *const rdram = m_activeRdram && !t_onIopWorker
++    // Patch 0201: m_activeRdram belongs to the EE thread's calls; the worker uses the runtime's RDRAM (patch 0202:
++    // without reading m_activeRdram, which the EE thread may be changing).
++    uint8_t *const rdram = !t_onIopWorker && m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+     if (!rdram)
+@@ -169,16 +170,14 @@ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begi
+ 
+ bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t size) const
+ {
+-    if (!destination && size != 0)
+-    {
+-        return false;
+-    }
++    // Patch 0202: a null destination only checks the range (sceSifSetDma's destinations, see IopRpcBridge), so the
++    // IOP worker does not copy EE RAM the EE thread may be writing.
+     uint8_t *source = nullptr;
+     if (!guestRange(address, size, source))
+     {
+         return false;
+     }
+-    if (size != 0)
++    if (destination && size != 0)
+     {
+         std::memcpy(destination, source, size);
+     }
+@@ -667,7 +666,9 @@ void PS2IopHostAdapter::workerMain()
+         const auto start = std::chrono::steady_clock::now();
+         m_batchIop->runEeCycles(m_batchCycles);
+         m_workerBusyNs.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+-        m_batchState.store(0u, std::memory_order_release);
++        // Patch 0202: 1 -> 0 only, so a stop request (2) is never overwritten.
++        uint32_t inFlight = 1u;
++        (void)m_batchState.compare_exchange_strong(inFlight, 0u, std::memory_order_acq_rel);
+         m_batchState.notify_all();
+     }
+ }
+@@ -694,9 +695,24 @@ void PS2IopHostAdapter::handOffBatch(ps2x::iop::IopSubsystem &iop, uint64_t eeCy
+ 
+ bool PS2IopHostAdapter::iopSync()
+ {
+-    if (!m_workerStarted.load(std::memory_order_acquire) ||
+-        m_handOffThread.load(std::memory_order_relaxed) != std::this_thread::get_id())
++    if (!m_workerStarted.load(std::memory_order_acquire))
++    {
++        return false;
++    }
++    if (m_handOffThread.load(std::memory_order_relaxed) != std::this_thread::get_id())
+     {
++        // Patch 0202: the worker's own calls into the runtime end here; any other thread reaches the IOP without the
++        // barrier (only the debug panel's iopDebugSnapshot is expected to): counted in "[iop:hilo]", warned once.
++        if (!t_onIopWorker)
++        {
++            m_foreignSyncs.fetch_add(1u, std::memory_order_relaxed);
++            if (!m_foreignSyncWarned.load(std::memory_order_relaxed) &&
++                !m_foreignSyncWarned.exchange(true, std::memory_order_relaxed))
++            {
++                std::cerr << "[iop:hilo] aviso: llamada al IOP desde otro hilo (" << std::this_thread::get_id()
++                          << "), sin barrera" << std::endl;
++            }
++        }
+         return false;
+     }
+     if (m_batchState.load(std::memory_order_acquire) == 1u)
+@@ -742,6 +758,7 @@ PS2IopHostAdapter::WorkerStats PS2IopHostAdapter::takeWorkerStats()
+ {
+     WorkerStats stats = m_stats;
+     stats.busyNs = m_workerBusyNs.exchange(0u, std::memory_order_relaxed);
++    stats.foreignSyncs = m_foreignSyncs.exchange(0u, std::memory_order_relaxed);
+     m_stats = WorkerStats{};
+     return stats;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 1cb3fd1..20949a2 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -97,13 +97,14 @@ public:
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
+-    // Patch 0201 (A/B mode 178): the IOP on its own worker thread, in parallel with the EE.
++    // Patch 0201 (A/B mode 178; the default since patch 0202): the IOP on its own worker thread, in parallel with the EE.
+     // handOffBatch gives the worker (named "IOP", started on first use) one batch of eeCycles and returns at once; at
+     // most one batch is in flight, so it first waits for the previous one (iopSync). Inside a batch the IOP's effects
+     // on the EE side (writeGuest, zeroGuest, sendSifCommand: SIF DMA, the extra data of a SIF command and the command
+     // itself) are only checked and queued; iopSync applies them on the EE thread, in the order the IOP produced them.
+     // iopSync must come before every EE contact with the IOP's state (PS2Runtime's IOP calls do it); it only acts on
+-    // the thread that hands the batches off, and returns true when it applied queued effects. The other host calls
++    // the thread that hands the batches off (patch 0202: calls from any other thread but the worker are counted in
++    // WorkerStats::foreignSyncs and warned once), and returns true when it applied queued effects. The other host calls
+     // (memory card, libsd, files of the HLE services, module loading) only run inside EE calls, behind the barrier.
+     void handOffBatch(ps2x::iop::IopSubsystem &iop, uint64_t eeCycles);
+     bool iopSync();
+@@ -116,6 +117,7 @@ public:
+         uint64_t waits = 0u;    // iopSync calls that found the batch still running
+         uint64_t waitNs = 0u;   // time the EE spent in those waits
+         uint64_t busyNs = 0u;   // time the worker spent running batches
++        uint64_t foreignSyncs = 0u; // iopSync calls from another thread (neither the hand-off thread nor the worker)
+     };
+     // The counts since the last call (the EE thread).
+     WorkerStats takeWorkerStats();
+@@ -166,4 +168,6 @@ private:
+     bool m_applyingEffects = false;
+     WorkerStats m_stats{};
+     std::atomic<uint64_t> m_workerBusyNs{0u};
++    std::atomic<uint64_t> m_foreignSyncs{0u};
++    std::atomic<bool> m_foreignSyncWarned{false};
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+index ffdf7fa..1bc97ee 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -70,8 +70,9 @@ public:
+         }
+     }
+ 
+-    // Patch 0201 (A/B mode 178): one IOP batch on the IOP worker thread, and the barrier before the EE touches the IOP
+-    // (see PS2IopHostAdapter::handOffBatch). runIopBatch runs one on the calling thread, as mode 0 does.
++    // Patch 0201: one IOP batch on the IOP worker thread (mode 0 since patch 0202), and the barrier before the EE
++    // touches the IOP (see PS2IopHostAdapter::handOffBatch). runIopBatch runs one on the calling thread, as A/B mode 179
++    // and PS2X_IOP_HILO=0 do.
+     static void runIopBatch(PS2Runtime *runtime, uint64_t eeCycles)
+     {
+         if (runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ff0165a..d739881 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1765,9 +1765,9 @@ PS2Runtime::~PS2Runtime()
+     }
+ }
+ 
+-// Patch 0201 (A/B mode 178): with the IOP on its worker thread, every EE call into the IOP first waits for the batch in
+-// flight and applies the effects it left for the EE (PS2IopHostAdapter::iopSync; nothing to do without the worker,
+-// and nothing on other threads). isIopMemoryRange only checks the address.
++// Patch 0201 (A/B mode 178; the default since patch 0202): with the IOP on its worker thread, every EE call into the
++// IOP first waits for the batch in flight and applies the effects it left for the EE (PS2IopHostAdapter::iopSync;
++// nothing to do without the worker, and nothing on other threads). isIopMemoryRange only checks the address.
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+ {
+     m_iopHost->iopSync();
+@@ -1818,7 +1818,7 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+-    m_iopHost->iopSync(); // a batch on this thread (mode 0) after one on the worker (mode 178): in order
++    m_iopHost->iopSync(); // a batch on this thread (modes 179, 177, 4) after one on the worker (mode 0): in order
+     m_iopSubsystem->runEeCycles(eeCycles);
+ }
+ 
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index 5e87452..d35daac 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -12,8 +12,11 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
++#include <functional>
++#include <memory>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ using namespace ps2_syscalls;
+@@ -184,7 +187,7 @@ namespace
+     constexpr uint32_t kWorkerCid = 0x12u;
+     constexpr uint32_t kWorkerSid = 0x0F0F0201u;
+     constexpr uint32_t kWorkerEeHandler = 0x00120000u;
+-    constexpr uint64_t kWorkerBatch = 294912u; // 1 ms of EE time, as mode 178
++    constexpr uint64_t kWorkerBatch = 294912u; // 1 ms of EE time, as the worker's batches (mode 0 since patch 0202)
+ 
+     void writeWorkerIrx(uint8_t *rdram)
+     {
+@@ -378,9 +381,10 @@ void register_ps2_sif_rpc_tests()
+         {
+             TestEnv env;
+ 
+-            // A whole IOP batch (32 us of EE time, see EeScheduler::accountCycles): with fewer cycles the IOP only ran
+-            // if an earlier test had left it real-time debt (patch 0159's tests drain it).
+-            env.runtime.eeScheduler().accountCycles(10000u);
++            // A whole IOP batch (1 ms of EE time on the worker by default, 32 us in A/B mode 179, see
++            // EeScheduler::accountCycles): with fewer cycles the IOP only ran if an earlier test had left it real-time
++            // debt (patch 0159's tests drain it).
++            env.runtime.eeScheduler().accountCycles(kWorkerBatch);
+             const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
+             t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
+ 
+@@ -392,7 +396,7 @@ void register_ps2_sif_rpc_tests()
+ 
+         tc.Run("IOP batches on the worker thread match the same batches run on the EE thread", [](TestCase &t)
+         {
+-            // Patch 0201 (A/B mode 178): inline (mode 0), all on the worker, and switching every batch.
++            // Patch 0201: inline (mode 179 since patch 0202), all on the worker, and switching every batch.
+             constexpr int kBatches = 24;
+             WorkerEnv inlineEnv, worker, mixed;
+             t.IsTrue(inlineEnv.ready && worker.ready && mixed.ready, "the synthetic IRX should load");
+@@ -480,23 +484,127 @@ void register_ps2_sif_rpc_tests()
+             checkWorkerEffects(t, env, env.counter(), "after the reads");
+         });
+ 
+-        tc.Run("A/B mode 178 hands the IOP batches to the worker and back to mode 0 safely", [](TestCase &t)
++        tc.Run("A/B switching between the IOP worker (modes 0 and 178) and the EE thread (179, 177) keeps the effects in order", [](TestCase &t)
+         {
++            // Patch 0202: the A/B race switches 0 <-> 179 every 2 s; 178 is the old name of the worker mode.
+             WorkerEnv env;
+             t.IsTrue(env.ready, "the synthetic IRX should load");
+             const int previous = g_ps2AbMode.load();
+-            for (int i = 0; i < 60; ++i)
++            constexpr int kModes[] = {0, 179, 178, 177};
++            for (int i = 0; i < 80; ++i)
+             {
+-                g_ps2AbMode.store((i / 5) % 2 == 0 ? 178 : 0);
++                g_ps2AbMode.store(kModes[(i / 5) % 4]);
+                 env.runtime.eeScheduler().accountCycles(100000u);
+             }
+             g_ps2AbMode.store(previous);
+             (void)PS2IopTransport::iopSync(&env.runtime);
+             const uint32_t count = env.counter();
+-            t.IsTrue(count > 10u, "the IOP should run in both modes");
++            t.IsTrue(count > 10u, "the IOP should run in every mode");
+             checkWorkerEffects(t, env, count, "switching modes");
+         });
+ 
++        tc.Run("the IOP runs on the worker by default and on the EE thread in A/B mode 179", [](TestCase &t)
++        {
++            // Patch 0202: 1 ms batches on the worker in mode 0; mode 179 is the path of before (32 us batches inline).
++            WorkerEnv env;
++            t.IsTrue(env.ready, "the synthetic IRX should load");
++            const int previous = g_ps2AbMode.load();
++            (void)PS2IopTransport::takeIopWorkerStats(&env.runtime);
++
++            g_ps2AbMode.store(179);
++            const uint64_t before = env.runtime.iopDebugSnapshot().emulatorCycles;
++            env.runtime.eeScheduler().accountCycles(10000u);
++            const bool inFlight179 = PS2IopTransport::iopBatchInFlight(&env.runtime);
++            const bool ran179 = env.runtime.iopDebugSnapshot().emulatorCycles != before;
++            const uint64_t handOffs179 = PS2IopTransport::takeIopWorkerStats(&env.runtime).handOffs;
++
++            g_ps2AbMode.store(0);
++            for (int i = 0; i < 4; ++i)
++                env.runtime.eeScheduler().accountCycles(kWorkerBatch);
++            const uint64_t handOffs0 = PS2IopTransport::takeIopWorkerStats(&env.runtime).handOffs;
++
++            g_ps2AbMode.store(179);
++            env.runtime.eeScheduler().accountCycles(10000u);
++            const bool inFlightBack = PS2IopTransport::iopBatchInFlight(&env.runtime);
++            const uint64_t handOffsBack = PS2IopTransport::takeIopWorkerStats(&env.runtime).handOffs;
++            g_ps2AbMode.store(previous);
++
++            t.IsTrue(ran179, "mode 179 should run a 32 us batch");
++            t.IsFalse(inFlight179, "mode 179 should run it on the EE thread");
++            t.Equals(handOffs179, uint64_t{0}, "mode 179 should hand nothing to the worker");
++            t.IsTrue(handOffs0 >= 4u, "mode 0 should hand every 1 ms batch to the worker");
++            t.IsFalse(inFlightBack, "back in mode 179, the batch runs on the EE thread after the worker's");
++            t.Equals(handOffsBack, uint64_t{0}, "back in mode 179, nothing goes to the worker");
++            (void)PS2IopTransport::iopSync(&env.runtime);
++            checkWorkerEffects(t, env, env.counter(), "mode 179, 0 and 179");
++        });
++
++        tc.Run("every EE entry into the IOP waits for the batch on the worker", [](TestCase &t)
++        {
++            // Patch 0202 (verification of 0201, A8): each entry with a long batch (100 ms of EE time) in flight must
++            // return with the batch finished and its effects applied (nothing left for iopSync).
++            constexpr uint64_t kLong = kWorkerBatch * 100u;
++            WorkerEnv env;
++            t.IsTrue(env.ready, "the synthetic IRX should load");
++            R5900Context ctx{};
++            const std::vector<std::pair<std::string, std::function<void()>>> entries = {
++                {"loadIopModuleBuffer", [&] { (void)env.runtime.loadIopModuleBuffer(0x01F00000u); }},
++                {"stopIopModule", [&] { (void)env.runtime.stopIopModule(0x7FFF); }},
++                {"selectRpcAbi", [&] { (void)PS2IopTransport::selectRpcAbi(&env.runtime, ps2x::iop::RpcAbiRequest{}); }},
++                {"canBindRpc", [&] { (void)PS2IopTransport::canBindRpc(&env.runtime, kWorkerSid); }},
++                {"handleRpc", [&]
++                 {
++                     ps2x::iop::RpcRequest request{};
++                     request.sid = kWorkerSid;
++                     request.function = 1u;
++                     (void)PS2IopTransport::handleRpc(&env.runtime, env.rdram, &ctx, std::move(request));
++                 }},
++                {"sendSifCommand", [&]
++                 {
++                     const std::array<uint32_t, 4> packet{16u, 0u, 0x7Fu, 0u};
++                     (void)PS2IopTransport::sendSifCommand(&env.runtime, env.rdram, &ctx, 0x7Fu, packet.data(), 16u);
++                 }},
++                {"notifyTransfer", [&] { PS2IopTransport::notifyTransfer(&env.runtime, env.rdram, ps2x::iop::SifTransfer{}); }},
++                {"runIopBatch", [&] { PS2IopTransport::runIopBatch(&env.runtime, 1000u); }},
++                {"iopDebugSnapshot", [&] { (void)env.runtime.iopDebugSnapshot(); }},
++                {"allocateIopMemory", [&] { (void)env.runtime.allocateIopMemory(64u); }},
++                {"freeIopMemory", [&] { (void)env.runtime.freeIopMemory(0x001FFF00u); }},
++                {"readIopMemory", [&] { (void)env.counter(); }},
++                {"writeIopMemory", [&]
++                 {
++                     const uint32_t value = 0u;
++                     (void)env.runtime.writeIopMemory(0x001FFFF0u, &value, sizeof(value));
++                 }},
++                {"zeroIopMemory", [&] { (void)env.runtime.zeroIopMemory(0x001FFFF0u, 4u); }},
++                {"resetIop", [&] { PS2IopTransport::reset(&env.runtime); }},
++            };
++            for (const auto &[name, entry] : entries)
++            {
++                PS2IopTransport::handOffIopBatch(&env.runtime, kLong);
++                const bool inFlight = PS2IopTransport::iopBatchInFlight(&env.runtime);
++                entry();
++                const bool stillInFlight = PS2IopTransport::iopBatchInFlight(&env.runtime);
++                const bool leftEffects = PS2IopTransport::iopSync(&env.runtime);
++                t.IsTrue(inFlight, name + ": the long batch should still be running when the entry comes");
++                t.IsFalse(stillInFlight, name + ": should wait for the batch in flight");
++                t.IsFalse(leftEffects, name + ": should apply the batch's effects before returning");
++            }
++        });
++
++        tc.Run("destroying the runtime with a batch on the worker stops the worker first", [](TestCase &t)
++        {
++            // Patch 0202 (verification of 0201, A8): ~PS2Runtime waits for the batch and joins the worker before the
++            // IOP is destroyed.
++            constexpr uint64_t kLong = kWorkerBatch * 100u;
++            auto env = std::make_unique<WorkerEnv>();
++            t.IsTrue(env->ready, "the synthetic IRX should load");
++            PS2IopTransport::handOffIopBatch(&env->runtime, kLong);
++            const bool inFlight = PS2IopTransport::iopBatchInFlight(&env->runtime);
++            env.reset();
++            t.IsTrue(inFlight, "the long batch should still be running when the runtime is destroyed");
++            t.IsTrue(env == nullptr, "the runtime should be destroyed");
++        });
++
+         tc.Run("SifLoadModule validates ROM modules and activates their HLE service", [](TestCase &t)
+         {
+             TestEnv env;

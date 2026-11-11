@@ -1,0 +1,129 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index ab9db4e..827e9f9 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -136,6 +136,9 @@ namespace ps2x
+     // Nativizacion T5: the same for some options only (the rows of one page of the game's OPTIONS); unknown keys are
+     // ignored.
+     void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys);
++    // Nativizacion T7: the options of each page of the game's OPTIONS that has a DEFAULT VALUES row (1 PC GRAPHICS in
++    // the main menu, 2 PC SETTINGS, 3 PC DISPLAY, 4 PC NETPLAY; src/f1_overrides.cpp); empty for any other page.
++    const std::vector<std::string> &gameOptionsPageKeys(int page);
+     // Nativizacion T6: red_puerto, red_calidad and red_publicas apply when the host starts, so they are fixed while it
+     // runs or is asked to start (hosting): the F2 menu shows them disabled and the game's OPTIONS > PC NETPLAY page
+     // cannot change them (PS2OptionsMenu::setGameOptionNumber, setGameOptionText, resetGameOptions).
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 8454910..e668e37 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -564,6 +564,19 @@ namespace ps2x
+                 model.current[key] = optionDefault(*spec, model.development);
+     }
+ 
++    const std::vector<std::string> &gameOptionsPageKeys(int page)
++    {
++        static const std::vector<std::vector<std::string>> pages = {
++            {},
++            {"filtro", "supersampling", "alta_resolucion", "vsync", "mostrar_fps", "pantalla", "volumen"},
++            {"saltar_intro", "latencia_audio", "audio_mono", "vibracion", "daltonismo", "tecla_foto", "hud", "tecla_hud",
++             "cargas_rapidas", "fov", "tecla_modo_foto"},
++            {"aspecto", "tamano_ventana", "gs"},
++            {"red_puerto", "red_calidad", "red_publicas"},
++        };
++        return page > 0 && static_cast<size_t>(page) < pages.size() ? pages[static_cast<size_t>(page)] : pages[0];
++    }
++
+     bool netplayOptionLocked(std::string_view key, bool hosting)
+     {
+         return hosting && (key == "red_puerto" || key == "red_calidad" || key == "red_publicas");
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index a0ca35d..57970d0 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -10,6 +10,7 @@
+ #include "ps2_replay_scrub.h"
+ #include "ps2_user_paths.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
+@@ -274,6 +275,78 @@ void register_ps2_options_menu_tests()
+             t.Equals(development.current.at("gs"), std::string("cpu"), "development: its own defaults");
+         });
+ 
++        tc.Run("each page of the game's OPTIONS with DEFAULT VALUES has its own options", [](TestCase &t)
++        {
++            using Keys = std::vector<std::string>;
++            t.IsTrue(ps2x::gameOptionsPageKeys(1) == Keys{"filtro", "supersampling", "alta_resolucion", "vsync",
++                                                           "mostrar_fps", "pantalla", "volumen"},
++                     "PC GRAPHICS: its seven rows");
++            t.IsTrue(ps2x::gameOptionsPageKeys(2) == Keys{"saltar_intro", "latencia_audio", "audio_mono", "vibracion",
++                                                           "daltonismo", "tecla_foto", "hud", "tecla_hud",
++                                                           "cargas_rapidas", "fov", "tecla_modo_foto"},
++                     "PC SETTINGS: its eleven rows");
++            t.IsTrue(ps2x::gameOptionsPageKeys(3) == Keys{"aspecto", "tamano_ventana", "gs"}, "PC DISPLAY");
++            t.IsTrue(ps2x::gameOptionsPageKeys(4) == Keys{"red_puerto", "red_calidad", "red_publicas"}, "PC NETPLAY");
++            t.IsTrue(ps2x::gameOptionsPageKeys(0).empty() && ps2x::gameOptionsPageKeys(5).empty() &&
++                         ps2x::gameOptionsPageKeys(-1).empty(),
++                     "the game's own page and unknown pages: none");
++            std::map<std::string, int> pageOf;
++            for (int page = 1; page <= 4; ++page)
++                for (const std::string &key : ps2x::gameOptionsPageKeys(page))
++                {
++                    bool known = false;
++                    for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                        known = known || key == spec.key;
++                    t.IsTrue(known, key + ": an option of opciones.ini");
++                    t.IsTrue(pageOf.emplace(key, page).second, key + ": on one page only");
++                }
++            t.IsTrue(pageOf.count("dificultad_ia") == 0u, "dificultad_ia belongs to DIFFICULTY, not to these pages");
++            t.IsTrue(pageOf.count("registro") == 0u, "registro stays technical");
++            for (const auto &[key, page] : pageOf)
++                t.IsTrue((key.rfind("red_", 0) == 0) == (page == 4), key + ": the netplay options only on PC NETPLAY");
++        });
++
++        tc.Run("the defaults of PC GRAPHICS and PC SETTINGS change only their own options", [](TestCase &t)
++        {
++            const std::string file =
++                "pantalla = completa\ntamano_ventana = 1920x1080\naspecto = 16:9\nfiltro = crt\nvsync = 0\n"
++                "mostrar_fps = 1\nvolumen = 40\nregistro = 0\ngs = cpu\nsupersampling = 8\nalta_resolucion = 0\n"
++                "saltar_intro = 1\nlatencia_audio = alta\naudio_mono = 1\nvibracion = 30\ndaltonismo = tritanopia\n"
++                "tecla_foto = f9\nhud = oculto\ntecla_hud = f7\ncargas_rapidas = 0\nfov = 20\ntecla_modo_foto = p\n"
++                "dificultad_ia = 40\nred_puerto = 50700\nred_calidad = alta\nred_publicas = 1\n";
++            for (int page : {1, 2})
++            {
++                const Environment environment = {{"PS2X_VOLUMEN", "10"}};
++                ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel(
++                    file, false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++                const std::map<std::string, std::string> before = model.current;
++                const std::map<std::string, std::string> savedBefore = model.saved;
++                const std::vector<std::string> &keys = ps2x::gameOptionsPageKeys(page);
++                ps2x::resetMenuOptionsToDefaults(model, keys);
++                const std::string name = page == 1 ? "PC GRAPHICS: " : "PC SETTINGS: ";
++                for (const ps2x::OptionSpec &spec : ps2x::optionSpecs())
++                {
++                    const std::string key = spec.key;
++                    const bool ofThePage = std::find(keys.begin(), keys.end(), key) != keys.end();
++                    if (ofThePage && key != "volumen")
++                        t.Equals(model.current.at(key), std::string(ps2x::optionDefault(spec, false)),
++                                 name + key + " back to its default");
++                    else
++                        t.Equals(model.current.at(key), before.at(key), name + key + " does not change");
++                }
++                t.IsTrue(model.saved == savedBefore, name + "nothing is saved yet");
++                const std::string saved = ps2x::rewriteOptionsText(file, ps2x::menuValuesToSave(model), false);
++                t.Equals(fileValue(saved, "dificultad_ia"), std::string("40"), name + "the OPPONENT AI as it was");
++                t.Equals(fileValue(saved, "red_puerto"), std::string("50700"), name + "the netplay port as it was");
++                t.Equals(fileValue(saved, "volumen"), std::string("40"), name + "a forced option keeps the file's value");
++            }
++            ps2x::OptionsMenuModel development = ps2x::makeOptionsMenuModel(file, true, {}, environmentOf({}));
++            ps2x::resetMenuOptionsToDefaults(development, ps2x::gameOptionsPageKeys(1));
++            t.Equals(development.current.at("filtro"), std::string("bilineal"), "development: its own filter");
++            t.Equals(development.current.at("supersampling"), std::string("1"), "and its own supersampling");
++            t.Equals(development.current.at("alta_resolucion"), std::string("0"), "and its double resolution");
++        });
++
+         tc.Run("the PC DISPLAY rows read and set aspecto and gs as the position of their choice", [](TestCase &t)
+         {
+             ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("aspecto = 16:9\n", false, {}, environmentOf({}));

@@ -1,0 +1,147 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 04a887d..d9d0a3c 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -67,7 +67,8 @@
+ // compiled schedules worked out and committed whole (before patch 0083; kept by runBlocks), 78 everything of patches
+ // 0081-0084 off at once (73, 75, 77 and 79; kept by runBlocks), 79 the PATH1 GIF packets queued and copied by the
+ // arbiter (before patch 0084), 99 the VU1 schedules with the MAC and status flags worked out even when nothing
+-// reads them (before patch 0097).
++// reads them (before patch 0097), 101 the VU1 and VU0 schedules that jump on to themselves normalizing the FMAC
++// operands they never write on every entry (before patch 0098).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 1c30c0d..e455a90 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -201,6 +201,9 @@ namespace
+         // Patch 0087: normalize4 of VF registers, kept by a compiled schedule for the FMAC operands it reads again
+         // (JitNormShadow says, at compile time, which rows hold the current register's value).
+         alignas(16) float jitNorm[32][4] = {};
++        // Patch 0098: the schedule that jumps on to itself, set right before that jump and cleared by its code at
++        // once: its rows of jitNorm for the registers it never writes still hold the current values.
++        const void *jitNormOwner = nullptr;
+     };
+ 
+     // ---------------------------------------------------------------------------------------------------------
+@@ -1907,6 +1910,7 @@ namespace
+         // What compiled code checks before it jumps on to the next schedule (patch 0081; the D and T bits stay as
+         // they are while the VU runs).
+         st.budgetEnd = budgetEnd;
++        st.jitNormOwner = nullptr;
+         st.chainDeny = static_cast<uint8_t>(1u | (host.dEnabled() ? 2u : 0u) | (host.tEnabled() ? 4u : 0u));
+         if (engine.storage.size() > 200000u)
+         {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 27fad75..866b5e1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -1507,8 +1507,9 @@
+     // st.jitLast = s and return; runBlocks goes on from there (looking up, linking, compiling, waiting).
+     // Uses rax, rcx and rdx, free between steps. jitCode: offsetof(Schedule, jit) or, for an A/B compile,
+     // jitCalls (each kind of compiled code chains to its own kind).
++    // loopNorm (patch 0098): a jump on to s itself first sets st.jitNormOwner = &s.
+     inline void jitEmitChain(JitEmitter &e, const JitHostLayout &h, const BlockEngine &engine, const Schedule &s,
+-                             size_t jitCode, bool chain)
++                             size_t jitCode, bool chain, bool loopNorm = false)
+     {
+         using B = JitEmitter;
+         std::vector<size_t> exits;
+@@ -1585,6 +1586,21 @@
+             e.bytes({0x48, 0x83, 0x82}); // add qword [rdx + jitBlocks], 1
+             disp32(offsetof(BlockStats, jitBlocks));
+             e.bytes({0x01});
++            if (loopNorm)
++            {
++                e.bytes({0x48, 0xBA}); // mov rdx, &g_ps2AbMode
++                e.imm64(reinterpret_cast<uint64_t>(&g_ps2AbMode));
++                e.bytes({0x83, 0x3A, 101}); // cmp dword [rdx], 101 (A/B mode 101: normalize again every time)
++                const size_t abOff = e.je32();
++                e.bytes({0x48, 0xBA}); // mov rdx, &s
++                e.imm64(reinterpret_cast<uint64_t>(&s));
++                e.bytes({0x48, 0x39, 0xD1}); // cmp rcx, rdx
++                const size_t other = e.jne32();
++                e.bytes({0x48, 0x89}); // mov [rsi + jitNormOwner], rdx
++                e.modrm(2, B::St, static_cast<uint32_t>(offsetof(BlockState, jitNormOwner)));
++                e.bind(other);
++                e.bind(abOff);
++            }
+             e.bytes({0x48, 0x83, 0xC0, static_cast<uint8_t>(kJitPrologueBytes)}); // add rax, prologue
+             e.bytes({0xFF, 0xE0});                                                 // jmp rax
+         }
+@@ -1754,6 +1770,63 @@
+             e.call(reinterpret_cast<const void *>(&jitCommits<Host>), &s.jitRanges.back());
+             nextCommit = end;
+         };
++        // Patch 0098 (A/B mode 101: always normalized on entry): the VF registers that FMACs of s read through the shadow and that nothing
++        // in s writes. On entry they are normalized into st.jitNorm, unless s comes from its own jump on to itself
++        // (st.jitNormOwner == &s: nothing ran in between, so the rows still hold them); the body then reads them
++        // from there (shadow valid from the start). A loop of one schedule normalizes its matrices once.
++        // PS2X_VU1_JIT_BUCLES=0: not at all (for the bench).
++        static const bool s_jitLoopNorm = []
++        {
++            const char *value = std::getenv("PS2X_VU1_JIT_BUCLES");
++            return value == nullptr || value[0] != '0';
++        }();
++        uint32_t invariant = 0u;
++        if (shadow != nullptr && s_jitLoopNorm)
++        {
++            uint32_t written = 1u, read = 0u;
++            bool exec = false;
++            for (const BlockPair &p : s.pairs)
++            {
++                exec = exec || p.lowerExec == LowerExec;
++                if (p.upperDst != DstNone && p.upperDst != DstAcc)
++                    written |= 1u << p.upperReg;
++                if (p.lowerDst != DstNone)
++                    written |= 1u << p.lowerReg;
++                if (p.upperPath == UpperFmac)
++                {
++                    read |= 1u << p.fmac.fs;
++                    if (p.fmac.source == FmacSourceVt || p.fmac.source == FmacSourceBc)
++                        read |= 1u << p.fmac.ft;
++                }
++            }
++            for (const BlockCommit &c : s.commits)
++                if (c.kind == CommitVf)
++                    written |= 1u << c.reg;
++            invariant = exec ? 0u : read & ~written;
++        }
++        if (invariant != 0u)
++        {
++            using B = JitEmitter;
++            e.bytes({0x48, 0x8B}); // mov rax, [rsi + jitNormOwner]
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, jitNormOwner)));
++            e.bytes({0x48, 0xC7}); // mov qword [rsi + jitNormOwner], 0
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, jitNormOwner)));
++            e.imm32(0u);
++            e.bytes({0x48, 0xBA}); // mov rdx, &s
++            e.imm64(reinterpret_cast<uint64_t>(&s));
++            e.bytes({0x48, 0x39, 0xD0}); // cmp rax, rdx
++            const size_t kept = e.je32();
++            e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
++            for (uint32_t r = 1u; r < 32u; ++r)
++                if ((invariant >> r) & 1u)
++                {
++                    e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * r);
++                    jitNormalize(e, 0);
++                    e.storeXmm(B::St, offsetof(BlockState, jitNorm) + 16u * r, 0);
++                }
++            e.bind(kept);
++            normShadow.valid |= invariant;
++        }
+         JitKnownNormal known;
+         std::FILE *const mapFile = jitMapFile();
+         std::vector<uint32_t> pairOffsets;
+@@ -1887,7 +1960,8 @@
+                      alternative == 0 ? offsetof(Schedule, jit)
+                      : noFlags        ? offsetof(Schedule, jitNoFlags)
+                                       : offsetof(Schedule, jitCalls),
+-                     s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78);
++                     s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78,
++                     invariant != 0u);
+         e.epilogue();
+ 
+         uint8_t *const code = engine.jit.alloc(e.code().size());

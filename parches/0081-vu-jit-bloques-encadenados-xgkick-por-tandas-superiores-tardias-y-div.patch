@@ -1,0 +1,560 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 8e39b8f..685ef45 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -192,6 +192,12 @@ namespace
+         uint64_t xgkickThrough = 0; // last cycle boundary at which the XGKICK transfer has progressed
+         FmacResult jitUp{};         // compiled schedules (ps2_vu1_jit.h): an upper result waiting for its pair's lower
+         int32_t jitOldVi = 0;       // ... and the VI before the lower instruction, for the branch backup
++        // Patch 0081: chained compiled schedules. runBlocks' cycle budget, the schedule whose code returned last
++        // (it may have jumped on to others) and the Schedule::chainFlags that stop a chain: 1 always (fallback), 2
++        // with the D bit enabled, 4 with the T bit enabled.
++        uint64_t budgetEnd = 0;
++        const void *jitLast = nullptr;
++        uint8_t chainDeny = 1u;
+     };
+ 
+     // ---------------------------------------------------------------------------------------------------------
+@@ -628,6 +634,9 @@ namespace
+         void *jitCalls = nullptr; // A/B modes 30 and 31: compiled without the inline FMAC or lower steps
+         bool jitCallsTried = false;
+         std::vector<JitCommitRange> jitRanges;
++        // Patch 0081: what a chain into this schedule checks (set when compiled): 1 fallback, 2 hasD, 4 hasT,
++        // 8 xgkickFirst.
++        uint8_t chainFlags = 0u;
+     };
+ 
+     // The schedule was made for the code now in micro memory (its pairs are the same).
+@@ -1878,8 +1887,17 @@ namespace
+         // code. Until patch 0069 they ran the schedules without their compiled code (only mode 0 used it), so their B
+         // windows were also slower by the whole JIT: the A/B of patches 0063-0067 (modes 36-39, 41, 42) came out too big.
+         const int abModeAll = g_ps2AbMode.load(std::memory_order_relaxed);
+-        const int abMode =
+-            abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 || abModeAll == 70 ? abModeAll : 0;
++        const int abMode = abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 || abModeAll == 70 ||
++                                   abModeAll == 71 || abModeAll == 73 || abModeAll == 74 ||
++                                   abModeAll == 76
++                               ? abModeAll
++                               : 0;
++        // A/B modes 72 and 73: XGKICK waited for cycle by cycle (before patch 0081).
++        const bool oldXgkick = abModeAll == 72 || abModeAll == 73 || abModeAll == 76;
++        // What compiled code checks before it jumps on to the next schedule (patch 0081; the D and T bits stay as
++        // they are while the VU runs).
++        st.budgetEnd = budgetEnd;
++        st.chainDeny = static_cast<uint8_t>(1u | (host.dEnabled() ? 2u : 0u) | (host.tEnabled() ? 4u : 0u));
+         if (engine.storage.size() > 200000u)
+         {
+             // Too many schedules (code that keeps changing): start again, keeping the current timing state.
+@@ -1953,7 +1971,14 @@ namespace
+                 // XGKICK waits for the previous transfer (the interpreter's pairReadyCycle re-checks every cycle):
+                 // let the cycles go by, then look up the schedule for the new timing state.
+                 uint32_t waited = 0u;
+-                while (host.xgkickActive())
++                if (!oldXgkick)
++                {
++                    // Patch 0081: the cycles at once.
++                    const uint64_t limit = budgetEnd > st.cycle + 1u ? budgetEnd - st.cycle - 1u : 0u;
++                    const uint64_t used = host.progressXgkickCycles(limit);
++                    waited = static_cast<uint32_t>(host.xgkickActive() ? limit : used);
++                }
++                while (oldXgkick && host.xgkickActive())
+                 {
+                     if (st.cycle + waited + 1u >= budgetEnd)
+                         break;
+@@ -1972,17 +1997,23 @@ namespace
+                 return BlockRunEnd::Budget;
+             if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s, host))))
+             {
+-                reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
++                // Compiled (patch 0057). The code may have jumped on to the schedules after it (patch 0081): what
++                // follows is for the last one, the earlier ones counted themselves.
++                reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host);
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
+                 ++engine.stats.jitBlocks;
+             }
+-            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 || abMode == 43 || abMode == 44 || abMode == 70) && s_jitEnabled &&
++            else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 ||
++                      abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76) &&
++                     s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+                 reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B modes 30 and 31: the second compile
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
+                 ++engine.stats.jitBlocks;
+             }
+             else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40 ||
+-                     abMode == 43 || abMode == 44 || abMode == 70)
++                     abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+@@ -1995,6 +2026,8 @@ namespace
+                 // The program ended: complete what is in flight as flushPipelines does, cycle by cycle while an
+                 // XGKICK transfer goes on, so that the interpreter finds nothing pending.
+                 uint32_t transfer = 0u;
++                if (!oldXgkick)
++                    transfer = static_cast<uint32_t>(host.progressXgkickCycles(~0ull >> 1)); // patch 0081
+                 while (host.xgkickActive())
+                 {
+                     ++transfer;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index ead0e38..cc6c761 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3342,6 +3342,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         int32_t backupRegOffset() const { return stateOffset(&vu.m_viBranchBackupReg); }
+         int32_t backupValidOffset() const { return stateOffset(&vu.m_viBranchBackupValid); }
+         int32_t workingClipOffset() const { return stateOffset(&vu.m_workingClip); } // patch 0080: inline CLIP
++        int32_t xgkickActiveOffset() const { return stateOffset(&vu.m_xgkick.active); } // patch 0081: chains
+         float normalizeResult(float value) const
+         {
+             uint32_t ignoredFlags = 0u;
+@@ -3351,6 +3352,73 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         bool xgkickActive() const { return vu.m_xgkick.active; }
+         void startXgkick(uint32_t qwordAddress) { vu.startXgkick(qwordAddress); }
+         void progressXgkickOneCycle() { vu.progressXgkick(); }
++        // Patch 0081: `cycles` calls of progressXgkick in one (XGKICK brought up to a cycle, or waited for). Here and
++        // not in VU1Interpreter, so that its header (included by the translated code) stays as it is. Inside the data
++        // of a GIFtag the qwords move one every two cycles, as there, so a run of them up to the end of the tag is
++        // copied at once; the GIFtags themselves go through progressXgkick. Nothing writes the micro data memory during
++        // those cycles (the blocks bring the transfer up to date before every store), so the packet is the same.
++        // Returns how many of the calls found the transfer active (the one that finishes it included).
++        PS2_VU_NOINLINE uint64_t progressXgkickCycles(uint64_t cycles)
++        {
++            if (!vu.m_xgkick.active || !vu.m_activeVuData || vu.m_activeVuDataSize == 0u)
++                return 0u;
++            const uint32_t dataSize = vu.m_activeVuDataSize;
++            uint64_t used = 0u;
++            if ((dataSize & (dataSize - 1u)) != 0u || (vu.m_xgkick.sourceAddress & 15u) != 0u)
++            {
++                while (used < cycles && vu.m_xgkick.active)
++                {
++                    ++used;
++                    vu.progressXgkick();
++                }
++                return used;
++            }
++            while (used < cycles && vu.m_xgkick.active)
++            {
++                if (vu.m_xgkick.currentTagEnd == 0u || vu.m_xgkick.copiedBytes >= vu.m_xgkick.currentTagEnd ||
++                    vu.m_xgkick.cycleCredit > 1u)
++                {
++                    ++used; // a GIFtag next
++                    vu.progressXgkick();
++                    continue;
++                }
++                const uint64_t left = cycles - used;
++                const uint32_t credit = vu.m_xgkick.cycleCredit; // 0 or 1
++                const uint64_t tagQwords = (vu.m_xgkick.currentTagEnd - vu.m_xgkick.copiedBytes) / 16u;
++                const uint64_t n =
++                    std::min<uint64_t>(tagQwords, (std::min<uint64_t>(left, 2u * tagQwords + 2u) + credit) / 2u);
++                if (n == 0u)
++                {
++                    vu.m_xgkick.cycleCredit += static_cast<uint32_t>(left); // one call that only earns credit
++                    return cycles;
++                }
++                uint32_t bytes = static_cast<uint32_t>(n * 16u);
++                uint8_t *out = vu.m_xgkick.packet.data() + vu.m_xgkick.copiedBytes;
++                uint32_t source = (vu.m_xgkick.sourceAddress + vu.m_xgkick.copiedBytes) & (dataSize - 1u);
++                while (bytes != 0u)
++                {
++                    const uint32_t chunk = std::min(bytes, dataSize - source);
++                    std::memcpy(out, vu.m_activeVuData + source, chunk);
++                    out += chunk;
++                    bytes -= chunk;
++                    source = 0u;
++                }
++                vu.m_xgkick.copiedBytes += static_cast<uint32_t>(n * 16u);
++                vu.m_xgkick.cycleCredit = 0u;
++                used += 2u * n - credit;
++                if (vu.m_xgkick.copiedBytes >= vu.m_xgkick.currentTagEnd)
++                {
++                    if (vu.m_xgkick.currentTagEop)
++                        vu.finishXgkick();
++                    else
++                    {
++                        vu.m_xgkick.currentTagEnd = 0u;
++                        vu.m_xgkick.currentTagEop = false;
++                    }
++                }
++            }
++            return used;
++        }
+         // Called after every block and before every store: the common cases (already there, no transfer) inline.
+         PS2_VU_FORCEINLINE void catchUpXgkick(uint64_t cycle)
+         {
+@@ -3365,6 +3433,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         PS2_VU_NOINLINE void catchUpXgkickTransfer(uint64_t cycle)
+         {
++            const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++            if (abMode != 72 && abMode != 73 && abMode != 76)
++            {
++                // Patch 0081: the cycles at once (A/B modes 72 and 73: cycle by cycle, as before).
++                progressXgkickCycles(cycle - blockState.xgkickThrough);
++                blockState.xgkickThrough = cycle;
++                return;
++            }
+             while (blockState.xgkickThrough < cycle)
+             {
+                 ++blockState.xgkickThrough;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 862c3d3..32850ab 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -431,7 +431,10 @@
+     // (the IEEE sign rules do not depend on the precision), so the slow path keeps it and adds Z (and S if negative)
+     // to MAC and status; a zero product of MADD/MSUB adds Z (and its S) to the sticky flags, and c +- 0 is c, whose
+     // own range test still applies.
+-    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true)
++    // lateSlow (patch 0081): a pair whose upper result waits until after its lower instruction (jitUpperLate): the
++    // result goes whole to st.jitUp.value, the flag entry as there, and the slow path calls lateSlow instead.
++    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
++                            const void *lateSlow = nullptr)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -661,13 +664,17 @@
+             e.bytes({p.upperFlags});
+         }
+ 
+-        // The result in its lanes (blendLanes: x = bit 3; blendps: lane i = bit i).
+-        const B::Base base = p.upperDst == DstVfPending ? B::St : B::Vu;
+-        const size_t target = p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
++        // The result in its lanes (blendLanes: x = bit 3; blendps: lane i = bit i); a late one whole in st.jitUp.
++        const B::Base base = p.upperDst == DstVfPending || lateSlow != nullptr ? B::St : B::Vu;
++        const size_t target = lateSlow != nullptr          ? offsetof(BlockState, jitUp) + offsetof(FmacResult, value)
++                              : p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
+                               : p.upperDst == DstVfPending ? offsetof(BlockState, pendingVf) + 16u * p.upperReg
+                                                            : offsetof(VU1State, acc);
+-        const uint8_t lanes = static_cast<uint8_t>(((p.upperLanes >> 3) & 1u) | (((p.upperLanes >> 2) & 1u) << 1) |
+-                                                   (((p.upperLanes >> 1) & 1u) << 2) | ((p.upperLanes & 1u) << 3));
++        const uint8_t lanes =
++            lateSlow != nullptr
++                ? static_cast<uint8_t>(0xFu)
++                : static_cast<uint8_t>(((p.upperLanes >> 3) & 1u) | (((p.upperLanes >> 2) & 1u) << 1) |
++                                       (((p.upperLanes >> 1) & 1u) << 2) | ((p.upperLanes & 1u) << 3));
+         if (lanes == 0xFu)
+             e.storeXmm(base, target, 3);
+         else if (lanes != 0u)
+@@ -678,7 +685,7 @@
+         }
+         const size_t toDone = e.jmp32();
+         e.bind(toSlow);
+-        e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
++        e.call(lateSlow != nullptr ? lateSlow : reinterpret_cast<const void *>(p.upperEarly), &p);
+         e.bind(toDone);
+         return true;
+     }
+@@ -686,7 +693,8 @@
+     // Patch 0080: the SimpleOp upper instructions (MAX/MINI with a register, a lane or I; ITOF; FTOI; ABS) inline, as
+     // upperEarly<upperSimple<Kind>, Dst> does them (simpleOpSse2: the same SSE operations, in the rounding mode the
+     // run set; no flags). False (the call stays) for anything else.
+-    inline bool jitEmitSimple(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known)
++    // late (patch 0081): the result whole to st.jitUp.value, for jitEmitUpperDst after the lower instruction.
++    inline bool jitEmitSimple(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool late = false)
+     {
+         const SimpleOp &op = p.simple;
+         if (p.upperPath != UpperSimple || !s_jitSse41 || p.upperFlags != 0u)
+@@ -774,6 +782,11 @@
+             break;
+         }
+ 
++        if (late)
++        {
++            e.storeXmm(JitEmitter::St, offsetof(BlockState, jitUp) + offsetof(FmacResult, value), result);
++            return true;
++        }
+         const JitEmitter::Base base = p.upperDst == DstVfPending ? JitEmitter::St : JitEmitter::Vu;
+         const size_t target = p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
+                               : p.upperDst == DstVfPending ? offsetof(BlockState, pendingVf) + 16u * p.upperReg
+@@ -802,6 +815,28 @@
+                         p.upperFlags);
+     }
+ 
++    // Patch 0081: jitUpperDst inline (st.jitUp.value into the destination's lanes).
++    inline void jitEmitUpperDst(JitEmitter &e, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        const B::Base base = p.upperDst == DstVfPending ? B::St : B::Vu;
++        const size_t target = p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
++                              : p.upperDst == DstVfPending ? offsetof(BlockState, pendingVf) + 16u * p.upperReg
++                                                           : offsetof(VU1State, acc);
++        const uint8_t imm = jitLanesToComponents(p.upperLanes);
++        if (imm == 0u)
++            return;
++        e.loadXmm(1, B::St, offsetof(BlockState, jitUp) + offsetof(FmacResult, value));
++        if (imm == 0xFu)
++            e.storeXmm(base, target, 1);
++        else
++        {
++            e.loadXmm(0, base, target);
++            e.blendXmm0Xmm1(imm);
++            e.storeXmm(base, target, 0);
++        }
++    }
++
+     template <typename Host>
+     void jitUpperDst(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
+     {
+@@ -961,6 +996,9 @@
+         uint32_t pcMask;
+         int32_t backupValue, backupReg, backupValid;
+         int32_t workingClip; // patch 0080: the interpreter's working clip flags, from the VU1State
++        // Patch 0081: the code generation in the host, and the XGKICK transfer's active flag from the VU1State.
++        uint32_t generation;
++        int32_t xgkickActive;
+     };
+ 
+     // Patch 0080: jitClip inline. vuClipFlags on x, y, z against the limit from w (signed compares of the raw words,
+@@ -1170,8 +1208,45 @@
+         e.imm32(1u);
+     }
+ 
+-    // IADDIU, MOVE, B, IBEQ and IBNE inline (fastLowerBody's expressions). False: not one of them.
+-    inline bool jitEmitLowerMore(JitEmitter &e, const JitHostLayout &h, const BlockPair &p)
++    // Patch 0081: DIV inline (fastLowerBody's FastDiv and setQ): the operands normalized, a zero denominator gives the
++    // signed maximum (the sign of num * den) with D (I if num is zero too), anything else num / den (divss, the
++    // run's rounding mode, as the compiled expression) normalized; into st.fdivValue and st.fdivDi.
++    inline void jitEmitDiv(JitEmitter &e, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
++        e.loadSs(0, B::Vu, offsetof(VU1State, vf) + 16u * p.fastA + 4u * (p.fastDest & 0x3u));
++        jitNormalize(e, 0);
++        e.loadSs(1, B::Vu, offsetof(VU1State, vf) + 16u * p.fastB + 4u * ((p.fastDest >> 2) & 0x3u));
++        jitNormalize(e, 1);
++        e.rr({0x0F, 0x57}, 2, 2); // xorps xmm2, xmm2
++        e.rr({0x0F, 0x2E}, 1, 2); // ucomiss xmm1, xmm2 (normalized: never NaN)
++        const size_t divide = e.jne32();
++        e.bytes({0x66, 0x0F, 0x7E, 0xC0}); // movd eax, xmm0
++        e.bytes({0x66, 0x0F, 0x7E, 0xC9}); // movd ecx, xmm1
++        e.bytes({0x31, 0xC1});             // xor ecx, eax
++        e.andEcx(0x80000000u);
++        e.bytes({0x81, 0xC9});             // or ecx, 0x7F7FFFFF
++        e.imm32(0x7F7FFFFFu);
++        e.store32(B::St, offsetof(BlockState, fdivValue), 1);
++        e.andEax(0x7FFFFFFFu);
++        e.bytes({0xF7, 0xD8, 0x19, 0xC0, 0x83, 0xE0, 0x10, 0x83, 0xC0, 0x10}); // eax = num != 0 ? 0x20 : 0x10
++        e.store32(B::St, offsetof(BlockState, fdivDi), 0);
++        const size_t done = e.jmp32();
++        e.bind(divide);
++        e.rr({0xF3, 0x0F, 0x5E}, 0, 1); // divss xmm0, xmm1
++        jitNormalize(e, 0);
++        e.bytes({0xF3, 0x0F, 0x11}); // movss [rsi + fdivValue], xmm0
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, fdivValue)));
++        e.bytes({0xC7}); // mov dword [rsi + fdivDi], 0
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, fdivDi)));
++        e.imm32(0u);
++        e.bind(done);
++    }
++
++    // IADDIU, MOVE, B, IBEQ and IBNE inline (fastLowerBody's expressions), and DIV (patch 0081) when div. False: not
++    // one of them.
++    inline bool jitEmitLowerMore(JitEmitter &e, const JitHostLayout &h, const BlockPair &p, bool div)
+     {
+         using B = JitEmitter;
+         if (p.lowerExec != LowerFast)
+@@ -1213,6 +1288,11 @@
+         case FastB:
+             jitEmitBranchTo(e, h, p);
+             return true;
++        case FastDiv:
++            if (!div || !s_jitSse41)
++                return false;
++            jitEmitDiv(e, p);
++            return true;
+         case FastIbeq:
+         case FastIbne:
+         {
+@@ -1290,6 +1370,114 @@
+         e.bind(skip);
+     }
+ 
++    // Patch 0081: bytes of JitEmitter::prologue. A chain jumps past them into the next schedule's code, which runs
++    // in the same frame with the same vu, st and host.
++    constexpr size_t kJitPrologueBytes = 16u;
++
++    // PS2X_VU1_JIT_ENCADENAR=0: every compiled schedule returns to runBlocks (as before patch 0081).
++    const bool s_jitChain = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT_ENCADENAR");
++        return value == nullptr || value[0] != '0';
++    }();
++
++    // Patch 0081: the end of a compiled schedule that does not end the program. Instead of returning to runBlocks
++    // to look up the next schedule, it does the same as runBlocks' loop with `previous` = s: the next pc's
++    // successor seen last time (nextPc/next), and every check before runBlocks would run its code (the same pc and
++    // timing state, validated for this code generation, no fallbackAt at the pc, no fallback, D or T bit, XGKICK
++    // waiting for the previous transfer, the cycle budget, compiled code). Then it counts s as runBlocks does and
++    // jumps into the next schedule's code past its prologue. Anything else, or a schedule that ends the program:
++    // st.jitLast = s and return; runBlocks goes on from there (looking up, linking, compiling, waiting).
++    // Uses rax, rcx and rdx, free between steps. jitCode: offsetof(Schedule, jit) or, for an A/B compile,
++    // jitCalls (each kind of compiled code chains to its own kind).
++    inline void jitEmitChain(JitEmitter &e, const JitHostLayout &h, const BlockEngine &engine, const Schedule &s,
++                             size_t jitCode, bool chain)
++    {
++        using B = JitEmitter;
++        std::vector<size_t> exits;
++        const auto disp32 = [&](size_t value) { e.imm32(static_cast<uint32_t>(value)); };
++        if (chain && s.end != EndProgram)
++        {
++            e.load32(2, B::Vu, offsetof(VU1State, pc)); // edx = pc
++            e.movRaxImm(reinterpret_cast<uint64_t>(&s));
++            e.bytes({0x3B, 0x90}); // cmp edx, [rax + nextPc[0]]
++            disp32(offsetof(Schedule, nextPc));
++            const size_t second = e.jne32();
++            e.bytes({0x48, 0x8B, 0x88}); // mov rcx, [rax + next[0]]
++            disp32(offsetof(Schedule, next));
++            const size_t found = e.jmp32();
++            e.bind(second);
++            e.bytes({0x3B, 0x90}); // cmp edx, [rax + nextPc[1]]
++            disp32(offsetof(Schedule, nextPc) + 4u);
++            exits.push_back(e.jne32());
++            e.bytes({0x48, 0x8B, 0x88}); // mov rcx, [rax + next[1]]
++            disp32(offsetof(Schedule, next) + sizeof(Schedule *));
++            e.bind(found);
++            e.bytes({0x48, 0x85, 0xC9}); // test rcx, rcx
++            exits.push_back(e.je32());
++            e.bytes({0x3B, 0x91}); // cmp edx, [rcx + pc]
++            disp32(offsetof(Schedule, pc));
++            exits.push_back(e.jne32());
++            e.bytes({0x81, 0xB9}); // cmp dword [rcx + sig], exitSig
++            disp32(offsetof(Schedule, sig));
++            e.imm32(s.exitSig);
++            exits.push_back(e.jne32());
++            e.bytes({0x48, 0x8B}); // mov rax, [rdi + generation]
++            e.modrm(0, B::HostReg, h.generation);
++            e.bytes({0x48, 0x39, 0x81}); // cmp [rcx + validated], rax
++            disp32(offsetof(Schedule, validated));
++            exits.push_back(e.jne32());
++            e.bytes({0xC1, 0xEA, 0x03}); // shr edx, 3
++            e.movRaxImm(reinterpret_cast<uint64_t>(&engine.fallbackAt[0]));
++            e.bytes({0x80, 0x3C, 0x10, 0x00}); // cmp byte [rax + rdx], 0
++            exits.push_back(e.jne32());
++            e.bytes({0x0F, 0xB6, 0x81}); // movzx eax, byte [rcx + chainFlags]
++            disp32(offsetof(Schedule, chainFlags));
++            e.bytes({0x85, 0xC0}); // test eax, eax
++            const size_t noFlags = e.je32();
++            e.bytes({0x84}); // test al, [rsi + chainDeny]
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, chainDeny)));
++            exits.push_back(e.jne32());
++            e.bytes({0xA8, 0x08}); // test al, 8 (xgkickFirst)
++            const size_t noXgkick = e.je32();
++            e.bytes({0x80}); // cmp byte [rbx + xgkick active], 0
++            e.modrm(7, B::Vu, static_cast<uint32_t>(h.xgkickActive));
++            e.bytes({0x00});
++            exits.push_back(e.jne32());
++            e.bind(noFlags);
++            e.bind(noXgkick);
++            e.bytes({0x0F, 0xB7, 0x81}); // movzx eax, word [rcx + lastIssue]
++            disp32(offsetof(Schedule, lastIssue));
++            e.bytes({0x48, 0x03}); // add rax, [rsi + cycle]
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++            e.bytes({0x48, 0x3B}); // cmp rax, [rsi + budgetEnd]
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, budgetEnd)));
++            exits.push_back(e.jae32());
++            e.bytes({0x48, 0x8B, 0x81}); // mov rax, [rcx + jit]
++            disp32(jitCode);
++            e.bytes({0x48, 0x85, 0xC0}); // test rax, rax
++            exits.push_back(e.je32());
++            e.bytes({0x48, 0xBA}); // mov rdx, &engine.stats
++            e.imm64(reinterpret_cast<uint64_t>(&engine.stats));
++            e.bytes({0x48, 0x81, 0x82}); // add qword [rdx + pairs], pair count
++            disp32(offsetof(BlockStats, pairs));
++            e.imm32(static_cast<uint32_t>(s.pairs.size()));
++            e.bytes({0x48, 0x83, 0x82}); // add qword [rdx + blocks], 1
++            disp32(offsetof(BlockStats, blocks));
++            e.bytes({0x01});
++            e.bytes({0x48, 0x83, 0x82}); // add qword [rdx + jitBlocks], 1
++            disp32(offsetof(BlockStats, jitBlocks));
++            e.bytes({0x01});
++            e.bytes({0x48, 0x83, 0xC0, static_cast<uint8_t>(kJitPrologueBytes)}); // add rax, prologue
++            e.bytes({0xFF, 0xE0});                                                 // jmp rax
++        }
++        for (const size_t exit : exits)
++            e.bind(exit);
++        e.movRaxImm(reinterpret_cast<uint64_t>(&s));
++        e.bytes({0x48, 0x89}); // mov [rsi + jitLast], rax
++        e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, jitLast)));
++    }
++
+     // PS2X_JIT_MAPA=<file> (diagnostic, patch 0078): every compiled schedule is appended to that file, so that a
+     // profile's addresses without a symbol can be put down to VU instruction pairs (scripts/jit_mapa.py): a line
+     // "B <code address> <bytes> <micro memory bytes> <pc>" and then, for each pair, "P <code offset> <pc> <lower>
+@@ -1318,17 +1506,26 @@
+         const bool trackNormal = alternative != 34; // A/B mode 34: every FMAC operand normalized
+         const bool inlineMore = alternative != 43 && alternative != 44 && inlineLower; // A/B modes 43 and 44: as before
+         const bool inlineSimple = alternative != 70; // patch 0080 (A/B mode 70: through upperEarly)
++        // Patch 0081: the late upper results and DIV inline too (A/B modes 74 and 73: through jitUpperLate,
++        // jitUpperDst and kLowerFast).
++        const bool inlineLate = alternative != 74 && alternative != 73 && alternative != 76 && s_jitInlineFmac;
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.dataSize) - hostBase), host.codeSize(),
+             host.pcMask(), host.backupValueOffset(), host.backupRegOffset(), host.backupValidOffset(),
+-            host.workingClipOffset()};
++            host.workingClipOffset(),
++            static_cast<uint32_t>(reinterpret_cast<const char *>(&host.codeGeneration) - hostBase),
++            host.xgkickActiveOffset()};
+         (alternative == 0 ? s.jitTried : s.jitCallsTried) = true;
+         s.jitRanges.clear();
+         s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
+         JitEmitter e;
+         e.prologue();
++        if (e.code().size() != kJitPrologueBytes)
++            return false;
++        s.chainFlags = static_cast<uint8_t>((s.fallback ? 1u : 0u) | (s.hasD ? 2u : 0u) | (s.hasT ? 4u : 0u) |
++                                            (s.xgkickFirst ? 8u : 0u));
+         size_t nextCommit = 0u;
+         // Kind of the side 0 flag entry queued for each due cycle (relative to the entry) by a pair of this schedule.
+         std::vector<uint8_t> upperFlagKind;
+@@ -1383,7 +1580,13 @@
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+             else if (p.upperFn != nullptr)
+-                e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
++            {
++                const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
++                if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
++                                                reinterpret_cast<const void *>(&jitUpperLate<Host>))) &&
++                    !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
++                    e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
++            }
+             else if (p.upperPath == UpperClip)
+             {
+                 if (inlineSimple && s_jitSse41)
+@@ -1405,7 +1608,7 @@
+                 if (p.lowerExec == LowerFast)
+                 {
+                     if (!(inlineLower && (jitEmitLq(e, layout, p) || jitEmitSq<Host>(e, layout, p))) &&
+-                        !(inlineMore && jitEmitLowerMore(e, layout, p)))
++                        !(inlineMore && jitEmitLowerMore(e, layout, p, inlineLate)))
+                         e.call(reinterpret_cast<const void *>(kLowerFast<Host>[p.fastOp]), &p);
+                 }
+                 else if (p.lowerExec == LowerImmediate)
+@@ -1421,7 +1624,12 @@
+ 
+             if (!upperDone && p.upperFn != nullptr &&
+                 (p.upperDst == DstVf || p.upperDst == DstVfPending || p.upperDst == DstAcc))
+-                e.call(reinterpret_cast<const void *>(&jitUpperDst<Host>), &p);
++            {
++                if (inlineLate && s_jitSse41)
++                    jitEmitUpperDst(e, p);
++                else
++                    e.call(reinterpret_cast<const void *>(&jitUpperDst<Host>), &p);
++            }
+ 
+             // What this pair wrote: a FMAC result is known normalized; any other write forgets the lanes it wrote
+             // (execLower: everything but vf0).
+@@ -1456,6 +1664,9 @@
+             jitEmitEnd<Host>(e, s);
+         else
+             e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
++        // A/B modes 71 and 73: every schedule returns to runBlocks, as before patch 0081.
++        jitEmitChain(e, layout, engine, s, alternative == 0 ? offsetof(Schedule, jit) : offsetof(Schedule, jitCalls),
++                     s_jitChain && alternative != 71 && alternative != 73 && alternative != 76);
+         e.epilogue();
+ 
+         uint8_t *const code = engine.jit.alloc(e.code().size());

@@ -1,0 +1,44 @@
+diff --git a/ps2xRuntime/src/lib/ps2_photo_mode.h b/ps2xRuntime/src/lib/ps2_photo_mode.h
+index 6557522..d285c59 100644
+--- a/ps2xRuntime/src/lib/ps2_photo_mode.h
++++ b/ps2xRuntime/src/lib/ps2_photo_mode.h
+@@ -328,6 +328,16 @@ namespace ps2x
+         double m_since = -1.0;
+     };
+ 
++    // Aspecto T1: a frozen race keeps drawing the effects of the car's speed (F1 06: the speed effects object's mask, from
++    // the player's options when the race is set up: 4 highspeedblur, 2 highspeedzoom, 1 enginevibration). While the
++    // photo mode is on the game draws with them off; the mask itself is left as it was (src/f1_overrides.cpp).
++    constexpr uint32_t kPhotoModeSpeedEffects = 0x7u;
++
++    inline uint32_t photoModeSpeedEffectsMask(uint32_t mask, bool photoMode)
++    {
++        return photoMode ? mask & ~kPhotoModeSpeedEffects : mask;
++    }
++
+     // The shared state (ps2_runtime.cpp; any thread). The window: setPhotoModeKeyOption from the menus,
+     // togglePhotoMode with the key or PS2X_MENU_GUION's "modo_foto", setPhotoModeInput on each of its frames. The game:
+     // photoModeCameraFrame when a race camera draws, photoModeActive and photoModeInput.
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 81cb277..2fb80ad 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1222,6 +1222,18 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(request.pending(), "nothing pending");
+         });
+ 
++        tc.Run("the photo mode draws the race without its speed effects and leaves the rest of the mask", [](TestCase &t)
++        {
++            using ps2x::photoModeSpeedEffectsMask;
++            t.IsTrue(ps2x::kPhotoModeSpeedEffects == 0x7u, "blur 4, zoom 2 and engine vibration 1");
++            t.IsTrue(photoModeSpeedEffectsMask(0x7u, false) == 0x7u, "off: the player's mask");
++            t.IsTrue(photoModeSpeedEffectsMask(0x5u, false) == 0x5u, "off: as it is");
++            t.IsTrue(photoModeSpeedEffectsMask(0x7u, true) == 0x0u, "on: no blur, zoom or vibration");
++            t.IsTrue(photoModeSpeedEffectsMask(0x4u, true) == 0x0u, "on: blur only, off too");
++            t.IsTrue(photoModeSpeedEffectsMask(0xFFFFFFF8u | 0x3u, true) == 0xFFFFFFF8u, "on: other bits kept");
++            t.IsTrue(photoModeSpeedEffectsMask(0x0u, true) == 0x0u, "on: nothing to take off");
++        });
++
+         tc.Run("the photo mode's pad: circle takes a photo and START leaves, on the press only", [](TestCase &t)
+         {
+             using ps2x::photoModePadActions;

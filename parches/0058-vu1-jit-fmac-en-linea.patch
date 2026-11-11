@@ -1,0 +1,366 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index d5470b8..1d46e5e 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -25,7 +25,8 @@
+ // commits reading their entry again before each test (before patch 0051), 27 the VU1 schedules run by the copy that
+ // tests the A/B mode on every pair (before patch 0056; mode 0 runs one without the tests), 28 the EE
+ // timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056), 29 the VU1
+-// schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057). A
++// schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057), 30 the
++// compiled schedules with the upper FMAC through calls instead of inline (before patch 0058). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 1682786..3c5ae17 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -622,6 +622,8 @@ namespace
+         // it points into.
+         void *jit = nullptr;
+         bool jitTried = false;
++        void *jitCalls = nullptr; // A/B mode 30: compiled without the inline FMAC
++        bool jitCallsTried = false;
+         std::vector<JitCommitRange> jitRanges;
+     };
+ 
+@@ -1965,7 +1967,13 @@ namespace
+                 reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
+                 ++engine.stats.jitBlocks;
+             }
+-            else if (abMode == 0 || abMode == 29)
++            else if (abMode == 30 && s_jitEnabled &&
++                     (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, false))))
++            {
++                reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host); // A/B mode 30: FMAC through calls
++                ++engine.stats.jitBlocks;
++            }
++            else if (abMode == 0 || abMode == 29 || abMode == 30)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index c68094f..1475519 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -24,6 +24,13 @@
+ 
+     using JitCode = void (*)(VU1State *, BlockState *, void *);
+ 
++    // PS2X_VU1_JIT_FMAC=0: the FMAC through upperEarly calls, as the first version of the JIT.
++    const bool s_jitInlineFmac = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT_FMAC");
++        return value == nullptr || value[0] != '0';
++    }();
++
+     // x64 code of one schedule, built in a byte buffer and copied to the engine's arena.
+     class JitEmitter
+     {
+@@ -97,6 +104,60 @@
+             for (int i = 0; i < 4; ++i)
+                 m_code.push_back(static_cast<uint8_t>(value >> (i * 8)));
+         }
++        // SSE on xmm0-xmm5 (no REX). rr: register-register; cst: a row of kJitConst through rax (16-byte aligned).
++        void rr(std::initializer_list<uint8_t> op, uint8_t dst, uint8_t src)
++        {
++            bytes(op);
++            m_code.push_back(static_cast<uint8_t>(0xC0u | (dst << 3) | src));
++        }
++        void cst(std::initializer_list<uint8_t> op, uint8_t xmm, uint32_t index)
++        {
++            bytes(op);
++            m_code.push_back(static_cast<uint8_t>(0x80u | (xmm << 3))); // [rax + disp32]
++            imm32(index * 16u);
++        }
++        void movaps(uint8_t dst, uint8_t src) { rr({0x0F, 0x28}, dst, src); }
++        void movmskps(uint8_t r32, uint8_t xmm) { rr({0x0F, 0x50}, r32, xmm); }
++        void shufps(uint8_t dst, uint8_t src, uint8_t imm)
++        {
++            rr({0x0F, 0xC6}, dst, src);
++            m_code.push_back(imm);
++        }
++        void psrld(uint8_t xmm, uint8_t n)
++        {
++            rr({0x66, 0x0F, 0x72}, 2u, xmm); // /2
++            m_code.push_back(n);
++        }
++        void loadSs(uint8_t xmm, Base base, size_t disp)
++        {
++            bytes({0xF3, 0x0F, 0x10});
++            modrm(xmm, base, static_cast<uint32_t>(disp));
++        }
++        void movRaxImm(uint64_t value)
++        {
++            bytes({0x48, 0xB8});
++            imm64(value);
++        }
++        // Forward jumps: the position after their rel32, for bind.
++        size_t jne32()
++        {
++            bytes({0x0F, 0x85});
++            imm32(0u);
++            return m_code.size();
++        }
++        size_t jmp32()
++        {
++            bytes({0xE9});
++            imm32(0u);
++            return m_code.size();
++        }
++        // Points the rel32 that ends at `after` to the current position.
++        void bind(size_t after)
++        {
++            const uint32_t rel = static_cast<uint32_t>(m_code.size() - after);
++            for (int i = 0; i < 4; ++i)
++                m_code[after - 4 + i] = static_cast<uint8_t>(rel >> (i * 8));
++        }
+         const std::vector<uint8_t> &code() const { return m_code; }
+ 
+     private:
+@@ -208,6 +269,209 @@
+         }
+     }
+ 
++    // Constants of the inline FMAC (rows of kJitConst).
++    enum JitConst : uint32_t
++    {
++        JcExp = 0, // 0x7F800000
++        JcZero,    // 0
++        JcAbs,     // 0x7FFFFFFF
++        JcMax,     // 0x7F7FFFFF
++        JcFF,      // 0xFF
++        JcTop,     // 254
++        JcOne,     // 1
++        JcBinades, // 23
++    };
++    alignas(16) const uint32_t kJitConst[8][4] = {
++        {0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u}, {0u, 0u, 0u, 0u},
++        {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu}, {0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu},
++        {0xFFu, 0xFFu, 0xFFu, 0xFFu}, {254u, 254u, 254u, 254u}, {1u, 1u, 1u, 1u}, {23u, 23u, 23u, 23u}};
++
++    // normalize4 on xmm x (rax = kJitConst), with xmm3-xmm5 as scratch: bits & ~(D & 0x7FFFFFFF) | (maxE & 0x7F7FFFFF)
++    // with D = zero exponent | maximum exponent. The same as normalize4: a zero exponent keeps the sign alone, the
++    // maximum one becomes the signed maximum.
++    inline void jitNormalize(JitEmitter &e, uint8_t x)
++    {
++        e.movaps(3, x);
++        e.cst({0x66, 0x0F, 0xDB}, 3, JcExp);  // pand: exponent
++        e.movaps(4, 3);
++        e.cst({0x66, 0x0F, 0x76}, 3, JcZero); // pcmpeqd: zero exponent
++        e.cst({0x66, 0x0F, 0x76}, 4, JcExp);  // pcmpeqd: maximum exponent
++        e.movaps(5, 3);
++        e.rr({0x66, 0x0F, 0xEB}, 5, 4);       // por: D
++        e.cst({0x66, 0x0F, 0xDB}, 5, JcAbs);  // pand
++        e.rr({0x66, 0x0F, 0xDF}, 5, x);       // pandn: bits & ~(D & abs)
++        e.cst({0x66, 0x0F, 0xDB}, 4, JcMax);  // pand
++        e.rr({0x66, 0x0F, 0xEB}, 5, 4);       // por
++        e.movaps(x, 5);
++    }
++
++    // xmm dst = exponent field of xmm src (rax = kJitConst).
++    inline void jitExponent(JitEmitter &e, uint8_t dst, uint8_t src)
++    {
++        e.movaps(dst, src);
++        e.psrld(dst, 23);
++        e.cst({0x66, 0x0F, 0xDB}, dst, JcFF);
++    }
++
++    // The upper FMAC of p inline when fmacSse2 would take its fast path (ADD, SUB, MUL, MADD, MSUB; any source), as
++    // upperEarly<upperFmac<Kind, Source>, Dst> does it: operands normalized, one rounding (two for MADD/MSUB) in the
++    // current MXCSR mode, the range test of fmacSse2, the flag entry (sign flags alone) and the result in its lanes.
++    // Outside that range: a call to p.upperEarly, which does all of it from the registers, still untouched.
++    // False: not one of these (the caller calls p.upperEarly).
++    inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p)
++    {
++        using B = JitEmitter;
++        const FmacOp &op = p.fmac;
++        if (p.upperPath != UpperFmac || !s_jitSse41)
++            return false;
++        const bool madd = op.kind == FmacMadd || op.kind == FmacMsub;
++        if (op.kind != FmacAdd && op.kind != FmacSub && op.kind != FmacMul && !madd)
++            return false;
++        if (p.upperDst != DstVf && p.upperDst != DstVfPending && p.upperDst != DstAcc)
++            return false;
++        if (p.upperFlags != 0u && p.upperFlags != (kFlagMac | kFlagStatus))
++            return false;
++        static_assert(sizeof(FlagSlot) == 20u, "the inline FMAC writes the flag entry field by field");
++
++        e.movRaxImm(reinterpret_cast<uint64_t>(&kJitConst[0][0]));
++        // a = xmm0, b = xmm1, c = xmm2 (MADD/MSUB: ACC)
++        e.loadXmm(0, B::Vu, offsetof(VU1State, vf) + 16u * op.fs);
++        jitNormalize(e, 0);
++        switch (op.source)
++        {
++        case FmacSourceBc:
++            e.loadSs(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft + 4u * op.bc);
++            e.shufps(1, 1, 0x00);
++            break;
++        case FmacSourceQ:
++            e.loadSs(1, B::Vu, offsetof(VU1State, q));
++            e.shufps(1, 1, 0x00);
++            break;
++        case FmacSourceI:
++            e.loadSs(1, B::Vu, offsetof(VU1State, i));
++            e.shufps(1, 1, 0x00);
++            break;
++        default:
++            e.loadXmm(1, B::Vu, offsetof(VU1State, vf) + 16u * op.ft);
++            break;
++        }
++        jitNormalize(e, 1);
++        if (madd)
++        {
++            e.loadXmm(2, B::Vu, offsetof(VU1State, acc));
++            jitNormalize(e, 2);
++            // product = xmm4, value = xmm3
++            e.movaps(4, 0);
++            e.rr({0x0F, 0x59}, 4, 1); // mulps
++            e.movaps(3, 2);
++            e.rr({0x0F, static_cast<uint8_t>(op.kind == FmacMadd ? 0x58 : 0x5C)}, 3, 4); // addps / subps
++            // Value and product exponents between 2 and 253, the value at most 22 binades below the product.
++            jitExponent(e, 0, 3);                    // ve
++            jitExponent(e, 1, 4);                    // pe
++            e.cst({0x0F, 0x28}, 2, JcTop);           // movaps xmm2, 254
++            e.rr({0x66, 0x0F, 0x66}, 2, 0);          // pcmpgtd: 254 > ve
++            e.cst({0x0F, 0x28}, 5, JcTop);
++            e.rr({0x66, 0x0F, 0x66}, 5, 1);          // 254 > pe
++            e.rr({0x66, 0x0F, 0xDB}, 2, 5);          // pand
++            e.movaps(5, 0);
++            e.cst({0x66, 0x0F, 0x66}, 5, JcOne);     // ve > 1
++            e.rr({0x66, 0x0F, 0xDB}, 2, 5);
++            e.movaps(5, 1);
++            e.cst({0x66, 0x0F, 0x66}, 5, JcOne);     // pe > 1
++            e.rr({0x66, 0x0F, 0xDB}, 2, 5);
++            e.cst({0x66, 0x0F, 0xFE}, 0, JcBinades); // paddd: ve + 23
++            e.rr({0x66, 0x0F, 0x66}, 0, 1);          // ve + 23 > pe
++            e.rr({0x66, 0x0F, 0xDB}, 2, 0);
++            e.movmskps(0, 2);
++        }
++        else
++        {
++            // value = xmm3
++            e.movaps(3, 0);
++            e.rr({0x0F, static_cast<uint8_t>(op.kind == FmacAdd ? 0x58 : op.kind == FmacSub ? 0x5C : 0x59)}, 3, 1);
++            jitExponent(e, 4, 3);
++            e.cst({0x0F, 0x28}, 5, JcTop);
++            e.rr({0x66, 0x0F, 0x66}, 5, 4);          // 254 > exponent
++            e.cst({0x66, 0x0F, 0x66}, 4, JcOne);     // exponent > 1
++            e.rr({0x66, 0x0F, 0xDB}, 4, 5);
++            e.movmskps(0, 4);
++        }
++        e.andEax(op.components);
++        e.bytes({0x3D}); // cmp eax, components
++        e.imm32(op.components);
++        const size_t toSlow = e.jne32();
++
++        if (p.upperFlags != 0u)
++        {
++            // rax = &st.flags[(st.cycle + issue + 4) & 7][0] - offsetof(BlockState, flags)
++            e.bytes({0x48, 0x8B}); // mov rax, [rsi + cycle]
++            e.modrm(0, B::St, static_cast<uint32_t>(offsetof(BlockState, cycle)));
++            e.bytes({0x05}); // add eax, issue + 4
++            e.imm32(p.issue + 4u);
++            e.bytes({0x83, 0xE0, 0x07});                                        // and eax, 7
++            e.bytes({0x6B, 0xC0, static_cast<uint8_t>(2u * sizeof(FlagSlot))}); // imul eax, eax, 40
++            e.bytes({0x48, 0x01, 0xF0});                                        // add rax, rsi
++            const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
++            const auto storeSlot = [&](uint32_t field, uint8_t reg) // mov [rax + slot + field], reg32
++            {
++                e.bytes({0x89, static_cast<uint8_t>(0x80u | (reg << 3))});
++                e.imm32(slot + field);
++            };
++            const auto storeSlotImm = [&](uint32_t field, uint32_t value) // mov dword [rax + slot + field], imm32
++            {
++                e.bytes({0xC7, 0x80});
++                e.imm32(slot + field);
++                e.imm32(value);
++            };
++            // MAC: the sign bits of the written lanes, x = bit 3 (the lanes reversed before movmskps).
++            const uint8_t reversed = static_cast<uint8_t>(((op.components & 1u) << 3) | ((op.components & 2u) << 1) |
++                                                          ((op.components & 4u) >> 1) | ((op.components & 8u) >> 3));
++            e.movaps(5, 3);
++            e.shufps(5, 5, 0x1B);
++            e.movmskps(1, 5); // ecx
++            e.andEcx(reversed);
++            e.bytes({0x89, 0xCA}); // mov edx, ecx
++            e.shlEcx(4);
++            storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, mac)), 1);
++            e.bytes({0x85, 0xD2, 0x0F, 0x95, 0xC2, 0x0F, 0xB6, 0xD2, 0x01, 0xD2}); // edx = edx != 0 ? 2 : 0
++            storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, status)), 2);
++            if (madd)
++            {
++                e.movmskps(1, 4); // the product's signs go to the sticky flags
++                e.andEcx(op.components);
++                e.bytes({0x85, 0xC9, 0x0F, 0x95, 0xC1, 0x0F, 0xB6, 0xC9, 0x01, 0xC9}); // ecx = ecx != 0 ? 2 : 0
++                storeSlot(static_cast<uint32_t>(offsetof(FlagSlot, sticky)), 1);
++            }
++            else
++                storeSlotImm(static_cast<uint32_t>(offsetof(FlagSlot, sticky)), 0u);
++            storeSlotImm(static_cast<uint32_t>(offsetof(FlagSlot, clip)), 0u);
++            e.bytes({0xC6, 0x80}); // mov byte [rax + slot + kind], upperFlags
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, kind)));
++            e.bytes({p.upperFlags});
++        }
++
++        // The result in its lanes (blendLanes: x = bit 3; blendps: lane i = bit i).
++        const B::Base base = p.upperDst == DstVfPending ? B::St : B::Vu;
++        const size_t target = p.upperDst == DstVf          ? offsetof(VU1State, vf) + 16u * p.upperReg
++                              : p.upperDst == DstVfPending ? offsetof(BlockState, pendingVf) + 16u * p.upperReg
++                                                           : offsetof(VU1State, acc);
++        const uint8_t lanes = static_cast<uint8_t>(((p.upperLanes >> 3) & 1u) | (((p.upperLanes >> 2) & 1u) << 1) |
++                                                   (((p.upperLanes >> 1) & 1u) << 2) | ((p.upperLanes & 1u) << 3));
++        if (lanes == 0xFu)
++            e.storeXmm(base, target, 3);
++        else if (lanes != 0u)
++        {
++            e.loadXmm(0, base, target);
++            e.bytes({0x66, 0x0F, 0x3A, 0x0C, 0xC3, lanes}); // blendps xmm0, xmm3, lanes
++            e.storeXmm(base, target, 0);
++        }
++        const size_t toDone = e.jmp32();
++        e.bind(toSlow);
++        e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
++        e.bind(toDone);
++        return true;
++    }
++
+     // Upper through upperFn: the result waits in st.jitUp until after the lower instruction (jitUpperDst).
+     template <typename Host>
+     void jitUpperLate(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
+@@ -345,10 +609,11 @@
+ 
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
++    // inlineFmac false: the FMAC through upperEarly calls (A/B mode 30, s.jitCalls).
+     template <typename Host>
+-    bool jitCompile(BlockEngine &engine, Schedule &s)
++    bool jitCompile(BlockEngine &engine, Schedule &s, bool inlineFmac = true)
+     {
+-        s.jitTried = true;
++        (inlineFmac ? s.jitTried : s.jitCallsTried) = true;
+         s.jitRanges.clear();
+         s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
+         JitEmitter e;
+@@ -373,7 +638,10 @@
+             commitsUpTo(p.commitEnd);
+             const bool upperDone = p.upperEarly != nullptr;
+             if (upperDone)
+-                e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
++            {
++                if (!(inlineFmac && s_jitInlineFmac && jitEmitFmac(e, p)))
++                    e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
++            }
+             else if (p.upperFn != nullptr)
+                 e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             else if (p.upperPath == UpperClip)
+@@ -412,7 +680,7 @@
+         if (code == nullptr)
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+-        s.jit = code;
++        (inlineFmac ? s.jit : s.jitCalls) = code;
+         return true;
+     }
+ 

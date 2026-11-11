@@ -1,0 +1,1115 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..862f2c5 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_threaded_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+@@ -396,6 +397,13 @@ add_library(ps2_runtime STATIC
+     src/lib/games_database.cpp
+ )
+ 
++if(MSVC)
++    # The hot paths of the runtime (VU1 interpreter, software GS rasterizer, VIF) are built from many small
++    # out-of-class helpers. Builds that pass /Ob1 globally (to keep the translated functions quick to compile) never
++    # inline them, so the runtime library asks for normal inlining. /Z7 keeps symbols and line numbers for profiling.
++    target_compile_options(ps2_runtime PRIVATE /Ob2 /Z7)
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..b9a8cc8 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -34,6 +34,8 @@ public:
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
+ private:
++    friend class GSThreadedBackend; // converts its presentation snapshots with PresentFromLocalMemory
++
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+@@ -43,6 +45,9 @@ private:
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
++    // Previous triangle rasterizer, kept to check the current one pixel for pixel (F1_GS_VERIFICAR) and for A/B timing.
++    void DrawTriangleReference(const GSPrimitiveBatch &batch);
++    void VerifyTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+new file mode 100644
+index 0000000..50f24d6
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -0,0 +1,125 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <variant>
++#include <vector>
++
++// Runs the software rasterizer (GSCpuBackend) on its own thread. The GS front-end keeps parsing GIF packets on the EE
++// thread, and every backend call that changes local memory (draws, CLUT loads, transfers, uploads, clears) is queued
++// in order and executed by the worker, so the EE/VIF1/VU1 work overlaps with rasterization. Calls that read local
++// memory back wait until the queue is empty. Presentation is queued too, as a snapshot of local memory taken in order
++// with the draws; Present() converts the newest snapshot and never waits for pending draws (the displayed frame is one
++// presentation behind).
++// The queue is bounded by estimated work (pixels), not only by commands: a full-screen primitive costs milliseconds and
++// a small one microseconds, so a command bound alone let the EE run tens of seconds ahead of the rasterizer.
++// PS2X_GS_THREAD=0 selects the plain GSCpuBackend instead.
++class GSThreadedBackend final : public GSRasterBackend
++{
++public:
++    GSThreadedBackend();
++    ~GSThreadedBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    struct ClutCommand
++    {
++        GSTex0Reg tex0{};
++        GSTexClutReg texclut{};
++    };
++    struct ClearCommand
++    {
++        GSContext context{};
++        uint32_t rgba = 0;
++    };
++    struct WriteVramCommand
++    {
++        uint32_t psm = 0, base = 0, bw = 0, x = 0, y = 0, value = 0;
++    };
++    struct TextureFlushCommand
++    {
++    };
++    struct SnapshotCommand
++    {
++        GSPresentationRequest request{};
++    };
++    using Command = std::variant<GSPrimitiveBatch, ClutCommand, GSTransferCommand, std::vector<uint8_t>,
++                                 TextureFlushCommand, ClearCommand, WriteVramCommand, SnapshotCommand>;
++    struct Slot
++    {
++        Command command;
++        uint32_t cost = 0u; // estimated work, in pixels
++    };
++
++    static constexpr uint64_t kCapacity = 16384u;
++    static constexpr uint64_t kChunk = 512u;
++    static constexpr uint64_t kMaxPendingCost = 2000000u; // about 5 full 640x448 screens of pixels
++    static constexpr uint32_t kPublishCost = 65536u;       // the worker reports progress at least this often
++
++    template <typename T>
++    void Push(T &&command, uint32_t cost);
++    void Drain() const;
++    void WorkerLoop();
++    void Execute(Command &command, uint64_t index);
++
++    std::unique_ptr<GSCpuBackend> m_cpu;
++    std::vector<Slot> m_ring;
++    mutable std::mutex m_mutex;
++    mutable std::condition_variable m_notEmpty;
++    mutable std::condition_variable m_notFull;
++    mutable std::condition_variable m_idle;
++    uint64_t m_head = 0u;        // next command the worker runs
++    uint64_t m_tail = 0u;        // next free slot
++    uint64_t m_pendingCost = 0u; // cost of the commands in [m_head, m_tail)
++    uint32_t m_producersWaiting = 0u;
++    bool m_workerBusy = false;
++    bool m_workerWaiting = false;
++    bool m_stop = false;
++    std::atomic<uint64_t> m_lastSnapshotIndex{UINT64_MAX}; // ring index of the newest queued snapshot
++    mutable std::atomic<uint64_t> m_fullWaits{0u};          // pushes that found the queue full (statistics)
++    mutable std::atomic<uint64_t> m_drains{0u};             // drains that had to wait for the worker (statistics)
++    mutable std::atomic<uint64_t> m_producerWaitNs{0u};     // time producers spent waiting (statistics)
++    std::thread m_worker;
++
++    // Presentation. The worker publishes local-memory snapshots; Present() converts the newest one.
++    std::mutex m_publishMutex;
++    std::vector<uint8_t> m_workerSnapshot;
++    std::vector<uint8_t> m_publishedSnapshot;
++    GSPresentationRequest m_publishedRequest{};
++    uint64_t m_publishedSerial = 0u;
++    std::mutex m_presentMutex; // serializes Present() callers; guards the fields below
++    std::vector<uint8_t> m_presentSnapshot;
++    GSPresentationRequest m_presentRequest{};
++    uint64_t m_presentSerial = 0u;
++    PresentationFrame m_presentFrame;
++};
++
++// Backend used by the GS front-end: GSThreadedBackend, or GSCpuBackend with PS2X_GS_THREAD=0.
++std::unique_ptr<GSRasterBackend> CreateDefaultGSRasterBackend();
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+new file mode 100644
+index 0000000..28de21e
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include <atomic>
++
++// A/B switch for performance work. Optimized paths that keep their previous implementation check it: 0 runs the
++// current code, any other value the previous one. A game hook can alternate it while running so both versions are
++// measured on the same scene within one run (the host load varies a lot between runs).
++extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 01dc09f..97ada8e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/ps2_ab.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <algorithm>
+@@ -930,8 +931,43 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     case GS_PRIM_TRIANGLE:
+     case GS_PRIM_TRISTRIP:
+     case GS_PRIM_TRIFAN:
+-        DrawTriangle(batch);
++    {
++        // Debug (F1 06): F1_GS_SIN_TRIANGULOS=<seconds> skips triangle rasterization from that second after start-up
++        // (sprites, such as most 2D/HUD, still draw). The software rasterizer is the bottleneck in a race; this shows
++        // whether the game logic runs once it is fast, without changing the menu timings before that second.
++        static const auto s_start = std::chrono::steady_clock::now();
++        static const double s_skipFrom = []
++        {
++            const char *value = std::getenv("F1_GS_SIN_TRIANGULOS");
++            return value != nullptr ? std::atof(value) : -1.0;
++        }();
++        if (s_skipFrom >= 0.0 &&
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() >= s_skipFrom)
++            break;
++        // F1_GS_VERIFICAR=<n>: n triangles (from second F1_GS_VERIFICAR_DESDE) are drawn by both rasterizers and local
++        // memory is compared.
++        static uint32_t s_verifyLeft = []
++        {
++            const char *value = std::getenv("F1_GS_VERIFICAR");
++            return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
++        }();
++        static const double s_verifyFrom = []
++        {
++            const char *value = std::getenv("F1_GS_VERIFICAR_DESDE");
++            return value != nullptr ? std::atof(value) : 0.0;
++        }();
++        if (s_verifyLeft != 0u &&
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() >= s_verifyFrom)
++        {
++            --s_verifyLeft;
++            VerifyTriangle(batch);
++        }
++        else if (g_ps2AbMode.load(std::memory_order_relaxed) != 0)
++            DrawTriangleReference(batch);
++        else
++            DrawTriangle(batch);
+         break;
++    }
+     case GS_PRIM_LINE:
+     case GS_PRIM_LINESTRIP:
+         DrawLine(batch);
+@@ -1379,20 +1415,383 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
++namespace
++{
++    using ReadVramFn = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
++    using WriteVramFn = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
++
++    // The part of WritePixel that depends only on the draw state, worked out once per primitive. writePixelFast does
++    // exactly what WritePixel does with it.
++    struct PixelPipeline
++    {
++        int scissorX0 = 0, scissorX1 = 0, scissorY0 = 0, scissorY1 = 0;
++        bool fge = false;
++        uint8_t fogR = 0, fogG = 0, fogB = 0;
++        uint32_t fbp = 0, fbw = 1, fpsm = 0, zbp = 0, zpsm = 0;
++        uint64_t test = 0;
++        uint32_t ztestMethod = 0;
++        bool abe = false;
++        bool pabe = false;
++        uint8_t asel = 0, bsel = 0, csel = 0, dsel = 0, fix = 0;
++        bool fbaSetsAlpha = false;
++        uint32_t fbmsk = 0;
++        bool frame16 = false;
++        bool frameCt24 = false;
++        bool frameCt32 = false;
++        bool dateNeedsRead = false;
++        bool zmask = false;
++        ReadVramFn readFrame = nullptr;
++        ReadVramFn readZ = nullptr;
++        WriteVramFn writeFrame = nullptr;
++        WriteVramFn writeZ = nullptr;
++    };
++
++    inline void writePixelFast(uint8_t *vram, const PixelPipeline &pp, int x, int y, int z, uint8_t r, uint8_t g,
++                               uint8_t b, uint8_t a, uint8_t fog)
++    {
++        if (x < pp.scissorX0 || x > pp.scissorX1 || y < pp.scissorY0 || y > pp.scissorY1)
++            return;
++
++        if (pp.fge)
++        {
++            const uint32_t inverseFog = 255u - fog;
++            auto applyFog = [&](uint8_t input, uint8_t fogColor) -> uint8_t
++            {
++                return static_cast<uint8_t>(((static_cast<uint32_t>(fog) * input) >> 8) + ((inverseFog * fogColor) >> 8));
++            };
++
++            r = applyFog(r, pp.fogR);
++            g = applyFog(g, pp.fogG);
++            b = applyFog(b, pp.fogB);
++        }
++
++        const PixelWriteMask writeMask = classifyAlphaTest(pp.test, a, static_cast<uint8_t>(pp.fpsm));
++        if (!writeMask.writesAnything())
++            return;
++
++        const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && pp.frameCt32;
++        const bool frmw = pp.dateNeedsRead ||
++                          (writeMask.writesFramebuffer() && (pp.fbmsk != 0 || pp.abe || preserveDestinationAlpha));
++
++        u32 rawFramebufferPixel = 0;
++        u32 fbrgba = 0;
++        if (frmw)
++        {
++            rawFramebufferPixel = pp.readFrame(vram, pp.fbp, pp.fbw, x, y);
++            fbrgba = rawFramebufferPixel;
++            if (pp.frame16)
++                fbrgba = Rgba5551ToRgba8888(fbrgba);
++            else if (pp.frameCt24)
++                fbrgba |= 0x80000000u;
++        }
++
++        if (!passesDestinationAlphaTest(pp.test, static_cast<uint8_t>(pp.fpsm), rawFramebufferPixel))
++            return;
++
++        bool zpass = false;
++        uint32_t storedZ = 0u;
++        switch (pp.ztestMethod)
++        {
++        case 0:
++            zpass = false;
++            break;
++        case 1:
++            zpass = true;
++            break;
++        case 2:
++            storedZ = pp.readZ(vram, pp.zbp, pp.fbw, x, y);
++            zpass = static_cast<uint32_t>(z) >= storedZ;
++            break;
++        case 3:
++            storedZ = pp.readZ(vram, pp.zbp, pp.fbw, x, y);
++            zpass = static_cast<uint32_t>(z) > storedZ;
++            break;
++        }
++        if (!zpass)
++            return;
++
++        if (writeMask.writesFramebuffer())
++        {
++            if (pp.abe && !(pp.pabe && (a & 0x80u) == 0u))
++            {
++                const uint8_t dr = fbrgba & 0xFF;
++                const uint8_t dg = (fbrgba >> 8) & 0xFF;
++                const uint8_t db = (fbrgba >> 16) & 0xFF;
++                const uint8_t da = (fbrgba >> 24) & 0xFF;
++                auto pickRGB = [](uint8_t sel, int cs, int cd) -> int
++                {
++                    if (sel == 0)
++                        return cs;
++                    if (sel == 1)
++                        return cd;
++                    return 0;
++                };
++                const int cAlpha = (pp.csel == 0) ? a : (pp.csel == 1) ? da
++                                                                       : pp.fix;
++                r = clampU8(((pickRGB(pp.asel, r, dr) - pickRGB(pp.bsel, r, dr)) * cAlpha >> 7) + pickRGB(pp.dsel, r, dr));
++                g = clampU8(((pickRGB(pp.asel, g, dg) - pickRGB(pp.bsel, g, dg)) * cAlpha >> 7) + pickRGB(pp.dsel, g, dg));
++                b = clampU8(((pickRGB(pp.asel, b, db) - pickRGB(pp.bsel, b, db)) * cAlpha >> 7) + pickRGB(pp.dsel, b, db));
++            }
++
++            if (writeMask.writeAlpha && pp.fbaSetsAlpha)
++                a = static_cast<uint8_t>(a | 0x80u);
++
++            u32 pixel = pack32(r, g, b, a);
++            if (pp.fbmsk != 0)
++                pixel = (pixel & ~pp.fbmsk) | (fbrgba & pp.fbmsk);
++            if (preserveDestinationAlpha)
++                pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++            if (pp.frame16)
++                pixel = Rgba8888ToRgba5551(pixel);
++            pp.writeFrame(vram, pp.fbp, pp.fbw, x, y, pixel);
++        }
++
++        if (writeMask.writeDepth && !pp.zmask)
++            pp.writeZ(vram, pp.zbp, pp.fbw, x, y, static_cast<uint32_t>(z));
++    }
++}
++
+ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ {
+-    // Debug (F1 06): F1_GS_SIN_TRIANGULOS=<seconds> skips triangle rasterization from that second after start-up
+-    // (sprites, such as most 2D/HUD, still draw). The software rasterizer is the bottleneck in a race; this shows
+-    // whether the game logic runs once it is fast, without changing the menu timings before that second.
+-    static const auto s_start = std::chrono::steady_clock::now();
+-    static const double s_skipFrom = []
+-    {
+-        const char *value = std::getenv("F1_GS_SIN_TRIANGULOS");
+-        return value != nullptr ? std::atof(value) : -1.0;
+-    }();
+-    if (s_skipFrom >= 0.0 &&
+-        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() >= s_skipFrom)
++    // Same arithmetic as DrawTriangleReference, pixel for pixel (F1_GS_VERIFICAR checks it), with the per-primitive
++    // work hoisted out of the pixel loop: the WritePixel state (PixelPipeline), the vertex attributes as floats and
++    // the row terms of the barycentric weights.
++    const GSDrawState &state = batch.state;
++    const GSVertex &v0 = batch.vertices[0];
++    const GSVertex &v1 = batch.vertices[1];
++    const GSVertex &v2 = batch.vertices[2];
++    const auto &ctx = state.context;
++
++    int ofx = ctx.xyoffset.ofx >> 4;
++    int ofy = ctx.xyoffset.ofy >> 4;
++
++    float fx0 = v0.x - static_cast<float>(ofx);
++    float fy0 = v0.y - static_cast<float>(ofy);
++    float fx1 = v1.x - static_cast<float>(ofx);
++    float fy1 = v1.y - static_cast<float>(ofy);
++    float fx2 = v2.x - static_cast<float>(ofx);
++    float fy2 = v2.y - static_cast<float>(ofy);
++
++    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
++    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
++    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
++    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
++
++    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
++    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
++    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
++    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
++
++    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
++    if (std::fabs(denom) < 0.001f)
+         return;
++
++    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
++    const float invAbsDenom = 1.0f / std::fabs(denom);
++    constexpr float kEdgeEpsilon = 1.0e-4f;
++
++    const float k = winding * invAbsDenom;
++    const float slope0 = (fy1 - fy2) * k;
++    const float slope1 = (fy2 - fy0) * k;
++    const float slope2 = -(slope0 + slope1);
++    auto narrowSpan = [](float slope, float offset, float &lo, float &hi) -> bool
++    {
++        if (std::fabs(slope) < 1.0e-12f)
++            return offset >= -kEdgeEpsilon;
++        const float bound = (-kEdgeEpsilon - offset) / slope;
++        if (slope > 0.0f)
++            lo = std::max(lo, bound);
++        else
++            hi = std::min(hi, bound);
++        return true;
++    };
++
++    PixelPipeline pp;
++    {
++        const uint32_t fpsm = ctx.frame.psm;
++        pp.scissorX0 = ctx.scissor.x0;
++        pp.scissorX1 = ctx.scissor.x1;
++        pp.scissorY0 = ctx.scissor.y0;
++        pp.scissorY1 = ctx.scissor.y1;
++        pp.fge = state.prim.fge;
++        pp.fogR = state.fogR;
++        pp.fogG = state.fogG;
++        pp.fogB = state.fogB;
++        pp.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++        pp.fbw = std::max<u32>(ctx.frame.fbw, 1u);
++        pp.fpsm = fpsm;
++        pp.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++        pp.zpsm = ctx.zbuf.psm;
++        pp.test = ctx.test;
++        pp.ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++        pp.abe = state.prim.abe;
++        pp.pabe = state.pabe;
++        pp.asel = static_cast<uint8_t>(ctx.alpha & 3);
++        pp.bsel = static_cast<uint8_t>((ctx.alpha >> 2) & 3);
++        pp.csel = static_cast<uint8_t>((ctx.alpha >> 4) & 3);
++        pp.dsel = static_cast<uint8_t>((ctx.alpha >> 6) & 3);
++        pp.fix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFF);
++        pp.fbaSetsAlpha = (ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24;
++        pp.fbmsk = ctx.frame.fbmsk;
++        pp.frame16 = bitsPerPixel(static_cast<uint8_t>(fpsm)) == 16;
++        pp.frameCt24 = fpsm == GS_PSM_CT24;
++        pp.frameCt32 = fpsm == GS_PSM_CT32;
++        pp.dateNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u &&
++                           (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
++        pp.zmask = ctx.zbuf.zmask;
++        pp.readFrame = m_readVramFuncs[fpsm & 0x3Fu];
++        pp.writeFrame = m_writeVramFuncs[fpsm & 0x3Fu];
++        pp.readZ = m_readVramFuncs[pp.zpsm & 0x3Fu];
++        pp.writeZ = m_writeVramFuncs[pp.zpsm & 0x3Fu];
++    }
++
++    // Vertex attributes as floats (the conversions are exact, as in the expressions of the reference).
++    const float r0 = v0.r, r1 = v1.r, r2 = v2.r;
++    const float g0 = v0.g, g1 = v1.g, g2 = v2.g;
++    const float b0 = v0.b, b1 = v1.b, b2 = v2.b;
++    const float a0 = v0.a, a1 = v1.a, a2 = v2.a;
++    const float fog0 = v0.fog, fog1 = v1.fog, fog2 = v2.fog;
++    const float u0 = v0.u, u1 = v1.u, u2 = v2.u;
++    const float t0 = v0.v, t1 = v1.v, t2 = v2.v;
++    const bool iip = state.prim.iip;
++    const bool tme = state.prim.tme;
++    const bool fst = state.prim.fst;
++    const auto &tex = ctx.tex0;
++    const float e0 = fy1 - fy2;
++    const float e1 = fy2 - fy0;
++
++    for (int y = minY; y <= maxY; ++y)
++    {
++        float py = static_cast<float>(y) + 0.5f;
++        int spanX0 = minX;
++        int spanX1 = maxX;
++        {
++            const float offset0 = ((fx2 - fx1) * (py - fy2) - (fy1 - fy2) * fx2) * k;
++            const float offset1 = ((fx0 - fx2) * (py - fy2) - (fy2 - fy0) * fx2) * k;
++            const float offset2 = 1.0f - offset0 - offset1;
++            float lo = static_cast<float>(minX) + 0.5f;
++            float hi = static_cast<float>(maxX) + 0.5f;
++            if (!narrowSpan(slope0, offset0, lo, hi) || !narrowSpan(slope1, offset1, lo, hi) ||
++                !narrowSpan(slope2, offset2, lo, hi) || !(lo <= hi + 2.0f))
++                continue;
++            spanX0 = std::max(minX, static_cast<int>(std::floor(lo - 0.5f)) - 1);
++            spanX1 = std::min(maxX, static_cast<int>(std::ceil(hi - 0.5f)) + 1);
++        }
++        const float row0 = (fx2 - fx1) * (py - fy2);
++        const float row1 = (fx0 - fx2) * (py - fy2);
++        for (int x = spanX0; x <= spanX1; ++x)
++        {
++            float px = static_cast<float>(x) + 0.5f;
++
++            float w0 = ((e0 * (px - fx2) + row0) * winding) * invAbsDenom;
++            float w1 = ((e1 * (px - fx2) + row1) * winding) * invAbsDenom;
++            float w2 = 1.0f - w0 - w1;
++
++            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++                continue;
++
++            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
++
++            uint8_t r, g, b, a;
++            if (iip)
++            {
++                r = clampU8(static_cast<int>(r0 * w0 + r1 * w1 + r2 * w2));
++                g = clampU8(static_cast<int>(g0 * w0 + g1 * w1 + g2 * w2));
++                b = clampU8(static_cast<int>(b0 * w0 + b1 * w1 + b2 * w2));
++                a = clampU8(static_cast<int>(a0 * w0 + a1 * w1 + a2 * w2));
++            }
++            else
++            {
++                r = v2.r;
++                g = v2.g;
++                b = v2.b;
++                a = v2.a;
++            }
++
++            if (tme)
++            {
++                float is, it, iq;
++                uint16_t iu, iv;
++                if (fst)
++                {
++                    iu = static_cast<uint16_t>(u0 * w0 + u1 * w1 + u2 * w2);
++                    iv = static_cast<uint16_t>(t0 * w0 + t1 * w1 + t2 * w2);
++                    is = 0.0f;
++                    it = 0.0f;
++                    iq = 1.0f;
++                }
++                else
++                {
++                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
++                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
++                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
++                    iu = 0;
++                    iv = 0;
++                }
++
++                const uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
++                const TextureCombineResult color = combineTexture(tex, r, g, b, a,
++                                                                  static_cast<uint8_t>(texel & 0xFF),
++                                                                  static_cast<uint8_t>((texel >> 8) & 0xFF),
++                                                                  static_cast<uint8_t>((texel >> 16) & 0xFF),
++                                                                  static_cast<uint8_t>((texel >> 24) & 0xFF));
++                r = color.r;
++                g = color.g;
++                b = color.b;
++                a = color.a;
++            }
++
++            const uint8_t fog = clampU8(static_cast<int>(fog0 * w0 + fog1 * w1 + fog2 * w2));
++            writePixelFast(m_vram, pp, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
++        }
++    }
++}
++
++void GSCpuBackend::VerifyTriangle(const GSPrimitiveBatch &batch)
++{
++    // Draws the triangle with the reference rasterizer on a copy of local memory and with the current one on the real
++    // memory, and compares the whole 4 MB. Slow: only for the first F1_GS_VERIFICAR triangles.
++    static std::vector<uint8_t> before;
++    static std::vector<uint8_t> reference;
++    static uint64_t checked = 0u;
++    static uint64_t different = 0u;
++    before.assign(m_vram, m_vram + m_vramSize);
++    DrawTriangleReference(batch);
++    reference.assign(m_vram, m_vram + m_vramSize);
++    std::memcpy(m_vram, before.data(), m_vramSize);
++    DrawTriangle(batch);
++    ++checked;
++    if (std::memcmp(m_vram, reference.data(), m_vramSize) != 0)
++    {
++        ++different;
++        size_t first = 0u;
++        size_t count = 0u;
++        for (size_t i = 0; i < m_vramSize; ++i)
++            if (m_vram[i] != reference[i])
++            {
++                if (count++ == 0u)
++                    first = i;
++            }
++        const GSDrawState &state = batch.state;
++        if (different <= 20u)
++            std::fprintf(stderr,
++                         "[gs:verificar] DISTINTO triangulo %llu: %zu bytes, primero 0x%zx (%02x frente a %02x) tme=%d "
++                         "fst=%d iip=%d abe=%d fge=%d fpsm=%d zpsm=%d test=0x%llx alpha=0x%llx\n",
++                         static_cast<unsigned long long>(checked), count, first, m_vram[first], reference[first],
++                         int(state.prim.tme), int(state.prim.fst), int(state.prim.iip), int(state.prim.abe),
++                         int(state.prim.fge), int(state.context.frame.psm), int(state.context.zbuf.psm),
++                         static_cast<unsigned long long>(state.context.test),
++                         static_cast<unsigned long long>(state.context.alpha));
++        // Keep the reference result so later triangles start from the same memory in both versions.
++        std::memcpy(m_vram, reference.data(), m_vramSize);
++    }
++    if ((checked % 2000u) == 0u)
++        std::fprintf(stderr, "[gs:verificar] %llu triangulos comprobados, %llu distintos\n",
++                     static_cast<unsigned long long>(checked), static_cast<unsigned long long>(different));
++}
++
++void GSCpuBackend::DrawTriangleReference(const GSPrimitiveBatch &batch)
++{
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 0eeb01c..02ef1b7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_threaded_backend.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -106,7 +107,7 @@ namespace
+ 
+ 
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(CreateDefaultGSRasterBackend())
+ {
+     reset();
+ }
+@@ -117,7 +118,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = CreateDefaultGSRasterBackend();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -1650,7 +1651,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
+     if (!backend)
+-        backend = std::make_unique<GSCpuBackend>();
++        backend = CreateDefaultGSRasterBackend();
+ 
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+new file mode 100644
+index 0000000..1e08405
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -0,0 +1,381 @@
++#include "runtime/gs/gs_threaded_backend.h"
++#include "runtime/ps2_ab.h"
++#include "ThreadNaming.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <type_traits>
++#include <utility>
++
++std::atomic<int> g_ps2AbMode{0};
++
++namespace
++{
++    constexpr uint32_t kCommandCost = 32u; // fixed cost of any command, in pixels
++
++    // Pixels a primitive may touch: its bounding box clipped to the scissor (half of it for triangles, the longer side
++    // for lines). Only used to bound the queued work, so a rough figure is enough.
++    uint32_t estimatePixels(const GSPrimitiveBatch &batch)
++    {
++        const GSContext &ctx = batch.state.context;
++        const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++        float minX = batch.vertices[0].x, maxX = minX, minY = batch.vertices[0].y, maxY = minY;
++        for (uint32_t i = 1; i < count; ++i)
++        {
++            minX = std::min(minX, batch.vertices[i].x);
++            maxX = std::max(maxX, batch.vertices[i].x);
++            minY = std::min(minY, batch.vertices[i].y);
++            maxY = std::max(maxY, batch.vertices[i].y);
++        }
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        const float x0 = std::max(minX - ofx, static_cast<float>(ctx.scissor.x0));
++        const float x1 = std::min(maxX - ofx, static_cast<float>(ctx.scissor.x1));
++        const float y0 = std::max(minY - ofy, static_cast<float>(ctx.scissor.y0));
++        const float y1 = std::min(maxY - ofy, static_cast<float>(ctx.scissor.y1));
++        if (!(x1 >= x0 && y1 >= y0))
++            return 0u;
++        const float width = x1 - x0 + 1.0f;
++        const float height = y1 - y0 + 1.0f;
++        float pixels = width * height;
++        switch (batch.state.prim.type)
++        {
++        case GS_PRIM_TRIANGLE:
++        case GS_PRIM_TRISTRIP:
++        case GS_PRIM_TRIFAN:
++            pixels *= 0.5f;
++            break;
++        case GS_PRIM_LINE:
++        case GS_PRIM_LINESTRIP:
++            pixels = std::max(width, height);
++            break;
++        case GS_PRIM_POINT:
++            pixels = 1.0f;
++            break;
++        default:
++            break;
++        }
++        return static_cast<uint32_t>(std::min(pixels, 4.0e6f));
++    }
++}
++
++std::unique_ptr<GSRasterBackend> CreateDefaultGSRasterBackend()
++{
++    const char *value = std::getenv("PS2X_GS_THREAD");
++    if (value != nullptr && value[0] == '0')
++        return std::make_unique<GSCpuBackend>();
++    return std::make_unique<GSThreadedBackend>();
++}
++
++GSThreadedBackend::GSThreadedBackend()
++    : m_cpu(std::make_unique<GSCpuBackend>()),
++      m_ring(kCapacity)
++{
++    m_worker = std::thread([this]()
++                           { WorkerLoop(); });
++}
++
++GSThreadedBackend::~GSThreadedBackend()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_stop = true;
++    }
++    m_notEmpty.notify_all();
++    if (m_worker.joinable())
++        m_worker.join();
++}
++
++template <typename T>
++void GSThreadedBackend::Push(T &&command, uint32_t cost)
++{
++    cost += kCommandCost;
++    std::unique_lock<std::mutex> lock(m_mutex);
++    // Wait for a free slot and for the queued work to fall under the bound (a command larger than the bound still
++    // goes in when the queue is empty).
++    const auto hasRoom = [this, cost]()
++    {
++        return m_tail - m_head < kCapacity && (m_head == m_tail || m_pendingCost + cost <= kMaxPendingCost);
++    };
++    if (!hasRoom())
++    {
++        m_fullWaits.fetch_add(1u, std::memory_order_relaxed);
++        const auto waitStart = std::chrono::steady_clock::now();
++        ++m_producersWaiting;
++        m_notFull.wait(lock, hasRoom);
++        --m_producersWaiting;
++        const auto waited = std::chrono::steady_clock::now() - waitStart;
++        m_producerWaitNs.fetch_add(
++            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
++            std::memory_order_relaxed);
++    }
++    Slot &slot = m_ring[m_tail % kCapacity];
++    slot.command = std::forward<T>(command);
++    slot.cost = cost;
++    m_pendingCost += cost;
++    if constexpr (std::is_same_v<std::decay_t<T>, SnapshotCommand>)
++        m_lastSnapshotIndex.store(m_tail, std::memory_order_relaxed);
++    ++m_tail;
++    if (m_workerWaiting)
++        m_notEmpty.notify_one();
++}
++
++void GSThreadedBackend::Drain() const
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    if (m_head == m_tail && !m_workerBusy)
++        return;
++    m_drains.fetch_add(1u, std::memory_order_relaxed);
++    m_idle.wait(lock, [this]()
++                { return m_head == m_tail && !m_workerBusy; });
++}
++
++void GSThreadedBackend::WorkerLoop()
++{
++    ThreadNaming::SetCurrentThreadName("GS raster");
++    // Every 10 s, "[gs:hilo]" reports how busy the worker was, the commands it ran, and how often a producer found the
++    // queue full or had to drain it: a busy worker with many full-queue waits means the rasterizer is the bottleneck.
++    using Clock = std::chrono::steady_clock;
++    Clock::time_point reportStart = Clock::now();
++    Clock::duration busyTime{};
++    uint64_t commandsRun = 0u;
++
++    std::unique_lock<std::mutex> lock(m_mutex);
++    for (;;)
++    {
++        while (m_head == m_tail && !m_stop)
++        {
++            m_workerWaiting = true;
++            m_idle.notify_all();
++            m_notEmpty.wait(lock);
++            m_workerWaiting = false;
++        }
++        if (m_head == m_tail)
++            break;
++
++        // Producers only write slots at m_tail and later, so [begin, end) can run without the lock. Progress (m_head
++        // and the pending cost) is published every kPublishCost of work, so producers waiting on the work bound resume
++        // while the chunk is still running.
++        const uint64_t begin = m_head;
++        const uint64_t end = std::min<uint64_t>(m_tail, begin + kChunk);
++        m_workerBusy = true;
++        lock.unlock();
++        const Clock::time_point chunkStart = Clock::now();
++        uint64_t unpublishedCost = 0u;
++        for (uint64_t index = begin; index < end; ++index)
++        {
++            Slot &slot = m_ring[index % kCapacity];
++            Execute(slot.command, index);
++            unpublishedCost += slot.cost;
++            if (unpublishedCost >= kPublishCost && index + 1u < end)
++            {
++                lock.lock();
++                m_head = index + 1u;
++                m_pendingCost -= unpublishedCost;
++                if (m_producersWaiting != 0u)
++                    m_notFull.notify_all();
++                lock.unlock();
++                unpublishedCost = 0u;
++            }
++        }
++        const Clock::time_point chunkEnd = Clock::now();
++        busyTime += chunkEnd - chunkStart;
++        commandsRun += end - begin;
++        if (chunkEnd - reportStart >= std::chrono::seconds(10))
++        {
++            const double seconds = std::chrono::duration<double>(chunkEnd - reportStart).count();
++            const double producerWait = 1e-9 * static_cast<double>(m_producerWaitNs.exchange(0u, std::memory_order_relaxed));
++            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu\n",
++                         100.0 * std::chrono::duration<double>(busyTime).count() / seconds, commandsRun / seconds,
++                         static_cast<unsigned long long>(m_fullWaits.exchange(0u, std::memory_order_relaxed)),
++                         100.0 * producerWait / seconds,
++                         static_cast<unsigned long long>(m_drains.exchange(0u, std::memory_order_relaxed)));
++            reportStart = chunkEnd;
++            busyTime = {};
++            commandsRun = 0u;
++        }
++        lock.lock();
++        m_head = end;
++        m_pendingCost -= unpublishedCost;
++        m_workerBusy = false;
++        if (m_producersWaiting != 0u)
++            m_notFull.notify_all();
++    }
++    m_idle.notify_all();
++}
++
++void GSThreadedBackend::Execute(Command &command, uint64_t index)
++{
++    std::visit([&](auto &payload)
++               {
++                   using T = std::decay_t<decltype(payload)>;
++                   if constexpr (std::is_same_v<T, GSPrimitiveBatch>)
++                       m_cpu->Submit(payload);
++                   else if constexpr (std::is_same_v<T, ClutCommand>)
++                       m_cpu->LoadClut(payload.tex0, payload.texclut);
++                   else if constexpr (std::is_same_v<T, GSTransferCommand>)
++                       m_cpu->BeginTransfer(payload);
++                   else if constexpr (std::is_same_v<T, std::vector<uint8_t>>)
++                   {
++                       m_cpu->UploadImage(payload.data(), static_cast<uint32_t>(payload.size()));
++                       // Release the copy now; the slot may stay unused for a long time.
++                       std::vector<uint8_t>().swap(payload);
++                   }
++                   else if constexpr (std::is_same_v<T, TextureFlushCommand>)
++                       m_cpu->TextureFlush();
++                   else if constexpr (std::is_same_v<T, ClearCommand>)
++                       m_cpu->ClearFramebuffer(payload.context, payload.rgba);
++                   else if constexpr (std::is_same_v<T, WriteVramCommand>)
++                       m_cpu->WriteVram(payload.psm, payload.base, payload.bw, payload.x, payload.y, payload.value);
++                   else if constexpr (std::is_same_v<T, SnapshotCommand>)
++                   {
++                       // Older snapshots are skipped while a newer one is queued, but at least one is taken every
++                       // 33 ms: under steady load the queue is always more than a presentation (16 ms) behind, and
++                       // skipping every non-newest snapshot froze the display on the first frame.
++                       static std::chrono::steady_clock::time_point s_lastSnapshot{};
++                       const auto now = std::chrono::steady_clock::now();
++                       if (index != m_lastSnapshotIndex.load(std::memory_order_relaxed) &&
++                           now - s_lastSnapshot < std::chrono::milliseconds(33))
++                           return;
++                       s_lastSnapshot = now;
++                       m_cpu->SnapshotVram(m_workerSnapshot);
++                       std::lock_guard<std::mutex> lock(m_publishMutex);
++                       std::swap(m_workerSnapshot, m_publishedSnapshot);
++                       m_publishedRequest = payload.request;
++                       ++m_publishedSerial;
++                   } },
++               command);
++}
++
++void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    Drain();
++    m_cpu->Initialize(vram, vramSize);
++}
++
++void GSThreadedBackend::Reset()
++{
++    Drain();
++    m_cpu->Reset();
++}
++
++void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    if (batch.vertexCount == 0u)
++        return;
++    if (g_ps2AbMode.load(std::memory_order_relaxed) != 0)
++    {
++        // A/B comparison: draw on the calling thread, as the plain CPU backend does.
++        Drain();
++        m_cpu->Submit(batch);
++        return;
++    }
++    Push(batch, estimatePixels(batch));
++}
++
++void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    Push(ClutCommand{tex0, texclut}, 256u);
++}
++
++void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    // Local-to-local and local-to-host transfers run when the command executes.
++    const uint64_t pixels = static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh;
++    Push(command, command.direction == 0u ? 0u : static_cast<uint32_t>(std::min<uint64_t>(pixels, 4000000u)));
++}
++
++void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    if (data == nullptr || sizeBytes == 0u)
++        return;
++    Push(std::vector<uint8_t>(data, data + sizeBytes), sizeBytes / 2u);
++}
++
++void GSThreadedBackend::Flush()
++{
++}
++
++void GSThreadedBackend::TextureFlush()
++{
++    Push(TextureFlushCommand{}, 0u);
++}
++
++void GSThreadedBackend::Sync(GSSyncReason reason)
++{
++    // FINISH and presentation do not need the pixels yet; readbacks drain in the calls that return data.
++    if (reason == GSSyncReason::Reset || reason == GSSyncReason::LocalToHost || reason == GSSyncReason::DebugReadback)
++        Drain();
++}
++
++PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
++{
++    std::lock_guard<std::mutex> presentLock(m_presentMutex);
++    Push(SnapshotCommand{request}, 65536u); // a 4 MB copy
++    if (m_presentSerial == 0u)
++    {
++        // Nothing converted yet: wait for this first snapshot instead of showing an empty frame.
++        Drain();
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(m_publishMutex);
++        if (m_publishedSerial == m_presentSerial)
++            return m_presentFrame;
++        std::swap(m_publishedSnapshot, m_presentSnapshot);
++        m_presentRequest = m_publishedRequest;
++        m_presentSerial = m_publishedSerial;
++    }
++
++    // Convert outside the queue: the worker keeps drawing while this thread builds the host frame.
++    if (m_presentSnapshot.empty())
++    {
++        m_presentFrame = {};
++        return m_presentFrame;
++    }
++    thread_local GSCpuBackend converter;
++    converter.Initialize(m_presentSnapshot.data(), static_cast<uint32_t>(m_presentSnapshot.size()));
++    m_presentFrame = converter.PresentFromLocalMemory(m_presentRequest);
++    return m_presentFrame;
++}
++
++bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    const uint32_t width = context.scissor.x1 >= context.scissor.x0 ? context.scissor.x1 - context.scissor.x0 + 1u : 0u;
++    const uint32_t height = context.scissor.y1 >= context.scissor.y0 ? context.scissor.y1 - context.scissor.y0 + 1u : 0u;
++    Push(ClearCommand{context, rgba}, width * height);
++    const uint8_t psm = context.frame.psm;
++    return context.frame.fbw != 0u &&
++           (psm == GS_PSM_CT32 || psm == GS_PSM_CT24 || psm == GS_PSM_CT16 || psm == GS_PSM_CT16S);
++}
++
++uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    Drain();
++    return m_cpu->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    Drain();
++    return m_cpu->ReadVram(psm, base, bw, x, y);
++}
++
++void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    Push(WriteVramCommand{psm, base, bw, x, y, value}, 0u);
++}
++
++void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    Drain();
++    m_cpu->SnapshotVram(out);
++}
++
++GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
++{
++    // Only the debug history uses it; it does not need to wait for the queue.
++    return m_cpu->GetTransferSnapshot();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1e0dd2a..1ce317e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -33,12 +33,29 @@
+ // Declared by hand: <windows.h> clashes with raylib names (Rectangle, CloseWindow, DrawText...).
+ extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hWndInsertAfter, int x, int y, int cx,
+                                                             int cy, unsigned int flags);
++extern "C" __declspec(dllimport) void *__stdcall GetCurrentProcess(void);
++extern "C" __declspec(dllimport) int __stdcall SetProcessInformation(void *hProcess, int processInformationClass,
++                                                                     void *processInformation, unsigned long size);
+ namespace
+ {
+     void ps2xSetWindowPos(void *hwnd, void *insertAfter, int x, int y, int cx, int cy, unsigned int flags)
+     {
+         SetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags);
+     }
++
++    // Opts the process out of execution-speed power throttling (EcoQoS). Windows may otherwise run an unfocused or
++    // hidden window's threads (a background test run, for example) on efficiency cores at low clocks.
++    void ps2xDisablePowerThrottling()
++    {
++        struct PowerThrottlingState
++        {
++            unsigned long version;     // PROCESS_POWER_THROTTLING_CURRENT_VERSION
++            unsigned long controlMask; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
++            unsigned long stateMask;   // 0: never throttled
++        } state{1u, 0x1u, 0u};
++        constexpr int kProcessPowerThrottling = 4;
++        SetProcessInformation(GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof(state));
++    }
+ }
+ #endif
+ 
+@@ -751,6 +768,9 @@ bool PS2Runtime::initialize(const char *title)
+         // activated. PrintWindow can still capture it, and it keeps running while unfocused.
+         const char *backgroundEnv = std::getenv("PS2X_BACKGROUND_WINDOW");
+         const bool backgroundWindow = backgroundEnv && backgroundEnv[0] != '\0' && backgroundEnv[0] != '0';
++#if defined(_WIN32)
++        ps2xDisablePowerThrottling();
++#endif
+         unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
+         if (backgroundWindow)
+         {

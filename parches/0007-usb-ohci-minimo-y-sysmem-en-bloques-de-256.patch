@@ -1,0 +1,196 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..a7d8e81 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -13,6 +13,33 @@ namespace ps2x::iop::detail
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
+ 
++        // USB OHCI host controller (IOP 0x1F801600). Minimal model with no device attached: enough for
++        // USBD.IRX to reset the controller and stay resident, so USB class drivers (LGDEVW.IRX, the
++        // Logitech wheel driver F1 06 binds to over RPC) can register and report "nothing connected".
++        constexpr uint32_t kOhciBase = 0x1F801600u;
++        constexpr uint32_t kOhciEnd = 0x1F801700u;
++        constexpr uint32_t kOhciRevision = 0x00u;
++        constexpr uint32_t kOhciControl = 0x04u;
++        constexpr uint32_t kOhciCommandStatus = 0x08u;
++        constexpr uint32_t kOhciInterruptStatus = 0x0Cu;
++        constexpr uint32_t kOhciInterruptEnable = 0x10u;
++        constexpr uint32_t kOhciInterruptDisable = 0x14u;
++        constexpr uint32_t kOhciHcca = 0x18u;
++        constexpr uint32_t kOhciFmInterval = 0x34u;
++        constexpr uint32_t kOhciFmRemaining = 0x38u;
++        constexpr uint32_t kOhciFmNumber = 0x3Cu;
++        constexpr uint32_t kOhciLsThreshold = 0x44u;
++        constexpr uint32_t kOhciRhDescriptorA = 0x48u;
++        constexpr uint32_t kOhciRhStatus = 0x50u;
++        constexpr uint32_t kOhciRhPortStatus0 = 0x54u;
++        constexpr uint32_t kOhciPortCount = 2u;
++        constexpr uint32_t kOhciControlStateMask = 0xC0u;
++        constexpr uint32_t kOhciStateOperational = 0x80u;
++        constexpr uint32_t kOhciStateSuspend = 0xC0u;
++        constexpr uint32_t kOhciPortPowered = 1u << 8u;
++        constexpr uint32_t kOhciPortChangeMask = 0x001F0000u;
++        constexpr uint32_t kOhciPortConnectChange = 1u << 16u;
++
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+             return (value + alignment - 1u) & ~(alignment - 1u);
+@@ -31,6 +58,7 @@ namespace ps2x::iop::detail
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
+         m_hardware.clear();
++        resetOhci();
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+         m_interruptStatus = 0;
+@@ -211,8 +239,95 @@ namespace ps2x::iop::detail
+                (phys >= SifBase && phys < SifEnd);
+     }
+ 
++    void IopMemory::resetOhci()
++    {
++        for (uint32_t address = kOhciBase; address < kOhciBase + 0x60u; address += 4u)
++            m_hardware[address] = 0u;
++        m_hardware[kOhciBase + kOhciRevision] = 0x10u;
++        m_hardware[kOhciBase + kOhciFmInterval] = 0x27782EDFu;
++        m_hardware[kOhciBase + kOhciFmRemaining] = 0x00002EDFu;
++        m_hardware[kOhciBase + kOhciLsThreshold] = 0x628u;
++        m_hardware[kOhciBase + kOhciRhDescriptorA] = 0x200u | kOhciPortCount; // NPS: ports always powered
++        for (uint32_t port = 0; port < kOhciPortCount; ++port)
++            m_hardware[kOhciBase + kOhciRhPortStatus0 + port * 4u] = kOhciPortPowered;
++        m_ohciFrameNumber = 0u;
++    }
++
++    uint32_t IopMemory::readOhci(uint32_t address) const
++    {
++        const uint32_t offset = address - kOhciBase;
++        const auto stored = [this](uint32_t registerAddress)
++        {
++            const auto value = m_hardware.find(registerAddress);
++            return value != m_hardware.end() ? value->second : 0u;
++        };
++        if (offset == kOhciInterruptDisable)
++            return stored(kOhciBase + kOhciInterruptEnable);
++        if (offset == kOhciFmNumber)
++        {
++            // No real frame timing: advance one frame per poll while the controller is operational.
++            if ((stored(kOhciBase + kOhciControl) & kOhciControlStateMask) == kOhciStateOperational)
++                ++m_ohciFrameNumber;
++            return m_ohciFrameNumber & 0xFFFFu;
++        }
++        return stored(address);
++    }
++
++    void IopMemory::writeOhci(uint32_t address, uint32_t value)
++    {
++        const uint32_t offset = address - kOhciBase;
++        uint32_t &reg = m_hardware[address];
++        switch (offset)
++        {
++        case kOhciRevision:
++        case kOhciFmNumber:
++        case kOhciRhDescriptorA:
++            return;
++        case kOhciCommandStatus:
++            // HostControllerReset completes immediately and leaves the controller in UsbSuspend.
++            // CLF/BLF are cleared at once: there are never transfer descriptors to process.
++            if ((value & 1u) != 0u)
++            {
++                resetOhci();
++                m_hardware[kOhciBase + kOhciControl] = kOhciStateSuspend;
++            }
++            m_hardware[address] = 0u;
++            return;
++        case kOhciInterruptStatus:
++            reg &= ~value;
++            return;
++        case kOhciInterruptEnable:
++            reg |= value;
++            return;
++        case kOhciInterruptDisable:
++            m_hardware[kOhciBase + kOhciInterruptEnable] &= ~value;
++            return;
++        case kOhciHcca:
++            reg = value & ~0xFFu;
++            return;
++        case kOhciRhStatus:
++            reg &= ~(value & 0x00020000u); // write 1 to clear OCIC; power switching is not modelled
++            return;
++        default:
++            break;
++        }
++        if (offset >= kOhciRhPortStatus0 && offset < kOhciRhPortStatus0 + kOhciPortCount * 4u)
++        {
++            // Nothing is connected: enable/suspend/reset requests only raise ConnectStatusChange,
++            // which tells the driver the port is empty; change bits are write-1-to-clear.
++            if ((value & 0x16u) != 0u)
++                reg |= kOhciPortConnectChange;
++            reg &= ~(value & kOhciPortChangeMask);
++            reg |= kOhciPortPowered;
++            return;
++        }
++        reg = value;
++    }
++
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        if (address >= kOhciBase && address < kOhciEnd)
++            return readOhci(address);
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+@@ -231,6 +346,11 @@ namespace ps2x::iop::detail
+ 
+     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
+     {
++        if (address >= kOhciBase && address < kOhciEnd)
++        {
++            writeOhci(address, value);
++            return;
++        }
+         switch (address)
+         {
+         case 0x1F801070u:
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..5ef2f60 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -75,6 +75,9 @@ namespace ps2x::iop::detail
+     private:
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
++        void resetOhci();
++        [[nodiscard]] uint32_t readOhci(uint32_t address) const;
++        void writeOhci(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+ 
+         std::vector<uint8_t> m_ram;
+@@ -87,5 +90,6 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++        mutable uint32_t m_ohciFrameNumber = 0;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 2c8d8f7..4bc5a01 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -27,9 +27,14 @@ namespace ps2x::iop::detail
+         {
+         case 4: // AllocSysMemory
+         {
++            // SYSMEM manages memory in 256-byte blocks, so every block is 256-byte aligned. Drivers rely
++            // on it: USBD.IRX puts the OHCI HCCA (which must be 256-byte aligned) at the start of its
++            // block and gives up otherwise.
++            constexpr uint32_t kSysmemBlock = 256u;
++            const uint32_t size = (a1 + kSysmemBlock - 1u) & ~(kSysmemBlock - 1u);
+             const uint32_t address = a0 == 2u
+-                                         ? m_memory.allocate(a1, 16u, a2)
+-                                         : m_memory.allocate(a1, 16u);
++                                         ? m_memory.allocate(size, kSysmemBlock, a2)
++                                         : m_memory.allocate(size, kSysmemBlock);
+             setV0(address);
+             return true;
+         }

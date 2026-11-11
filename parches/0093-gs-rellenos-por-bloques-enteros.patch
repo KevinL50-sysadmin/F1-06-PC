@@ -1,0 +1,138 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 348c7a6..6014f0f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -3806,6 +3806,59 @@ namespace
+     // the frame and Z addresses from texelLanes (spriteFillRows works them out through PixelStorageTraits for each
+     // read and write). The destination alpha test and the depth test have no side effect, so their order does not
+     // matter.
++    // Patch 0093: what writePixels4Ct32Z24 writes for every pixel of an untextured sprite whose writes do not depend
++    // on what is in memory (depth test ALWAYS, no blend, no frame mask, no destination alpha test, the alpha preserved
++    // or written with the colour): the colour, fog and alpha test are the sprite's everywhere, so every pixel gets the
++    // same frame value and depth (Z24: the top byte kept), worked out here with writePixels4Ct32Z24's operations.
++    struct PlainFill
++    {
++        uint32_t pixel = 0u;
++        bool frame = false, depth = false;
++    };
++
++    bool plainFill(const PixelPipeline &pp, const FastWrite4 &w, const SpriteSetup &s, PlainFill &out)
++    {
++        if (w.scalar || w.abe || w.fbmskOn || w.readAlways || w.dateCt32 || pp.ztestMethod != 1u)
++            return false;
++        uint32_t rgba = s.vertexRgba;
++        if (w.fge)
++        {
++            const uint32_t f = s.fog;
++            const uint32_t fogColor[3] = {pp.fogR, pp.fogG, pp.fogB};
++            uint32_t fogged = rgba & 0xFF000000u;
++            for (int c = 0; c < 3; ++c)
++            {
++                const uint32_t ch = (rgba >> (8 * c)) & 0xFFu;
++                fogged |= ((((f * ch) >> 8) + (((255u - f) * (fogColor[c] & 0xFFu)) >> 8)) & 0xFFu) << (8 * c);
++            }
++            rgba = fogged;
++        }
++        const uint32_t a = rgba >> 24;
++        const uint32_t aref = (pp.test >> 4) & 0xFFu;
++        bool pass;
++        switch (w.atst)
++        {
++        case 0: pass = false; break;
++        case 2: pass = a < aref; break;
++        case 3: pass = !(a > aref); break;
++        case 4: pass = a == aref; break;
++        case 5: pass = !(a < aref); break;
++        case 6: pass = a > aref; break;
++        case 7: pass = a != aref; break;
++        default: pass = true; break;
++        }
++        const bool wRgb = pass || w.failRgb, wAlpha = pass || w.failAlpha, wDepth = pass || w.failDepth;
++        if (w.frameCt32 && wRgb && !wAlpha) // the frame's alpha kept: a read
++            return false;
++        out.frame = wRgb || wAlpha;
++        out.depth = w.writeZ && wDepth;
++        if (out.frame && out.depth && pp.fbp == pp.zbp)
++            return false;
++        const uint32_t alpha = a | (w.fbaSetsAlpha && wAlpha ? 0x80u : 0u);
++        out.pixel = (rgba & 0x00FFFFFFu) | (alpha << 24);
++        return true;
++    }
++
+     void spriteFill4Rows(const BandJob &job, int shift, unsigned count, unsigned index)
+     {
+         const SpriteSetup s = job.sprite;
+@@ -3821,12 +3874,19 @@ namespace
+         alignas(16) uint32_t bufPre[4], bufIdx[4];
+         uint32_t zByte[4], frameByte[4];
+         const int skip = static_cast<int>(count - 1u) << shift;
+-        for (int y = firstBandRow(s.drawY0, shift, count, index); y <= s.drawY1; y = nextBandRow(y, shift, skip))
++        // Patch 0093: in a plain fill, the 8 x 8 blocks the sprite covers whole are written whole: a band owns whole
++        // groups of 8 rows (shift >= 3), and a PSMCT32 or PSMZ24 block is 64 pixels in 256 contiguous bytes (A/B mode
++        // 90: pixel by pixel, as before).
++        PlainFill plain;
++        const bool blocks = (shift >= 3 || count <= 1u) && g_ps2AbMode.load(std::memory_order_relaxed) != 90 &&
++                            plainFill(pp, fw.w4, s, plain);
++        const int blockX0 = (s.drawX0 + 7) & ~7, blockX1 = (s.drawX1 + 1) & ~7; // whole block columns: [blockX0, blockX1)
++        const auto row = [&](int y, int x0, int x1)
+         {
+             const __m128i rowY = _mm_set1_epi32(y);
+-            for (int x = s.drawX0; x <= s.drawX1; x += 4)
++            for (int x = x0; x <= x1; x += 4)
+             {
+-                const int lanesLeft = std::min(4, s.drawX1 - x + 1);
++                const int lanesLeft = std::min(4, x1 - x + 1);
+                 unsigned live = (1u << lanesLeft) - 1u;
+                 const __m128i xs = _mm_add_epi32(_mm_set1_epi32(x), lanes);
+                 texelLanes<GSMem::Z24>(xs, rowY, fw.depth.basePage, fw.depth.rowPages, bufPre, bufIdx);
+@@ -3859,6 +3919,50 @@ namespace
+                 }
+                 writePixels4Ct32Z24(pp, fw, live, rgba, fogV, zL, frameByte, zByte);
+             }
++        };
++        const __m128i pixelV = _mm_set1_epi32(static_cast<int>(plain.pixel));
++        const __m128i zV = _mm_set1_epi32(static_cast<int>(z & 0x00FFFFFFu));
++        const __m128i zKeep = _mm_set1_epi32(static_cast<int>(0xFF000000u));
++        for (int y = firstBandRow(s.drawY0, shift, count, index); y <= s.drawY1;)
++        {
++            if (blocks && (y & 7) == 0 && y + 7 <= s.drawY1 && blockX0 < blockX1)
++            {
++                const __m128i rowY = _mm_set1_epi32(y);
++                for (int bx = blockX0; bx < blockX1; bx += 8)
++                {
++                    const __m128i xs = _mm_set1_epi32(bx);
++                    if (plain.frame)
++                    {
++                        texelLanes<GSMem::C32>(xs, rowY, fw.frame.basePage, fw.frame.rowPages, bufPre, bufIdx);
++                        uint8_t *const block =
++                            vram + (pixelByteAddr<GSMem::C32>(fw.frame.blockTable, bufPre[0], bufIdx[0]) & ~255u);
++                        for (int k = 0; k < 256; k += 16)
++                            _mm_storeu_si128(reinterpret_cast<__m128i *>(block + k), pixelV);
++                    }
++                    if (plain.depth)
++                    {
++                        texelLanes<GSMem::Z24>(xs, rowY, fw.depth.basePage, fw.depth.rowPages, bufPre, bufIdx);
++                        uint8_t *const block =
++                            vram + (pixelByteAddr<GSMem::Z24>(fw.depth.blockTable, bufPre[0], bufIdx[0]) & ~255u);
++                        for (int k = 0; k < 256; k += 16)
++                        {
++                            const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block + k));
++                            _mm_storeu_si128(reinterpret_cast<__m128i *>(block + k), _mm_or_si128(_mm_and_si128(old, zKeep), zV));
++                        }
++                    }
++                }
++                for (int yy = y; yy < y + 8; ++yy)
++                {
++                    if (s.drawX0 < blockX0)
++                        row(yy, s.drawX0, blockX0 - 1);
++                    if (blockX1 <= s.drawX1)
++                        row(yy, blockX1, s.drawX1);
++                }
++                y = nextBandRow(y + 7, shift, skip);
++                continue;
++            }
++            row(y, s.drawX0, s.drawX1);
++            y = nextBandRow(y, shift, skip);
+         }
+     }
+ 

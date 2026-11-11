@@ -1,0 +1,126 @@
+diff --git a/ps2xRuntime/src/lib/ps2_game_rand.h b/ps2xRuntime/src/lib/ps2_game_rand.h
+new file mode 100644
+index 0000000..43fa493
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_game_rand.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <cstdint>
++#include <cstring>
++
++// T1 of the 1.0 beta (F1 06, patch 0173): the game's rand() (0x2E00B8). The recompiler binds it to the runtime's libc
++// stub, which returns the host's std::rand() & 0x7FFF and ignores the game's srand(). The game's own code is the C
++// library's LCG on _rand_next of its reent: next = next * 1103515245 + 12345, return next & 0x7FFFFFFF (31 bits), and
++// func_275CE0 makes per-object streams with it (srand(*state), rand(), srand back). With 15 bits, the failure
++// thresholds of func_184D80 (rand * 2^-31 of a range) all fall at the bottom of their range: with failures on, the
++// gearbox broke ~30 s into every race and the automatic gearbox skipped the broken gear (3 -> 5).
++namespace ps2x
++{
++    // One rand() of the game: _impure_ptr at 0x3F8D64 points to the reent, _rand_next at + 0x58 (the ELF starts it at
++    // 1). false (and the RAM untouched) if that state is not in the RAM.
++    inline bool gameRand(uint8_t *ram, uint32_t ramSize, int32_t &value)
++    {
++        constexpr uint32_t kImpurePtr = 0x003F8D64u;
++        constexpr uint32_t kRandNext = 0x58u;
++        auto inside = [ramSize](uint32_t address) { return ramSize >= 4u && address <= ramSize - 4u; };
++        if (ram == nullptr || !inside(kImpurePtr))
++            return false;
++        uint32_t reent = 0u;
++        std::memcpy(&reent, ram + kImpurePtr, 4);
++        reent &= 0x01FFFFFFu;
++        if (reent == 0u || !inside(reent + kRandNext))
++            return false;
++        uint32_t next = 0u;
++        std::memcpy(&next, ram + reent + kRandNext, 4);
++        next = next * 1103515245u + 12345u;
++        std::memcpy(ram + reent + kRandNext, &next, 4);
++        value = static_cast<int32_t>(next & 0x7FFFFFFFu);
++        return true;
++    }
++}
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 82ed51a..4a72c62 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_options.h"
+ #include "ps2_ai_difficulty.h"
+ #include "ps2_camera_fov.h"
++#include "ps2_game_rand.h"
+ #include "ps2_hud.h"
+ #include "ps2_photo_mode.h"
+ #include "ps2_options_menu.h"
+@@ -1280,4 +1281,72 @@ void register_ps2_options_menu_tests()
+             t.Equals(ps2x::trackFullLaps(nullptr, 0u, 1), 0, "no RAM");
+         });
+     });
++
++    // T1 of the 1.0 beta (patch 0173): the game's rand() (0x2E00B8), not the host's 15 bits.
++    MiniTest::Case("GameRand", [](TestCase &tc)
++    {
++        // The C library's state: _impure_ptr (0x3F8D64) -> its reent (0x3F8A78 in the ELF), _rand_next at + 0x58.
++        auto ramWithState = [](uint32_t next)
++        {
++            std::vector<uint8_t> ram(0x00400000u, 0u);
++            const uint32_t reent = 0x003F8A78u;
++            std::memcpy(ram.data() + 0x003F8D64u, &reent, 4);
++            std::memcpy(ram.data() + reent + 0x58u, &next, 4);
++            return ram;
++        };
++        auto state = [](const std::vector<uint8_t> &ram)
++        {
++            uint32_t next = 0u;
++            std::memcpy(&next, ram.data() + 0x003F8A78u + 0x58u, 4);
++            return next;
++        };
++
++        tc.Run("gameRand is the game's rand(): next * 1103515245 + 12345 in the C library's state, 31 bits",
++               [&](TestCase &t)
++        {
++            std::vector<uint8_t> ram = ramWithState(1u); // the ELF's starting seed
++            const uint32_t size = static_cast<uint32_t>(ram.size());
++            const int32_t expected[3] = {1103527590, 377401575, 662824084};
++            for (int i = 0; i < 3; ++i)
++            {
++                int32_t value = -1;
++                t.IsTrue(ps2x::gameRand(ram.data(), size, value), "the state is there");
++                t.Equals(value, expected[i], "the game's sequence from seed 1");
++            }
++            t.Equals(state(ram), 0x2781E494u, "the new state is stored, all 32 bits");
++        });
++
++        tc.Run("gameRand follows the game's srand(): the same seed gives the same number (func_275CE0's streams)",
++               [&](TestCase &t)
++        {
++            std::vector<uint8_t> ram = ramWithState(0xDEADBEEFu);
++            const uint32_t size = static_cast<uint32_t>(ram.size());
++            int32_t first = -1, again = -1;
++            t.IsTrue(ps2x::gameRand(ram.data(), size, first), "first");
++            t.Equals(first, 469847548, "from seed 0xDEADBEEF");
++            const uint32_t seed = 0xDEADBEEFu;
++            std::memcpy(ram.data() + 0x003F8A78u + 0x58u, &seed, 4);
++            t.IsTrue(ps2x::gameRand(ram.data(), size, again), "again");
++            t.Equals(again, first, "same seed, same number");
++        });
++
++        tc.Run("gameRand without the C library's state fails and leaves the RAM as it was", [&](TestCase &t)
++        {
++            std::vector<uint8_t> ram = ramWithState(1u);
++            const uint32_t size = static_cast<uint32_t>(ram.size());
++            const uint32_t outside = 0x01FFFF00u;
++            std::memcpy(ram.data() + 0x003F8D64u, &outside, 4);
++            const std::vector<uint8_t> before = ram;
++            int32_t value = 7;
++            t.IsFalse(ps2x::gameRand(ram.data(), size, value), "a reent outside the RAM");
++            t.Equals(value, 7, "no number");
++            t.IsTrue(ram == before, "the RAM is untouched");
++            const uint32_t none = 0u;
++            std::memcpy(ram.data() + 0x003F8D64u, &none, 4);
++            t.IsFalse(ps2x::gameRand(ram.data(), size, value), "no reent yet");
++            std::vector<uint8_t> small(0x1000u, 0u);
++            t.IsFalse(ps2x::gameRand(small.data(), static_cast<uint32_t>(small.size()), value), "a RAM without 0x3F8D64");
++            t.IsFalse(ps2x::gameRand(nullptr, 0u, value), "no RAM");
++        });
++    });
+ }

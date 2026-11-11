@@ -1,0 +1,1032 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 91a7b0e..2eb1ed7 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "iop_memory.h"
+ #include "../iop_emulator_const.h"
++#include "../services/iop_rpc.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -21,6 +22,13 @@ namespace ps2x::iop::detail
+             const uint32_t mask = alignment - 1u;
+             return (value + mask) & ~mask;
+         }
++
++        // thbase error codes and limits of the alarms (as the IOP kernel: a delay under 100 cycles waits 100).
++        constexpr int32_t kErrorFoundHandler = -104;
++        constexpr int32_t kErrorNotFoundHandler = -105;
++        constexpr int32_t kErrorNoMemory = -400;
++        constexpr uint64_t kMinAlarmCycles = 100u;
++        constexpr size_t kMaxAlarms = 64u;
+     }
+ 
+     IopKernel::IopKernel(IopMemory &memory) noexcept
+@@ -34,6 +42,8 @@ namespace ps2x::iop::detail
+         m_deadPending = false;
+         m_semaphores.clear();
+         m_eventFlags.clear();
++        m_alarms.clear();
++        m_servicingAlarms = false;
+         m_nextThreadId = 1;
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
+@@ -274,11 +284,13 @@ namespace ps2x::iop::detail
+             m_memory.write32(cpu.gpr[4] + 4u, static_cast<uint32_t>(currentCycle >> 32u));
+             setV0(0);
+             return true;
+-        case 35:
+-        case 36:
+-        case 37:
+-        case 38:
+-            setV0(0);
++        case 35: // SetAlarm(clock, handler, common)
++        case 36: // iSetAlarm
++            setV0(setAlarm(cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[28], currentCycle));
++            return true;
++        case 37: // CancelAlarm(handler, common)
++        case 38: // iCancelAlarm
++            setV0(cancelAlarm(cpu.gpr[4], cpu.gpr[5]));
+             return true;
+         case 39: // USec2SysClock
+         {
+@@ -721,6 +733,68 @@ namespace ps2x::iop::detail
+         return next;
+     }
+ 
++    int32_t IopKernel::setAlarm(uint32_t clockAddress, uint32_t handler, uint32_t common, uint32_t gp, uint64_t currentCycle)
++    {
++        for (const Alarm &alarm : m_alarms)
++            if (alarm.handler == handler && alarm.common == common)
++                return kErrorFoundHandler;
++        if (m_alarms.size() >= kMaxAlarms)
++            return kErrorNoMemory;
++        const uint64_t clock = static_cast<uint64_t>(m_memory.read32(clockAddress)) |
++                               (static_cast<uint64_t>(m_memory.read32(clockAddress + 4u)) << 32u);
++        m_alarms.push_back(Alarm{handler, common, gp, currentCycle + std::max(clock, kMinAlarmCycles)});
++        return 0;
++    }
++
++    int32_t IopKernel::cancelAlarm(uint32_t handler, uint32_t common)
++    {
++        const auto it = std::find_if(m_alarms.begin(), m_alarms.end(), [&](const Alarm &alarm)
++                                     { return alarm.handler == handler && alarm.common == common; });
++        if (it == m_alarms.end())
++            return kErrorNotFoundHandler;
++        m_alarms.erase(it);
++        return 0;
++    }
++
++    void IopKernel::serviceAlarms(uint64_t currentCycle, IopGuestExecutor &executor)
++    {
++        if (m_servicingAlarms || m_alarms.empty())
++            return;
++        m_servicingAlarms = true;
++        // Earliest first; a handler may set or cancel alarms (its own included), so each one is taken out before it
++        // runs and only goes back if it asked for another call and nobody set it again meanwhile.
++        for (;;)
++        {
++            const auto due = std::min_element(m_alarms.begin(), m_alarms.end(), [](const Alarm &a, const Alarm &b)
++                                              { return a.dueCycle < b.dueCycle; });
++            if (due == m_alarms.end() || due->dueCycle > currentCycle)
++                break;
++            const Alarm alarm = *due;
++            m_alarms.erase(due);
++            const uint32_t next = executor.executeGuestFunctionWithBudget(alarm.handler, alarm.common, 0u, 0u, 0u,
++                                                                          alarm.gp, 100000u);
++            const bool setAgain = std::any_of(m_alarms.begin(), m_alarms.end(), [&](const Alarm &a)
++                                              { return a.handler == alarm.handler && a.common == alarm.common; });
++            if (next != 0u && !setAgain && m_alarms.size() < kMaxAlarms)
++            {
++                Alarm again = alarm;
++                again.dueCycle = alarm.dueCycle + std::max<uint64_t>(next, kMinAlarmCycles);
++                if (again.dueCycle <= currentCycle)
++                    again.dueCycle = currentCycle + kMinAlarmCycles; // at most one call per alarm and service
++                m_alarms.push_back(again);
++            }
++        }
++        m_servicingAlarms = false;
++    }
++
++    uint64_t IopKernel::nextAlarmCycle(uint64_t fallback) const noexcept
++    {
++        uint64_t next = fallback;
++        for (const Alarm &alarm : m_alarms)
++            next = std::min(next, alarm.dueCycle);
++        return next;
++    }
++
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
+         uint64_t nextWake = fallback;
+@@ -778,6 +852,9 @@ namespace ps2x::iop::detail
+             std::fprintf(stderr, "[iop:hilos]   sema id=%d cuenta=%d/%d\n", id, semaphore.current, semaphore.maximum);
+         for (const auto &[id, event] : m_eventFlags)
+             std::fprintf(stderr, "[iop:hilos]   evento id=%d bits=0x%x\n", id, event.bits);
++        for (const Alarm &alarm : m_alarms)
++            std::fprintf(stderr, "[iop:hilos]   alarma manejador=0x%x comun=0x%x vence=%llu\n", alarm.handler, alarm.common,
++                         static_cast<unsigned long long>(alarm.dueCycle));
+     }
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 0ccad15..b2802b1 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,10 +5,12 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+     class IopMemory;
++    class IopGuestExecutor;
+ 
+     enum class IopThreadState : uint8_t
+     {
+@@ -62,6 +64,12 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
++
++        // Alarms (thbase SetAlarm/iSetAlarm/CancelAlarm/iCancelAlarm, phase 3 T7): the handlers that are due run as
++        // interrupt handlers, handler(common) with the gp of the module that set them; a non-zero result is the
++        // time until the next call. F1 06's AUDIO.IRX drives two of its threads with them (commentary, streams).
++        void serviceAlarms(uint64_t currentCycle, IopGuestExecutor &executor);
++        [[nodiscard]] uint64_t nextAlarmCycle(uint64_t fallback) const noexcept;
+         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
+         void cleanupDeadThreads();
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+@@ -89,6 +97,17 @@ namespace ps2x::iop::detail
+             uint32_t option = 0;
+         };
+ 
++        struct Alarm
++        {
++            uint32_t handler = 0;
++            uint32_t common = 0;
++            uint32_t gp = 0;
++            uint64_t dueCycle = 0;
++        };
++
++        [[nodiscard]] int32_t setAlarm(uint32_t clockAddress, uint32_t handler, uint32_t common, uint32_t gp,
++                                       uint64_t currentCycle);
++        [[nodiscard]] int32_t cancelAlarm(uint32_t handler, uint32_t common);
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+@@ -98,6 +117,8 @@ namespace ps2x::iop::detail
+         std::map<int, IopThread> m_threads;
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
++        std::vector<Alarm> m_alarms;
++        bool m_servicingAlarms = false;
+         uint32_t m_nextThreadId = 1;
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index c8fee78..fd51bed 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -27,6 +27,7 @@ namespace ps2x::iop::detail
+     namespace
+     {
+         constexpr uint32_t kQueueSize = 1u << 16;
++        constexpr uint32_t kPayloadSize = 1u << 20; // halfwords (2 MB)
+ 
+         // Patch 0115: the SPU's 4-point gaussian interpolation table (the PS1 SPU's, which the SPU2 keeps; psx-spx,
+         // "4-Point Gaussian Interpolation"). Each set of four mirrored entries sums to 7F7Fh..7F81h.
+@@ -84,6 +85,43 @@ namespace ps2x::iop::detail
+             }();
+             return traced;
+         }
++        // PS2X_SPU2_SOLO=<core>:<voice> or ssa=<hex> (debugging, phase 3 T7): only that voice, or the voices whose SSA
++        // is that address, are heard (the other voices and the sound data inputs are silent), e.g. the commentary
++        // (F1 06 plays it from 0xF0000 on whichever voice is free) in a WAV dump.
++        struct SoloVoice
++        {
++            bool active = false;
++            int core = -1;
++            int voice = -1;
++            uint32_t ssa = UINT32_MAX;
++        };
++        const SoloVoice &soloVoice()
++        {
++            static const SoloVoice solo = []
++            {
++                SoloVoice s;
++                if (const char *value = std::getenv("PS2X_SPU2_SOLO"))
++                {
++                    unsigned ssa = 0;
++                    if (std::sscanf(value, "ssa=%x", &ssa) == 1)
++                        s.ssa = ssa;
++                    else
++                        (void)std::sscanf(value, "%d:%d", &s.core, &s.voice);
++                    s.active = s.ssa != UINT32_MAX || s.core >= 0;
++                }
++                return s;
++            }();
++            return solo;
++        }
++        bool voiceMuted(int core, int voice, uint32_t ssa)
++        {
++            const SoloVoice &s = soloVoice();
++            if (!s.active)
++                return false;
++            if (s.ssa != UINT32_MAX)
++                return ssa != s.ssa;
++            return s.core != core || s.voice != voice;
++        }
+         bool voiceTraced(int core, int voice)
+         {
+             const TracedVoice &t = tracedVoice();
+@@ -101,6 +139,58 @@ namespace ps2x::iop::detail
+             va_end(args);
+             std::fprintf(stderr, "[spu2:voz] %s\n", text);
+         }
++        // F1_SPU2_EVENTOS=<seconds> (debugging, phase 3 T7): from that second of the IOP clock, key-ons (with SSA,
++        // pitch and ADSR), IRQA and ATTR writes and DMA into SPU2 RAM outside the input areas, at most 20.000 lines of
++        // "[spu2:ev]" in stderr.
++        bool eventsTraced(uint64_t sample)
++        {
++            static const uint64_t from = []
++            {
++                const char *value = std::getenv("F1_SPU2_EVENTOS");
++                return value ? static_cast<uint64_t>(std::max(0, std::atoi(value))) * 48000u : UINT64_MAX;
++            }();
++            return sample >= from;
++        }
++        void eventTrace(const char *format, ...)
++        {
++            static std::atomic<uint32_t> lines{0};
++            if (lines.fetch_add(1u, std::memory_order_relaxed) >= 20000u)
++                return;
++            char text[256];
++            va_list args;
++            va_start(args, format);
++            std::vsnprintf(text, sizeof(text), format, args);
++            va_end(args);
++            std::fprintf(stderr, "[spu2:ev] %s\n", text);
++        }
++        // F1_SPU2_REGS=<hex SPU2 address>[:<accesses>] (debugging, phase 3 T7): from the first DMA into SPU2 RAM at that
++        // address, the next accesses of the IOP to the SPU2 registers (3.000 by default; "[spu2:reg]"), except IRQA,
++        // ATTR, STATX, IRQINFO, TSA pointing into the input areas (the 375 refills a second of AUDIO.IRX) and the 60 Hz
++        // voice upkeep (reads of NAX, ENVX, VOLX and ENDX; writes of volumes and pitch).
++        struct RegTrace
++        {
++            uint32_t armAddress = UINT32_MAX;
++            uint32_t remaining = 0;
++            bool armed = false;
++        };
++        RegTrace &regTrace()
++        {
++            static RegTrace trace = []
++            {
++                RegTrace t;
++                if (const char *value = std::getenv("F1_SPU2_REGS"))
++                {
++                    unsigned address = 0, count = 3000;
++                    if (std::sscanf(value, "%x:%u", &address, &count) >= 1)
++                    {
++                        t.armAddress = address;
++                        t.remaining = count;
++                    }
++                }
++                return t;
++            }();
++            return trace;
++        }
+         constexpr uint32_t kChunk = 64u;
+         constexpr uint32_t kRamMask = Spu2::RamWords - 1u;
+ 
+@@ -178,6 +268,8 @@ namespace ps2x::iop::detail
+             std::atomic<size_t> write{0};
+             std::atomic<size_t> read{0};
+             std::atomic<uint64_t> underruns{0};
++            std::atomic<uint64_t> silentFrames{0}; // frames the device asked for and did not get (filled with zeros)
++            std::atomic<uint32_t> requestMin{UINT32_MAX}, requestMax{0}; // frames per device request, per report
+         };
+         OutputRing g_output;
+         std::atomic<int32_t> g_outputGain{256}; // PS2X_VOLUMEN (0-100 %), 256 = 100 %
+@@ -225,6 +317,8 @@ namespace ps2x::iop::detail
+         };
+ 
+         Spu2 &owner;
++        // SPU2 RAM as the synthesis thread sees it: transfers land at their IOP sample (see Spu2).
++        std::vector<uint16_t> ram;
+         uint16_t regs[0x400]{};
+         Core cores[2];
+         uint64_t sample = 0;
+@@ -238,7 +332,7 @@ namespace ps2x::iop::detail
+         FILE *wav = nullptr;
+         uint64_t wavFrames = 0;
+ 
+-        explicit Synth(Spu2 &spu) : owner(spu)
++        explicit Synth(Spu2 &spu) : owner(spu), ram(spu.m_ram)
+         {
+             for (int core = 0; core < 2; ++core)
+             {
+@@ -362,7 +456,7 @@ namespace ps2x::iop::detail
+         {
+             Voice &voice = cores[core].voices[v];
+             const uint32_t base = voice.nax & kRamMask & ~7u;
+-            const uint16_t header = owner.m_ram[base];
++            const uint16_t header = ram[base];
+             voice.flags = static_cast<uint8_t>(header >> 8);
+             if ((voice.flags & 4u) != 0u)
+                 voice.lsa = base;
+@@ -395,7 +489,7 @@ namespace ps2x::iop::detail
+             int32_t p1 = voice.prev1, p2 = voice.prev2;
+             for (int i = 0; i < 7; ++i)
+             {
+-                const uint16_t word = owner.m_ram[(base + 1u + i) & kRamMask];
++                const uint16_t word = ram[(base + 1u + i) & kRamMask];
+                 for (int n = 0; n < 4; ++n)
+                 {
+                     const int32_t nibble = static_cast<int16_t>(static_cast<uint16_t>(((word >> (n * 4)) & 0xFu) << 12)) >> shift;
+@@ -502,7 +596,7 @@ namespace ps2x::iop::detail
+             // A voice nobody can hear only walks its addresses (NAX, ENDX, loops, IRQA) and its envelope.
+             // Patch 0115: A/B mode 108 interpolates with Catmull-Rom, as before (the hardware uses the gaussian table).
+             const bool catmullRom = g_ps2AbMode.load(std::memory_order_relaxed) == 108;
+-            const bool quiet = voice.phase == 0u || g_ps2AbMode.load(std::memory_order_relaxed) == 105 ||
++            const bool quiet = voice.phase == 0u || g_ps2AbMode.load(std::memory_order_relaxed) == 105 || voiceMuted(core, v, address(core, kVoiceAddr + static_cast<uint32_t>(v) * 0xCu)) ||
+                                (!modOutNeeded && (!routed || (fixedVolume && volRegL == 0u && volRegR == 0u)));
+             for (uint32_t i = 0; i < n; ++i)
+             {
+@@ -645,9 +739,9 @@ namespace ps2x::iop::detail
+             auto at = [&](uint32_t offset) -> uint32_t
+             { return (start + (rv.position + offset % size) % size) & kRamMask; };
+             auto rd = [&](uint32_t offset) -> int32_t
+-            { return static_cast<int16_t>(owner.m_ram[at(offset)]); };
++            { return static_cast<int16_t>(ram[at(offset)]); };
+             auto wr = [&](uint32_t offset, int32_t value)
+-            { owner.m_ram[at(offset)] = static_cast<uint16_t>(clamp16(value)); };
++            { ram[at(offset)] = static_cast<uint16_t>(clamp16(value)); };
+             auto ad = [&](int index) -> uint32_t
+             { return address(core, kRevAddr + static_cast<uint32_t>(index) * 4u); };
+             auto vol = [&](uint32_t offset) -> int32_t
+@@ -766,18 +860,18 @@ namespace ps2x::iop::detail
+                 if (s_wavInputCore >= 0)
+                 {
+                     const uint32_t base = kInputAreaBegin + static_cast<uint32_t>(s_wavInputCore) * 0x400u + inputPos;
+-                    wavInput[0] = static_cast<int16_t>(owner.m_ram[base]);
+-                    wavInput[1] = static_cast<int16_t>(owner.m_ram[base + 0x200u]);
++                    wavInput[0] = static_cast<int16_t>(ram[base]);
++                    wavInput[1] = static_cast<int16_t>(ram[base + 0x200u]);
+                 }
+                 for (int core = 0; core < 2; ++core)
+                 {
+                     const uint32_t mmix = reg(core, kMmix) & (core == 0 ? 0xFF0u : 0xFFFu);
+                     int32_t inL = 0, inR = 0;
+-                    if ((mmix & 0xF0u) != 0u)
++                    if ((mmix & 0xF0u) != 0u && !soloVoice().active)
+                     {
+                         const uint32_t base = kInputAreaBegin + static_cast<uint32_t>(core) * 0x400u + inputPos;
+-                        inL = (static_cast<int16_t>(owner.m_ram[base]) * static_cast<int16_t>(common(core, 0xC))) >> 15;
+-                        inR = (static_cast<int16_t>(owner.m_ram[base + 0x200u]) * static_cast<int16_t>(common(core, 0xE))) >> 15;
++                        inL = (static_cast<int16_t>(ram[base]) * static_cast<int16_t>(common(core, 0xC))) >> 15;
++                        inR = (static_cast<int16_t>(ram[base + 0x200u]) * static_cast<int16_t>(common(core, 0xE))) >> 15;
+                         inputPeak[core] = std::max(inputPeak[core], std::max(std::abs(inL), std::abs(inR)));
+                     }
+                     int32_t tdL = ((mmix & 0x800u) ? dryL[core][i] : 0) + ((mmix & 0x080u) ? inL : 0) + ((mmix & 0x008u) ? extL : 0);
+@@ -808,6 +902,7 @@ namespace ps2x::iop::detail
+                 ++sample;
+             }
+             ++chunks;
++            owner.m_synthSample.store(sample, std::memory_order_release);
+         }
+ 
+         void publish()
+@@ -834,15 +929,19 @@ namespace ps2x::iop::detail
+             if (seconds < 10.0)
+                 return;
+             const size_t fill = g_output.write.load() - g_output.read.load();
++            const uint32_t requestMin = g_output.requestMin.exchange(UINT32_MAX);
++            const uint32_t requestMax = g_output.requestMax.exchange(0u);
+             std::fprintf(stderr,
+                          "[spu2] muestras/s=%.0f kon/s=%.1f vocesOidas=%.1f irqVoz=%llu retraso=%.1fms anillo=%.0fms "
+-                         "vaciados=%llu descartes=%llu repetidas=%llu\n",
++                         "vaciados=%llu (marcos %llu) descartes=%llu repetidas=%llu pedido=%u-%u\n",
+                          static_cast<double>(sample - reportSample) / seconds, static_cast<double>(keyOns) / seconds,
+                          static_cast<double>(audibleVoiceSamples) / std::max<double>(1.0, static_cast<double>(sample - reportSample)),
+                          static_cast<unsigned long long>(fetchIrqs),
+                          static_cast<double>(target - sample) / 48.0, static_cast<double>(fill) / 48.0,
+                          static_cast<unsigned long long>(g_output.underruns.load()),
+-                         static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(duplicated));
++                         static_cast<unsigned long long>(g_output.silentFrames.load()),
++                         static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(duplicated),
++                         requestMin == UINT32_MAX ? 0u : requestMin, requestMax);
+             static const bool s_voices = std::getenv("PS2X_SPU2_VOCES") != nullptr;
+             for (int core = 0; core < 2 && s_voices; ++core)
+                 for (int v = 0; v < 24; ++v)
+@@ -860,6 +959,16 @@ namespace ps2x::iop::detail
+                          reg(1, kAttr), common(0, 0xC), common(0, 0xE), common(1, 0xC), common(1, 0xE),
+                          owner.m_inputTransfers[0].exchange(0u), owner.m_inputTransfers[1].exchange(0u), inputPeak[0],
+                          inputPeak[1]);
++            if (std::getenv("F1_SPU2_ENTRADA") != nullptr)
++            {
++                uint32_t lead[8];
++                for (int i = 0; i < 8; ++i)
++                    lead[i] = owner.m_inputLead[i].exchange(0u);
++                std::fprintf(stderr, "[spu2]   entradaDma=%u adelantadas=%u (palabras %u) retrasoHiloMax=%u adelanto/64=%u,%u,%u,%u,%u,%u,%u,%u\n",
++                             owner.m_inputDmas.exchange(0u), owner.m_inputEarly.exchange(0u),
++                             owner.m_inputEarlyWords.exchange(0u), owner.m_inputLagMax.exchange(0u), lead[0], lead[1],
++                             lead[2], lead[3], lead[4], lead[5], lead[6], lead[7]);
++            }
+             peak = 0;
+             inputPeak[0] = inputPeak[1] = 0;
+             reportStart = now;
+@@ -869,7 +978,7 @@ namespace ps2x::iop::detail
+     };
+ 
+     Spu2::Spu2()
+-        : m_ram(RamWords), m_queue(kQueueSize)
++        : m_ram(RamWords), m_queue(kQueueSize), m_payload(kPayloadSize)
+     {
+         const char *enabled = std::getenv("PS2X_SPU2");
+         m_threadEnabled = enabled == nullptr || enabled[0] != '0';
+@@ -900,6 +1009,8 @@ namespace ps2x::iop::detail
+         std::fill(m_ram.begin(), m_ram.end(), uint16_t{0});
+         m_queueWrite.store(0);
+         m_queueRead.store(0);
++        m_payloadWrite.store(0);
++        m_payloadRead.store(0);
+         m_publishedCycle.store(0);
+         m_asyncIrq.store(0);
+         for (int core = 0; core < 2; ++core)
+@@ -935,6 +1046,9 @@ namespace ps2x::iop::detail
+         m_synth = std::make_unique<Synth>(*this);
+         std::memcpy(m_synth->regs, m_regs, sizeof(m_regs));
+         m_synth->sample = nowSample();
++        if (std::getenv("PS2X_SPU2_WAV") != nullptr)
++            std::fprintf(stderr, "[spu2] sintesis desde s=%llu (primera muestra del volcado WAV)\n",
++                         static_cast<unsigned long long>(m_synth->sample));
+         m_stop.store(false);
+         m_thread = std::thread([this]
+                                { threadMain(); });
+@@ -958,6 +1072,33 @@ namespace ps2x::iop::detail
+         m_queueWrite.store(w + 1u, std::memory_order_release);
+     }
+ 
++    void Spu2::pushRam(uint32_t address, uint32_t count)
++    {
++        // The words just written to m_ram, for the synthesis thread's copy at the current IOP sample. Waiting for room
++        // lets the thread catch up with the published clock (it applies everything stamped up to it).
++        if (!m_threadEnabled)
++            return;
++        ensureThread();
++        publishClock();
++        while (count != 0u)
++        {
++            const uint32_t n = std::min(count, kPayloadSize / 2u);
++            const uint64_t pw = m_payloadWrite.load(std::memory_order_relaxed);
++            while (pw + n - m_payloadRead.load(std::memory_order_acquire) > kPayloadSize)
++                std::this_thread::yield();
++            for (uint32_t i = 0; i < n; ++i)
++                m_payload[(pw + i) % kPayloadSize] = m_ram[(address + i) & kRamMask];
++            m_payloadWrite.store(pw + n, std::memory_order_release);
++            const uint64_t w = m_queueWrite.load(std::memory_order_relaxed);
++            while (w - m_queueRead.load(std::memory_order_acquire) >= kQueueSize)
++                std::this_thread::yield();
++            m_queue[w % kQueueSize] = Command{nowSample(), RamWrite, 0u, address & kRamMask, n};
++            m_queueWrite.store(w + 1u, std::memory_order_release);
++            address = (address + n) & kRamMask;
++            count -= n;
++        }
++    }
++
+     void Spu2::threadMain()
+     {
+         Synth &synth = *m_synth;
+@@ -973,7 +1114,17 @@ namespace ps2x::iop::detail
+                 while (r < w && m_queue[r % kQueueSize].sample <= synth.sample)
+                 {
+                     const Command &command = m_queue[r % kQueueSize];
+-                    synth.apply(command.reg, command.value);
++                    if (command.reg == RamWrite)
++                    {
++                        const uint64_t pr = m_payloadRead.load(std::memory_order_relaxed);
++                        for (uint32_t i = 0; i < command.count; ++i)
++                            synth.ram[(command.address + i) & kRamMask] = m_payload[(pr + i) % kPayloadSize];
++                        m_payloadRead.store(pr + command.count, std::memory_order_release);
++                    }
++                    else
++                    {
++                        synth.apply(command.reg, command.value);
++                    }
+                     ++r;
+                     m_queueRead.store(r, std::memory_order_release);
+                     worked = true;
+@@ -1023,6 +1174,19 @@ namespace ps2x::iop::detail
+     uint16_t Spu2::read16(uint32_t phys)
+     {
+         const uint16_t value = read16Impl(phys);
++        if (regTrace().armed && regTrace().remaining != 0u)
++        {
++            const uint32_t offset = (phys - RegBase) & 0x7FEu;
++            const uint32_t local = offset & 0x3FFu;
++            // Reads: only those that are not the 60 Hz polling of the voices (NAX, ENVX, VOLX, ENDX).
++            const bool polling = offset < kCommon && (local < 0x180u || (local >= kVoiceAddr && local < kVoiceAddr + 24u * 0xCu) ||
++                                                      local == kEndx || local == kEndx + 2u);
++            if (offset != kIrqInfo && !polling && (offset >= kCommon || (local != kAttr && local != kIrqa && local != kIrqa + 2u && local != kStatx)))
++            {
++                --regTrace().remaining;
++                std::fprintf(stderr, "[spu2:reg] s=%llu r %03x=%04x\n", static_cast<unsigned long long>(nowSample()), offset, value);
++            }
++        }
+         if (tracedVoice().core >= 0)
+         {
+             const uint32_t offset = (phys - RegBase) & 0x7FEu;
+@@ -1097,6 +1261,19 @@ namespace ps2x::iop::detail
+         const uint16_t index = static_cast<uint16_t>(offset / 2u);
+         if (offset == kIrqInfo)
+             return;
++        if (regTrace().armed && regTrace().remaining != 0u)
++        {
++            const uint32_t local = offset & 0x3FFu;
++            const int c = static_cast<int>((offset >> 10) & 1u);
++            const bool inputTsa = offset < kCommon && (local == kTsa || local == kTsa + 2u) &&
++                                  ((tsa(c) - kInputAreaBegin) & kRamMask) < kInputAreaEnd - kInputAreaBegin;
++            // Writes: not the volumes and pitch of the voices (rewritten at 60 Hz).
++            if (offset >= kCommon || (local >= 0x180u && local != kAttr && local != kIrqa && local != kIrqa + 2u && !inputTsa))
++            {
++                --regTrace().remaining;
++                std::fprintf(stderr, "[spu2:reg] s=%llu w %03x=%04x\n", static_cast<unsigned long long>(nowSample()), offset, value);
++            }
++        }
+         if (offset >= kCommon)
+         {
+             m_regs[index] = value;
+@@ -1124,6 +1301,7 @@ namespace ps2x::iop::detail
+             // Manual transfer: one halfword at TSA.
+             const uint32_t at = tsa(core);
+             m_ram[at & kRamMask] = value;
++            pushRam(at, 1u);
+             transferIrqCheck(core, at, 1u);
+             setTsa(core, (at + 1u) & kRamMask);
+             return;
+@@ -1131,6 +1309,11 @@ namespace ps2x::iop::detail
+         if (local == kStatx)
+             return;
+         m_regs[index] = value;
++        // (Not while the IRQ is in the input areas: AUDIO.IRX moves it there 375 times a second.)
++        if (eventsTraced(nowSample()) && (local == kAttr || local == kIrqa || local == kIrqa + 2u) &&
++            (irqa(core) < kInputAreaBegin || irqa(core) >= kInputAreaEnd))
++            eventTrace("s=%llu %s %d=%04x irqa=%x", static_cast<unsigned long long>(nowSample()),
++                       local == kAttr ? "attr" : "irqa", core, value, irqa(core));
+         if (local == kAttr)
+         {
+             if ((value & 0x40u) == 0u)
+@@ -1148,7 +1331,19 @@ namespace ps2x::iop::detail
+             const uint32_t bits = local == kKon ? value : static_cast<uint32_t>(value) << 16;
+             for (int v = 0; v < 24; ++v)
+                 if ((bits & (1u << v)) != 0u)
++                {
+                     m_konSeq[core][v] = m_queueWrite.load(std::memory_order_relaxed) + 1u;
++                    if (eventsTraced(nowSample()))
++                    {
++                        const uint32_t vb = core * 0x200u;
++                        const uint32_t ssa = ((static_cast<uint32_t>(m_regs[vb + (kVoiceAddr + v * 0xCu) / 2u]) & 0xFu) << 16) |
++                                             m_regs[vb + (kVoiceAddr + v * 0xCu) / 2u + 1u];
++                        eventTrace("s=%llu kon %d:%d ssa=%x pitch=%x adsr=%x/%x vol=%x/%x",
++                                   static_cast<unsigned long long>(nowSample()), core, v, ssa, m_regs[vb + v * 8u + 2u],
++                                   m_regs[vb + v * 8u + 3u], m_regs[vb + v * 8u + 4u], m_regs[vb + v * 8u],
++                                   m_regs[vb + v * 8u + 1u]);
++                    }
++                }
+         }
+         else if (local == kEndx || local == kEndx + 2u)
+         {
+@@ -1195,6 +1390,17 @@ namespace ps2x::iop::detail
+                        static_cast<unsigned long long>(now() / 768u), core, toSpu ? "->spu" : "<-spu", start, words, source,
+                        sum, nonZero);
+         }
++        const bool inInput = ((start - kInputAreaBegin) & kRamMask) < kInputAreaEnd - kInputAreaBegin;
++        if (start == regTrace().armAddress)
++            regTrace().armed = true;
++        if (regTrace().armed && regTrace().remaining != 0u && !inInput)
++            std::fprintf(stderr, "[spu2:reg] s=%llu dma %d %s tsa=%x palabras=%x\n", static_cast<unsigned long long>(nowSample()),
++                         core, toSpu ? "->spu" : "<-spu", start, words);
++        if (eventsTraced(nowSample()) && !inInput)
++            eventTrace("s=%llu dma %d %s tsa=%x palabras=%x", static_cast<unsigned long long>(nowSample()), core,
++                       toSpu ? "->spu" : "<-spu", start, words);
++        if (toSpu && inInput)
++            inputWriteCheck(start, words);
+         for (uint32_t i = 0; i < words; ++i)
+         {
+             uint16_t *spu = &m_ram[(start + i) & kRamMask];
+@@ -1203,13 +1409,56 @@ namespace ps2x::iop::detail
+             else
+                 std::memcpy(iopRam + source + i * 2u, spu, 2u);
+         }
++        if (toSpu)
++            pushRam(start, words);
+         transferIrqCheck(core, start, words);
+         for (int c = 0; c < 2; ++c)
+             if (((start - (kInputAreaBegin + static_cast<uint32_t>(c) * 0x400u)) & kRamMask) < 0x400u)
+                 m_inputTransfers[c].fetch_add(1u, std::memory_order_relaxed);
+         setTsa(core, (start + words) & kRamMask);
+-        if (toSpu && m_threadEnabled)
+-            ensureThread();
++    }
++
++    void Spu2::inputWriteCheck(uint32_t start, uint32_t words)
++    {
++        static const int s_listed = []
++        {
++            const char *value = std::getenv("F1_SPU2_ENTRADA");
++            return value ? std::max(0, std::atoi(value)) : -1;
++        }();
++        if (s_listed < 0)
++            return;
++        // A transfer into a sound data input area that rewrites positions the synthesis thread has not read yet,
++        // although the IOP clock is already past them ("adelantadas"): before the thread had its own copy of SPU2 RAM
++        // it played the new data there (the clicks of T8); now the copy only takes it at the transfer's sample.
++        const uint32_t pos = (start - kInputAreaBegin) & 0x1FFu;
++        const uint64_t current = nowSample();
++        const uint64_t synth = m_synthSample.load(std::memory_order_acquire);
++        const uint64_t lag = current > synth ? current - synth : 0u;
++        uint32_t early = 0;
++        for (uint32_t i = 0; i < std::min(words, 0x200u); ++i)
++        {
++            const uint32_t first = (((pos + i) & 0x1FFu) - static_cast<uint32_t>(synth)) & 0x1FFu;
++            if (lag >= 0x200u || first < lag)
++                ++early;
++        }
++        const uint32_t lead = (pos - static_cast<uint32_t>(current)) & 0x1FFu;
++        const uint32_t n = m_inputDmas.fetch_add(1u, std::memory_order_relaxed);
++        if (early != 0u)
++        {
++            m_inputEarly.fetch_add(1u, std::memory_order_relaxed);
++            m_inputEarlyWords.fetch_add(early, std::memory_order_relaxed);
++        }
++        if (lag > m_inputLagMax.load(std::memory_order_relaxed))
++            m_inputLagMax.store(static_cast<uint32_t>(std::min<uint64_t>(lag, UINT32_MAX)), std::memory_order_relaxed);
++        m_inputLead[lead / 64u].fetch_add(1u, std::memory_order_relaxed);
++        static uint32_t s_printed = 0;
++        if (s_printed < static_cast<uint32_t>(s_listed))
++        {
++            ++s_printed;
++            std::fprintf(stderr, "[spu2:entrada] #%u s=%llu tsa=%x palabras=%x pos=%u posIop=%u adelanto=%u retrasoHilo=%llu pisadas=%u\n",
++                         n, static_cast<unsigned long long>(current), start, words, pos,
++                         static_cast<uint32_t>(current & 0x1FFu), lead, static_cast<unsigned long long>(lag), early);
++        }
+     }
+ 
+     void Spu2::transferIrqCheck(int core, uint32_t first, uint32_t count)
+@@ -1292,7 +1541,15 @@ namespace ps2x::iop::detail
+         }
+         g_output.read.store(r + count, std::memory_order_release);
+         if (count < frames)
++        {
+             g_output.underruns.fetch_add(1u, std::memory_order_relaxed);
++            g_output.silentFrames.fetch_add(frames - count, std::memory_order_relaxed);
++        }
++        const uint32_t requested = static_cast<uint32_t>(std::min<std::size_t>(frames, UINT32_MAX));
++        if (requested < g_output.requestMin.load(std::memory_order_relaxed))
++            g_output.requestMin.store(requested, std::memory_order_relaxed);
++        if (requested > g_output.requestMax.load(std::memory_order_relaxed))
++            g_output.requestMax.store(requested, std::memory_order_relaxed);
+         return count;
+     }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index 5d42d7c..6aafd37 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -19,7 +19,9 @@ namespace ps2x::iop::detail
+     // - Synthesis (its own thread): voices (ADPCM, pitch, ADSR, volumes), core mixing, reverb and noise, paced by the
+     //   IOP clock (768 IOP cycles per 48 kHz sample). It receives the register writes through a queue stamped with the
+     //   IOP sample, publishes what the IOP reads back (ENVX, VOLX, NAX, ENDX) and reports voice fetches that hit IRQA.
+-    //   It trails the IOP by a millisecond or two, like a slightly late SPU2.
++    //   It trails the IOP by a few milliseconds, so it plays from its own copy of SPU2 RAM, and transfers into SPU2
++    //   RAM reach that copy through the same queue (phase 3, T8): a buffer the IOP refills right after the SPU2 has
++    //   read it, in IOP time, must not change what the late thread still has to read.
+     class Spu2
+     {
+     public:
+@@ -53,19 +55,24 @@ namespace ps2x::iop::detail
+         struct Command
+         {
+             uint64_t sample;
+-            uint16_t reg; // halfword index (offset / 2)
++            uint16_t reg; // halfword index (offset / 2), or RamWrite
+             uint16_t value;
++            uint32_t address = 0; // RamWrite: first halfword in SPU2 RAM; its words follow in m_payload
++            uint32_t count = 0;
+         };
++        static constexpr uint16_t RamWrite = 0xFFFFu;
+ 
+         [[nodiscard]] uint64_t now() const noexcept { return m_clock ? *m_clock : 0u; }
+         [[nodiscard]] uint64_t nowSample() const noexcept { return now() / CyclesPerSample; }
+         void publishClock() noexcept;
+         void push(uint16_t reg, uint16_t value);
++        void pushRam(uint32_t address, uint32_t count);
+         void ensureThread();
+         void stopThread();
+         void threadMain();
+         void scheduleOutputIrq();
+         void transferIrqCheck(int core, uint32_t first, uint32_t count);
++        void inputWriteCheck(uint32_t start, uint32_t words);
+         [[nodiscard]] uint32_t irqa(int core) const noexcept;
+         [[nodiscard]] uint32_t tsa(int core) const noexcept;
+         void setTsa(int core, uint32_t address) noexcept;
+@@ -76,6 +83,9 @@ namespace ps2x::iop::detail
+         std::vector<Command> m_queue;
+         std::atomic<uint64_t> m_queueWrite{0};
+         std::atomic<uint64_t> m_queueRead{0}; // = commands applied by the synthesis thread
++        std::vector<uint16_t> m_payload;       // words of the queued RAM writes, in order
++        std::atomic<uint64_t> m_payloadWrite{0};
++        std::atomic<uint64_t> m_payloadRead{0};
+         std::atomic<uint64_t> m_publishedCycle{0};
+         std::atomic<uint32_t> m_pubEndx[2]{};
+         std::atomic<uint32_t> m_pubNax[2][24]{};
+@@ -84,6 +94,12 @@ namespace ps2x::iop::detail
+         std::atomic<uint32_t> m_asyncIrq{0};      // cores whose IRQA a voice fetch hit
+         std::atomic<uint32_t> m_inputTransfers[2]{}; // DMA/manual transfers into each core's sound data input area
+         std::atomic<uint64_t> m_asyncIrqSeq[2]{}; // commands applied when it happened
++        std::atomic<uint64_t> m_synthSample{0};   // samples the synthesis thread has generated
++        // F1_SPU2_ENTRADA (debugging): transfers into the input areas, those that rewrote positions the synthesis
++        // thread had not read yet (words), the largest lag of the thread then (samples) and how far ahead of the IOP's
++        // read position each one starts (8 buckets of 64 samples).
++        std::atomic<uint32_t> m_inputDmas{0}, m_inputEarly{0}, m_inputEarlyWords{0}, m_inputLagMax{0};
++        std::atomic<uint32_t> m_inputLead[8]{};
+         std::atomic<bool> m_stop{false};
+         std::unique_ptr<Synth> m_synth;
+         std::thread m_thread;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 9708f29..9ea6f57 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -795,8 +795,9 @@ namespace ps2x::iop::detail
+                 const IsoNode *node = !useImage() && buildVirtualIso() ? fileForSector(lsn) : nullptr;
+                 const std::optional<std::filesystem::path> modFile = image.modFileForSector(lsn);
+                 const std::string imageFile = modFile ? modFile->string() : std::string("imagen");
+-                std::fprintf(stderr, "[cdvd:leer] lsn=%u sectores=%u destino=%x propio=%d archivo=%s desde=%llu\n", lsn,
+-                             sectors, destination,
++                // s= is the 48 kHz sample of the IOP clock, like the SPU2 traces (phase 3, T7).
++                std::fprintf(stderr, "[cdvd:leer] s=%llu lsn=%u sectores=%u destino=%x propio=%d archivo=%s desde=%llu\n",
++                             static_cast<unsigned long long>(clock ? *clock / 768u : 0u), lsn, sectors, destination,
+                              byteCount64 <= IopMemory::RamSize && memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)) ? 1 : 0,
+                              node ? node->hostPath.string().c_str() : (image.isOpen() ? imageFile.c_str() : "?"),
+                              node ? static_cast<unsigned long long>(lsn - node->lsn) * kSectorSize : 0ull);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ada14cd..d0e4960 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -864,6 +864,7 @@ namespace ps2x::iop::detail
+                     if (totalCycles >= memory.spu2().nextPollCycle())
+                         serviceSpu2();
+                     timrman.serviceDue(totalCycles, *this);
++                    kernel.serviceAlarms(totalCycles, *this); // phase 3 T7: thbase alarms
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+@@ -873,6 +874,7 @@ namespace ps2x::iop::detail
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        nextWake = kernel.nextAlarmCycle(nextWake);
+                         nextWake = std::min(nextWake, memory.spu2().nextPollCycle());
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c91813e..f6ab4c4 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1142,6 +1142,20 @@ bool PS2Runtime::initialize(const char *title)
+             if (const char *volume = std::getenv("PS2X_VOLUMEN"))
+                 g_startVolume = std::clamp(std::atoi(volume), 0, 100);
+             g_outputVolumeReady.store(true);
++            // PS2X_SALIDA_WAV=<path> (debugging, phase 3 T8): what the callback hands to the device (after the zero
++            // fill and the live volume), as 48 kHz stereo after a 44-byte header left at zero, like PS2X_SPU2_WAV when
++            // the game is killed (the scripts read it raw).
++            static FILE *s_outputWav = []() -> FILE *
++            {
++                const char *path = std::getenv("PS2X_SALIDA_WAV");
++                FILE *file = path ? std::fopen(path, "wb") : nullptr;
++                if (file)
++                {
++                    const uint8_t header[44]{};
++                    std::fwrite(header, 1, sizeof(header), file);
++                }
++                return file;
++            }();
+             SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames)
+                                    {
+                                        int16_t *out = static_cast<int16_t *>(buffer);
+@@ -1152,7 +1166,9 @@ bool PS2Runtime::initialize(const char *title)
+                                        if (scale != 1.0f)
+                                            for (size_t i = 0; i < got * 2u; ++i)
+                                                out[i] = static_cast<int16_t>(std::clamp(
+-                                                   static_cast<int>(std::lround(out[i] * scale)), -32768, 32767)); });
++                                                   static_cast<int>(std::lround(out[i] * scale)), -32768, 32767));
++                                       if (s_outputWav)
++                                           std::fwrite(out, sizeof(int16_t) * 2u, frames, s_outputWav); });
+             const char *soundEnv = std::getenv("PS2X_SONIDO");
+             if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
+                 SetAudioStreamVolume(s_spu2Stream, 0.0f);
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index f1172e9..1e1a032 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -1,6 +1,113 @@
+ #include "MiniTest.h"
+ #include "ps2x/iop/ps2_path.h"
+ #include "../../ps2xIOP/tests/iop_compat_test_support.h"
++#include "../../ps2xIOP/src/emulator/core/iop_spu2.h"
++#include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
++#include "../../ps2xIOP/src/emulator/core/iop_memory.h"
++#include "../../ps2xIOP/src/emulator/services/iop_rpc.h"
++#include "ps2x/iop/iop_spu2_audio.h"
++
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++
++namespace
++{
++    // Phase 3 (T7): records the alarm handlers the kernel calls.
++    class AlarmExecutor final : public ps2x::iop::detail::IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t address, uint32_t a0, uint32_t, uint32_t, uint32_t, uint32_t gp) override
++        {
++            ++calls;
++            lastAddress = address;
++            lastArgument = a0;
++            lastGp = gp;
++            return result;
++        }
++
++        uint32_t result = 0u;
++        uint32_t calls = 0u;
++        uint32_t lastAddress = 0u;
++        uint32_t lastArgument = 0u;
++        uint32_t lastGp = 0u;
++    };
++
++    // thbase:35/36 SetAlarm/iSetAlarm(clock, handler, common) and 37/38 CancelAlarm/iCancelAlarm(handler, common).
++    int32_t alarmCall(ps2x::iop::detail::IopKernel &kernel, uint16_t ordinal, uint32_t a0, uint32_t a1, uint32_t a2,
++                      uint64_t cycle, uint32_t gp = 0x89AB0u)
++    {
++        ps2x::iop::detail::IopCpuState cpu{};
++        cpu.gpr[4] = a0;
++        cpu.gpr[5] = a1;
++        cpu.gpr[6] = a2;
++        cpu.gpr[28] = gp;
++        if (!kernel.dispatchThreadImport(ordinal, cpu, cycle))
++            return 0x7FFFFFFF;
++        return static_cast<int32_t>(cpu.gpr[2]);
++    }
++
++    // Phase 3 (T8): drives core 1's sound data input area (0x2400, left) straight to the SPU2 output and collects what
++    // the synthesis thread plays. The IOP clock is the test's own counter.
++    struct Spu2InputRig
++    {
++        static constexpr uint32_t kCore1 = ps2x::iop::detail::Spu2::RegBase + 0x400u;
++        static constexpr uint32_t kCommon1 = ps2x::iop::detail::Spu2::RegBase + 0x760u + 0x28u;
++        uint64_t cycles = 0;
++        ps2x::iop::detail::Spu2 spu;
++        std::vector<uint8_t> iopRam = std::vector<uint8_t>(0x1000u, 0u);
++
++        Spu2InputRig()
++        {
++            drain();
++            spu.setClock(&cycles);
++            spu.write16(kCore1 + 0x198u, 0x00C0u);  // MMIX: sound data input L/R into the dry mix
++            spu.write16(kCommon1 + 0x0u, 0x3FFFu);  // MVOL L/R
++            spu.write16(kCommon1 + 0x2u, 0x3FFFu);
++            spu.write16(kCommon1 + 0xCu, 0x7FFFu);  // BVOL L/R
++            spu.write16(kCommon1 + 0xEu, 0x7FFFu);
++        }
++
++        static void drain()
++        {
++            int16_t scratch[2048];
++            while (ps2x::iop::readSpu2Audio(scratch, 1024u) != 0u)
++            {
++            }
++        }
++
++        void setSample(uint64_t sample) { cycles = sample * ps2x::iop::detail::Spu2::CyclesPerSample; }
++
++        // 256 samples of one value into the left input half at `address` (0x2400 or 0x2500), by DMA.
++        void fillHalf(uint32_t address, int16_t value)
++        {
++            for (uint32_t i = 0; i < 256u; ++i)
++                std::memcpy(iopRam.data() + i * 2u, &value, 2u);
++            spu.write16(kCore1 + 0x1A8u, static_cast<uint16_t>(address >> 16));
++            spu.write16(kCore1 + 0x1AAu, static_cast<uint16_t>(address));
++            spu.dmaTransfer(1, iopRam.data(), static_cast<uint32_t>(iopRam.size()), 0u, 512u, true);
++        }
++
++        // Publishes the clock (a register write does) and collects `frames` left samples from the output.
++        std::vector<int16_t> collect(size_t frames)
++        {
++            spu.write16(kCore1 + 0x180u, 0u); // PMON: no effect here, publishes the IOP clock
++            std::vector<int16_t> left;
++            int16_t chunk[512];
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++            while (left.size() < frames && std::chrono::steady_clock::now() < deadline)
++            {
++                const size_t got = ps2x::iop::readSpu2Audio(chunk, 256u);
++                for (size_t i = 0; i < got; ++i)
++                    left.push_back(chunk[i * 2u]);
++                if (got == 0u)
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++            return left;
++        }
++    };
++}
+ 
+ void register_ps2_iop_tests()
+ {
+@@ -71,5 +178,81 @@ void register_ps2_iop_tests()
+ 
+         });
+ 
++        tc.Run("IOP alarms call their handler at the clock and rearm with its result", [](TestCase &t)
++        {
++            // F1 06's AUDIO.IRX drives two threads with SetAlarm; when it did nothing they never ran (no commentary).
++            ps2x::iop::detail::IopMemory memory;
++            ps2x::iop::detail::IopKernel kernel(memory);
++            kernel.reset();
++            constexpr uint32_t kClock = 0x2000u;
++            memory.write32(kClock, 5000u);
++            memory.write32(kClock + 4u, 0u);
++            t.Equals(alarmCall(kernel, 35u, kClock, 0x12340u, 0x45670u, 100u), 0, "SetAlarm should succeed");
++            t.Equals(kernel.nextAlarmCycle(UINT64_MAX), uint64_t{5100u}, "the alarm is due clock cycles later");
++            AlarmExecutor executor;
++            executor.result = 3000u;
++            kernel.serviceAlarms(5099u, executor);
++            t.Equals(executor.calls, 0u, "the handler must not run early");
++            kernel.serviceAlarms(5100u, executor);
++            t.Equals(executor.calls, 1u, "the handler runs when due");
++            t.Equals(executor.lastAddress, 0x12340u, "the alarm calls its handler");
++            t.Equals(executor.lastArgument, 0x45670u, "with its common argument");
++            t.Equals(executor.lastGp, 0x89AB0u, "and the gp of the module that set it");
++            t.Equals(kernel.nextAlarmCycle(UINT64_MAX), uint64_t{8100u}, "a non-zero result is the time to the next call");
++            executor.result = 0u;
++            kernel.serviceAlarms(8100u, executor);
++            t.Equals(executor.calls, 2u, "the rearmed alarm runs again");
++            t.Equals(kernel.nextAlarmCycle(UINT64_MAX), UINT64_MAX, "a zero result ends the alarm");
++        });
++
++        tc.Run("IOP alarms: duplicates, cancel, interrupt variants and the 100-cycle minimum", [](TestCase &t)
++        {
++            ps2x::iop::detail::IopMemory memory;
++            ps2x::iop::detail::IopKernel kernel(memory);
++            kernel.reset();
++            constexpr uint32_t kClock = 0x2000u;
++            memory.write32(kClock, 10u);
++            memory.write32(kClock + 4u, 0u);
++            t.Equals(alarmCall(kernel, 36u, kClock, 0x1000u, 7u, 0u), 0, "iSetAlarm should succeed");
++            t.Equals(kernel.nextAlarmCycle(UINT64_MAX), uint64_t{100u}, "a delay under 100 cycles waits 100");
++            t.Equals(alarmCall(kernel, 35u, kClock, 0x1000u, 7u, 0u), -104, "the same handler and common twice: KE_FOUND_HANDLER");
++            t.Equals(alarmCall(kernel, 35u, kClock, 0x1000u, 8u, 0u), 0, "another common is another alarm");
++            t.Equals(alarmCall(kernel, 37u, 0x1000u, 7u, 0u, 0u), 0, "CancelAlarm removes it");
++            t.Equals(alarmCall(kernel, 38u, 0x1000u, 7u, 0u, 0u), -105, "a second cancel: KE_NOTFOUND_HANDLER");
++            AlarmExecutor executor;
++            kernel.serviceAlarms(1000u, executor);
++            t.Equals(executor.calls, 1u, "only the alarm left runs");
++            t.Equals(executor.lastArgument, 8u, "the one with common 8");
++            t.Equals(alarmCall(kernel, 38u, 0x1000u, 8u, 0u, 0u), -105, "an alarm that ended cannot be cancelled");
++        });
++
++        tc.Run("SPU2 input area plays what was there at each IOP sample even when synthesis lags", [](TestCase &t)
++        {
++            // AUDIO.IRX refills the input half the SPU2 has just played, ~5 ms before it comes round again. The
++            // synthesis thread trails the IOP clock by several milliseconds, so the refill must not reach it early.
++            Spu2InputRig rig;
++            rig.setSample(0);
++            rig.fillHalf(0x2400u, 1000); // block A: samples 0-255
++            rig.setSample(300);          // the IOP has played the first half; the thread has generated nothing yet
++            rig.fillHalf(0x2400u, 2000); // block C: samples 512-767
++            rig.setSample(800);
++            const std::vector<int16_t> left = rig.collect(760u);
++            t.IsTrue(left.size() >= 760u, "the synthesis thread should produce the samples up to the IOP clock");
++            if (left.size() < 760u)
++                return;
++            int earlyFrames = 0, blockAFrames = 0;
++            for (size_t i = 16; i < 230; ++i)
++            {
++                earlyFrames += std::abs(left[i] - 2000) < 20 ? 1 : 0;
++                blockAFrames += std::abs(left[i] - 1000) < 20 ? 1 : 0;
++            }
++            t.Equals(earlyFrames, 0, "the refill written at sample 300 must not play in place of samples 0-255");
++            t.Equals(blockAFrames, 214, "samples 0-255 should play block A");
++            int blockCFrames = 0;
++            for (size_t i = 560; i < 740; ++i)
++                blockCFrames += std::abs(left[i] - 2000) < 20 ? 1 : 0;
++            t.Equals(blockCFrames, 180, "the refill should play when the read position comes round (sample 512)");
++        });
++
+     });
+ }

@@ -1,0 +1,73 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1ce317e..a8aebf3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <iostream>
+ #include <stdexcept>
++#include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+ #include <algorithm>
+@@ -405,6 +406,50 @@ namespace
+     }
+ }
+ 
++// PS2X_CAPTURA_PETICION=<file>: when that file exists, the window saves the frame it shows (without the debug UI) as a
++// PNG at the path written in the file, then deletes the file. Unlike PrintWindow it works with the window hidden and
++// with the session locked (PrintWindow then gets a white image). scripts\medir-carrera.ps1 and capturar-ventana.ps1
++// use it.
++static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t width, uint32_t height)
++{
++    static const char *const s_request = std::getenv("PS2X_CAPTURA_PETICION");
++    static uint32_t s_skip = 0u;
++    if (s_request == nullptr || s_request[0] == '\0')
++        return;
++    if (s_skip != 0u)
++    {
++        --s_skip;
++        return;
++    }
++    s_skip = 10u; // the file is looked for about every 10 frames
++    std::ifstream in(s_request, std::ios::binary);
++    if (!in)
++        return;
++    std::string path;
++    std::getline(in, path);
++    in.close();
++    if (path.size() >= 3u && static_cast<unsigned char>(path[0]) == 0xEFu && static_cast<unsigned char>(path[1]) == 0xBBu &&
++        static_cast<unsigned char>(path[2]) == 0xBFu)
++        path.erase(0, 3); // UTF-8 BOM
++    while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' '))
++        path.pop_back();
++    width = std::min<uint32_t>(width, FB_WIDTH);
++    height = std::min<uint32_t>(height, FB_HEIGHT);
++    if (!path.empty() && width != 0u && height != 0u && frame.size() >= static_cast<size_t>(FB_WIDTH) * height * 4u)
++    {
++        std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
++        for (uint32_t y = 0; y < height; ++y)
++            std::memcpy(pixels.data() + static_cast<size_t>(y) * width * 4u,
++                        frame.data() + static_cast<size_t>(y) * FB_WIDTH * 4u, static_cast<size_t>(width) * 4u);
++        for (size_t i = 3u; i < pixels.size(); i += 4u)
++            pixels[i] = 0xFFu;
++        Image image{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++        if (!ExportImage(image, path.c_str()))
++            std::cerr << "[captura] no se pudo guardar " << path << std::endl;
++    }
++    std::remove(s_request);
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -418,6 +463,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     static std::vector<uint8_t> s_scratch;
+     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+ 
++    if (s_hasUploadedFrame)
++        SaveRequestedCapture(s_uploadBuffer, s_lastWidth, s_lastHeight);
++
+     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+     if (needsLatch)

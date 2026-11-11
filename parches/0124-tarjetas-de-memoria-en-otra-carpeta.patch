@@ -1,0 +1,62 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9f52fd1..f812087 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1240,6 +1240,12 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
+ 
++    // PS2X_TARJETAS=<dir>: memory cards in <dir>/mc0 and <dir>/mc1 (tests keep the user's cards untouched).
++    if (const char *cards = std::getenv("PS2X_TARJETAS"); cards && *cards)
++    {
++        paths.mcRoot = std::filesystem::path(cards) / "mc0";
++    }
++
+     setIoPaths(paths);
+ }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 4f979be..3d72114 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -10,6 +10,7 @@
+ #include <vector>
+ #include <cstring>
+ #include <chrono>
++#include <cstdlib>
+ 
+ using namespace ps2_syscalls;
+ 
+@@ -168,6 +169,32 @@ void register_ps2_runtime_io_tests()
+ {
+     MiniTest::Case("PS2RuntimeIO", [](TestCase &tc)
+     {
++        tc.Run("PS2X_TARJETAS moves the memory cards out of the ELF directory", [](TestCase &t)
++        {
++            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
++            TempPaths temp = makeTempPaths();
++            const std::filesystem::path elf = temp.cdRoot / "SCES_539.50";
++            const std::filesystem::path cards = temp.base / "cards";
++
++            _putenv_s("PS2X_TARJETAS", "");
++            PS2Runtime::configureIoPathsFromElf(elf.string());
++            t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(temp.cdRoot) / "mc0").lexically_normal().string(),
++                     "without PS2X_TARJETAS the card stays next to the ELF");
++
++            _putenv_s("PS2X_TARJETAS", cards.string().c_str());
++            PS2Runtime::configureIoPathsFromElf(elf.string());
++            _putenv_s("PS2X_TARJETAS", "");
++            t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(cards) / "mc0").lexically_normal().string(),
++                     "PS2X_TARJETAS=<dir> puts the card in <dir>/mc0");
++            t.Equals(PS2Runtime::getIoPaths().hostRoot.lexically_normal().string(),
++                     std::filesystem::absolute(temp.cdRoot).lexically_normal().string(),
++                     "PS2X_TARJETAS leaves the host root next to the ELF");
++
++            PS2Runtime::setIoPaths(oldPaths);
++        });
++
+         tc.Run("ROM0 ROMVER is exposed as the 14-byte firmware pseudo-file", [](TestCase &t)
+         {
+             TestContext test;

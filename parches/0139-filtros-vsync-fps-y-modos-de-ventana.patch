@@ -1,0 +1,1938 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index f8e288e..e197f1a 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -394,6 +394,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+     src/lib/ps2_options.cpp
++    src/lib/ps2_display.cpp
+     src/lib/ps2_user_paths.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+diff --git a/ps2xRuntime/include/ps2_display.h b/ps2xRuntime/include/ps2_display.h
+new file mode 100644
+index 0000000..8b6cdfa
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_display.h
+@@ -0,0 +1,158 @@
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// Phase 3 (T2, F1 06): how the game frame is shown in the window. The options come from opciones.ini through their
++// PS2X_* variables (ps2_options.cpp); DisplaySettings is what the window applies, and what the in-game options menu
++// changes at run time (PS2Runtime::applyDisplaySettings).
++namespace ps2x
++{
++    // How the frame is scaled to the window (opciones.ini: filtro).
++    enum class FrameFilter
++    {
++        Nearest,  // cercano: the PS2 pixels as blocks
++        Bilinear, // bilineal: smooth (the default before phase 3)
++        Sharp,    // nitido: sharp bilinear, an integer prescale then bilinear (crisp pixels, no shimmering)
++        Fsr,      // fsr: AMD FidelityFX Super Resolution 1 (EASU upscale + RCAS sharpening)
++        Crt,      // crt: a simple CRT look (scanlines and a light mask)
++    };
++
++    // opciones.ini: pantalla.
++    enum class WindowMode
++    {
++        Windowed,   // ventana
++        Borderless, // sin_bordes: a borderless window as large as the monitor
++        Fullscreen, // completa: exclusive full screen at the desktop resolution
++    };
++
++    struct DisplaySettings
++    {
++        FrameFilter filter = FrameFilter::Bilinear;
++        bool vsync = false;
++        bool showFps = false;
++        WindowMode windowMode = WindowMode::Windowed;
++        int windowWidth = 960; // the window's size in windowed mode
++        int windowHeight = 720;
++
++        bool operator==(const DisplaySettings &) const = default;
++    };
++
++    constexpr int kMinWindowWidth = 320, kMinWindowHeight = 240;
++    constexpr int kMaxWindowWidth = 7680, kMaxWindowHeight = 4320;
++
++    // The opciones.ini names. parseFrameFilter also takes the old PS2X_FILTRO values 0 (cercano) and 1 (bilineal).
++    const char *frameFilterName(FrameFilter filter);
++    bool parseFrameFilter(std::string_view text, FrameFilter &filter);
++    const char *windowModeName(WindowMode mode);
++    bool parseWindowMode(std::string_view text, WindowMode &mode);
++    // "<width>x<height>" (digits only), from 320x240 to 7680x4320.
++    bool parseWindowSize(std::string_view text, int &width, int &height);
++    std::string windowSizeText(int width, int height);
++
++    // From the variables that opciones.ini sets (PS2X_FILTRO, PS2X_VSYNC, PS2X_MOSTRAR_FPS, PS2X_PANTALLA, or the old
++    // PS2X_PANTALLA_COMPLETA=1 when PS2X_PANTALLA is not set, and PS2X_TAMANO_VENTANA). Unset or bad: the defaults of
++    // DisplaySettings (the presentation before phase 3).
++    DisplaySettings displaySettingsFromEnvironment(const std::function<const char *(const char *)> &getEnvironment);
++
++    // The opciones.ini values of the settings (key -> value), for the options menu to save them, and back from the
++    // values of a parsed opciones.ini (OptionsFile::values; missing or bad values: the DisplaySettings defaults).
++    std::map<std::string, std::string> displayOptionValues(const DisplaySettings &settings);
++    DisplaySettings displaySettingsFromOptionValues(const std::map<std::string, std::string> &values);
++
++    // Sharp bilinear: the integer prescale on each axis, floor(destination / source) and at least 1.
++    struct Prescale
++    {
++        int x = 1;
++        int y = 1;
++    };
++    Prescale sharpPrescale(float sourceWidth, float sourceHeight, float destinationWidth, float destinationHeight);
++
++    // CRT: how many scanlines the picture gets. The PS2 lines (frame height, halved for the GS's double resolution
++    // output, taller than 512), halved again while a line would be less than 3 window pixels high (448 interlaced
++    // lines in a 960 pixel window would make moire; 224 field lines look right).
++    int crtScanlines(int frameHeight, float destinationHeight);
++
++    // The window changes to go from one mode to another, in order.
++    enum class WindowStep
++    {
++        LeaveBorderless,
++        LeaveFullscreen,
++        EnterBorderless,
++        EnterFullscreen,
++    };
++    std::vector<WindowStep> windowModeSteps(WindowMode from, WindowMode to);
++    // F11: from a window to the full screen mode chosen in the options (sin_bordes when it is ventana), and back.
++    WindowMode toggledWindowMode(WindowMode current, WindowMode configured);
++
++    // A count per second, updated once at least a second has passed.
++    class RateMeter
++    {
++    public:
++        // Returns true when the rate was updated.
++        bool sample(double count, double seconds);
++        double rate() const { return m_rate; }
++
++    private:
++        bool m_started = false;
++        double m_count = 0.0;
++        double m_seconds = 0.0;
++        double m_rate = 0.0;
++    };
++
++    // The game's frames per second for the FPS counter, sampled once per window frame: flips is g_ps2DisplayFlips (the
++    // writes to DISPFB1 or DISPFB2 that changed the buffer shown; a game showing both read circuits writes both, two
++    // per frame, as F1 06), dispfb1, dispfb2 and pmode the GS registers. Each frame is as many flips as registers
++    // changed since the last sample; when neither did (the window runs slower than the game and lands on the same
++    // buffer, as with VSync and the monitor asleep), as many as last time, or as the read circuits PMODE enables.
++    class GameFrameCounter
++    {
++    public:
++        bool sample(uint64_t flips, uint64_t dispfb1, uint64_t dispfb2, uint64_t pmode, double seconds);
++        double rate() const { return m_meter.rate(); }
++
++    private:
++        RateMeter m_meter;
++        bool m_started = false;
++        uint64_t m_flips = 0u, m_dispfb1 = 0u, m_dispfb2 = 0u;
++        int m_flipsPerFrame = 0;
++        double m_frames = 0.0;
++    };
++
++    // The window side of the settings (raylib; main thread only, between InitWindow and CloseWindow).
++    class DisplayPresenter
++    {
++    public:
++        DisplayPresenter();
++        ~DisplayPresenter();
++        DisplayPresenter(const DisplayPresenter &) = delete;
++        DisplayPresenter &operator=(const DisplayPresenter &) = delete;
++
++        // The settings the window starts with (InitWindow already used their windowed size). backgroundWindow: the
++        // hidden window of the automated runs, which never goes full screen.
++        void start(const DisplaySettings &settings, bool backgroundWindow);
++        // Changes what differs from the current settings: window mode and size, VSync and filter.
++        void apply(const DisplaySettings &settings);
++        // F11 (toggledWindowMode). Returns the settings with the new window mode.
++        const DisplaySettings &toggleFullscreen();
++        const DisplaySettings &current() const;
++
++        // Draws the frame texture's top left sourceWidth x sourceHeight pixels into the destination rectangle (window
++        // pixels) with the filter; between BeginDrawing and EndDrawing.
++        void drawFrame(unsigned int textureId, int textureWidth, int textureHeight, float sourceWidth, float sourceHeight,
++                       float x, float y, float width, float height);
++        // The FPS counter, when showFps: the game's frames per second and the monitor's refresh rate.
++        void drawOverlay(double gameRate);
++        // Before CloseWindow: the shaders and the render texture.
++        void unload();
++
++    private:
++        struct State;
++        std::unique_ptr<State> m_state;
++    };
++}
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index c51efe3..7e146ab 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -31,10 +31,27 @@ namespace ps2x
+         int maximum = 0;
+         const char *comment; // Spanish, written above the key in the default file ('\n' between lines)
+         const char *developmentDefault = nullptr; // the default in development mode; nullptr: defaultValue
++        // Without choices: a value of another form, passed as is when isValid accepts it (valuesText describes it in
++        // the warnings) instead of an integer.
++        bool (*isValid)(std::string_view value) = nullptr;
++        const char *valuesText = nullptr;
+     };
+ 
+     const std::vector<OptionSpec> &optionSpecs();
+ 
++    // A key replaced by another option that opciones.ini still accepts (files written by older versions). Its values
++    // stand for values of the new option, unless the file also has the new key, which wins wherever it is. Its old
++    // variable, when set, also keeps the file from setting the new option's (the runtime still reads it).
++    struct OptionAlias
++    {
++        const char *key;
++        const char *target;
++        const char *environment;
++        std::vector<OptionChoice> values; // value: the old value; environment: the target's value it stands for
++    };
++
++    const std::vector<OptionAlias> &optionAliases();
++
+     // defaultValue, or developmentDefault in development mode when it has one.
+     const char *optionDefault(const OptionSpec &spec, bool development);
+ 
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 482df98..844cacb 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -24,6 +24,7 @@
+ #include <unordered_set>
+ 
+ #include "ps2_log.h"
++#include "ps2_display.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/ps2_memory.h"
+@@ -307,6 +308,13 @@ public:
+     bool zeroIopMemory(uint32_t address, size_t size);
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
+ 
++    // Phase 3 (T2): the presentation settings (filter, VSync, FPS counter, window mode and size). initialize() takes
++    // them from the PS2X_* variables (opciones.ini). applyDisplaySettings may be called from any thread (the options
++    // menu): the window applies them on the main thread before its next frame. displaySettings() returns the last
++    // ones requested, with the window mode F11 left.
++    ps2x::DisplaySettings displaySettings() const;
++    void applyDisplaySettings(const ps2x::DisplaySettings &settings);
++
+     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
+     void setDebugUiCallbacks(DebugUiCallback initCallback,
+                              DebugUiCallback drawCallback,
+@@ -549,6 +557,10 @@ private:
+     DebugUiCallback m_debugUiShutdownCallback = nullptr;
+     void *m_debugUiUserData = nullptr;
+     bool m_debugUiInitialized = false;
++    mutable std::mutex m_displayMutex;
++    ps2x::DisplaySettings m_displaySettings;
++    bool m_displaySettingsPending = false;
++    std::unique_ptr<ps2x::DisplayPresenter> m_displayPresenter; // created by initialize() (not on the Vita)
+ 
+ public:
+     std::atomic<uint32_t> m_debugPc{0};
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+new file mode 100644
+index 0000000..772b6d3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -0,0 +1,569 @@
++#include "ps2_display.h"
++#include "shaders/ps2_display_shaders.h"
++
++#include "raylib.h"
++#include "rlgl.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace ps2x
++{
++    namespace
++    {
++        struct FilterName
++        {
++            FrameFilter filter;
++            const char *name;
++        };
++        constexpr FilterName kFilterNames[] = {{FrameFilter::Nearest, "cercano"}, {FrameFilter::Bilinear, "bilineal"},
++                                               {FrameFilter::Sharp, "nitido"},    {FrameFilter::Fsr, "fsr"},
++                                               {FrameFilter::Crt, "crt"}};
++
++        struct ModeName
++        {
++            WindowMode mode;
++            const char *name;
++        };
++        constexpr ModeName kModeNames[] = {
++            {WindowMode::Windowed, "ventana"},
++            {WindowMode::Borderless, "sin_bordes"},
++            {WindowMode::Fullscreen, "completa"}};
++
++        bool parseFlag(const char *text, bool &flag)
++        {
++            if (text == nullptr || (std::strcmp(text, "0") != 0 && std::strcmp(text, "1") != 0))
++                return false;
++            flag = text[0] == '1';
++            return true;
++        }
++
++        bool parsePositive(std::string_view text, int &value)
++        {
++            if (text.empty() || text.size() > 5u)
++                return false;
++            value = 0;
++            for (const char c : text)
++            {
++                if (c < '0' || c > '9')
++                    return false;
++                value = value * 10 + (c - '0');
++            }
++            return true;
++        }
++    }
++
++    const char *frameFilterName(FrameFilter filter)
++    {
++        for (const FilterName &entry : kFilterNames)
++            if (entry.filter == filter)
++                return entry.name;
++        return "bilineal";
++    }
++
++    bool parseFrameFilter(std::string_view text, FrameFilter &filter)
++    {
++        if (text == "0" || text == "1")
++        {
++            filter = text == "0" ? FrameFilter::Nearest : FrameFilter::Bilinear;
++            return true;
++        }
++        for (const FilterName &entry : kFilterNames)
++            if (text == entry.name)
++            {
++                filter = entry.filter;
++                return true;
++            }
++        return false;
++    }
++
++    const char *windowModeName(WindowMode mode)
++    {
++        for (const ModeName &entry : kModeNames)
++            if (entry.mode == mode)
++                return entry.name;
++        return "ventana";
++    }
++
++    bool parseWindowMode(std::string_view text, WindowMode &mode)
++    {
++        for (const ModeName &entry : kModeNames)
++            if (text == entry.name)
++            {
++                mode = entry.mode;
++                return true;
++            }
++        return false;
++    }
++
++    bool parseWindowSize(std::string_view text, int &width, int &height)
++    {
++        const size_t x = text.find_first_of("xX");
++        int w = 0, h = 0;
++        if (x == std::string_view::npos || !parsePositive(text.substr(0, x), w) ||
++            !parsePositive(text.substr(x + 1u), h))
++            return false;
++        if (w < kMinWindowWidth || w > kMaxWindowWidth || h < kMinWindowHeight || h > kMaxWindowHeight)
++            return false;
++        width = w;
++        height = h;
++        return true;
++    }
++
++    std::string windowSizeText(int width, int height)
++    {
++        return std::to_string(width) + "x" + std::to_string(height);
++    }
++
++    DisplaySettings displaySettingsFromEnvironment(const std::function<const char *(const char *)> &getEnvironment)
++    {
++        DisplaySettings settings;
++        if (const char *filter = getEnvironment("PS2X_FILTRO"))
++            parseFrameFilter(filter, settings.filter);
++        parseFlag(getEnvironment("PS2X_VSYNC"), settings.vsync);
++        parseFlag(getEnvironment("PS2X_MOSTRAR_FPS"), settings.showFps);
++        const char *mode = getEnvironment("PS2X_PANTALLA");
++        if (mode == nullptr || !parseWindowMode(mode, settings.windowMode))
++        {
++            bool full = false;
++            if (parseFlag(getEnvironment("PS2X_PANTALLA_COMPLETA"), full) && full)
++                settings.windowMode = WindowMode::Borderless;
++        }
++        if (const char *size = getEnvironment("PS2X_TAMANO_VENTANA"))
++            parseWindowSize(size, settings.windowWidth, settings.windowHeight);
++        return settings;
++    }
++
++    std::map<std::string, std::string> displayOptionValues(const DisplaySettings &settings)
++    {
++        return {{"filtro", frameFilterName(settings.filter)},
++                {"vsync", settings.vsync ? "1" : "0"},
++                {"mostrar_fps", settings.showFps ? "1" : "0"},
++                {"pantalla", windowModeName(settings.windowMode)},
++                {"tamano_ventana", windowSizeText(settings.windowWidth, settings.windowHeight)}};
++    }
++
++    DisplaySettings displaySettingsFromOptionValues(const std::map<std::string, std::string> &values)
++    {
++        const auto value = [&values](const char *key) -> const char *
++        {
++            const auto found = values.find(key);
++            return found == values.end() ? nullptr : found->second.c_str();
++        };
++        DisplaySettings settings;
++        if (const char *filter = value("filtro"))
++            parseFrameFilter(filter, settings.filter);
++        parseFlag(value("vsync"), settings.vsync);
++        parseFlag(value("mostrar_fps"), settings.showFps);
++        if (const char *mode = value("pantalla"))
++            parseWindowMode(mode, settings.windowMode);
++        if (const char *size = value("tamano_ventana"))
++            parseWindowSize(size, settings.windowWidth, settings.windowHeight);
++        return settings;
++    }
++
++    Prescale sharpPrescale(float sourceWidth, float sourceHeight, float destinationWidth, float destinationHeight)
++    {
++        const auto axis = [](float source, float destination)
++        {
++            if (!(source > 0.0f) || !(destination > 0.0f))
++                return 1;
++            return std::max(1, static_cast<int>(std::floor(destination / source)));
++        };
++        return {axis(sourceWidth, destinationWidth), axis(sourceHeight, destinationHeight)};
++    }
++
++    int crtScanlines(int frameHeight, float destinationHeight)
++    {
++        if (frameHeight <= 0)
++            return 1;
++        int lines = frameHeight > 512 ? frameHeight / 2 : frameHeight;
++        while (lines / 2 >= 100 && destinationHeight < 3.0f * static_cast<float>(lines))
++            lines /= 2;
++        return lines;
++    }
++
++    std::vector<WindowStep> windowModeSteps(WindowMode from, WindowMode to)
++    {
++        std::vector<WindowStep> steps;
++        if (from == to)
++            return steps;
++        if (from == WindowMode::Borderless)
++            steps.push_back(WindowStep::LeaveBorderless);
++        else if (from == WindowMode::Fullscreen)
++            steps.push_back(WindowStep::LeaveFullscreen);
++        if (to == WindowMode::Borderless)
++            steps.push_back(WindowStep::EnterBorderless);
++        else if (to == WindowMode::Fullscreen)
++            steps.push_back(WindowStep::EnterFullscreen);
++        return steps;
++    }
++
++    WindowMode toggledWindowMode(WindowMode current, WindowMode configured)
++    {
++        if (current != WindowMode::Windowed)
++            return WindowMode::Windowed;
++        return configured == WindowMode::Windowed ? WindowMode::Borderless : configured;
++    }
++
++    bool GameFrameCounter::sample(uint64_t flips, uint64_t dispfb1, uint64_t dispfb2, uint64_t pmode, double seconds)
++    {
++        constexpr uint64_t kFbp = 0x1FFu;
++        if (m_started && flips > m_flips)
++        {
++            const int changed = ((dispfb1 ^ m_dispfb1) & kFbp ? 1 : 0) + ((dispfb2 ^ m_dispfb2) & kFbp ? 1 : 0);
++            if (changed != 0)
++                m_flipsPerFrame = changed;
++            else if (m_flipsPerFrame == 0)
++                m_flipsPerFrame = std::max(1, static_cast<int>(pmode & 1u) + static_cast<int>((pmode >> 1) & 1u));
++            m_frames += static_cast<double>(flips - m_flips) / m_flipsPerFrame;
++        }
++        m_started = true;
++        m_flips = flips;
++        m_dispfb1 = dispfb1;
++        m_dispfb2 = dispfb2;
++        return m_meter.sample(m_frames, seconds);
++    }
++
++    bool RateMeter::sample(double count, double seconds)
++    {
++        if (!m_started)
++        {
++            m_started = true;
++            m_count = count;
++            m_seconds = seconds;
++            return false;
++        }
++        const double elapsed = seconds - m_seconds;
++        if (elapsed < 1.0)
++            return false;
++        m_rate = (count - m_count) / elapsed;
++        m_count = count;
++        m_seconds = seconds;
++        return true;
++    }
++}
++
++// ---- The window side (raylib) ----
++
++namespace ps2x
++{
++    namespace
++    {
++        constexpr float kRcasSharpnessStops = 0.2f; // AMD's suggested default
++
++        int textureFilterOf(FrameFilter filter)
++        {
++            return filter == FrameFilter::Nearest ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR;
++        }
++
++        // The cap of the frame loop: SetTargetFPS(60) without VSync, as before phase 3. With VSync the swap already
++        // waits for the monitor; the cap (twice its rate) only keeps the loop from spinning when the driver forces
++        // VSync off or the window is not on a monitor.
++        int targetFps(bool vsync, int refreshRate)
++        {
++            return vsync ? std::max(120, 2 * refreshRate) : 60;
++        }
++
++        struct LoadedShader
++        {
++            Shader shader{};
++            bool tried = false;
++            bool valid = false;
++        };
++
++        bool ensureShader(LoadedShader &loaded, const char *code, const char *name)
++        {
++            if (!loaded.tried)
++            {
++                loaded.tried = true;
++                loaded.shader = LoadShaderFromMemory(nullptr, code);
++                loaded.valid = IsShaderValid(loaded.shader) && loaded.shader.id != rlGetShaderIdDefault();
++                if (!loaded.valid)
++                    std::fprintf(stderr, "[ventana] el shader %s no compila; se usa bilineal\n", name);
++            }
++            return loaded.valid;
++        }
++
++        void unloadShader(LoadedShader &loaded)
++        {
++            if (loaded.valid)
++                UnloadShader(loaded.shader);
++            loaded = LoadedShader{};
++        }
++
++        void setVec2(const Shader &shader, const char *name, float x, float y)
++        {
++            const float value[2] = {x, y};
++            SetShaderValue(shader, GetShaderLocation(shader, name), value, SHADER_UNIFORM_VEC2);
++        }
++
++        void setFloat(const Shader &shader, const char *name, float value)
++        {
++            SetShaderValue(shader, GetShaderLocation(shader, name), &value, SHADER_UNIFORM_FLOAT);
++        }
++    }
++
++    struct DisplayPresenter::State
++    {
++        DisplaySettings settings;
++        bool background = false;
++        WindowMode fullscreenChoice = WindowMode::Borderless; // where F11 goes from the window
++        int windowedWidth = 0, windowedHeight = 0;            // the window before exclusive full screen
++        int refreshRate = 60;
++        double refreshCheckedAt = -10.0;
++        unsigned int filteredTexture = 0u;
++        int textureFilter = -1;
++        LoadedShader sharp, crt, easu, rcas;
++        RenderTexture2D upscaled{};
++        bool upscaledValid = false;
++        float crtCurvature = 0.0f;
++    };
++
++    DisplayPresenter::DisplayPresenter() : m_state(std::make_unique<State>()) {}
++    DisplayPresenter::~DisplayPresenter() = default;
++
++    const DisplaySettings &DisplayPresenter::current() const
++    {
++        return m_state->settings;
++    }
++
++    void DisplayPresenter::start(const DisplaySettings &settings, bool backgroundWindow)
++    {
++        State &s = *m_state;
++        s.background = backgroundWindow;
++        s.refreshRate = std::max(1, GetMonitorRefreshRate(GetCurrentMonitor()));
++        const char *curvature = std::getenv("PS2X_CRT_CURVATURA");
++        s.crtCurvature = curvature != nullptr && curvature[0] == '1' ? 1.0f : 0.0f;
++        // The window starts as a window of the settings' size, without VSync (raylib's default) and capped at 60.
++        s.settings = settings;
++        s.settings.windowMode = WindowMode::Windowed;
++        s.settings.vsync = false;
++        SetTargetFPS(targetFps(false, s.refreshRate));
++        if (backgroundWindow && settings.windowMode != WindowMode::Windowed)
++            std::fprintf(stderr, "[ventana] pantalla = %s no se usa con la ventana en segundo plano\n",
++                         windowModeName(settings.windowMode));
++        apply(settings);
++        const int monitor = GetCurrentMonitor();
++        std::fprintf(stderr,
++                     "[ventana] filtro=%s vsync=%d mostrar_fps=%d pantalla=%s tamano=%dx%d; "
++                     "monitor %d (%s): %dx%d a %d Hz\n",
++                     frameFilterName(s.settings.filter), s.settings.vsync ? 1 : 0, s.settings.showFps ? 1 : 0,
++                     windowModeName(s.settings.windowMode), s.settings.windowWidth, s.settings.windowHeight, monitor,
++                     GetMonitorName(monitor), GetMonitorWidth(monitor), GetMonitorHeight(monitor), s.refreshRate);
++    }
++
++    void DisplayPresenter::apply(const DisplaySettings &requested)
++    {
++        State &s = *m_state;
++        DisplaySettings next = requested;
++        if (s.background)
++            next.windowMode = WindowMode::Windowed;
++
++        if (next.vsync != s.settings.vsync)
++        {
++            if (next.vsync)
++                SetWindowState(FLAG_VSYNC_HINT);
++            else
++                ClearWindowState(FLAG_VSYNC_HINT);
++            SetTargetFPS(targetFps(next.vsync, s.refreshRate));
++        }
++
++        const bool sizeChanged =
++            next.windowWidth != s.settings.windowWidth || next.windowHeight != s.settings.windowHeight;
++        bool leftFullscreen = false;
++        for (const WindowStep step : windowModeSteps(s.settings.windowMode, next.windowMode))
++        {
++            switch (step)
++            {
++            case WindowStep::LeaveBorderless:
++                if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++                    ToggleBorderlessWindowed();
++                break;
++            case WindowStep::LeaveFullscreen:
++                if (IsWindowFullscreen())
++                {
++                    ToggleFullscreen();
++                    leftFullscreen = true;
++                }
++                break;
++            case WindowStep::EnterBorderless:
++                ToggleBorderlessWindowed();
++                break;
++            case WindowStep::EnterFullscreen:
++            {
++                // Exclusive full screen at the desktop resolution: raylib's ToggleFullscreen asks GLFW for the video
++                // mode closest to the window's size (at the highest refresh rate), so the window takes the monitor's
++                // size first. Leaving it gives the window back its size.
++                s.windowedWidth = GetScreenWidth();
++                s.windowedHeight = GetScreenHeight();
++                const int monitor = GetCurrentMonitor();
++                SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
++                ToggleFullscreen();
++                break;
++            }
++            }
++        }
++        if (next.windowMode == WindowMode::Windowed)
++        {
++            if (sizeChanged)
++                SetWindowSize(next.windowWidth, next.windowHeight);
++            else if (leftFullscreen && s.windowedWidth > 0)
++                SetWindowSize(s.windowedWidth, s.windowedHeight);
++        }
++        else
++            s.fullscreenChoice = next.windowMode;
++        s.settings = next;
++    }
++
++    const DisplaySettings &DisplayPresenter::toggleFullscreen()
++    {
++        State &s = *m_state;
++        if (!s.background)
++        {
++            DisplaySettings next = s.settings;
++            next.windowMode = toggledWindowMode(s.settings.windowMode, s.fullscreenChoice);
++            apply(next);
++        }
++        return s.settings;
++    }
++
++    void DisplayPresenter::drawFrame(unsigned int textureId, int textureWidth, int textureHeight, float sourceWidth,
++                                     float sourceHeight, float x, float y, float width, float height)
++    {
++        State &s = *m_state;
++        const Texture2D frame{textureId, textureWidth, textureHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++        FrameFilter filter = s.settings.filter;
++        if ((filter == FrameFilter::Sharp && !ensureShader(s.sharp, shaders::kSharpBilinear, "nitido")) ||
++            (filter == FrameFilter::Crt && !ensureShader(s.crt, shaders::kCrt, "crt")) ||
++            (filter == FrameFilter::Fsr && (!ensureShader(s.easu, shaders::kFsrEasu, "fsr (EASU)") ||
++                                            !ensureShader(s.rcas, shaders::kFsrRcas, "fsr (RCAS)"))))
++            filter = FrameFilter::Bilinear;
++        const int textureFilter = textureFilterOf(filter);
++        if (textureId != s.filteredTexture || textureFilter != s.textureFilter)
++        {
++            SetTextureFilter(frame, textureFilter);
++            s.filteredTexture = textureId;
++            s.textureFilter = textureFilter;
++        }
++        const Rectangle source{0.0f, 0.0f, sourceWidth, sourceHeight};
++        const Rectangle destination{x, y, width, height};
++
++        switch (filter)
++        {
++        case FrameFilter::Nearest:
++        case FrameFilter::Bilinear:
++            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            return;
++        case FrameFilter::Sharp:
++        {
++            const Prescale prescale = sharpPrescale(sourceWidth, sourceHeight, width, height);
++            BeginShaderMode(s.sharp.shader);
++            setVec2(s.sharp.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++            setVec2(s.sharp.shader, "prescale", static_cast<float>(prescale.x), static_cast<float>(prescale.y));
++            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            EndShaderMode();
++            return;
++        }
++        case FrameFilter::Crt:
++            BeginShaderMode(s.crt.shader);
++            setVec2(s.crt.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++            setVec2(s.crt.shader, "sourceSize", sourceWidth, sourceHeight);
++            setFloat(s.crt.shader, "scanlines",
++                     static_cast<float>(crtScanlines(static_cast<int>(sourceHeight), height)));
++            setFloat(s.crt.shader, "curvature", s.crtCurvature);
++            DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            EndShaderMode();
++            return;
++        case FrameFilter::Fsr:
++            break;
++        }
++
++        // FSR: the picture at the window's size in a render texture (EASU when it grows on some axis; plain bilinear
++        // when the window is smaller than the frame on both, which EASU is not made for), then RCAS to the window
++        // pixel for pixel.
++        const int outWidth = std::max(1, static_cast<int>(std::lround(width)));
++        const int outHeight = std::max(1, static_cast<int>(std::lround(height)));
++        if (!s.upscaledValid || s.upscaled.texture.width != outWidth || s.upscaled.texture.height != outHeight)
++        {
++            if (s.upscaledValid)
++                UnloadRenderTexture(s.upscaled);
++            s.upscaled = LoadRenderTexture(outWidth, outHeight);
++            s.upscaledValid = IsRenderTextureValid(s.upscaled);
++            if (!s.upscaledValid)
++            {
++                DrawTexturePro(frame, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++                return;
++            }
++            SetTextureFilter(s.upscaled.texture, TEXTURE_FILTER_POINT);
++        }
++        const bool upscale =
++            static_cast<float>(outWidth) >= sourceWidth || static_cast<float>(outHeight) >= sourceHeight;
++        BeginTextureMode(s.upscaled);
++        ClearBackground(BLACK);
++        if (upscale)
++        {
++            BeginShaderMode(s.easu.shader);
++            setVec2(s.easu.shader, "textureSize", static_cast<float>(textureWidth), static_cast<float>(textureHeight));
++            setVec2(s.easu.shader, "sourceSize", sourceWidth, sourceHeight);
++        }
++        DrawTexturePro(frame, source, Rectangle{0.0f, 0.0f, static_cast<float>(outWidth), static_cast<float>(outHeight)},
++                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (upscale)
++            EndShaderMode();
++        EndTextureMode();
++
++        BeginShaderMode(s.rcas.shader);
++        setVec2(s.rcas.shader, "textureSize", static_cast<float>(outWidth), static_cast<float>(outHeight));
++        setFloat(s.rcas.shader, "sharpness", std::exp2(-kRcasSharpnessStops));
++        // Render textures are stored upside down: a negative source height flips them back.
++        const float w = static_cast<float>(outWidth), h = static_cast<float>(outHeight);
++        DrawTexturePro(s.upscaled.texture, Rectangle{0.0f, 0.0f, w, -h}, Rectangle{std::round(x), std::round(y), w, h},
++                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        EndShaderMode();
++    }
++
++    void DisplayPresenter::drawOverlay(double gameRate)
++    {
++        State &s = *m_state;
++        const double now = GetTime();
++        if (now - s.refreshCheckedAt >= 1.0)
++        {
++            s.refreshCheckedAt = now;
++            const int refresh = std::max(1, GetMonitorRefreshRate(GetCurrentMonitor()));
++            if (refresh != s.refreshRate)
++            {
++                s.refreshRate = refresh;
++                SetTargetFPS(targetFps(s.settings.vsync, refresh));
++            }
++        }
++        if (!s.settings.showFps)
++            return;
++        const int fontSize = std::max(20, GetScreenHeight() / 40);
++        char game[64], screen[96];
++        std::snprintf(game, sizeof(game), "Juego: %.1f fps", gameRate);
++        std::snprintf(screen, sizeof(screen), "Monitor: %d Hz%s, ventana: %d fps", s.refreshRate,
++                      s.settings.vsync ? " (vsync)" : "", GetFPS());
++        const int margin = fontSize / 2;
++        const int width = std::max(MeasureText(game, fontSize), MeasureText(screen, fontSize)) + 2 * margin;
++        const int height = 2 * fontSize + 3 * margin;
++        DrawRectangle(margin, margin, width, height, Fade(BLACK, 0.6f));
++        DrawText(game, 2 * margin, 2 * margin, fontSize, YELLOW);
++        DrawText(screen, 2 * margin, 3 * margin + fontSize, fontSize, RAYWHITE);
++    }
++
++    void DisplayPresenter::unload()
++    {
++        State &s = *m_state;
++        unloadShader(s.sharp);
++        unloadShader(s.crt);
++        unloadShader(s.easu);
++        unloadShader(s.rcas);
++        if (s.upscaledValid)
++            UnloadRenderTexture(s.upscaled);
++        s.upscaledValid = false;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index cca58ee..c144744 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -1,9 +1,11 @@
+ #include "ps2_options.h"
++#include "ps2_display.h"
+ #include "ps2_user_paths.h"
+ 
+ #include <cctype>
+ #include <cstdlib>
+ #include <fstream>
++#include <set>
+ #include <sstream>
+ #include <system_error>
+ 
+@@ -35,6 +37,8 @@ namespace ps2x
+ 
+         bool validValue(const OptionSpec &spec, const std::string &value)
+         {
++            if (spec.isValid != nullptr)
++                return spec.isValid(value);
+             if (!spec.choices.empty())
+             {
+                 for (const OptionChoice &choice : spec.choices)
+@@ -53,6 +57,8 @@ namespace ps2x
+ 
+         std::string allowedValues(const OptionSpec &spec)
+         {
++            if (spec.valuesText != nullptr)
++                return spec.valuesText;
+             if (spec.choices.empty())
+                 return std::to_string(spec.minimum) + " a " + std::to_string(spec.maximum);
+             std::string text;
+@@ -60,19 +66,45 @@ namespace ps2x
+                 text += (text.empty() ? "" : ", ") + std::string(choice.value);
+             return text;
+         }
++
++        bool validWindowSize(std::string_view value)
++        {
++            int width = 0, height = 0;
++            return parseWindowSize(value, width, height);
++        }
+     }
+ 
+     // One line per option. A new option needs its PS2X_* variable to be read by the runtime as usual.
+     const std::vector<OptionSpec> &optionSpecs()
+     {
+         static const std::vector<OptionSpec> specs = {
+-            {"pantalla_completa", "PS2X_PANTALLA_COMPLETA", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
+-             "Pantalla completa sin bordes al arrancar: 0 = ventana, 1 = pantalla completa (F11 la cambia jugando)."},
++            // Phase 3 (T2): pantalla replaces pantalla_completa (still read, optionAliases).
++            {"pantalla", "PS2X_PANTALLA", "ventana",
++             {{"ventana", "ventana"}, {"sin_bordes", "sin_bordes"}, {"completa", "completa"}}, 0, 0,
++             "Modo de la ventana al arrancar: ventana, sin_bordes (una ventana sin bordes del tamano del monitor) o\n"
++             "completa (pantalla completa exclusiva, a la resolucion del escritorio). F11 cambia jugando entre la\n"
++             "ventana y la pantalla completa."},
++            {"tamano_ventana", "PS2X_TAMANO_VENTANA", "960x720", {}, 0, 0,
++             "Tamano de la ventana en modo ventana, en pixeles: <ancho>x<alto>, de 320x240 a 7680x4320.", nullptr,
++             validWindowSize, "<ancho>x<alto>, de 320x240 a 7680x4320"},
+             {"aspecto", "PS2X_ASPECTO", "auto", {{"auto", nullptr}, {"4:3", "4:3"}, {"16:9", "16:9"}, {"pixel", "pixel"}}, 0, 0,
+              "Forma de la imagen: auto (la que se elija en las opciones del juego), 4:3, 16:9 o pixel (pixeles\n"
+              "cuadrados, sin ajustar). F10 la cambia jugando."},
+-            {"filtro", "PS2X_FILTRO", "bilineal", {{"bilineal", "1"}, {"cercano", "0"}}, 0, 0,
+-             "Filtro al ampliar la imagen a la ventana: bilineal (suave) o cercano (pixeles nitidos)."},
++            // PS2X_FILTRO keeps 0 and 1 for cercano and bilineal (patch 0100). The player's default is chosen from the
++            // window captures of odd/tasks/fase3 T2; development keeps bilineal.
++            {"filtro", "PS2X_FILTRO", "fsr",
++             {{"cercano", "0"}, {"bilineal", "1"}, {"nitido", "nitido"}, {"fsr", "fsr"}, {"crt", "crt"}}, 0, 0,
++             "Filtro al ampliar la imagen a la ventana: cercano (pixeles como bloques), bilineal (suave), nitido\n"
++             "(pixeles limpios y sin parpadeo; mejor cuanto mas grande la ventana), fsr (AMD FSR 1: amplia y enfoca,\n"
++             "mas nitido que bilineal) o crt (aspecto de television antigua, con lineas).",
++             "bilineal"},
++            {"vsync", "PS2X_VSYNC", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Sincronizacion vertical: 1 = la imagen cambia al ritmo del monitor (sin cortes horizontales); 0 = no.\n"
++             "El juego va a la misma velocidad con las dos.",
++             "0"},
++            {"mostrar_fps", "PS2X_MOSTRAR_FPS", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Contador de fotogramas por segundo en una esquina (los del juego y la frecuencia del monitor): 1 = si,\n"
++             "0 = no."},
+             {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
+             {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
+@@ -96,6 +128,14 @@ namespace ps2x
+         return specs;
+     }
+ 
++    const std::vector<OptionAlias> &optionAliases()
++    {
++        static const std::vector<OptionAlias> aliases = {
++            {"pantalla_completa", "pantalla", "PS2X_PANTALLA_COMPLETA", {{"0", "ventana"}, {"1", "sin_bordes"}}},
++        };
++        return aliases;
++    }
++
+     const char *optionDefault(const OptionSpec &spec, bool development)
+     {
+         return development && spec.developmentDefault != nullptr ? spec.developmentDefault : spec.defaultValue;
+@@ -126,6 +166,7 @@ namespace ps2x
+             text.remove_prefix(3);
+ 
+         const std::string where = "[opciones] " + std::string(fileName) + ":";
++        std::set<std::string> written; // keys given in the file: an alias does not override them
+         int lineNumber = 0;
+         size_t position = 0u;
+         while (position <= text.size())
+@@ -154,10 +195,39 @@ namespace ps2x
+                     spec = &candidate;
+             if (spec == nullptr)
+             {
+-                result.warnings.push_back(where + std::to_string(lineNumber) + ": opcion desconocida '" + key +
+-                                          "'; se ignora");
++                const OptionAlias *alias = nullptr;
++                for (const OptionAlias &candidate : optionAliases())
++                    if (key == candidate.key)
++                        alias = &candidate;
++                if (alias == nullptr)
++                {
++                    result.warnings.push_back(where + std::to_string(lineNumber) + ": opcion desconocida '" + key +
++                                              "'; se ignora");
++                    continue;
++                }
++                const OptionSpec *target = nullptr;
++                for (const OptionSpec &candidate : optionSpecs())
++                    if (std::string_view(alias->target) == candidate.key)
++                        target = &candidate;
++                const OptionChoice *choice = nullptr;
++                for (const OptionChoice &candidate : alias->values)
++                    if (value == candidate.value)
++                        choice = &candidate;
++                if (choice == nullptr)
++                {
++                    std::string values;
++                    for (const OptionChoice &candidate : alias->values)
++                        values += (values.empty() ? "" : ", ") + std::string(candidate.value);
++                    result.warnings.push_back(where + std::to_string(lineNumber) + ": valor no valido '" + value +
++                                              "' para " + alias->key + "; se usa " +
++                                              optionDefault(*target, development) + " (valores: " + values + ")");
++                    continue;
++                }
++                if (written.count(target->key) == 0u)
++                    result.values[target->key] = choice->environment;
+                 continue;
+             }
++            written.insert(spec->key);
+             if (!validValue(*spec, value))
+             {
+                 result.warnings.push_back(where + std::to_string(lineNumber) + ": valor no valido '" + value +
+@@ -179,6 +249,12 @@ namespace ps2x
+         {
+             if (getEnvironment(spec.environment) != nullptr)
+                 continue;
++            bool oldVariableSet = false;
++            for (const OptionAlias &alias : optionAliases())
++                oldVariableSet = oldVariableSet || (std::string_view(alias.target) == spec.key &&
++                                                    getEnvironment(alias.environment) != nullptr);
++            if (oldVariableSet)
++                continue;
+             const auto found = options.values.find(spec.key);
+             const std::string value =
+                 found == options.values.end() ? optionDefault(spec, options.development) : found->second;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 597daff..610537f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -13,6 +13,7 @@
+ #include "Kernel/Stubs/GS.h"
+ #include "Kernel/Stubs/MPEG.h"
+ #include "ps2_host_backend.h"
++#include "rlgl.h"
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ #include "ps2x/iop/iop_spu2_audio.h"
+@@ -573,11 +574,22 @@ namespace
+ // use it.
+ // With PS2X_CAPTURA_RAM=1 the capture also saves the EE RAM (32 MB) next to the PNG, as <path>.ram, taken at the same
+ // moment (to find game variables by what the screen shows).
++// Phase 3 (T2): with PS2X_CAPTURA_VENTANA=1 the request saves the window as presented instead (the frame filter and
++// the FPS counter, without the debug UI), to see the presentation in the automated runs: SaveRequestedCapture leaves
++// the path in s_windowCapturePath and the frame loop saves the window after drawing (SaveWindowCapture).
+ // frame: rows of rowPixels pixels (the frame texture's width), the picture in its top left width x height pixels.
++static const char *const s_captureRequest = std::getenv("PS2X_CAPTURA_PETICION");
++static std::string s_windowCapturePath;
++
+ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t rowPixels, uint32_t width, uint32_t height,
+                                  const uint8_t *rdram)
+ {
+-    static const char *const s_request = std::getenv("PS2X_CAPTURA_PETICION");
++    static const char *const s_request = s_captureRequest;
++    static const bool s_saveWindow = []()
++    {
++        const char *value = std::getenv("PS2X_CAPTURA_VENTANA");
++        return value != nullptr && value[0] == '1';
++    }();
+     static uint32_t s_skip = 0u;
+     if (s_request == nullptr || s_request[0] == '\0')
+         return;
+@@ -598,6 +610,11 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t row
+         path.erase(0, 3); // UTF-8 BOM
+     while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' '))
+         path.pop_back();
++    if (s_saveWindow && !path.empty())
++    {
++        s_windowCapturePath = path;
++        return;
++    }
+     width = std::min<uint32_t>(width, rowPixels);
+     if (!path.empty() && width != 0u && height != 0u && frame.size() >= static_cast<size_t>(rowPixels) * height * 4u)
+     {
+@@ -625,8 +642,22 @@ static void SaveRequestedCapture(const std::vector<uint8_t> &frame, uint32_t row
+     std::remove(s_request);
+ }
+ 
++// The window as drawn so far in this frame (PS2X_CAPTURA_VENTANA=1), then the request file is deleted.
++static void SaveWindowCapture()
++{
++    rlDrawRenderBatchActive();
++    Image image = LoadImageFromScreen();
++    if (image.data == nullptr || !ExportImage(image, s_windowCapturePath.c_str()))
++        std::cerr << "[captura] no se pudo guardar la ventana en " << s_windowCapturePath << std::endl;
++    UnloadImage(image);
++    s_windowCapturePath.clear();
++    if (s_captureRequest != nullptr)
++        std::remove(s_captureRequest);
++}
++
+ // Patch 0100: the frame scaled with bilinear filtering (the window is rarely a whole multiple of it; nearest made
+-// uneven pixels). PS2X_FILTRO=0: nearest, as before.
++// uneven pixels). PS2X_FILTRO=0: nearest, as before. Phase 3 (T2): on the desktop ps2x::DisplayPresenter sets the
++// filter of the frame texture before drawing it; this is the starting one (and the Vita's).
+ static void ApplyFrameFilter(Texture2D &tex)
+ {
+     const char *filterEnv = std::getenv("PS2X_FILTRO");
+@@ -796,6 +827,19 @@ PS2Runtime::PS2Runtime()
+     m_asyncCallbackStackTop = PS2_RAM_SIZE;
+ }
+ 
++ps2x::DisplaySettings PS2Runtime::displaySettings() const
++{
++    std::lock_guard<std::mutex> lock(m_displayMutex);
++    return m_displaySettings;
++}
++
++void PS2Runtime::applyDisplaySettings(const ps2x::DisplaySettings &settings)
++{
++    std::lock_guard<std::mutex> lock(m_displayMutex);
++    m_displaySettings = settings;
++    m_displaySettingsPending = true;
++}
++
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+                                      DebugUiCallback drawCallback,
+                                      DebugUiCallback shutdownCallback,
+@@ -1034,7 +1078,10 @@ bool PS2Runtime::initialize(const char *title)
+             windowFlags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED | FLAG_WINDOW_ALWAYS_RUN;
+         }
+         SetConfigFlags(windowFlags);
+-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        // Phase 3 (T2): filtro, vsync, mostrar_fps, pantalla and tamano_ventana from opciones.ini (their variables).
++        const ps2x::DisplaySettings startDisplay = ps2x::displaySettingsFromEnvironment(
++            [](const char *name) { return static_cast<const char *>(std::getenv(name)); });
++        InitWindow(startDisplay.windowWidth, startDisplay.windowHeight, title);
+ #if defined(_WIN32)
+         if (backgroundWindow)
+         {
+@@ -1063,16 +1110,20 @@ bool PS2Runtime::initialize(const char *title)
+             PlayAudioStream(s_spu2Stream);
+         }
+ #endif
+-        // Patch 0100: PS2X_PANTALLA_COMPLETA=1 starts in borderless full screen (F11 toggles it; not with the background
+-        // window of the automated runs).
++        // Patch 0100: PS2X_PANTALLA_COMPLETA=1 started in borderless full screen. Phase 3 (T2): the presenter starts
++        // the window mode (pantalla; never full screen with the background window of the automated runs), VSync and
++        // the frame cap (60 without VSync, as before).
+ #if !defined(PLATFORM_VITA)
++        m_displayPresenter = std::make_unique<ps2x::DisplayPresenter>();
++        m_displayPresenter->start(startDisplay, backgroundWindow);
+         {
+-            const char *fullEnv = std::getenv("PS2X_PANTALLA_COMPLETA");
+-            if (!backgroundWindow && fullEnv != nullptr && fullEnv[0] == '1')
+-                ToggleBorderlessWindowed();
++            std::lock_guard<std::mutex> lock(m_displayMutex);
++            m_displaySettings = m_displayPresenter->current();
++            m_displaySettingsPending = false;
+         }
+-#endif
++#else
+         SetTargetFPS(60);
++#endif
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2822,6 +2873,7 @@ void PS2Runtime::run()
+     bool aspectChosenByUser = std::getenv("PS2X_ASPECTO") != nullptr;
+ 
+     std::atomic<bool> gameThreadFinished{false};
++    ps2x::GameFrameCounter gameFrameRate; // the FPS counter
+ 
+     std::thread gameThread([&]()
+                            {
+@@ -2879,6 +2931,23 @@ void PS2Runtime::run()
+ 
+             }
+         });
++        if (m_displayPresenter)
++        {
++            ps2x::DisplaySettings requested;
++            bool pending = false;
++            {
++                std::lock_guard<std::mutex> lock(m_displayMutex);
++                std::swap(pending, m_displaySettingsPending);
++                requested = m_displaySettings;
++            }
++            if (pending)
++            {
++                m_displayPresenter->apply(requested);
++                std::lock_guard<std::mutex> lock(m_displayMutex);
++                if (!m_displaySettingsPending)
++                    m_displaySettings = m_displayPresenter->current();
++            }
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+@@ -2889,10 +2958,19 @@ void PS2Runtime::run()
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+-        // Patch 0100: F11 full screen (borderless), F10 the next aspect; the picture in the largest rectangle of the
+-        // aspect (presentAspect) centred in the window.
++        // Patch 0100: F11 full screen (borderless; phase 3: the full screen mode of pantalla), F10 the next aspect; the
++        // picture in the largest rectangle of the aspect (presentAspect) centred in the window.
+         if (IsKeyPressed(KEY_F11))
+-            ToggleBorderlessWindowed();
++        {
++            if (m_displayPresenter)
++            {
++                const ps2x::WindowMode mode = m_displayPresenter->toggleFullscreen().windowMode;
++                std::lock_guard<std::mutex> lock(m_displayMutex);
++                m_displaySettings.windowMode = mode;
++            }
++            else
++                ToggleBorderlessWindowed();
++        }
+         if (!aspectChosenByUser)
+         {
+             const int gameWidescreen = g_gameWidescreen.load(std::memory_order_relaxed);
+@@ -2917,7 +2995,20 @@ void PS2Runtime::run()
+             (screenHeight - dstHeight) * 0.5f,
+             dstWidth,
+             dstHeight};
+-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (m_displayPresenter)
++        {
++            m_displayPresenter->drawFrame(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight, dstRect.x,
++                                          dstRect.y, dstRect.width, dstRect.height);
++            // The counter is drawn over the window only: PS2X_CAPTURA_PETICION saves the game's frame.
++            const GSRegisters &shownRegs = m_memory.gs();
++            gameFrameRate.sample(g_ps2DisplayFlips.load(std::memory_order_relaxed), shownRegs.dispfb1, shownRegs.dispfb2,
++                                 shownRegs.pmode, GetTime());
++            m_displayPresenter->drawOverlay(gameFrameRate.rate());
++        }
++        else
++            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (!s_windowCapturePath.empty())
++            SaveWindowCapture();
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+@@ -2944,6 +3035,11 @@ void PS2Runtime::run()
+         m_debugUiInitialized = false;
+     }
+     UnloadTexture(frameTex);
++    if (m_displayPresenter)
++    {
++        m_displayPresenter->unload();
++        m_displayPresenter.reset();
++    }
+     CloseWindow();
+ 
+     RUNTIME_LOG("[run] exiting loop");
+diff --git a/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h b/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h
+new file mode 100644
+index 0000000..a604c22
+--- /dev/null
++++ b/ps2xRuntime/src/lib/shaders/ps2_display_shaders.h
+@@ -0,0 +1,250 @@
++#pragma once
++
++// Phase 3 (T2): the fragment shaders of the frame filters (GLSL 3.30, raylib's default vertex shader: fragTexCoord and
++// fragColor). Embedded so the .exe needs no extra files. ps2_display.cpp loads them on the main thread.
++namespace ps2x::shaders
++{
++    // nitido: sharp bilinear. The texture (bilinear filtering) is sampled as if it had been scaled up by a whole
++    // factor first (prescale, ps2x::sharpPrescale) with nearest: inside each source pixel the colour is flat, and only
++    // the last fraction of a window pixel at its edge blends with the next one. Crisp pixels without the uneven widths
++    // (shimmering when scrolling) of nearest at a non-integer scale.
++    inline constexpr const char *kSharpBilinear = R"glsl(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec2 textureSize;
++uniform vec2 prescale;
++out vec4 finalColor;
++
++void main()
++{
++    vec2 texel = fragTexCoord * textureSize;
++    vec2 texelFloored = floor(texel);
++    vec2 s = fract(texel);
++    vec2 regionRange = 0.5 - 0.5 / prescale;
++    vec2 centerDistance = s - 0.5;
++    vec2 f = (centerDistance - clamp(centerDistance, -regionRange, regionRange)) * prescale + 0.5;
++    finalColor = vec4(texture(texture0, (texelFloored + f) / textureSize).rgb, 1.0);
++}
++)glsl";
++
++    // crt: a light CRT look. Each scanline takes the colour at its centre and draws it as a beam (a gaussian across
++    // the line, wider for bright colours), with a soft aperture-grille mask on the window columns. Curvature is off
++    // unless PS2X_CRT_CURVATURA=1.
++    inline constexpr const char *kCrt = R"glsl(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec2 textureSize; // texels of the frame texture
++uniform vec2 sourceSize;  // the picture, in the texture's top left corner
++uniform float scanlines;  // lines across the picture (ps2x::crtScanlines)
++uniform float curvature;  // 0: flat
++out vec4 finalColor;
++
++vec2 curve(vec2 uv)
++{
++    uv = uv * 2.0 - 1.0;
++    vec2 offset = abs(uv.yx) / vec2(6.0, 5.0);
++    uv = uv + uv * offset * offset * curvature;
++    return uv * 0.5 + 0.5;
++}
++
++void main()
++{
++    vec2 uv = fragTexCoord * textureSize / sourceSize; // 0..1 across the picture
++    if (curvature > 0.0)
++    {
++        uv = curve(uv);
++        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
++        {
++            finalColor = vec4(0.0, 0.0, 0.0, 1.0);
++            return;
++        }
++    }
++    float line = uv.y * scanlines;
++    float lineCentre = floor(line) + 0.5;
++    float d = line - lineCentre;
++    vec2 sampleUv = vec2(uv.x, lineCentre / scanlines) * sourceSize / textureSize;
++    vec3 colour = pow(texture(texture0, sampleUv).rgb, vec3(2.2));
++    float luma = dot(colour, vec3(0.299, 0.587, 0.114));
++    float width = mix(0.30, 0.45, luma);
++    float beam = exp(-0.5 * d * d / (width * width));
++    colour *= beam * 1.45;
++    vec3 mask = vec3(0.88);
++    mask[int(mod(floor(gl_FragCoord.x), 3.0))] = 1.12;
++    colour *= mask;
++    finalColor = vec4(pow(clamp(colour, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
++}
++)glsl";
++
++    // fsr: AMD FidelityFX Super Resolution 1 (FSR 1.0), ported to GLSL from the float path of ffx_fsr1.h:
++    // EASU (edge adaptive spatial upsampling) draws the picture at the window's size into a render texture, then
++    // RCAS (robust contrast adaptive sharpening) draws that to the window pixel for pixel.
++    //
++    // Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
++    // Permission is hereby granted, free of charge, to any person obtaining a copy
++    // of this software and associated documentation files (the "Software"), to deal
++    // in the Software without restriction, including without limitation the rights
++    // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++    // copies of the Software, and to permit persons to whom the Software is
++    // furnished to do so, subject to the following conditions:
++    // The above copyright notice and this permission notice shall be included in
++    // all copies or substantial portions of the Software.
++    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++    // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++    // THE SOFTWARE.
++    inline constexpr const char *kFsrEasu = R"glsl(#version 330
++// AMD FidelityFX Super Resolution 1.0 EASU, GLSL port. Copyright (c) 2021 Advanced Micro Devices, Inc. MIT license.
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec2 textureSize; // texels of the frame texture
++uniform vec2 sourceSize;  // the picture, in the texture's top left corner
++out vec4 finalColor;
++
++vec3 tap(ivec2 p)
++{
++    return texelFetch(texture0, clamp(p, ivec2(0), ivec2(sourceSize) - 1), 0).rgb;
++}
++
++float luma2(vec3 c) // luma times 2, as FSR
++{
++    return c.b * 0.5 + (c.r * 0.5 + c.g);
++}
++
++float rcpLow(float x)
++{
++    return 1.0 / max(x, 1.0e-20);
++}
++
++void easuSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE)
++{
++    //    a
++    //  b c d
++    //    e
++    float lenX = rcpLow(max(abs(lD - lC), abs(lC - lB)));
++    float dirX = lD - lB;
++    dir.x += dirX * w;
++    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
++    len += lenX * lenX * w;
++    float lenY = rcpLow(max(abs(lE - lC), abs(lC - lA)));
++    float dirY = lE - lA;
++    dir.y += dirY * w;
++    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
++    len += lenY * lenY * w;
++}
++
++void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
++{
++    vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * (-dir.y) + off.y * dir.x) * len;
++    float d2 = min(dot(v, v), clp);
++    float wB = 0.4 * d2 - 1.0;
++    float wA = lob * d2 - 1.0;
++    wB *= wB;
++    wA *= wA;
++    wB = 1.5625 * wB - 0.5625;
++    float w = wB * wA;
++    aC += c * w;
++    aW += w;
++}
++
++void main()
++{
++    //    b c
++    //  e f g h
++    //  i j k l
++    //    n o
++    vec2 pp = fragTexCoord * textureSize - 0.5;
++    vec2 fp = floor(pp);
++    pp -= fp;
++    ivec2 p = ivec2(fp);
++    vec3 b = tap(p + ivec2(0, -1)), c = tap(p + ivec2(1, -1));
++    vec3 e = tap(p + ivec2(-1, 0)), f = tap(p), g = tap(p + ivec2(1, 0)), h = tap(p + ivec2(2, 0));
++    vec3 i = tap(p + ivec2(-1, 1)), j = tap(p + ivec2(0, 1)), k = tap(p + ivec2(1, 1)), l = tap(p + ivec2(2, 1));
++    vec3 n = tap(p + ivec2(0, 2)), o = tap(p + ivec2(1, 2));
++    float bL = luma2(b), cL = luma2(c), eL = luma2(e), fL = luma2(f), gL = luma2(g), hL = luma2(h);
++    float iL = luma2(i), jL = luma2(j), kL = luma2(k), lL = luma2(l), nL = luma2(n), oL = luma2(o);
++
++    vec2 dir = vec2(0.0);
++    float len = 0.0;
++    easuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
++    easuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
++    easuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
++    easuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
++
++    vec2 dir2 = dir * dir;
++    float dirR = dir2.x + dir2.y;
++    bool zero = dirR < (1.0 / 32768.0);
++    dirR = zero ? 1.0 : inversesqrt(dirR);
++    dir.x = zero ? 1.0 : dir.x;
++    dir *= dirR;
++    len = len * 0.5;
++    len *= len;
++    float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));
++    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
++    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
++    float clp = 1.0 / lob;
++
++    vec3 min4 = min(min(f, g), min(j, k));
++    vec3 max4 = max(max(f, g), max(j, k));
++    vec3 aC = vec3(0.0);
++    float aW = 0.0;
++    easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b);
++    easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c);
++    easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
++    easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);
++    easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);
++    easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
++    easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);
++    easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l);
++    easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h);
++    easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);
++    easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, o);
++    easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n);
++    finalColor = vec4(min(max4, max(min4, aC / aW)), 1.0);
++}
++)glsl";
++
++    inline constexpr const char *kFsrRcas = R"glsl(#version 330
++// AMD FidelityFX Super Resolution 1.0 RCAS, GLSL port. Copyright (c) 2021 Advanced Micro Devices, Inc. MIT license.
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec2 textureSize; // the render texture, drawn pixel for pixel
++uniform float sharpness;  // exp2(-stops): 1.0 is the sharpest
++out vec4 finalColor;
++
++#define FSR_RCAS_LIMIT (0.25 - (1.0 / 16.0))
++
++vec3 tap(ivec2 p)
++{
++    return texelFetch(texture0, clamp(p, ivec2(0), ivec2(textureSize) - 1), 0).rgb;
++}
++
++void main()
++{
++    //    b
++    //  d e f
++    //    h
++    ivec2 sp = ivec2(fragTexCoord * textureSize);
++    vec3 b = tap(sp + ivec2(0, -1));
++    vec3 d = tap(sp + ivec2(-1, 0));
++    vec3 e = tap(sp);
++    vec3 f = tap(sp + ivec2(1, 0));
++    vec3 h = tap(sp + ivec2(0, 1));
++    vec3 mn4 = min(min(b, d), min(f, h));
++    vec3 mx4 = max(max(b, d), max(f, h));
++    vec2 peakC = vec2(1.0, -4.0);
++    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0 / 256.0));
++    vec3 hitMax = (peakC.x - max(mx4, e)) / min(4.0 * mn4 + peakC.y, vec3(-1.0 / 256.0));
++    vec3 lobeRGB = max(-hitMin, hitMax);
++    float lobe = max(-FSR_RCAS_LIMIT, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * sharpness;
++    float rcpL = 1.0 / (4.0 * lobe + 1.0);
++    finalColor = vec4(clamp((lobe * (b + d + h + f) + e) * rcpL, 0.0, 1.0), 1.0);
++}
++)glsl";
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 914fc19..748f526 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+     src/ps2_user_paths_tests.cpp
++    src/ps2_display_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index c0159ed..b8e6e33 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -21,6 +21,7 @@ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_ps2_user_paths_tests();
++void register_ps2_display_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -46,6 +47,7 @@ int main()
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     register_ps2_user_paths_tests();
++    register_ps2_display_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_display_tests.cpp b/ps2xTest/src/ps2_display_tests.cpp
+new file mode 100644
+index 0000000..1fb4231
+--- /dev/null
++++ b/ps2xTest/src/ps2_display_tests.cpp
+@@ -0,0 +1,397 @@
++#include "MiniTest.h"
++#include "ps2_display.h"
++#include "ps2_options.h"
++#include "ps2_runtime.h"
++
++#include <map>
++#include <string>
++#include <vector>
++
++namespace
++{
++    using ps2x::DisplaySettings;
++    using ps2x::FrameFilter;
++    using ps2x::WindowMode;
++    using ps2x::WindowStep;
++
++    // The player's filter (chosen from the window captures of fase3 T2); development keeps bilineal.
++    const std::string kPlayerFilter = "fsr";
++
++    using Environment = std::map<std::string, std::string>;
++
++    std::function<const char *(const char *)> environmentOf(const Environment &environment)
++    {
++        return [&environment](const char *name) -> const char *
++        {
++            const auto found = environment.find(name);
++            return found == environment.end() ? nullptr : found->second.c_str();
++        };
++    }
++
++    Environment settingsOf(const ps2x::OptionsFile &options, const Environment &environment = {})
++    {
++        Environment result;
++        for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(options, environmentOf(environment)))
++            result[setting.variable] = setting.value;
++        return result;
++    }
++
++    std::string joined(const std::vector<std::string> &lines)
++    {
++        std::string text;
++        for (const std::string &line : lines)
++            text += line + "\n";
++        return text;
++    }
++
++    std::string stepsText(const std::vector<WindowStep> &steps)
++    {
++        std::string text;
++        for (const WindowStep step : steps)
++            text += step == WindowStep::LeaveBorderless   ? "-sin_bordes "
++                    : step == WindowStep::LeaveFullscreen ? "-completa "
++                    : step == WindowStep::EnterBorderless ? "+sin_bordes "
++                                                          : "+completa ";
++        return text;
++    }
++}
++
++void register_ps2_display_tests()
++{
++    MiniTest::Case("DisplayOptions", [](TestCase &tc)
++    {
++        tc.Run("the default opciones.ini has the display options with the player's and development defaults", [](TestCase &t)
++        {
++            const std::string player = ps2x::defaultOptionsText();
++            for (const std::string line : {"\npantalla = ventana\n", "\ntamano_ventana = 960x720\n",
++                                           "\nvsync = 1\n", "\nmostrar_fps = 0\n"})
++                t.IsTrue(player.find(line) != std::string::npos, "player file has" + line);
++            t.IsTrue(player.find("\nfiltro = " + kPlayerFilter + "\n") != std::string::npos,
++                     "player file has filtro = " + kPlayerFilter);
++            t.IsTrue(player.find("pantalla_completa") == std::string::npos, "pantalla_completa is no longer written");
++            for (const char *comment : {"# Modo de la ventana al arrancar: ventana, sin_bordes",
++                                        "# Tamano de la ventana en modo ventana", "# Filtro al ampliar la imagen",
++                                        "# Sincronizacion vertical", "# Contador de fotogramas por segundo"})
++                t.IsTrue(player.find(comment) != std::string::npos, std::string("comment: ") + comment);
++            t.IsTrue(ps2x::parseOptions(player).warnings.empty(), "the player file parses without warnings");
++
++            const std::string development = ps2x::defaultOptionsText(true);
++            for (const char *line : {"\nfiltro = bilineal\n", "\nvsync = 0\n", "\nmostrar_fps = 0\n",
++                                     "\npantalla = ventana\n", "\ntamano_ventana = 960x720\n"})
++                t.IsTrue(development.find(line) != std::string::npos, std::string("development file has") + line);
++            t.IsTrue(ps2x::parseOptions(development, "opciones.ini", true).warnings.empty(),
++                     "the development file parses without warnings");
++        });
++
++        tc.Run("the display options set their variables", [](TestCase &t)
++        {
++            const ps2x::OptionsFile options = ps2x::parseOptions("pantalla = completa\ntamano_ventana = 1280x960\n"
++                                                                 "filtro = nitido\nvsync = 0\nmostrar_fps = 1\n");
++            t.IsTrue(options.warnings.empty(), "no warnings: " + joined(options.warnings));
++            const Environment set = settingsOf(options);
++            t.IsTrue(set.count("PS2X_PANTALLA") && set.at("PS2X_PANTALLA") == "completa", "PS2X_PANTALLA=completa");
++            t.IsTrue(set.count("PS2X_TAMANO_VENTANA") && set.at("PS2X_TAMANO_VENTANA") == "1280x960",
++                     "PS2X_TAMANO_VENTANA=1280x960");
++            t.IsTrue(set.count("PS2X_FILTRO") && set.at("PS2X_FILTRO") == "nitido", "PS2X_FILTRO=nitido");
++            t.IsTrue(set.count("PS2X_VSYNC") && set.at("PS2X_VSYNC") == "0", "PS2X_VSYNC=0");
++            t.IsTrue(set.count("PS2X_MOSTRAR_FPS") && set.at("PS2X_MOSTRAR_FPS") == "1", "PS2X_MOSTRAR_FPS=1");
++            t.IsTrue(set.count("PS2X_PANTALLA_COMPLETA") == 0u, "the old variable is not set any more");
++
++            const std::map<std::string, std::string> filters = {
++                {"cercano", "0"}, {"bilineal", "1"}, {"nitido", "nitido"}, {"fsr", "fsr"}, {"crt", "crt"}};
++            for (const auto &[value, variable] : filters)
++            {
++                const Environment chosen = settingsOf(ps2x::parseOptions("filtro = " + value + "\n"));
++                t.IsTrue(chosen.count("PS2X_FILTRO") && chosen.at("PS2X_FILTRO") == variable,
++                         "filtro = " + value + " -> PS2X_FILTRO=" + variable);
++            }
++            for (const std::string mode : {"ventana", "sin_bordes", "completa"})
++                t.IsTrue(settingsOf(ps2x::parseOptions("pantalla = " + mode + "\n")).at("PS2X_PANTALLA") == mode,
++                         "pantalla = " + mode);
++        });
++
++        tc.Run("the old pantalla_completa key is still read; pantalla wins over it", [](TestCase &t)
++        {
++            const ps2x::OptionsFile on = ps2x::parseOptions("pantalla_completa = 1\n");
++            t.IsTrue(on.warnings.empty(), "no warning for the old key");
++            t.Equals(on.values.at("pantalla"), std::string("sin_bordes"), "1 -> sin_bordes");
++            t.Equals(settingsOf(on).at("PS2X_PANTALLA"), std::string("sin_bordes"), "PS2X_PANTALLA=sin_bordes");
++            const ps2x::OptionsFile off = ps2x::parseOptions("pantalla_completa = 0\n");
++            t.IsTrue(off.warnings.empty(), "no warning for 0");
++            t.Equals(off.values.at("pantalla"), std::string("ventana"), "0 -> ventana");
++            t.Equals(ps2x::parseOptions("pantalla = completa\npantalla_completa = 1\n").values.at("pantalla"),
++                     std::string("completa"), "pantalla written before wins");
++            t.Equals(ps2x::parseOptions("pantalla_completa = 1\npantalla = ventana\n").values.at("pantalla"),
++                     std::string("ventana"), "pantalla written after wins");
++            const ps2x::OptionsFile bad = ps2x::parseOptions("pantalla_completa = 2\n");
++            t.Equals(bad.values.at("pantalla"), std::string("ventana"), "a bad old value keeps the default");
++            t.Equals(joined(bad.warnings),
++                     std::string("[opciones] opciones.ini:1: valor no valido '2' para pantalla_completa; se usa "
++                                 "ventana (valores: 0, 1)\n"),
++                     "a bad old value is warned: " + joined(bad.warnings));
++        });
++
++        tc.Run("bad display values keep the default of the mode with one warning each", [](TestCase &t)
++        {
++            const char *const text = "filtro = lanczos\nvsync = 2\nmostrar_fps = si\npantalla = total\n"
++                                     "tamano_ventana = 1280\n";
++            const ps2x::OptionsFile player = ps2x::parseOptions(text);
++            t.Equals(player.values.at("filtro"), kPlayerFilter, "filtro falls back to the player's default");
++            t.Equals(player.values.at("vsync"), std::string("1"), "vsync falls back to 1 for the player");
++            t.Equals(player.values.at("mostrar_fps"), std::string("0"), "mostrar_fps falls back to 0");
++            t.Equals(player.values.at("pantalla"), std::string("ventana"), "pantalla falls back to ventana");
++            t.Equals(player.values.at("tamano_ventana"), std::string("960x720"), "tamano_ventana falls back to 960x720");
++            const ps2x::OptionsFile development = ps2x::parseOptions(text, "opciones.ini", true);
++            t.Equals(development.values.at("filtro"), std::string("bilineal"), "filtro falls back to bilineal in development");
++            t.Equals(development.values.at("vsync"), std::string("0"), "vsync falls back to 0 in development");
++            t.Equals(joined(development.warnings),
++                     std::string("[opciones] opciones.ini:1: valor no valido 'lanczos' para filtro; se usa bilineal "
++                                 "(valores: cercano, bilineal, nitido, fsr, crt)\n"
++                                 "[opciones] opciones.ini:2: valor no valido '2' para vsync; se usa 0 (valores: 0, 1)\n"
++                                 "[opciones] opciones.ini:3: valor no valido 'si' para mostrar_fps; se usa 0 "
++                                 "(valores: 0, 1)\n"
++                                 "[opciones] opciones.ini:4: valor no valido 'total' para pantalla; se usa ventana "
++                                 "(valores: ventana, sin_bordes, completa)\n"
++                                 "[opciones] opciones.ini:5: valor no valido '1280' para tamano_ventana; se usa "
++                                 "960x720 (valores: <ancho>x<alto>, de 320x240 a 7680x4320)\n"),
++                     "the warnings: " + joined(development.warnings));
++            for (const char *size : {"x960", "1280x", "0x0", "319x240", "1280x4321", "1280x960x2", "1280 x 960", "-1x5"})
++                t.Equals(ps2x::parseOptions(std::string("tamano_ventana = ") + size + "\n").values.at("tamano_ventana"),
++                         std::string("960x720"), std::string("bad size ") + size);
++            t.Equals(ps2x::parseOptions("tamano_ventana = 7680X4320\n").values.at("tamano_ventana"),
++                     std::string("7680x4320"), "the largest size, any case");
++        });
++
++        tc.Run("variables already set win over the file, the old PS2X_PANTALLA_COMPLETA too", [](TestCase &t)
++        {
++            const ps2x::OptionsFile options = ps2x::parseOptions("pantalla = completa\nfiltro = crt\nvsync = 1\n"
++                                                                 "mostrar_fps = 1\ntamano_ventana = 1280x960\n");
++            const Environment set = settingsOf(options, {{"PS2X_PANTALLA", "ventana"}, {"PS2X_FILTRO", "0"},
++                                                         {"PS2X_VSYNC", "0"}, {"PS2X_MOSTRAR_FPS", "0"},
++                                                         {"PS2X_TAMANO_VENTANA", "800x600"}});
++            for (const char *variable :
++                 {"PS2X_PANTALLA", "PS2X_FILTRO", "PS2X_VSYNC", "PS2X_MOSTRAR_FPS", "PS2X_TAMANO_VENTANA"})
++                t.IsTrue(set.count(variable) == 0u, std::string(variable) + " already set is not touched");
++            t.IsTrue(settingsOf(options, {{"PS2X_PANTALLA_COMPLETA", "1"}}).count("PS2X_PANTALLA") == 0u,
++                     "the old variable keeps the file from setting PS2X_PANTALLA");
++        });
++
++        tc.Run("displaySettingsFromEnvironment reads the variables; unset or bad ones keep the old presentation", [](TestCase &t)
++        {
++            const Environment none;
++            t.IsTrue(ps2x::displaySettingsFromEnvironment(environmentOf(none)) == DisplaySettings{},
++                     "nothing set: bilinear, no vsync, no counter, a 960x720 window");
++            const DisplaySettings defaults;
++            t.IsTrue(defaults.filter == FrameFilter::Bilinear && !defaults.vsync && !defaults.showFps &&
++                         defaults.windowMode == WindowMode::Windowed && defaults.windowWidth == 960 &&
++                         defaults.windowHeight == 720,
++                     "the defaults");
++
++            const Environment all = {{"PS2X_FILTRO", "fsr"}, {"PS2X_VSYNC", "1"}, {"PS2X_MOSTRAR_FPS", "1"},
++                                     {"PS2X_PANTALLA", "completa"}, {"PS2X_TAMANO_VENTANA", "1280x960"}};
++            const DisplaySettings read = ps2x::displaySettingsFromEnvironment(environmentOf(all));
++            t.IsTrue(read.filter == FrameFilter::Fsr && read.vsync && read.showFps &&
++                         read.windowMode == WindowMode::Fullscreen && read.windowWidth == 1280 && read.windowHeight == 960,
++                     "every variable");
++
++            const std::map<std::string, FrameFilter> filters = {
++                {"0", FrameFilter::Nearest}, {"1", FrameFilter::Bilinear}, {"cercano", FrameFilter::Nearest},
++                {"bilineal", FrameFilter::Bilinear}, {"nitido", FrameFilter::Sharp}, {"fsr", FrameFilter::Fsr},
++                {"crt", FrameFilter::Crt}, {"lanczos", FrameFilter::Bilinear}, {"", FrameFilter::Bilinear}};
++            for (const auto &[value, filter] : filters)
++                t.IsTrue(ps2x::displaySettingsFromEnvironment(environmentOf({{"PS2X_FILTRO", value}})).filter == filter,
++                         "PS2X_FILTRO='" + value + "'");
++
++            t.IsTrue(ps2x::displaySettingsFromEnvironment(environmentOf({{"PS2X_PANTALLA_COMPLETA", "1"}})).windowMode ==
++                         WindowMode::Borderless,
++                     "old PS2X_PANTALLA_COMPLETA=1 -> sin_bordes");
++            t.IsTrue(ps2x::displaySettingsFromEnvironment(environmentOf({{"PS2X_PANTALLA_COMPLETA", "0"}})).windowMode ==
++                         WindowMode::Windowed,
++                     "old PS2X_PANTALLA_COMPLETA=0 -> ventana");
++            t.IsTrue(ps2x::displaySettingsFromEnvironment(
++                         environmentOf({{"PS2X_PANTALLA_COMPLETA", "1"}, {"PS2X_PANTALLA", "ventana"}}))
++                             .windowMode == WindowMode::Windowed,
++                     "PS2X_PANTALLA wins over the old variable");
++            const DisplaySettings bad = ps2x::displaySettingsFromEnvironment(
++                environmentOf({{"PS2X_VSYNC", "x"}, {"PS2X_MOSTRAR_FPS", "2"}, {"PS2X_PANTALLA", "total"},
++                               {"PS2X_TAMANO_VENTANA", "10x10"}}));
++            t.IsTrue(bad == DisplaySettings{}, "bad values keep the defaults");
++        });
++
++        tc.Run("DisplaySettings map to the opciones.ini values and back", [](TestCase &t)
++        {
++            DisplaySettings settings;
++            settings.filter = FrameFilter::Crt;
++            settings.vsync = true;
++            settings.showFps = true;
++            settings.windowMode = WindowMode::Borderless;
++            settings.windowWidth = 1280;
++            settings.windowHeight = 960;
++            const std::map<std::string, std::string> values = ps2x::displayOptionValues(settings);
++            const std::map<std::string, std::string> expected = {{"filtro", "crt"}, {"vsync", "1"}, {"mostrar_fps", "1"},
++                                                                 {"pantalla", "sin_bordes"},
++                                                                 {"tamano_ventana", "1280x960"}};
++            t.IsTrue(values == expected, "the five opciones.ini values");
++            t.IsTrue(ps2x::displaySettingsFromOptionValues(values) == settings, "and back");
++
++            for (const FrameFilter filter :
++                 {FrameFilter::Nearest, FrameFilter::Bilinear, FrameFilter::Sharp, FrameFilter::Fsr, FrameFilter::Crt})
++                for (const WindowMode mode : {WindowMode::Windowed, WindowMode::Borderless, WindowMode::Fullscreen})
++                {
++                    DisplaySettings each;
++                    each.filter = filter;
++                    each.windowMode = mode;
++                    each.vsync = mode != WindowMode::Windowed;
++                    std::string text;
++                    for (const auto &[key, value] : ps2x::displayOptionValues(each))
++                        text += key + " = " + value + "\n";
++                    const ps2x::OptionsFile parsed = ps2x::parseOptions(text);
++                    const std::string name = std::string(ps2x::frameFilterName(filter)) + "/" + ps2x::windowModeName(mode);
++                    t.IsTrue(parsed.warnings.empty(), name + ": the values are valid opciones.ini values");
++                    t.IsTrue(ps2x::displaySettingsFromOptionValues(parsed.values) == each, name + ": from the file");
++                    const Environment set = settingsOf(parsed);
++                    t.IsTrue(ps2x::displaySettingsFromEnvironment(environmentOf(set)) == each, name + ": through the variables");
++                }
++            t.IsTrue(ps2x::displaySettingsFromOptionValues({}) == DisplaySettings{}, "missing values: the defaults");
++        });
++
++        tc.Run("names of the filters and window modes", [](TestCase &t)
++        {
++            t.Equals(std::string(ps2x::frameFilterName(FrameFilter::Nearest)), std::string("cercano"), "cercano");
++            t.Equals(std::string(ps2x::frameFilterName(FrameFilter::Bilinear)), std::string("bilineal"), "bilineal");
++            t.Equals(std::string(ps2x::frameFilterName(FrameFilter::Sharp)), std::string("nitido"), "nitido");
++            t.Equals(std::string(ps2x::frameFilterName(FrameFilter::Fsr)), std::string("fsr"), "fsr");
++            t.Equals(std::string(ps2x::frameFilterName(FrameFilter::Crt)), std::string("crt"), "crt");
++            t.Equals(std::string(ps2x::windowModeName(WindowMode::Windowed)), std::string("ventana"), "ventana");
++            t.Equals(std::string(ps2x::windowModeName(WindowMode::Borderless)), std::string("sin_bordes"), "sin_bordes");
++            t.Equals(std::string(ps2x::windowModeName(WindowMode::Fullscreen)), std::string("completa"), "completa");
++            WindowMode mode = WindowMode::Windowed;
++            t.IsTrue(!ps2x::parseWindowMode("1", mode) && mode == WindowMode::Windowed, "no number for pantalla");
++            int width = 0, height = 0;
++            t.IsTrue(ps2x::parseWindowSize("320x240", width, height) && width == 320 && height == 240, "the smallest size");
++            t.IsTrue(!ps2x::parseWindowSize("320x239", width, height), "too short");
++            t.Equals(ps2x::windowSizeText(1920, 1080), std::string("1920x1080"), "size text");
++        });
++
++        tc.Run("sharp bilinear prescales by the whole times the picture fits", [](TestCase &t)
++        {
++            const auto check = [&](float sw, float sh, float dw, float dh, int x, int y)
++            {
++                const ps2x::Prescale p = ps2x::sharpPrescale(sw, sh, dw, dh);
++                t.IsTrue(p.x == x && p.y == y,
++                         std::to_string(sw) + "x" + std::to_string(sh) + " -> " + std::to_string(dw) + "x" +
++                             std::to_string(dh) + ": " + std::to_string(p.x) + "," + std::to_string(p.y));
++            };
++            check(640, 448, 1280, 960, 2, 2);
++            check(512, 448, 1440, 1080, 2, 2);
++            check(512, 448, 2880, 2160, 5, 4);
++            check(1024, 896, 1280, 960, 1, 1); // alta_resolucion in a 1280x960 window: plain bilinear
++            check(1024, 896, 640, 480, 1, 1);  // smaller than the frame
++            check(0, 0, 640, 480, 1, 1);
++        });
++
++        tc.Run("the CRT scanlines are the PS2 lines while each gets 3 window pixels", [](TestCase &t)
++        {
++            t.Equals(ps2x::crtScanlines(448, 1440.0f), 448, "448 lines in 1440 pixels");
++            t.Equals(ps2x::crtScanlines(448, 1344.0f), 448, "exactly 3 pixels each");
++            t.Equals(ps2x::crtScanlines(448, 960.0f), 224, "960 pixels: the 224 field lines");
++            t.Equals(ps2x::crtScanlines(896, 2160.0f), 448, "alta_resolucion frames have the PS2 lines halved");
++            t.Equals(ps2x::crtScanlines(896, 960.0f), 224, "and halved again in a small window");
++            t.Equals(ps2x::crtScanlines(512, 480.0f), 128, "never below 3 pixels while lines can halve");
++            t.Equals(ps2x::crtScanlines(448, 100.0f), 112, "at least 100 lines");
++            t.Equals(ps2x::crtScanlines(0, 960.0f), 1, "no frame: one line");
++        });
++
++        tc.Run("window mode changes and F11", [](TestCase &t)
++        {
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Windowed, WindowMode::Windowed)), std::string(""), "none");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Windowed, WindowMode::Borderless)),
++                     std::string("+sin_bordes "), "window -> borderless");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Windowed, WindowMode::Fullscreen)),
++                     std::string("+completa "), "window -> fullscreen");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Borderless, WindowMode::Fullscreen)),
++                     std::string("-sin_bordes +completa "), "borderless -> fullscreen");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Fullscreen, WindowMode::Borderless)),
++                     std::string("-completa +sin_bordes "), "fullscreen -> borderless");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Fullscreen, WindowMode::Windowed)),
++                     std::string("-completa "), "fullscreen -> window");
++            t.Equals(stepsText(ps2x::windowModeSteps(WindowMode::Borderless, WindowMode::Windowed)),
++                     std::string("-sin_bordes "), "borderless -> window");
++
++            t.IsTrue(ps2x::toggledWindowMode(WindowMode::Windowed, WindowMode::Windowed) == WindowMode::Borderless,
++                     "F11 in a window with pantalla = ventana: borderless, as before");
++            t.IsTrue(ps2x::toggledWindowMode(WindowMode::Windowed, WindowMode::Fullscreen) == WindowMode::Fullscreen,
++                     "F11 with pantalla = completa: exclusive full screen");
++            t.IsTrue(ps2x::toggledWindowMode(WindowMode::Windowed, WindowMode::Borderless) == WindowMode::Borderless,
++                     "F11 with pantalla = sin_bordes: borderless");
++            t.IsTrue(ps2x::toggledWindowMode(WindowMode::Borderless, WindowMode::Fullscreen) == WindowMode::Windowed,
++                     "F11 in full screen: back to the window");
++            t.IsTrue(ps2x::toggledWindowMode(WindowMode::Fullscreen, WindowMode::Fullscreen) == WindowMode::Windowed,
++                     "F11 in exclusive full screen: back to the window");
++        });
++
++        tc.Run("applyDisplaySettings keeps the settings for the window's next frame", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            t.IsTrue(runtime.displaySettings() == DisplaySettings{}, "before initialize: the defaults");
++            DisplaySettings settings;
++            settings.filter = FrameFilter::Sharp;
++            settings.vsync = true;
++            settings.showFps = true;
++            settings.windowMode = WindowMode::Fullscreen;
++            settings.windowWidth = 1280;
++            settings.windowHeight = 960;
++            runtime.applyDisplaySettings(settings);
++            t.IsTrue(runtime.displaySettings() == settings, "the requested settings are the current ones");
++        });
++
++        tc.Run("the game frame counter counts buffer changes, not register writes, at any window rate", [](TestCase &t)
++        {
++            constexpr uint64_t kA = 0x00u, kB = 0x46u; // two FBP values
++            // 50 frames a second writing DISPFB1 and DISPFB2 (two flips each), seen by a window at 60 Hz.
++            ps2x::GameFrameCounter both;
++            for (int k = 0; k <= 120; ++k)
++            {
++                const double seconds = k / 60.0;
++                const uint64_t frames = static_cast<uint64_t>(seconds * 50.0 + 1e-9);
++                const uint64_t shown = (frames & 1u) != 0u ? kB : kA;
++                both.sample(2u * frames, shown, shown, 0x3u, seconds);
++            }
++            t.IsTrue(both.rate() > 49.0 && both.rate() < 51.0, "both registers, 60 Hz window: " + std::to_string(both.rate()));
++
++            // A window at 12 Hz (VSync with the monitor asleep) that always lands on the same buffer: the flips still
++            // count, two per frame because PMODE shows both read circuits.
++            ps2x::GameFrameCounter slow;
++            for (int k = 0; k <= 24; ++k)
++                slow.sample(8u * static_cast<uint64_t>(k), kA, kA, 0x3u, k / 12.0);
++            t.IsTrue(slow.rate() > 47.0 && slow.rate() < 49.0, "aliased 12 Hz window: " + std::to_string(slow.rate()));
++
++            // One read circuit, only DISPFB1 flips.
++            ps2x::GameFrameCounter one;
++            for (int k = 0; k <= 120; ++k)
++            {
++                const double seconds = k / 60.0;
++                const uint64_t frames = static_cast<uint64_t>(seconds * 25.0 + 1e-9);
++                one.sample(frames, (frames & 1u) != 0u ? kB : kA, kA, 0x1u, seconds);
++            }
++            t.IsTrue(one.rate() > 24.0 && one.rate() < 26.0, "one register at 25 fps: " + std::to_string(one.rate()));
++
++            ps2x::GameFrameCounter still;
++            for (int k = 0; k <= 120; ++k)
++                still.sample(10u, kA, kA, 0x3u, k / 60.0);
++            t.Equals(still.rate(), 0.0, "no flips: 0");
++        });
++
++        tc.Run("the frame rate meter counts per second", [](TestCase &t)
++        {
++            ps2x::RateMeter meter;
++            t.IsTrue(!meter.sample(100u, 10.0), "the first sample only starts");
++            t.Equals(meter.rate(), 0.0, "no rate yet");
++            t.IsTrue(!meter.sample(140u, 10.5), "half a second: not yet");
++            t.IsTrue(meter.sample(150u, 11.0), "a second");
++            t.Equals(meter.rate(), 50.0, "50 per second");
++            t.IsTrue(meter.sample(200u, 13.0), "two seconds");
++            t.Equals(meter.rate(), 25.0, "25 per second");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index af3dc9f..8f89e70 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -311,7 +311,7 @@ void register_ps2_user_paths_tests()
+         tc.Run("the default opciones.ini lists every option with its default and a comment", [](TestCase &t)
+         {
+             const std::string text = ps2x::defaultOptionsText();
+-            for (const char *line : {"pantalla_completa = 0\n", "aspecto = auto\n", "filtro = bilineal\n",
++            for (const char *line : {"pantalla = ventana\n", "aspecto = auto\n", "filtro = fsr\n",
+                                      "volumen = 100\n", "registro = 1\n"})
+                 t.IsTrue(text.find(line) != std::string::npos, std::string("has ") + line);
+             const ps2x::OptionsFile parsed = ps2x::parseOptions(text);
+@@ -323,7 +323,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{8}, "eight options");
++            t.Equals(ps2x::optionSpecs().size(), size_t{11}, "eleven options");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);
+@@ -353,7 +353,7 @@ void register_ps2_user_paths_tests()
+                 "volumen = 35\r\n"
+                 "registro = 0");
+             t.IsTrue(parsed.warnings.empty(), "no warnings");
+-            t.Equals(parsed.values.at("pantalla_completa"), std::string("1"), "pantalla_completa");
++            t.Equals(parsed.values.at("pantalla"), std::string("sin_bordes"), "the old Pantalla_Completa=1 key");
+             t.Equals(parsed.values.at("aspecto"), std::string("16:9"), "aspecto");
+             t.Equals(parsed.values.at("filtro"), std::string("cercano"), "filtro");
+             t.Equals(parsed.values.at("volumen"), std::string("35"), "volumen");
+@@ -401,11 +401,11 @@ void register_ps2_user_paths_tests()
+             t.IsTrue(set.count("PS2X_VOLUMEN") == 0u, "a variable already set is not touched");
+             t.Equals(set.at("PS2X_FILTRO"), std::string("0"), "cercano -> PS2X_FILTRO=0");
+             t.Equals(set.at("PS2X_ASPECTO"), std::string("4:3"), "aspecto -> PS2X_ASPECTO");
+-            t.Equals(set.at("PS2X_PANTALLA_COMPLETA"), std::string("0"), "default pantalla_completa");
++            t.Equals(set.at("PS2X_PANTALLA"), std::string("ventana"), "default pantalla");
+             t.Equals(set.at("PS2X_LOG"), std::string("1"), "default registro");
+ 
+             const std::map<std::string, std::string> defaults =
+-                environmentMap(ps2x::optionsEnvironment(ps2x::parseOptions(""), getEnvironment));
++                environmentMap(ps2x::optionsEnvironment(ps2x::parseOptions("filtro = bilineal\n"), getEnvironment));
+             t.IsTrue(defaults.count("PS2X_ASPECTO") == 0u, "aspecto = auto leaves the game's own option");
+             t.Equals(defaults.at("PS2X_FILTRO"), std::string("1"), "bilineal -> PS2X_FILTRO=1");
+         });

@@ -1,0 +1,182 @@
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index b377b9d..2701624 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -201,11 +201,20 @@ namespace ps2x
+              "vuelve a la carrera. En el mando, R3 (pulsar el stick derecho) hace lo mismo y L3 muestra u oculta la\n"
+              "ayuda."},
+             // Lejania T4: also a row of GRAFICOS PC; the game reads it every frame (src/f1_overrides.cpp, igualarCalidadV1).
+-            // Development keeps it on too: it is the PS2's own level of detail.
+-            {"detalle_coches", "PS2X_DETALLE_COCHES", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++            // Development keeps it on too: it is the PS2's own level of detail. Lejania T5: 2 and 3, more than the PS2
++            // (src/f1_overrides.cpp, lodCoches).
++            {"detalle_coches", "PS2X_DETALLE_COCHES", "1", {{"0", "0"}, {"1", "1"}, {"2", "2"}, {"3", "3"}}, 0, 0,
+              "Detalle de los coches lejanos: 1 = como en la PS2 (cada coche cambia a un modelo mas sencillo a 20, 40 y\n"
+              "60 m); 0 = reducido, como el port antes (a menos de la mitad de esas distancias, algo mas rapido en un PC\n"
+-             "lento)."},
++             "lento); 2 = alto (al doble de distancia que en la PS2); 3 = maximo (todos los coches con el modelo de\n"
++             "cerca, como el del jugador, a cualquier distancia; lo que mas cuesta)."},
++            // Lejania T5: also a row of GRAFICOS PC; the game reads it every frame (src/f1_overrides.cpp,
++            // fundidoCircuito). Development keeps the PS2's distances too.
++            {"distancia_circuito", "PS2X_DISTANCIA_CIRCUITO", "100", {{"100", "100"}, {"150", "150"}, {"200", "200"}},
++             0, 0,
++             "Distancia a la que se ve el escenario del circuito (gradas, arboles, carteles...), en tanto por ciento de\n"
++             "la de la PS2: 100 = como en la PS2 (los objetos se funden a 150, 300, 450 o 1200 m segun su tipo); 150 =\n"
++             "lejos; 200 = muy lejos (al doble)."},
+             // Fase 5 (T16): also the OPPONENT AI row of the game's DIFFICULTY menu; the race reads it when it sets up
+             // the AI drivers and cars (src/f1_overrides.cpp, ps2_ai_difficulty.h).
+             {"dificultad_ia", "PS2X_DIFICULTAD_IA", "0", {}, 0, 100,
+@@ -577,7 +586,8 @@ namespace ps2x
+     {
+         static const std::vector<std::vector<std::string>> pages = {
+             {},
+-            {"filtro", "supersampling", "alta_resolucion", "vsync", "mostrar_fps", "pantalla", "volumen", "detalle_coches"},
++            {"filtro", "supersampling", "alta_resolucion", "vsync", "mostrar_fps", "pantalla", "volumen", "detalle_coches",
++             "distancia_circuito"},
+             {"saltar_intro", "latencia_audio", "audio_mono", "vibracion", "daltonismo", "tecla_foto", "hud", "tecla_hud",
+              "cargas_rapidas", "fov", "tecla_modo_foto"},
+             {"aspecto", "tamano_ventana", "gs"},
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 606d510..e0778d7 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -100,10 +100,16 @@ namespace
+                "Mueve los colores que se confunden a otros que se distinguen, sobre la imagen ya ampliada."},
+               {"tecla_foto", "Tecla de foto", {{"f12", "F12"}, {"f9", "F9"}, {"f8", "F8"}, {"no", "Ninguna"}},
+                "Guarda la imagen del juego a su resolución interna, en PNG, en la carpeta capturas."},
+-              // Lejania T4.
+-              {"detalle_coches", "Detalle de los coches", {{"1", "Como en PS2"}, {"0", "Reducido"}},
++              // Lejania T4 and T5.
++              {"detalle_coches", "Detalle de los coches",
++               {{"1", "Como en PS2"}, {"0", "Reducido"}, {"2", "Alto"}, {"3", "Máximo"}},
+                "Como en PS2: los coches lejanos cambian a modelos más sencillos a 20, 40 y 60 m. Reducido: a menos de "
+-               "la mitad de esas distancias, como el port antes; algo más rápido en un PC lento."}}},
++               "la mitad de esas distancias, como el port antes. Alto: al doble de distancia. Máximo: todos con el "
++               "modelo de cerca, como el del jugador; lo que más cuesta."},
++              {"distancia_circuito", "Distancia del escenario",
++               {{"100", "Como en PS2"}, {"150", "Lejos"}, {"200", "Muy lejos"}},
++               "Gradas, árboles y carteles del circuito se ven hasta 1,5 o 2 veces más lejos que en la PS2 "
++               "(150, 300, 450 o 1200 m según el objeto)."}}},
+             {"Sonido",
+              {{"volumen", "Volumen", {}, "El volumen de todo el sonido del juego."},
+               // Fase 5 (T5, T6).
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 85c11c2..0daf6af 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -279,8 +279,9 @@ void register_ps2_options_menu_tests()
+         {
+             using Keys = std::vector<std::string>;
+             t.IsTrue(ps2x::gameOptionsPageKeys(1) == Keys{"filtro", "supersampling", "alta_resolucion", "vsync",
+-                                                           "mostrar_fps", "pantalla", "volumen", "detalle_coches"},
+-                     "PC GRAPHICS: its eight rows");
++                                                           "mostrar_fps", "pantalla", "volumen", "detalle_coches",
++                                                           "distancia_circuito"},
++                     "PC GRAPHICS: its nine rows");
+             t.IsTrue(ps2x::gameOptionsPageKeys(2) == Keys{"saltar_intro", "latencia_audio", "audio_mono", "vibracion",
+                                                            "daltonismo", "tecla_foto", "hud", "tecla_hud",
+                                                            "cargas_rapidas", "fov", "tecla_modo_foto"},
+@@ -313,7 +314,8 @@ void register_ps2_options_menu_tests()
+                 "mostrar_fps = 1\nvolumen = 40\nregistro = 0\ngs = cpu\nsupersampling = 8\nalta_resolucion = 0\n"
+                 "saltar_intro = 1\nlatencia_audio = alta\naudio_mono = 1\nvibracion = 30\ndaltonismo = tritanopia\n"
+                 "tecla_foto = f9\nhud = oculto\ntecla_hud = f7\ncargas_rapidas = 0\nfov = 20\ntecla_modo_foto = p\n"
+-                "dificultad_ia = 40\nred_puerto = 50700\nred_calidad = alta\nred_publicas = 1\ndetalle_coches = 0\n";
++                "dificultad_ia = 40\nred_puerto = 50700\nred_calidad = alta\nred_publicas = 1\ndetalle_coches = 0\n"
++                "distancia_circuito = 200\n";
+             for (int page : {1, 2})
+             {
+                 const Environment environment = {{"PS2X_VOLUMEN", "10"}};
+@@ -632,7 +634,7 @@ void register_ps2_options_menu_tests()
+         });
+ 
+         // Lejania T4: the cars' level of detail (detalle_coches = 1, as on the PS2, or 0, the port's old reduced one),
+-        // on in development too.
++        // on in development too. Lejania T5: 2 (high, each level twice as far) and 3 (maximum, every piece at level 0).
+         tc.Run("the detalle_coches option has its default, variable, checks and number", [](TestCase &t)
+         {
+             t.Equals(ps2x::parseOptions("").values.at("detalle_coches"), std::string("1"), "as on the PS2 by default");
+@@ -649,7 +651,10 @@ void register_ps2_options_menu_tests()
+                     variable = setting.value;
+             t.Equals(variable, std::string("0"), "detalle_coches -> PS2X_DETALLE_COCHES");
+ 
+-            const ps2x::OptionsFile bad = ps2x::parseOptions("detalle_coches = 2\n");
++            for (const char *level : {"2", "3"})
++                t.IsTrue(ps2x::parseOptions(std::string("detalle_coches = ") + level + "\n").warnings.empty(),
++                         std::string("level ") + level + " is valid");
++            const ps2x::OptionsFile bad = ps2x::parseOptions("detalle_coches = 4\n");
+             t.Equals(bad.warnings.size(), size_t{1u}, "a bad value warns");
+             t.Equals(bad.values.at("detalle_coches"), std::string("1"), "and takes the default");
+ 
+@@ -664,12 +669,58 @@ void register_ps2_options_menu_tests()
+             t.Equals(value, 1.0f, "as on the PS2");
+             t.IsTrue(ps2x::setMenuOptionNumber(model, "detalle_coches", 0.0f), "reduced");
+             t.Equals(model.current.at("detalle_coches"), std::string("0"), "is 0");
+-            t.IsFalse(ps2x::setMenuOptionNumber(model, "detalle_coches", 2.0f), "past as on the PS2");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "detalle_coches", 2.0f), "high");
++            t.Equals(model.current.at("detalle_coches"), std::string("2"), "is 2");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "detalle_coches", 3.0f), "maximum");
++            t.IsTrue(ps2x::menuOptionNumber(model, "detalle_coches", value), "read back");
++            t.Equals(value, 3.0f, "as the level itself");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "detalle_coches", 4.0f), "past maximum");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "detalle_coches", 0.0f), "reduced again");
+             const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
+             t.Equals(fileValue(saved, "detalle_coches"), std::string("0"), "CONFIRM writes it");
+             t.Equals(fileValue(saved, "fov"), std::string("0"), "the other options keep their values");
+         });
+ 
++        // Lejania T5: how far the track's scenery is drawn (distancia_circuito = 100, as on the PS2, 150 or 200 per
++        // cent of the game's fade distances), as on the PS2 in development too.
++        tc.Run("the distancia_circuito option has its default, variable, checks and number", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("distancia_circuito"), std::string("100"), "as on the PS2 by default");
++            t.Equals(fileValue("", "distancia_circuito", true), std::string("100"), "also in development");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "distancia_circuito = 100\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "detalle_coches = 1\n"), "and keeps detalle_coches");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("distancia_circuito = 150\n");
++            t.IsTrue(file.warnings.empty(), "a valid value gives no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            std::string variable = "<none>";
++            for (const ps2x::EnvironmentSetting &setting : settings)
++                if (setting.variable == "PS2X_DISTANCIA_CIRCUITO")
++                    variable = setting.value;
++            t.Equals(variable, std::string("150"), "distancia_circuito -> PS2X_DISTANCIA_CIRCUITO");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("distancia_circuito = 120\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "a value off the list warns");
++            t.Equals(bad.values.at("distancia_circuito"), std::string("100"), "and takes the default");
++
++            const Environment environment = {{"PS2X_DISTANCIA_CIRCUITO", "200"}};
++            const ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            t.Equals(forced.current.at("distancia_circuito"), std::string("200"), "the variable wins over the file");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "distancia_circuito", value), "a number for the game's row");
++            t.Equals(value, 100.0f, "as on the PS2: the per cent itself");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "distancia_circuito", 200.0f), "very far");
++            t.Equals(model.current.at("distancia_circuito"), std::string("200"), "is 200");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "distancia_circuito", 300.0f), "past very far");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "distancia_circuito", 1.0f), "not a position in the list");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "distancia_circuito"), std::string("200"), "CONFIRM writes it");
++            t.Equals(fileValue(saved, "detalle_coches"), std::string("1"), "the other options keep their values");
++        });
++
+         // Fase 5 (T16): a finer opponent AI (dificultad_ia = 0, the game's three levels, or 1 to 100).
+         tc.Run("the dificultad_ia option has its default, variable, checks and number", [](TestCase &t)
+         {
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 8890730..183b44e 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{27}, "twenty-seven options (fase 5: fifteen more; lejania: one)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{28}, "twenty-eight options (fase 5: fifteen more; lejania: two)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

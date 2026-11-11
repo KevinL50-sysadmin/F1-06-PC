@@ -1,0 +1,26 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f047ef5..b665fbc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4469,7 +4469,7 @@ struct GSCpuBackend::BandState
+     // bottleneck (a race), workers spinning between jobs that come every few microseconds kept four cores busy and
+     // slowed down the EE thread (turbo, hyper-threading siblings).
+     static constexpr uint64_t kPublishBatch = 32u;
+-    static constexpr int kWorkerSpin = 64;
++    static constexpr int kWorkerSpin = 8192; // patch 0110 (was 64)
+     static constexpr int kCoordinatorSpin = 4000;
+ 
+     unsigned threads = 0u;
+@@ -5071,7 +5071,11 @@ struct GSCpuBackend::BandState
+             uint64_t available = published.load(std::memory_order_acquire);
+             if (available == next)
+             {
+-                const int spin = g_ps2AbMode.load(std::memory_order_relaxed) == 48 ? 0 : kWorkerSpin;
++                // Patch 0110: a band spins ~0.3 ms (8192 pauses, was 64) before sleeping; the coordinator spent ~9 % of its
++                // time waking sleeping bands (NtAlertThreadByThreadIdEx) during the start with 22 cars. A/B: +2.4 % (two
++                // runs, 21 pairs; up to +11 % in the slow windows). A/B mode 104: 64, as before.
++                const int abSpin = g_ps2AbMode.load(std::memory_order_relaxed);
++                const int spin = abSpin == 48 ? 0 : abSpin == 104 ? 64 : kWorkerSpin;
+                 for (int i = 0; i < spin && available == next; ++i)
+                 {
+                     spinPause();

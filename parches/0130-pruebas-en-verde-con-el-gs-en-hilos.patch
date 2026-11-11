@@ -1,0 +1,817 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 4c3f641..1f53c01 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -147,6 +147,9 @@ public:
+ 
+     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
++    // Until every GIF packet queued by this thread and every backend command so far has run, so the caller may read
++    // or write the local memory array directly (tests; the GS methods that return data already wait).
++    void waitIdle() const;
+ 
+ private:
+     void snapshotVRAM();
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index e2444e9..a6739ac 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -2196,6 +2196,16 @@ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint
+     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
+ }
+ 
++void GS::waitIdle() const
++{
++    gifSyncBeforeAccess(__func__);
++    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    // A readback is what every backend completes first: the threaded one drains its queue, the CPU one waits for its
++    // band jobs.
++    if (m_backend)
++        (void)m_backend->ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
++}
++
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     gifSyncBeforeAccess(__func__);
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 967ceb2..4f1ba58 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -48,6 +48,9 @@ target_include_directories(ps2_test_lib PRIVATE
+     ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+ )
+ 
++# Lets tests read source files (e.g. instructions.h) whatever the working directory.
++target_compile_definitions(ps2_test_lib PRIVATE PS2X_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
++
+ target_link_libraries(ps2_test_lib PRIVATE
+     ps2_recomp_lib
+     ps2_analyzer_lib
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 463b6cf..f7d2192 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1267,14 +1267,13 @@ void register_code_generator_tests()
+         });
+ 
+         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {
++            // Resolved from the source tree (PS2X_TEST_SOURCE_DIR, set by CMake), not from the working directory.
+             const std::vector<std::string> candidates = {
+-                "ps2xRecomp/include/ps2recomp/instructions.h",
+-                "../ps2xRecomp/include/ps2recomp/instructions.h",
+-                "../../ps2xRecomp/include/ps2recomp/instructions.h"
++                PS2X_TEST_SOURCE_DIR "/../ps2xRecomp/include/ps2recomp/instructions.h"
+             };
+ 
+             std::string text = readFileFromCandidates(candidates);
+-            t.IsTrue(!text.empty(), "instructions.h should be readable from the test working directory");
++            t.IsTrue(!text.empty(), "instructions.h should be readable from the source tree");
+ 
+             std::vector<uint32_t> s1 = parseEnumValues(text, "VU0_S1_");
+             std::vector<uint32_t> s2 = parseEnumValues(text, "VU0_S2_");
+diff --git a/ps2xTest/src/gs_test_sync.h b/ps2xTest/src/gs_test_sync.h
+new file mode 100644
+index 0000000..598093f
+--- /dev/null
++++ b/ps2xTest/src/gs_test_sync.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include "runtime/gs/gs_frontend.h"
++
++// The tests run the GS as the game does: GIF packets from DMA/VIF1/XGKICK on the GIF thread (patch 0082), and the
++// rasterizer on its own thread and band workers (patches 0026, 0030). A test that reads or writes the local memory
++// array directly, instead of through GS::ReadVram/WriteVram, waits for the GS first.
++inline void waitForGs(const GS &gs)
++{
++    gs.waitIdle();
++}
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 07f9b7a..c165eef 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -293,12 +293,13 @@ void register_pad_input_tests()
+             ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should accept analog mode");
+ 
++            // Patch 0010: the DualShock 2 mode table is {digital (4), DualShock (7)} in either mode.
+             setRegU32(ctx, 4, 0u);
+             setRegU32(ctx, 5, 0u);
+             setRegU32(ctx, 6, 4);
+-            setRegU32(ctx, 7, 0u);
++            setRegU32(ctx, 7, 1u);
+             ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+-            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "mode table entry should return DualShock in analog mode");
++            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "mode table entry 1 should return DualShock in analog mode");
+ 
+             closePadPort(ctx, rdram);
+         });
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..a8730cb 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -11,6 +11,7 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "Stubs/Helpers/Support.h"
+ #include "Stubs/GS.h"
++#include "gs_test_sync.h"
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -644,6 +645,7 @@ void register_ps2_gs_tests()
+             setRegU32(ctx, 5, 0u);
+             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+ 
++            waitForGs(runtime.gs());
+             uint32_t clearedPixel = 0u;
+             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+             t.Equals(clearedPixel, kClearColor,
+@@ -699,6 +701,7 @@ void register_ps2_gs_tests()
+             setRegU32(ctx, 5, 0u);
+             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+ 
++            waitForGs(runtime.gs());
+             uint32_t clearedPixel = 0u;
+             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+             t.Equals(clearedPixel, kClearColor,
+@@ -725,6 +728,7 @@ void register_ps2_gs_tests()
+             t.IsTrue(gs.clearFramebufferContext(0u, kCtx0Color),
+                      "context-targeted clear should succeed for a configured CT32 framebuffer");
+ 
++            waitForGs(gs);
+             const uint32_t ctx0Pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 0u, 1u);
+             t.Equals(ctx0Pixel, kCtx0Color,
+                      "context-targeted clear should write the requested context even when PRIM.ctxt points elsewhere");
+@@ -769,6 +773,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ3, xyz(0u, 6u));
+             gs.writeRegister(GS_REG_XYZ2, xyz(6u, 6u));
+ 
++            waitForGs(gs);
+             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), 0u,
+                      "XYZ3 should suppress the completed ABC triangle");
+             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 4u), kColor,
+@@ -803,6 +808,7 @@ void register_ps2_gs_tests()
+                 gs.writeRegister(GS_REG_FOG, static_cast<uint64_t>(fog) << 56);
+                 gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
++                waitForGs(gs);
+                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             };
+ 
+@@ -845,6 +851,7 @@ void register_ps2_gs_tests()
+                 gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+                 gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
++                waitForGs(gs);
+                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             };
+ 
+@@ -875,6 +882,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t blendedPixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&blendedPixel, vram.data(), sizeof(blendedPixel));
+             t.Equals(blendedPixel, 0x013F3F3Fu,
+                      "without PABE, low-alpha fullscreen copies should still apply ALPHA blending");
+@@ -887,6 +895,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pabeBypassedPixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pabeBypassedPixel, vram.data(), sizeof(pabeBypassedPixel));
+             t.Equals(pabeBypassedPixel, 0x01000000u,
+                      "with PABE enabled, low-alpha source pixels should bypass ALPHA blending and overwrite the destination");
+@@ -899,6 +908,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t highAlphaPixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&highAlphaPixel, vram.data(), sizeof(highAlphaPixel));
+             t.Equals(highAlphaPixel, 0x803F3F3Fu,
+                      "with PABE enabled, high-alpha source pixels should still use the configured ALPHA blend");
+@@ -921,6 +931,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixelWithoutFba = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixelWithoutFba, vram.data(), sizeof(pixelWithoutFba));
+             t.Equals(pixelWithoutFba, 0x01112233u,
+                      "without FBA, CT32 writes should preserve the source alpha byte");
+@@ -933,6 +944,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixelWithFba = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixelWithFba, vram.data(), sizeof(pixelWithFba));
+             t.Equals(pixelWithFba, 0x81112233u,
+                      "with FBA enabled, CT32 writes should force the framebuffer alpha high bit");
+@@ -1004,6 +1016,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_UV, kUvRow1);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
++            waitForGs(gs);
+             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
+             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
+                      "CT32 primitives should land in the same local-memory layout that later CT32 texture sampling expects");
+@@ -1074,6 +1087,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, kXyz0);
+             gs.writeRegister(GS_REG_UV, kUv1);
+             gs.writeRegister(GS_REG_XYZ2, kXyz1);
++            waitForGs(gs);
+ 
+             for (uint32_t y = 0u; y < 4u; ++y)
+             {
+@@ -1291,6 +1305,10 @@ void register_ps2_gs_tests()
+             t.Equals(static_cast<uint32_t>(staleFrame[0]), 0x44u,
+                      "latched host presentation should stay stable until the next latch");
+ 
++            // The threaded backend (patch 0026) converts the snapshot published last: a latch shows the snapshot
++            // queued by the previous one.
++            gs.latchHostPresentationFrame();
++            waitForGs(gs);
+             gs.latchHostPresentationFrame();
+ 
+             std::vector<uint8_t> refreshedFrame;
+@@ -1948,6 +1966,7 @@ void register_ps2_gs_tests()
+                 gs.writeRegister(GS_REG_ST, packSt(s, tVal));
+                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
+ 
++                waitForGs(gs);
+                 const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                 t.Equals(pixel, sample.color,
+                          "T4 triangle sampling should fetch the manual-layout atlas texel from the correct 128x128 page");
+@@ -2020,6 +2039,7 @@ void register_ps2_gs_tests()
+             packet.insert(packet.end(), payload, payload + sizeof(payload));
+ 
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
+ 
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)
+@@ -2074,6 +2094,7 @@ void register_ps2_gs_tests()
+             packet.insert(packet.end(), payload, payload + sizeof(payload));
+ 
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
+ 
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)
+@@ -2147,6 +2168,7 @@ void register_ps2_gs_tests()
+             packet.insert(packet.end(), payload, payload + sizeof(payload));
+ 
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
+ 
+             bool same = true;
+             for (uint32_t y = 0; y < 2u && same; ++y)
+@@ -2206,6 +2228,7 @@ void register_ps2_gs_tests()
+             packet.insert(packet.end(), payload, payload + sizeof(payload));
+ 
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
+ 
+             t.Equals(gs.nativeImageUploadCount(), 1ull, "load-image packet should use the native image upload fast path");
+ 
+@@ -2483,6 +2506,7 @@ void register_ps2_gs_tests()
+             appendU64(packet, 0ull);
+             packet.insert(packet.end(), upload.begin(), upload.end());
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            waitForGs(gs);
+ 
+             bool aliasOk = true;
+             uint32_t badX = 0u;
+@@ -2645,6 +2669,7 @@ void register_ps2_gs_tests()
+             // TEX0 loads the palette into the GS CLUT temporary buffer. The
+             // source VRAM can subsequently be reused without changing the
+             // palette seen by this draw.
++            waitForGs(gs);
+             std::memcpy(vram.data() + expectedClutOff, &kWrongColor, sizeof(kWrongColor));
+             gs.writeRegister(GS_REG_TEX0_1, kTex0LoadIfCbp0Changed);
+ 
+@@ -2656,12 +2681,15 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "T4 CSM1 lookup should keep the cached palette after its source VRAM is reused");
+         });
+ 
+-        tc.Run("GS texture page buffer hides local-memory writes until TEXFLUSH", [](TestCase &t)
++        // Patch 0021: texture reads go straight to local memory, without the real GS's stale texture page buffer
++        // until TEXFLUSH (copying the 8 KB page dominated the race profile).
++        tc.Run("GS texture reads see local-memory writes without waiting for TEXFLUSH", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+             GS gs;
+@@ -2717,8 +2745,8 @@ void register_ps2_gs_tests()
+ 
+             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u), kInitialColor,
+                      "the first sample should read the original texture page");
+-            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kInitialColor,
+-                     "writes to local memory must remain hidden by the cached texture page");
++            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kUpdatedColor,
++                     "writes to local memory should be visible to the next texture read");
+             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 0u), kUpdatedColor,
+                      "TEXFLUSH must make the updated local-memory page visible to texture reads");
+         });
+@@ -2801,6 +2829,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "T8 CSM1 CLUT sampling should read CT32-uploaded palette entries through GS swizzled addressing");
+@@ -2863,6 +2892,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "T8 CSM1 should offset by CSA while CT32 ignores the fifth CSA bit");
+@@ -2929,6 +2959,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "CT16 CSM1 should retain CSA[4] instead of aliasing the upper palette onto the lower one");
+@@ -3069,6 +3100,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "TEX2 should override the active CLUT base and format state without requiring a new TEX0 write");
+@@ -3134,6 +3166,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+             t.Equals(pixel, kExpectedColor,
+                      "TEXCLUT should offset the CLUT lookup coordinates instead of always starting from the CLUT base");
+@@ -3208,6 +3241,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_UV, (16ull << 0));
+             gs.writeRegister(GS_REG_XYZ2, (32ull << 0) | (16ull << 16));
+ 
++            waitForGs(gs);
+             const uint32_t redPixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             const uint32_t blackPixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u);
+             t.Equals(redPixel, kExpectedRed,
+@@ -3273,6 +3307,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+ 
++            waitForGs(gs);
+             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             t.Equals(pixel, kExpectedPixel,
+                      "TCC=0 MODULATE should still use texture RGB while sourcing alpha from the shaded vertex");
+@@ -3335,6 +3370,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+ 
++            waitForGs(gs);
+             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             t.Equals(pixel, kExpectedPixel,
+                      "HIGHLIGHT should add the shaded vertex alpha into RGB and accumulate texture plus vertex alpha");
+@@ -3397,6 +3433,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+ 
++            waitForGs(gs);
+             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             t.Equals(pixel, kExpectedPixel,
+                      "HIGHLIGHT2 should add the shaded vertex alpha into RGB while preserving the texture alpha");
+@@ -3469,13 +3506,15 @@ void register_ps2_gs_tests()
+                 gs.writeRegister(GS_REG_TEX1_1, tex1Reg);
+                 gs.writeRegister(GS_REG_PRIM, kPrim);
+                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
++                // Patch 0119: sampled at the integer pixel coordinate, so pixel (1,1) gets S = 1.5 / 4 (U = 0.75).
+                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, 0ull);
+-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
++                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
+                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
+ 
++                waitForGs(gs);
+                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+             };
+ 
+@@ -3557,6 +3596,7 @@ void register_ps2_gs_tests()
+                 gs.writeRegister(GS_REG_UV, uv);
+                 gs.writeRegister(GS_REG_XYZ2, (32ull << 16));
+ 
++                waitForGs(gs);
+                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+             };
+ 
+@@ -3638,17 +3678,20 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
+-            gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
++            // Patch 0119: triangles are sampled at the integer pixel coordinate (as the GS and PCSX2), not at the
++            // pixel centre, so pixel (1,1) has weight 1/4 for the second vertex.
++            gs.writeRegister(GS_REG_ST, packSt(4.0f, 0.0f));
++            gs.writeRegister(GS_REG_RGBAQ, packRgbaq(4.0f));
+             gs.writeRegister(GS_REG_XYZ2, 64ull);
+             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
+             gs.writeRegister(GS_REG_XYZ2, (64ull << 16));
+ 
++            waitForGs(gs);
+             const uint32_t pixel =
+                 readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+             t.Equals(pixel, kHomogeneousTexel,
+-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
++                     "the DDA should interpolate S=1.0 and Q=1.75, selecting texel 2 after S/Q");
+         });
+ 
+         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
+@@ -3846,7 +3889,10 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 102u));
+             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 420u));
+             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
++            waitForGs(gs);
+ 
++            // The frame is PSMCT32 local memory (swizzled blocks), not a linear 64-pixel-wide array: read it through
++            // the reference address mapping.
+             bool sawFilledRow = false;
+             for (uint32_t y = 6u; y <= 26u; ++y)
+             {
+@@ -3854,9 +3900,7 @@ void register_ps2_gs_tests()
+                 int last = -1;
+                 for (uint32_t x = 6u; x <= 26u; ++x)
+                 {
+-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+-                    uint32_t pixel = 0u;
+-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
++                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
+                     if ((pixel & 0x00FFFFFFu) != 0u)
+                     {
+                         if (first < 0)
+@@ -3875,9 +3919,7 @@ void register_ps2_gs_tests()
+                 sawFilledRow = true;
+                 for (int x = first; x <= last; ++x)
+                 {
+-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+-                    uint32_t pixel = 0u;
+-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
++                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
+                     if ((pixel & 0x00FFFFFFu) == 0u)
+                     {
+                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
+@@ -4215,6 +4257,7 @@ void register_ps2_gs_tests()
+             appendU64(packetB, 0ull);
+             packetB.insert(packetB.end(), packedB.begin(), packedB.end());
+             gs.processGIFPacket(packetB.data(), static_cast<uint32_t>(packetB.size()));
++            waitForGs(gs);
+ 
+             bool planesMatch = true;
+             bool memReadersMatch = true;
+@@ -4280,6 +4323,7 @@ void register_ps2_gs_tests()
+             appendU64(packetT8H, 0ull);
+             packetT8H.insert(packetT8H.end(), packedT8H.begin(), packedT8H.end());
+             gs.processGIFPacket(packetT8H.data(), static_cast<uint32_t>(packetT8H.size()));
++            waitForGs(gs);
+ 
+             bool t8hByteMatches = true;
+             bool t8hMemReaderMatches = true;
+@@ -4374,6 +4418,7 @@ void register_ps2_gs_tests()
+             appendU64(packetMixNibble, 0ull);
+             packetMixNibble.insert(packetMixNibble.end(), packedMixNibble.begin(), packedMixNibble.end());
+             gs.processGIFPacket(packetMixNibble.data(), static_cast<uint32_t>(packetMixNibble.size()));
++            waitForGs(gs);
+ 
+             bool mixClobberMatches = true;
+             for (uint32_t y = 0; y < kRrh; ++y)
+@@ -4470,6 +4515,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixelHL = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
+             t.Equals(pixelHL, kExpectedColorA,
+                      "T4HL sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HH nibble");
+@@ -4493,6 +4539,7 @@ void register_ps2_gs_tests()
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+ 
+             uint32_t pixelHH = 0u;
++            waitForGs(gs);
+             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));
+             t.Equals(pixelHH, kExpectedColorB,
+                      "T4HH sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HL nibble");
+@@ -4554,6 +4601,7 @@ void register_ps2_gs_tests()
+             std::memcpy(packet.data() + payloadOffset, packed1.data(), packed1.size());
+             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+ 
++            waitForGs(gs);
+             const GSDebugSnapshot snap1 = gs.getDebugSnapshot();
+             t.Equals(snap1.transferCopiedPixels, 64u, "T4HL transfer should stop after copying exactly rrw*rrh texels");
+             t.Equals(snap1.trxdir, 3u, "T4HL transfer should deactivate (trxdir=3) once total_pixels is reached");
+@@ -4598,6 +4646,7 @@ void register_ps2_gs_tests()
+             packet2.insert(packet2.end(), packed2.begin(), packed2.end());
+             gs.processGIFPacket(packet2.data(), static_cast<uint32_t>(packet2.size()));
+ 
++            waitForGs(gs);
+             const GSDebugSnapshot snap2 = gs.getDebugSnapshot();
+             t.Equals(snap2.transferCopiedPixels, 64u, "second, correctly-sized T4HL transfer should copy exactly rrw*rrh texels");
+             t.Equals(snap2.trxdir, 3u, "second T4HL transfer should also deactivate cleanly");
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..8abc3e1 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "Stubs/DMA.h"
+ #include "Stubs/GS.h"
++#include "gs_test_sync.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -1173,6 +1174,7 @@ void register_ps2_memory_tests()
+             t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gs, kChain, 0x105u),
+                      "canonical load-image chain should use the native upload path");
+ 
++            waitForGs(gs);
+             t.Equals(gs.nativeImageUploadCount(), 1ull, "native GIF DMA chain should upload through GS fast path");
+             t.Equals(mem.gifCopyCount(), 1ull, "native GIF DMA chain should still count as a GIF DMA copy");
+             t.IsTrue((mem.readIORegister(kDStat) & (1u << 2u)) != 0u,
+@@ -1343,6 +1345,7 @@ void register_ps2_memory_tests()
+             }
+             t.IsTrue(ct32PayloadOk, "flattened GIF chain should preserve CT32 REF bytes after the T4 REF payload");
+ 
++            waitForGs(gs);
+             const uint32_t row1Off = GSPSMCT32::addrPSMCT32(kCt32Dbp, 1u, 0u, 1u);
+             uint32_t actualRow1X0 = 0u;
+             uint32_t expectedRow1X0 = 0u;
+@@ -2095,6 +2098,7 @@ void register_ps2_memory_tests()
+ 
+             mem.processPendingTransfers();
+ 
++            waitForGs(gs);
+             const uint8_t *vramOut = mem.getGSVRAM();
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)
+@@ -2148,6 +2152,7 @@ void register_ps2_memory_tests()
+ 
+             mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+ 
++            waitForGs(gs);
+             const uint8_t *vramOut = mem.getGSVRAM();
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)
+@@ -2199,6 +2204,7 @@ void register_ps2_memory_tests()
+ 
+             mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+ 
++            waitForGs(gs);
+             const uint8_t *vramOut = mem.getGSVRAM();
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..ab6a3a3 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -16,6 +16,7 @@
+ #include "Stubs/Audio.h"
+ #include "Stubs/GS.h"
+ #include "Stubs/VU.h"
++#include "gs_test_sync.h"
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -245,6 +246,27 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // Patch 0112: audio packets reach their callback as an invocation of the thread that demuxes them, so the demux
++    // has to run on a guest thread. Arguments come in a0-t0 of the thread's context.
++    constexpr uint32_t kMpegGuestDemuxPc = 0x00124FE0u;
++    std::atomic<int32_t> gMpegGuestDemuxResult{0};
++
++    void testMpegGuestDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = kMpegCallbackStopPc;
++        try
++        {
++            ps2_stubs::sceMpegDemuxPssRing(rdram, ctx, runtime);
++        }
++        catch (...)
++        {
++            // Queuing the audio invocation leaves through the dispatcher (EeScheduler::invokeCurrent).
++            gMpegGuestDemuxResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
++            throw;
++        }
++        gMpegGuestDemuxResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
++    }
++
+     void testMpegWaitProducer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         gMpegWaitStage.store(2u, std::memory_order_release);
+@@ -563,6 +585,7 @@ void register_ps2_runtime_expansion_tests()
+ 
+             runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+             runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
++            runtime.registerFunction(kMpegGuestDemuxPc, &testMpegGuestDemuxPssRing);
+             auto prepareCallbackDispatch = [&]()
+             {
+                 R5900Context idleContext{};
+@@ -643,25 +666,29 @@ void register_ps2_runtime_expansion_tests()
+             const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
+             const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
+ 
++            // Patch 0112: the audio packet is copied and handed to its callback on the demuxing guest thread.
+             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+-            prepareCallbackDispatch();
++            gMpegGuestDemuxResult.store(0, std::memory_order_release);
+             R5900Context audioDemuxCtx{};
++            audioDemuxCtx.pc = kMpegGuestDemuxPc;
+             setRegU32(audioDemuxCtx, 4, kMpegAddr);
+             setRegU32(audioDemuxCtx, 5, kAudioPacketAddr);
+             setRegU32(audioDemuxCtx, 6, audioPacketSize);
+             setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
+             setRegU32(audioDemuxCtx, 8, audioPacketSize);
+-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
++            runtime.eeScheduler().reset(rdram.data(), audioDemuxCtx);
+             runtime.eeScheduler().run();
+ 
+-            t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
++            t.Equals(gMpegGuestDemuxResult.load(std::memory_order_acquire), static_cast<int32_t>(audioPacketSize),
+                      "sceMpegDemuxPssRing should consume the audio PES packet");
+             t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                      "registered audio stream callback should be invoked");
+             t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
+                      "audio callback data should report PCM stream type");
+-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
+-                     "audio callback data should point at PES payload");
++            const uint32_t audioDataAddr = gMpegStreamCallbackDataAddr.load(std::memory_order_acquire);
++            t.IsTrue(audioDataAddr != 0u && audioDataAddr + audioPayload.size() <= rdram.size() &&
++                         std::memcmp(rdram.data() + audioDataAddr, audioPayload.data(), audioPayload.size()) == 0,
++                     "audio callback data should hold a copy of the PES payload");
+             t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
+                      static_cast<uint32_t>(audioPayload.size()),
+                      "audio callback data should report PES payload length");
+@@ -936,8 +963,9 @@ void register_ps2_runtime_expansion_tests()
+ 
+             t.IsFalse(runtime.isStopRequested(),
+                       "sceIpuInit should tolerate the missing optional SetD4 helper");
+-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
+-                     "sceIpuInit should still program IPU_CTRL");
++            // Patch 0102: IPU_CTRL.RST resets the emulated IPU and is not latched, so the register reads back idle.
++            t.Equals(runtime.memory().read32(0x10002010u), 0u,
++                     "sceIpuInit should still reset the IPU through IPU_CTRL");
+             t.Equals(runtime.memory().read32(0x10002000u), 0u,
+                      "sceIpuInit should leave IPU_CMD reset after initialization");
+         });
+@@ -964,7 +992,8 @@ void register_ps2_runtime_expansion_tests()
+                      "the invocation should receive the SetD4 enable argument");
+             t.Equals(gIpuInitResult.load(std::memory_order_acquire), 0,
+                      "the HLE completion should resume the preserved base context with success");
+-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
++            // Patch 0102: IPU_CTRL.RST resets the emulated IPU and is not latched, so the register reads back idle.
++            t.Equals(runtime.memory().read32(0x10002010u), 0u,
+                      "IPU initialization should finish only after the guest invocation completes");
+         });
+ 
+@@ -1297,6 +1326,7 @@ void register_ps2_runtime_expansion_tests()
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+ 
++            waitForGs(gs);
+             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
+             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
+             t.Equals(vram[insideOff + 1u], static_cast<uint8_t>(20u), "inside draw should write G");
+@@ -1311,6 +1341,7 @@ void register_ps2_runtime_expansion_tests()
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+ 
++            waitForGs(gs);
+             bool anyWrite = false;
+             for (size_t i = 0; i < 1024u; ++i)
+             {
+@@ -1360,6 +1391,7 @@ void register_ps2_runtime_expansion_tests()
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+ 
++            waitForGs(gs);
+             // ((200 - 40) * 64 >> 7) + 40 = 120
+             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
+             t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(120u), "alpha blend should update G with FIX factor");
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..7c9ce94 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1094,8 +1094,9 @@ void register_ps2_runtime_kernel_tests()
+             setRegU32(env.ctx, 6, kMainStackSize);
+             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                      "SetupThread syscall should dispatch");
+-            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
+-                     "automatic main stack should start below the reserved top-of-RDRAM area");
++            // Patch 0008: stack -1 occupies [RAM_END - size, RAM_END) and the returned sp is its top.
++            t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE,
++                     "automatic main stack sp should start at the top of RDRAM");
+ 
+             // ReferThreadStatus can be called after many nested frames have moved $sp.
+             // It must report the initial stack recorded by SetupThread, not this live snapshot.
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index aace83c..b839bb0 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -200,7 +200,8 @@ void register_ps2_sif_dma_tests()
+             setRegU32(env.ctx, 4, kIopBlockSize);
+             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
+-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
++            // Patch 0111: the IOP heap starts at 0xA0000 (it used to start at 0x120000).
++            t.IsTrue(iopAddress >= 0x000A0000u && iopAddress < 0x00200000u,
+                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
+             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
+ 
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 0754b69..60667db 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_vu1.h"
++#include "gs_test_sync.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -807,11 +808,12 @@ void register_ps2_vu1_tests()
+                 uint8_t opcode;
+                 uint32_t latency;
+             };
++            // Patch 0022: ERSQRT 0x79, ESIN 0x7C, EATAN 0x7D, EEXP 0x7E (as in the VU manual and PCSX2); 0x77 is reserved.
+             constexpr EfuCase cases[] = {
+                 {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u},
+-                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x77u, 18u},
+-                {0x78u, 12u}, {0x79u, 29u}, {0x7Au, 12u}, {0x7Cu, 54u},
+-                {0x7Du, 44u}};
++                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x78u, 12u},
++                {0x79u, 18u}, {0x7Au, 12u}, {0x7Cu, 29u}, {0x7Du, 54u},
++                {0x7Eu, 44u}};
+ 
+             for (const EfuCase &efu : cases)
+             {
+@@ -1053,13 +1055,15 @@ void register_ps2_vu1_tests()
+                      "the flag-driven branch should arrive at its target");
+         });
+ 
+-        tc.Run("JR shares the one-instruction VI branch visibility rule", [](TestCase &t)
++        // Patch 0004: only the conditional branches see the previous VI value; JR/JALR read the current one (as in
++        // PCSX2's VUops.cpp; F1 06's command dispatcher at 0x5e0 relies on it).
++        tc.Run("JR reads the VI written by the previous instruction", [](TestCase &t)
+         {
+             Vu1Fixture fx;
+             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+ 
+             writeVuInstructionPair(
+-                fx.code, 0u, makeVuIaddiu(1u, 0u, 2),
++                fx.code, 0u, makeVuIaddiu(1u, 0u, 4),
+                 kVuUpperNop);
+             writeVuInstructionPair(
+                 fx.code, 8u, makeVuJr(1u),
+@@ -1075,19 +1079,19 @@ void register_ps2_vu1_tests()
+                 kVuUpperNop);
+ 
+             VU1Interpreter vu1;
+-            vu1.state().vi[1] = 4;
++            vu1.state().vi[1] = 2;
+             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                         0u, 0u, 0u, 4u);
+ 
+-            t.Equals(vu1.state().vi[1], 2,
++            t.Equals(vu1.state().vi[1], 4,
+                      "the pending IALU write should still commit normally");
+             t.Equals(vu1.state().vi[2], 2,
+                      "JR should execute exactly one delay-slot pair");
+             t.Equals(vu1.state().vi[3], 0,
+                      "JR should skip the sequential instruction after its delay slot");
+             t.Equals(vu1.state().vi[4], 4,
+-                     "JR immediately after a VI write should branch using the previous VI value");
++                     "JR immediately after a VI write should branch using the new VI value");
+         });
+ 
+         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)
+@@ -1434,6 +1438,7 @@ void register_ps2_vu1_tests()
+             const uint32_t mscalCmd = makeVifCmd(0x14u, 0u, 0u);
+             mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscalCmd), sizeof(mscalCmd));
+ 
++            waitForGs(gs);
+             const uint8_t *vramOut = mem.getGSVRAM();
+             bool imageOk = true;
+             for (uint32_t x = 0; x < 4u && imageOk; ++x)

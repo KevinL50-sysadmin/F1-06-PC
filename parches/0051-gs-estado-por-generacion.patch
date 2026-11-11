@@ -1,0 +1,199 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 2eb311f..219d726 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -31,6 +31,9 @@ public:
+     void Reset() override;
+ 
+     void Submit(const GSPrimitiveBatch &batch) override;
++    // Submit for a batch whose draw state is the one of the previous Submit (the frontend knows it from its draw
++    // state generation, patch 0051): only the vertices are queued, without comparing the state.
++    void SubmitSameState(const GSPrimitiveBatch &batch);
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
+     void BeginTransfer(const GSTransferCommand &command) override;
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0510367..c108e24 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -19,7 +19,10 @@
+ // inside runBlocks, 19 the GS band dependencies by the unions of the pending blocks instead of the last job of each
+ // block (before patch 0046), 20 the GS queue published with a full barrier on every command (before patch 0047), 21 the VU1 block
+ // upper results through a temporary and a dispatch on their destination instead of upperEarly (before patch 0048), 22 the EE scheduler taking its event lock and reading the host clock on every
+-// checkpoint (before patch 0049). A
++// checkpoint (before patch 0049), 23 the GS frontend building the whole draw state of every primitive and the threaded
++// backend comparing it with memcmp (before patch 0051), 24 the VIF1 UNPACKs through the general loop, the masked and
++// adding ones field by field (before patch 0051), 25 the VU1 pairs cached by content in 4 versions per address instead of 8 (before patch 0051), 26 the VU1 block flag
++// commits reading their entry again before each test (before patch 0051). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index d268a43..7f440ce 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -2,11 +2,13 @@
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_threaded_backend.h"
+ #include "ps2_log.h"
++#include "runtime/ps2_ab.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
+@@ -15,6 +17,22 @@ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+ 
++    // Draw state generation (patch 0051): bumped by reset and by every register write that is not a vertex or a
++    // vertex attribute. While it does not change, the draw state buildDrawBatch would copy is the one of the previous
++    // primitive, so vertexKick only refreshes the vertices of its cached batch and the threaded backend queues them
++    // without comparing the state (before: the whole state copied and compared with memcmp on every primitive).
++    // A/B mode 23: the batch built and compared every time. Used under the GS state mutex.
++    uint64_t s_drawStateGeneration = 1u;
++    struct DrawBatchCache
++    {
++        const void *owner = nullptr;
++        GSRasterBackend *backend = nullptr;
++        GSThreadedBackend *threaded = nullptr;
++        uint64_t generation = 0u; // of the state in batch (0: none)
++        GSPrimitiveBatch batch{};
++    };
++    DrawBatchCache s_drawBatchCache;
++
+     GSPrimReg decodePrimRegister(uint64_t value)
+     {
+         GSPrimReg prim{};
+@@ -189,6 +207,7 @@ void GS::reset()
+         m_ctx[i].scissor = {0, 639, 0, 447};
+         m_ctx[i].xyoffset = {0, 0};
+     }
++    ++s_drawStateGeneration;
+ }
+ 
+ GSContext &GS::activeContext()
+@@ -1090,6 +1109,22 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ {
++    switch (regAddr)
++    {
++    case GS_REG_RGBAQ:
++    case GS_REG_ST:
++    case GS_REG_UV:
++    case GS_REG_XYZF2:
++    case GS_REG_XYZF3:
++    case GS_REG_XYZ2:
++    case GS_REG_XYZ3:
++    case GS_REG_FOG:
++        break;
++    default:
++        ++s_drawStateGeneration;
++        break;
++    }
++
+     const bool interestingReg =
+         regAddr == GS_REG_PRIM ||
+         regAddr == GS_REG_RGBAQ ||
+@@ -1597,9 +1632,60 @@ void GS::vertexKick(bool drawing)
+ 
+     if (drawing && m_backend)
+     {
+-        GSPrimitiveBatch batch = buildDrawBatch(needed);
+-        updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
++        if (g_ps2AbMode.load(std::memory_order_relaxed) == 23)
++        {
++            GSPrimitiveBatch batch = buildDrawBatch(needed);
++            updatePreferredDisplaySourceForDraw(batch);
++            m_backend->Submit(batch);
++        }
++        else
++        {
++            DrawBatchCache &cache = s_drawBatchCache;
++            if (cache.owner != this || cache.backend != m_backend.get())
++            {
++                cache.owner = this;
++                cache.backend = m_backend.get();
++                cache.threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get());
++                cache.generation = 0u;
++            }
++            // Same generation: same primitive type, so the same vertex count.
++            const bool sameState = cache.generation == s_drawStateGeneration;
++            if (sameState)
++            {
++                for (int i = 0; i < cache.batch.vertexCount; ++i)
++                    cache.batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
++                // PS2X_GS_COMPROBAR_ESTADO=1: build the batch anyway and compare (state, vertex count and vertices).
++                static const bool s_checkState = []()
++                {
++                    const char *value = std::getenv("PS2X_GS_COMPROBAR_ESTADO");
++                    return value != nullptr && value[0] != '0';
++                }();
++                if (s_checkState)
++                {
++                    static uint64_t s_checked = 0u, s_different = 0u;
++                    const GSPrimitiveBatch fresh = buildDrawBatch(needed);
++                    if ((std::memcmp(&fresh.state, &cache.batch.state, sizeof(GSDrawState)) != 0 ||
++                         fresh.vertexCount != cache.batch.vertexCount ||
++                         std::memcmp(fresh.vertices.data(), cache.batch.vertices.data(),
++                                     sizeof(GSVertex) * fresh.vertexCount) != 0) &&
++                        s_different++ < 20u)
++                        std::cerr << "[gs:estado] DISTINTO prim=" << static_cast<uint32_t>(m_prim.type) << std::endl;
++                    if (++s_checked % 1000000u == 0u)
++                        std::cerr << "[gs:estado] " << s_checked << " primitivas con el mismo estado comprobadas, "
++                                  << s_different << " distintas" << std::endl;
++                }
++            }
++            else
++            {
++                cache.batch = buildDrawBatch(needed);
++                cache.generation = s_drawStateGeneration;
++            }
++            updatePreferredDisplaySourceForDraw(cache.batch);
++            if (sameState && cache.threaded)
++                cache.threaded->SubmitSameState(cache.batch);
++            else
++                m_backend->Submit(cache.batch);
++        }
+         recordDrawDebugEventUnlocked(needed);
+     }
+ 
+@@ -1682,6 +1768,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+     m_backend = std::move(backend);
+     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
++    s_drawBatchCache.owner = nullptr; // a new backend may reuse the old one's address
+ }
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 5692ffd..c03ac82 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -559,6 +559,20 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+     Push(batch, cost);
+ }
+ 
++void GSThreadedBackend::SubmitSameState(const GSPrimitiveBatch &batch)
++{
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (!m_queuedStateValid || mode == 1 || mode == 12 || batch.vertexCount == 0u)
++    {
++        Submit(batch);
++        return;
++    }
++    PrimitiveCommand primitive;
++    primitive.vertices = batch.vertices;
++    primitive.vertexCount = batch.vertexCount;
++    Push(std::move(primitive), estimatePixels(batch));
++}
++
+ void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     Push(ClutCommand{tex0, texclut}, 256u);

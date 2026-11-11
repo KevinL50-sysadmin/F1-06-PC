@@ -1,0 +1,330 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0b39036..798bf09 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -13,7 +13,10 @@
+ // FCOR through execLower (before patch 0042), 11 the VU1 block DIV, SQRT and RSQRT through execLower, 12 the GS queue
+ // with the whole draw state in every primitive (before patch 0043), 13 the GS triangle rows calling the pixel writer
+ // and sampler through their pointers (before patch 0044), 14 the GS band workers on the efficiency cores, 15 the GS band dependencies tracked by
+-// pages instead of blocks (before patch 0045). A
++// pages instead of blocks (before patch 0045), 16 the VU1 block lower instructions through one switch (runFastLower)
++// instead of a function per operation, 17 the VU1 block BAL, JR, JALR, FCSET, MFP, XTOP, XITOP and XGKICK through
++// execLower (before patch 0045), 18 the VU1 block schedules run through a call of their own (runSchedule) instead of
++// inside runBlocks. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index ccb5439..e9897a7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -260,7 +260,17 @@ namespace
+         // A/B mode 11: through execLower as before. A = vfS, B = vfT, dest = fsf | ftf << 2 (bits 21-24 of the word).
+         FastDiv,
+         FastSqrt,
+-        FastRsqrt
++        FastRsqrt,
++        // A/B mode 17: through execLower as before.
++        FastBal,    // BAL viT, imm: B = viT, imm
++        FastJr,     // JR viS: A = viS (the current value, not the branch "old value")
++        FastJalr,   // JALR viT, viS: A = viS, B = viT
++        FastFcset,  // FCSET imm24 (from the word)
++        FastMfp,    // MFP.dest vfT, P
++        FastXtop,   // XTOP viT
++        FastXitop,  // XITOP viT
++        FastXgkick, // XGKICK viS: A = viS
++        FastCount
+     };
+ 
+     // The FastLower operation of a lower instruction (0: execLower).
+@@ -300,9 +310,22 @@ namespace
+             return FastFcand;
+         case 0x13:
+             return FastFcor;
++        case 0x11:
++            return FastFcset;
+         case 0x20:
+             imm = IMM11(lower);
+             return FastB;
++        case 0x21:
++            b = VIT(lower);
++            imm = IMM11(lower);
++            return FastBal;
++        case 0x24:
++            a = VIS(lower);
++            return FastJr;
++        case 0x25:
++            a = VIS(lower);
++            b = VIT(lower);
++            return FastJalr;
+         case 0x28:
+         case 0x29:
+             a = VIS(lower);
+@@ -353,6 +376,10 @@ namespace
+         case 0x38: a = FS(lower); b = FT(lower); return FastDiv;
+         case 0x39: b = FT(lower); return FastSqrt;
+         case 0x3A: a = FS(lower); b = FT(lower); return FastRsqrt;
++        case 0x64: return FastMfp;
++        case 0x68: b = VIT(lower); return FastXtop;
++        case 0x69: b = VIT(lower); return FastXitop;
++        case 0x6C: a = VIS(lower); return FastXgkick;
+         default:
+             return 0u;
+         }
+@@ -1149,10 +1176,12 @@ namespace
+ 
+     // A FastLower operation: the same expressions as execLower, with the VF result going where the schedule says and
+     // the VI result applied now (as its commit would, 16 bits) or kept pending. Stores bring XGKICK up to their cycle,
+-    // as queueStore does in a block.
++    // as queueStore does in a block. Expanded once per operation (lowerFast, through kLowerFast), so each pair calls a
++    // small function for its operation; runFastLower is the dispatch before that (one switch in a large function).
+     template <typename Host>
+-    inline void runFastLower(const BlockPair &p, VU1State &vu, BlockState &st, Host &host, uint64_t issue)
++    PS2_VU_FORCEINLINE void fastLowerBody(uint8_t op, const BlockPair &p, VU1State &vu, BlockState &st, Host &host)
+     {
++        const uint64_t issue = st.cycle + p.issue; // st.cycle is the block entry until the schedule ends
+         uint8_t *const data = host.data();
+         const uint32_t dataMask = host.dataBytes() - 1u;
+         // One blend to the register or to pendingVf (two inlined blends made the lambda too big to inline).
+@@ -1202,7 +1231,7 @@ namespace
+             st.fdivValue = host.normalizeResult(value);
+             st.fdivDi = statusDi & 0x30u;
+         };
+-        switch (p.fastOp)
++        switch (op)
+         {
+         case FastLq:
+             writeVf(data + offsetAddress(p.fastA));
+@@ -1367,7 +1396,7 @@ namespace
+             setQ(std::sqrt(std::fabs(val)), val < 0.0f ? 0x10u : 0u);
+             break;
+         }
+-        default: // FastRsqrt
++        case FastRsqrt:
+         {
+             const float num = vuNormalizeOperand(vu.vf[p.fastA][p.fastDest & 0x3u]);
+             const float radicand = vuNormalizeOperand(vu.vf[p.fastB][(p.fastDest >> 2) & 0x3u]);
+@@ -1384,16 +1413,87 @@ namespace
+             setQ(host.normalizeResult(result), statusDi);
+             break;
+         }
++        case FastBal:
++            // The link is the pair after the delay slot, in pair units (execLower: (pc + 16) / 8).
++            writeVi(static_cast<int32_t>((p.pc + 16u) / 8u));
++            branchTo();
++            break;
++        case FastJr:
++        case FastJalr:
++        {
++            // The target from the current VI (read before JALR writes the link, which may be the same register).
++            const uint32_t target = (static_cast<uint32_t>(static_cast<uint16_t>(vu.vi[p.fastA])) * 8u) & host.pcMask();
++            if (op == FastJalr)
++                writeVi(static_cast<int32_t>((p.pc + 16u) / 8u));
++            vu.branchPending = true;
++            vu.branchTarget = target;
++            vu.branchDelay = 1;
++            break;
++        }
++        case FastFcset:
++        {
++            // queueFcset in a block: the working clip now, the entry at its completion cycle (side 1), and the upper's
++            // entry of this cycle no longer writes the clip flag.
++            uint32_t &workingClip = host.workingClip();
++            workingClip = p.lower & 0xFFFFFFu;
++            FlagSlot(&ring)[2] = st.flags[(issue + 4u) & 7u];
++            if (p.upperFlags != 0u)
++                ring[0].kind = static_cast<uint8_t>(ring[0].kind & ~kFlagClip);
++            setFlagSlot(ring[1], 0u, 0u, 0u, workingClip, kFlagClip);
++            break;
++        }
++        case FastMfp:
++        {
++            alignas(16) float words[4];
++            _mm_store_ps(words, _mm_set1_ps(vu.p));
++            writeVf(words);
++            break;
++        }
++        case FastXtop:
++            writeVi(static_cast<int32_t>(vu.top & 0x3FFu));
++            break;
++        case FastXitop:
++            writeVi(static_cast<int32_t>(vu.itop & 0x3FFu));
++            break;
++        case FastXgkick:
++            host.startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(vu.vi[p.fastA])));
++            st.xgkickThrough = issue; // the transfer moves its first qword at the next cycle boundary
++            break;
++        default:
++            break;
+         }
+     }
+ 
+-    // Runs one schedule. Host gives what needs the interpreter's private members (see run()).
++    template <typename Host, uint8_t Op>
++    void lowerFast(const BlockPair &p, VU1State &vu, BlockState &st, Host &host)
++    {
++        fastLowerBody<Host>(Op, p, vu, st, host);
++    }
++    template <typename Host>
++    using LowerFastFn = void (*)(const BlockPair &, VU1State &, BlockState &, Host &);
++    template <typename Host, size_t... Ops>
++    constexpr std::array<LowerFastFn<Host>, sizeof...(Ops)> lowerFastTable(std::index_sequence<Ops...>)
++    {
++        return {&lowerFast<Host, static_cast<uint8_t>(Ops)>...};
++    }
++    template <typename Host>
++    constexpr std::array<LowerFastFn<Host>, FastCount> kLowerFast = lowerFastTable<Host>(std::make_index_sequence<FastCount>{});
++
++    // A/B mode 16: the dispatch before kLowerFast.
+     template <typename Host>
+-    inline void runSchedule(const Schedule &s, BlockState &st, Host &host)
++    PS2_VU_NOINLINE void runFastLower(const BlockPair &p, VU1State &vu, BlockState &st, Host &host)
++    {
++        fastLowerBody<Host>(p.fastOp, p, vu, st, host);
++    }
++
++    // Runs one schedule. Host gives what needs the interpreter's private members (see run()).
++    // Expanded in runBlocks: as a call of its own, every block saved and restored eight XMM registers, loaded the
++    // constants and checked the stack cookie (Old: that call, as A/B mode 18).
++    template <typename Host, bool Old>
++    PS2_VU_FORCEINLINE void runScheduleBody(const Schedule &s, BlockState &st, Host &host, int abMode)
+     {
+         VU1State &vu = host.state();
+         const uint64_t entry = st.cycle;
+-        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
+         const bool oldDispatch = abMode == 5;
+         BlockRedirect redirect;
+         redirect.state = &st;
+@@ -1461,12 +1561,19 @@ namespace
+ 
+             // Lower instruction.
+             const int32_t oldVi = vu.vi[p.viReg];
+-            // A/B modes 10 and 11: the lower instructions of patch 0042 through execLower, as before.
+-            const bool fastLower = p.lowerExec == LowerFast &&
+-                                   !(p.fastOp >= FastWaitq && ((abMode == 10 && p.fastOp < FastDiv) ||
+-                                                               (abMode == 11 && p.fastOp >= FastDiv)));
++            // A/B modes 10, 11 and 17: the lower instructions of patches 0042 and 0045 through execLower, as before.
++            const bool fastLower =
++                p.lowerExec == LowerFast &&
++                (abMode < 10 || !((abMode == 10 && p.fastOp >= FastWaitq && p.fastOp < FastDiv) ||
++                                  (abMode == 11 && p.fastOp >= FastDiv && p.fastOp < FastBal) ||
++                                  (abMode == 17 && p.fastOp >= FastBal)));
+             if (fastLower)
+-                runFastLower(p, vu, st, host, issue);
++            {
++                if (abMode == 16)
++                    runFastLower(p, vu, st, host); // A/B mode 16: one switch for every operation, as before
++                else
++                    kLowerFast<Host>[p.fastOp](p, vu, st, host);
++            }
+             else if (p.lowerExec == LowerImmediate)
+             {
+                 float immediate = 0.0f;
+@@ -1508,6 +1615,13 @@ namespace
+                     st.pendingVi[p.viReg] = vu.vi[p.viReg];
+                     vu.vi[p.viReg] = oldVi;
+                 }
++                if constexpr (!Old)
++                {
++                    // A lower write to vf0 or vi0 does not stay. Only execLower writes them: a block writes VF and VI
++                    // registers through upperDst, lowerDst and viMode, which are never register 0.
++                    _mm_storeu_ps(vu.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
++                    vu.vi[0] = 0;
++                }
+             }
+             // The branch "old value" of the next pair: invalid after every pair, unless this one wrote a VI with an
+             // integer instruction (backupReg). Only kept where a conditional branch can read it.
+@@ -1529,8 +1643,11 @@ namespace
+             default:
+                 break;
+             }
+-            _mm_storeu_ps(vu.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f)); // a lower write to vf0 does not stay
+-            vu.vi[0] = 0;
++            if constexpr (Old)
++            {
++                _mm_storeu_ps(vu.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f)); // a lower write to vf0 does not stay
++                vu.vi[0] = 0;
++            }
+ 
+             // pc and branches, as after every pair of the interpreter. Only a branch and the last pair (a delay slot,
+             // or the end of the block) need it; the other pairs only move on.
+@@ -1559,6 +1676,13 @@ namespace
+         host.catchUpXgkick(st.cycle);
+     }
+ 
++    // A/B mode 18: one call per block, as before.
++    template <typename Host>
++    PS2_VU_NOINLINE void runSchedule(const Schedule &s, BlockState &st, Host &host, int abMode)
++    {
++        runScheduleBody<Host, true>(s, st, host, abMode);
++    }
++
+     enum class BlockRunEnd : uint8_t
+     {
+         Interpreter, // the next pair needs the interpreter
+@@ -1575,6 +1699,7 @@ namespace
+         BlockState &st = engine.state;
+         VU1State &vu = host.state();
+         const uint64_t generation = host.generation();
++        const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
+         if (engine.storage.size() > 200000u)
+         {
+             // Too many schedules (code that keeps changing): start again, keeping the current timing state.
+@@ -1665,7 +1790,10 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            runSchedule(*s, st, host);
++            if (abMode == 18)
++                runSchedule(*s, st, host, abMode);
++            else
++                runScheduleBody<Host, false>(*s, st, host, abMode);
+             ++engine.stats.blocks;
+             engine.stats.pairs += s->pairs.size();
+             if (s->end == EndProgram)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index d1ed845..39a8015 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -17,6 +17,7 @@
+ #include <limits>
+ #include <memory>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ #include <ps2_log.h>
+ 
+@@ -31,8 +32,10 @@
+ // The operations the blocks call through one pointer per pair (runFmacOpFixed, runSimpleOpFixed) are expanded there.
+ #if defined(_MSC_VER)
+ #define PS2_VU_FORCEINLINE __forceinline
++#define PS2_VU_NOINLINE __declspec(noinline)
+ #else
+ #define PS2_VU_FORCEINLINE inline __attribute__((always_inline))
++#define PS2_VU_NOINLINE __attribute__((noinline))
+ #endif
+ 
+ namespace
+@@ -3225,8 +3228,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         uint32_t pcMask() const { return vu.microAddressMask(); }
+         bool xgkickActive() const { return vu.m_xgkick.active; }
++        void startXgkick(uint32_t qwordAddress) { vu.startXgkick(qwordAddress); }
+         void progressXgkickOneCycle() { vu.progressXgkick(); }
+-        void catchUpXgkick(uint64_t cycle)
++        // Called after every block and before every store: the common cases (already there, no transfer) inline.
++        PS2_VU_FORCEINLINE void catchUpXgkick(uint64_t cycle)
++        {
++            if (blockState.xgkickThrough >= cycle)
++                return;
++            if (!vu.m_xgkick.active)
++            {
++                blockState.xgkickThrough = cycle;
++                return;
++            }
++            catchUpXgkickTransfer(cycle);
++        }
++        PS2_VU_NOINLINE void catchUpXgkickTransfer(uint64_t cycle)
+         {
+             while (blockState.xgkickThrough < cycle)
+             {

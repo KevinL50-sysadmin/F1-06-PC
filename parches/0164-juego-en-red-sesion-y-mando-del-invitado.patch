@@ -1,0 +1,3290 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index f25fb0b..ab86632 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -396,6 +396,10 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_ipu.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_pad_win.cpp
++    src/lib/ps2_netplay.cpp
++    src/lib/ps2_netplay_crypto.cpp
++    src/lib/ps2_netplay_guest.cpp
++    src/lib/ps2_netplay_protocol.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+@@ -581,8 +585,10 @@ target_include_directories(ps2_runtime PUBLIC
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop)
+ target_link_libraries(ps2_runtime PRIVATE ffmpeg)
+ # F1 06: SHGetKnownFolderPath (Documents, LocalAppData) for the player's folders.
++# Fase 5 (T15): the netplay (Winsock 2) and its random nonces (BCryptGenRandom).
+ if(WIN32)
+     target_link_libraries(ps2_runtime PRIVATE shell32 ole32)
++    target_link_libraries(ps2_runtime PUBLIC ws2_32 bcrypt)
+ endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+new file mode 100644
+index 0000000..490a199
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -0,0 +1,981 @@
++#include "ps2_netplay.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#endif
++
++// Fase 5 (T15, netplay N1): the host and the guest over TCP (Winsock 2). One thread per side; the game thread only
++// reads the guest's last pad (readRemotePad). Nothing received is ever executed or loaded: the frames are fixed-size
++// records (ps2_netplay_protocol.h) checked before they are read.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        using Clock = std::chrono::steady_clock;
++
++        constexpr int kHandshakeTimeoutMs = 5000; // from the connection to WELCOME
++        constexpr int kIdleTimeoutMs = 5000;      // nothing received for this long: the other side is gone
++        constexpr int kPingIntervalMs = 1000;
++        constexpr int kPadIntervalUs = 16667;     // ~60 Hz
++        constexpr int kAuthFailureDelayMs = 1000; // no new connection is taken for this long after a wrong password
++        constexpr int kStatsIntervalMs = 10000;
++        constexpr int kConnectTimeoutMs = 5000;
++        constexpr int kSendTimeoutMs = 2000;
++        constexpr int kPollMs = 20;
++
++        void logLine(const char *format, ...)
++        {
++            char text[512];
++            va_list args;
++            va_start(args, format);
++            std::vsnprintf(text, sizeof(text), format, args);
++            va_end(args);
++            std::fprintf(stderr, "[red] %s\n", text);
++            std::fflush(stderr);
++        }
++
++        int elapsedMs(Clock::time_point since, Clock::time_point now)
++        {
++            return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - since).count());
++        }
++
++        uint32_t clockMs()
++        {
++            return static_cast<uint32_t>(
++                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
++        }
++
++        // The guest's pad for the second port, owned by the host that has a guest.
++        std::mutex g_remoteMutex;
++        const void *g_remoteOwner = nullptr;
++        PadWire g_remotePad;
++
++        void setRemote(const void *owner, const PadWire &pad)
++        {
++            std::lock_guard<std::mutex> lock(g_remoteMutex);
++            g_remoteOwner = owner;
++            g_remotePad = pad;
++        }
++
++        void clearRemote(const void *owner)
++        {
++            std::lock_guard<std::mutex> lock(g_remoteMutex);
++            if (g_remoteOwner == owner)
++            {
++                g_remoteOwner = nullptr;
++                g_remotePad = PadWire{};
++            }
++        }
++
++        void put32(uint8_t *out, uint32_t value)
++        {
++            for (int i = 0; i < 4; ++i)
++                out[i] = static_cast<uint8_t>(value >> (8 * i));
++        }
++
++        uint32_t get32(const uint8_t *in)
++        {
++            return uint32_t(in[0]) | (uint32_t(in[1]) << 8) | (uint32_t(in[2]) << 16) | (uint32_t(in[3]) << 24);
++        }
++
++#if defined(_WIN32)
++        bool ensureWinsock()
++        {
++            static const bool s_ready = []
++            {
++                WSADATA data;
++                return WSAStartup(MAKEWORD(2, 2), &data) == 0;
++            }();
++            return s_ready;
++        }
++
++        std::string socketError(int code)
++        {
++            char text[256] = {};
++            if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
++                               static_cast<DWORD>(code), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), text,
++                               sizeof(text), nullptr) == 0)
++                return "error " + std::to_string(code);
++            std::string s(text);
++            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '.'))
++                s.pop_back();
++            return s + " (" + std::to_string(code) + ")";
++        }
++
++        // "1.2.3.4:5" or "[fd7a::1]:5" (an IPv4 client of a dual-stack socket shows as IPv4).
++        std::string addressText(const sockaddr *address, int length, bool withPort = true)
++        {
++            char host[NI_MAXHOST] = {}, service[NI_MAXSERV] = {};
++            if (getnameinfo(address, length, host, sizeof(host), service, sizeof(service),
++                            NI_NUMERICHOST | NI_NUMERICSERV) != 0)
++                return "?";
++            std::string h(host);
++            if (h.rfind("::ffff:", 0) == 0 && h.find('.') != std::string::npos)
++                h = h.substr(7);
++            const bool v6 = h.find(':') != std::string::npos;
++            if (!withPort)
++                return h;
++            return (v6 ? "[" + h + "]" : h) + ":" + service;
++        }
++
++        void closeSocket(SOCKET &s)
++        {
++            if (s != INVALID_SOCKET)
++            {
++                closesocket(s);
++                s = INVALID_SOCKET;
++            }
++        }
++
++        void setNonBlocking(SOCKET s)
++        {
++            u_long on = 1;
++            ioctlsocket(s, FIONBIO, &on);
++        }
++
++        void setNoDelay(SOCKET s)
++        {
++            BOOL on = TRUE;
++            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&on), sizeof(on));
++        }
++
++        // Sends every byte, waiting for room up to kSendTimeoutMs.
++        bool sendAll(SOCKET s, const std::vector<uint8_t> &bytes)
++        {
++            size_t sent = 0;
++            const Clock::time_point start = Clock::now();
++            while (sent < bytes.size())
++            {
++                const int n = send(s, reinterpret_cast<const char *>(bytes.data() + sent),
++                                   static_cast<int>(bytes.size() - sent), 0);
++                if (n > 0)
++                {
++                    sent += static_cast<size_t>(n);
++                    continue;
++                }
++                if (n == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK)
++                    return false;
++                if (elapsedMs(start, Clock::now()) > kSendTimeoutMs)
++                    return false;
++                fd_set writable;
++                FD_ZERO(&writable);
++                FD_SET(s, &writable);
++                timeval wait{0, kPollMs * 1000};
++                select(0, nullptr, &writable, nullptr, &wait);
++            }
++            return true;
++        }
++
++        // Reads what is there: >0 bytes, 0 = closed by the other side, -1 = nothing yet, -2 = error.
++        int receiveSome(SOCKET s, uint8_t *buffer, int size)
++        {
++            const int n = recv(s, reinterpret_cast<char *>(buffer), size, 0);
++            if (n > 0)
++                return n;
++            if (n == 0)
++                return 0;
++            return WSAGetLastError() == WSAEWOULDBLOCK ? -1 : -2;
++        }
++
++        // The machine's addresses, to tell the guest where to connect.
++        std::string localAddresses()
++        {
++            char name[256] = {};
++            if (gethostname(name, sizeof(name)) != 0)
++                return "?";
++            addrinfo hints{};
++            hints.ai_family = AF_UNSPEC;
++            hints.ai_socktype = SOCK_STREAM;
++            addrinfo *list = nullptr;
++            if (getaddrinfo(name, nullptr, &hints, &list) != 0)
++                return "?";
++            std::string out;
++            std::vector<std::string> seen;
++            for (addrinfo *a = list; a != nullptr; a = a->ai_next)
++            {
++                const std::string text = addressText(a->ai_addr, static_cast<int>(a->ai_addrlen), false);
++                bool repeated = false;
++                for (const std::string &s : seen)
++                    repeated = repeated || s == text;
++                if (repeated)
++                    continue;
++                seen.push_back(text);
++                out += (out.empty() ? "" : ", ") + text;
++            }
++            freeaddrinfo(list);
++            return out.empty() ? "?" : out;
++        }
++#endif
++    }
++
++    bool remotePadActive()
++    {
++        std::lock_guard<std::mutex> lock(g_remoteMutex);
++        return g_remoteOwner != nullptr;
++    }
++
++    bool readRemotePad(PadWire &pad)
++    {
++        std::lock_guard<std::mutex> lock(g_remoteMutex);
++        if (g_remoteOwner == nullptr)
++            return false;
++        pad = g_remotePad;
++        return true;
++    }
++
++#if defined(_WIN32)
++    struct Host::Impl
++    {
++        HostSettings settings;
++        SOCKET listener = INVALID_SOCKET;
++        std::thread thread;
++        std::atomic<bool> running{false};
++        std::atomic<uint16_t> port{0};
++        std::atomic<bool> connected{false};
++        std::atomic<uint64_t> padMessages{0};
++        std::atomic<uint64_t> rejected{0};
++
++        // The connection (thread only).
++        enum class Phase
++        {
++            None,
++            Handshake,
++            Session,
++        };
++        SOCKET client = INVALID_SOCKET;
++        std::string clientAddress;
++        Phase phase = Phase::None;
++        MessageAuth auth;
++        FrameReader reader{auth};
++        std::unique_ptr<HostHandshake> handshake;
++        Clock::time_point accepted, lastReceived, lastPing, statsStart, acceptAfter;
++        uint32_t pingToken = 0;
++        uint64_t statsPads = 0;
++        uint32_t roundTripMs = 0;
++
++        bool listen(std::string &error);
++        void run();
++        void acceptOne();
++        void drop(const std::string &why, bool sendBye, ByeReason reason);
++        bool sendFrame(MessageType type, const uint8_t *payload, size_t size);
++        void readClient();
++        void onSessionFrame(const Frame &frame);
++        void timers();
++    };
++
++    bool Host::Impl::listen(std::string &error)
++    {
++        if (!ensureWinsock())
++        {
++            error = "Winsock no arranca";
++            return false;
++        }
++        auto bindTo = [&](const sockaddr *address, int length, int family) -> bool
++        {
++            SOCKET s = socket(family, SOCK_STREAM, IPPROTO_TCP);
++            if (s == INVALID_SOCKET)
++            {
++                error = socketError(WSAGetLastError());
++                return false;
++            }
++            BOOL exclusive = TRUE; // nobody else may take the port while it is ours
++            setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&exclusive), sizeof(exclusive));
++            if (family == AF_INET6)
++            {
++                DWORD v6only = 0; // IPv4 too
++                setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&v6only), sizeof(v6only));
++            }
++            if (bind(s, address, length) == SOCKET_ERROR || ::listen(s, 4) == SOCKET_ERROR)
++            {
++                error = socketError(WSAGetLastError());
++                closesocket(s);
++                return false;
++            }
++            setNonBlocking(s);
++            listener = s;
++            sockaddr_storage bound{};
++            int boundLength = sizeof(bound);
++            getsockname(s, reinterpret_cast<sockaddr *>(&bound), &boundLength);
++            port = ntohs(bound.ss_family == AF_INET6 ? reinterpret_cast<sockaddr_in6 *>(&bound)->sin6_port
++                                                     : reinterpret_cast<sockaddr_in *>(&bound)->sin_port);
++            return true;
++        };
++
++        if (settings.listenAddress.empty())
++        {
++            sockaddr_in6 any6{};
++            any6.sin6_family = AF_INET6;
++            any6.sin6_addr = in6addr_any;
++            any6.sin6_port = htons(settings.port);
++            if (!bindTo(reinterpret_cast<sockaddr *>(&any6), sizeof(any6), AF_INET6))
++            {
++                sockaddr_in any4{};
++                any4.sin_family = AF_INET;
++                any4.sin_addr.s_addr = htonl(INADDR_ANY);
++                any4.sin_port = htons(settings.port);
++                if (!bindTo(reinterpret_cast<sockaddr *>(&any4), sizeof(any4), AF_INET))
++                    return false;
++            }
++            logLine("anfitrion escuchando en el puerto TCP %u de todas las interfaces; direcciones de este PC: %s",
++                    static_cast<unsigned>(port.load()), localAddresses().c_str());
++            return true;
++        }
++        // --escuchar: a numeric address only (no name lookups).
++        addrinfo hints{};
++        hints.ai_family = AF_UNSPEC;
++        hints.ai_socktype = SOCK_STREAM;
++        hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST | AI_NUMERICSERV;
++        addrinfo *list = nullptr;
++        const std::string service = std::to_string(settings.port);
++        if (getaddrinfo(settings.listenAddress.c_str(), service.c_str(), &hints, &list) != 0 || list == nullptr)
++        {
++            error = "direccion para escuchar no valida: " + settings.listenAddress;
++            return false;
++        }
++        const bool ok = bindTo(list->ai_addr, static_cast<int>(list->ai_addrlen), list->ai_family);
++        if (ok)
++            logLine("anfitrion escuchando en %s:%u (TCP)", settings.listenAddress.c_str(),
++                    static_cast<unsigned>(port.load()));
++        freeaddrinfo(list);
++        return ok;
++    }
++
++    bool Host::Impl::sendFrame(MessageType type, const uint8_t *payload, size_t size)
++    {
++        const std::vector<uint8_t> frame = encodeFrame(type, payload, size, phase == Phase::Session ? &auth : nullptr);
++        return !frame.empty() && sendAll(client, frame);
++    }
++
++    void Host::Impl::drop(const std::string &why, bool sendBye, ByeReason reason)
++    {
++        if (sendBye && phase == Phase::Session)
++        {
++            const uint8_t payload[1] = {static_cast<uint8_t>(reason)};
++            sendFrame(MessageType::Bye, payload, 1);
++        }
++        if (phase == Phase::Session)
++        {
++            clearRemote(this);
++            connected = false;
++            logLine("invitado %s desconectado (%s); el puerto 2 vuelve a [jugador2] de controles.ini o queda sin mando",
++                    clientAddress.c_str(), why.c_str());
++        }
++        else
++            logLine("conexion de %s cerrada en el saludo (%s)", clientAddress.c_str(), why.c_str());
++        closeSocket(client);
++        phase = Phase::None;
++        handshake.reset();
++        auth.reset();
++        reader.reset();
++    }
++
++    void Host::Impl::acceptOne()
++    {
++        sockaddr_storage from{};
++        int fromLength = sizeof(from);
++        SOCKET s = accept(listener, reinterpret_cast<sockaddr *>(&from), &fromLength);
++        if (s == INVALID_SOCKET)
++            return;
++        const std::string address = addressText(reinterpret_cast<sockaddr *>(&from), fromLength);
++        setNonBlocking(s);
++        setNoDelay(s);
++        if (phase != Phase::None)
++        {
++            uint8_t payload[3] = {static_cast<uint8_t>(RejectReason::Busy), static_cast<uint8_t>(kProtocolVersion & 0xFF),
++                                  static_cast<uint8_t>(kProtocolVersion >> 8)};
++            sendAll(s, encodeFrame(MessageType::Reject, payload, sizeof(payload), nullptr));
++            closesocket(s);
++            logLine("conexion de %s rechazada: ya hay un invitado", address.c_str());
++            return;
++        }
++        client = s;
++        clientAddress = address;
++        phase = Phase::Handshake;
++        auth.reset();
++        reader.reset();
++        handshake = std::make_unique<HostHandshake>(settings.password, auth);
++        accepted = lastReceived = Clock::now();
++        logLine("conexion desde %s: esperando la contrasena", address.c_str());
++    }
++
++    void Host::Impl::onSessionFrame(const Frame &frame)
++    {
++        switch (static_cast<MessageType>(frame.type))
++        {
++        case MessageType::Pad:
++        {
++            uint32_t counter = 0;
++            PadWire pad;
++            if (decodePad(frame.payload.data(), frame.size, counter, pad))
++            {
++                setRemote(this, pad);
++                ++padMessages;
++                ++statsPads;
++            }
++            return;
++        }
++        case MessageType::Ping:
++            sendFrame(MessageType::Pong, frame.payload.data(), frame.size);
++            return;
++        case MessageType::Pong:
++            if (get32(frame.payload.data()) == pingToken)
++                roundTripMs = clockMs() - get32(frame.payload.data() + 4);
++            return;
++        case MessageType::Bye:
++            drop(std::string("el invitado se fue: ") + byeReasonText(frame.payload[0]), false, ByeReason::Quit);
++            return;
++        default:
++            drop("mensaje fuera de lugar en la sesion", true, ByeReason::Protocol);
++            return;
++        }
++    }
++
++    void Host::Impl::readClient()
++    {
++        uint8_t buffer[512];
++        const int n = receiveSome(client, buffer, sizeof(buffer));
++        if (n == -1)
++            return;
++        if (n <= 0)
++        {
++            reader.finish();
++            drop(n == 0 ? (reader.error() == FrameError::Truncated ? "cerro a mitad de un mensaje" : "cerro la conexion")
++                        : "error de red",
++                 false, ByeReason::Quit);
++            return;
++        }
++        lastReceived = Clock::now();
++        if (!reader.feed(buffer, static_cast<size_t>(n)))
++        {
++            drop(std::string("mensaje no valido: ") + frameErrorText(reader.error()), true, ByeReason::Protocol);
++            return;
++        }
++        Frame frame;
++        while (client != INVALID_SOCKET)
++        {
++            const FrameReader::Result result = reader.next(frame);
++            if (result == FrameReader::Result::NeedMore)
++                return;
++            if (result == FrameReader::Result::Error)
++            {
++                drop(std::string("mensaje no valido: ") + frameErrorText(reader.error()), true, ByeReason::Protocol);
++                return;
++            }
++            if (phase == Phase::Session)
++            {
++                onSessionFrame(frame);
++                continue;
++            }
++            std::vector<std::vector<uint8_t>> out;
++            const HostHandshake::Result step = handshake->onFrame(frame, out);
++            for (const std::vector<uint8_t> &bytes : out)
++                sendAll(client, bytes);
++            if (step == HostHandshake::Result::Accepted)
++            {
++                phase = Phase::Session;
++                handshake.reset();
++                connected = true;
++                lastPing = statsStart = Clock::now();
++                statsPads = 0;
++                setRemote(this, PadWire{});
++                logLine("invitado conectado desde %s: es el jugador 2 (puerto 2 conectado al mando remoto)",
++                        clientAddress.c_str());
++            }
++            else if (step == HostHandshake::Result::Rejected)
++            {
++                if (handshake->rejectReason() == RejectReason::Password)
++                {
++                    ++rejected;
++                    acceptAfter = Clock::now() + std::chrono::milliseconds(kAuthFailureDelayMs);
++                    logLine("contrasena incorrecta desde %s: conexion rechazada", clientAddress.c_str());
++                }
++                const std::string why = handshake->reason();
++                drop(why, false, ByeReason::Protocol);
++                return;
++            }
++            else if (step == HostHandshake::Result::Invalid)
++            {
++                const std::string why = handshake->reason();
++                drop(why, false, ByeReason::Protocol);
++                return;
++            }
++        }
++    }
++
++    void Host::Impl::timers()
++    {
++        if (phase == Phase::None)
++            return;
++        const Clock::time_point now = Clock::now();
++        if (phase == Phase::Handshake)
++        {
++            if (elapsedMs(accepted, now) > kHandshakeTimeoutMs)
++                drop("saludo sin terminar en 5 s", false, ByeReason::Timeout);
++            return;
++        }
++        if (elapsedMs(lastReceived, now) > kIdleTimeoutMs)
++        {
++            drop("tiempo agotado: nada recibido en 5 s", true, ByeReason::Timeout);
++            return;
++        }
++        if (elapsedMs(lastPing, now) >= kPingIntervalMs)
++        {
++            lastPing = now;
++            uint8_t payload[8];
++            put32(payload, ++pingToken);
++            put32(payload + 4, clockMs());
++            if (!sendFrame(MessageType::Ping, payload, sizeof(payload)))
++            {
++                drop("no se puede enviar", false, ByeReason::Quit);
++                return;
++            }
++        }
++        const int statsMs = elapsedMs(statsStart, now);
++        if (statsMs >= kStatsIntervalMs)
++        {
++            logLine("mando del invitado: %.1f mensajes/s, ida y vuelta %u ms",
++                    static_cast<double>(statsPads) * 1000.0 / statsMs, static_cast<unsigned>(roundTripMs));
++            statsStart = now;
++            statsPads = 0;
++        }
++    }
++
++    void Host::Impl::run()
++    {
++        while (running)
++        {
++            fd_set readable;
++            FD_ZERO(&readable);
++            const bool canAccept = Clock::now() >= acceptAfter;
++            if (canAccept)
++                FD_SET(listener, &readable);
++            if (client != INVALID_SOCKET)
++                FD_SET(client, &readable);
++            timeval wait{0, kPollMs * 1000};
++            if (readable.fd_count == 0)
++                std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
++            else if (select(0, &readable, nullptr, nullptr, &wait) > 0)
++            {
++                if (client != INVALID_SOCKET && FD_ISSET(client, &readable))
++                    readClient();
++                if (canAccept && FD_ISSET(listener, &readable))
++                    acceptOne();
++            }
++            timers();
++        }
++        if (client != INVALID_SOCKET)
++            drop("el anfitrion se cierra", true, ByeReason::Shutdown);
++        closeSocket(listener);
++    }
++
++    Host::Host() : m_impl(std::make_unique<Impl>()) {}
++
++    Host::~Host()
++    {
++        stop();
++    }
++
++    bool Host::start(const HostSettings &settings, std::string &error)
++    {
++        stop();
++        if (settings.password.size() < kMinPasswordSize || settings.password.size() > kMaxPasswordSize)
++        {
++            error = "contrasena de longitud no valida";
++            return false;
++        }
++        m_impl->settings = settings;
++        if (!m_impl->listen(error))
++            return false;
++        if (settings.password.size() < 8)
++            logLine("aviso: contrasena corta (%u caracteres); mejor 8 o mas",
++                    static_cast<unsigned>(settings.password.size()));
++        m_impl->running = true;
++        m_impl->thread = std::thread([impl = m_impl.get()] { impl->run(); });
++        return true;
++    }
++
++    void Host::stop()
++    {
++        if (!m_impl->running.exchange(false))
++            return;
++        if (m_impl->thread.joinable())
++            m_impl->thread.join();
++        clearRemote(m_impl.get());
++    }
++
++    uint16_t Host::port() const
++    {
++        return m_impl->port;
++    }
++
++    bool Host::guestConnected() const
++    {
++        return m_impl->connected;
++    }
++
++    uint64_t Host::padMessages() const
++    {
++        return m_impl->padMessages;
++    }
++
++    uint64_t Host::rejectedLogins() const
++    {
++        return m_impl->rejected;
++    }
++
++    struct Guest::Impl
++    {
++        GuestSettings settings;
++        std::thread thread;
++        std::atomic<bool> running{false};
++        mutable std::mutex mutex;
++        GuestStatus status;
++        PadWire pad;
++
++        void setStatus(GuestState state, const std::string &text)
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            status.state = state;
++            status.text = text;
++        }
++
++        SOCKET connectToHost();
++        void run();
++    };
++
++    SOCKET Guest::Impl::connectToHost()
++    {
++        const std::string target = (settings.host.find(':') != std::string::npos ? "[" + settings.host + "]"
++                                                                                  : settings.host) +
++                                   ":" + std::to_string(settings.port);
++        setStatus(GuestState::Connecting, "Conectando con " + target + "...");
++        logLine("conectando con el anfitrion %s", target.c_str());
++        if (!ensureWinsock())
++        {
++            setStatus(GuestState::Failed, "Winsock no arranca");
++            return INVALID_SOCKET;
++        }
++        addrinfo hints{};
++        hints.ai_family = AF_UNSPEC;
++        hints.ai_socktype = SOCK_STREAM;
++        hints.ai_protocol = IPPROTO_TCP;
++        hints.ai_flags = AI_NUMERICSERV;
++        addrinfo *list = nullptr;
++        const std::string service = std::to_string(settings.port);
++        if (getaddrinfo(settings.host.c_str(), service.c_str(), &hints, &list) != 0 || list == nullptr)
++        {
++            setStatus(GuestState::Failed, "No se encuentra la direccion " + settings.host);
++            logLine("no se encuentra la direccion %s", settings.host.c_str());
++            return INVALID_SOCKET;
++        }
++        std::string lastError = "sin respuesta";
++        SOCKET connected = INVALID_SOCKET;
++        for (addrinfo *a = list; a != nullptr && connected == INVALID_SOCKET && running; a = a->ai_next)
++        {
++            SOCKET s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
++            if (s == INVALID_SOCKET)
++                continue;
++            setNonBlocking(s);
++            if (connect(s, a->ai_addr, static_cast<int>(a->ai_addrlen)) == SOCKET_ERROR &&
++                WSAGetLastError() != WSAEWOULDBLOCK)
++            {
++                lastError = socketError(WSAGetLastError());
++                closesocket(s);
++                continue;
++            }
++            const Clock::time_point start = Clock::now();
++            bool done = false;
++            while (running && !done && elapsedMs(start, Clock::now()) < kConnectTimeoutMs)
++            {
++                fd_set writable, failed;
++                FD_ZERO(&writable);
++                FD_ZERO(&failed);
++                FD_SET(s, &writable);
++                FD_SET(s, &failed);
++                timeval wait{0, 50 * 1000};
++                if (select(0, nullptr, &writable, &failed, &wait) > 0)
++                {
++                    int code = 0;
++                    int length = sizeof(code);
++                    getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&code), &length);
++                    if (FD_ISSET(s, &writable) && code == 0)
++                        connected = s;
++                    else
++                        lastError = socketError(code != 0 ? code : WSAECONNREFUSED);
++                    done = true;
++                }
++            }
++            if (connected == INVALID_SOCKET)
++            {
++                if (!done)
++                    lastError = "sin respuesta en 5 s";
++                closesocket(s);
++            }
++        }
++        freeaddrinfo(list);
++        if (connected == INVALID_SOCKET && running)
++        {
++            setStatus(GuestState::Failed, "No se puede conectar con " + target + ": " + lastError);
++            logLine("no se puede conectar con %s: %s", target.c_str(), lastError.c_str());
++        }
++        return connected;
++    }
++
++    void Guest::Impl::run()
++    {
++        SOCKET s = connectToHost();
++        if (s == INVALID_SOCKET)
++            return;
++        setNoDelay(s);
++        setStatus(GuestState::Authenticating, "Conectado; comprobando la contrasena...");
++        MessageAuth auth;
++        FrameReader reader(auth);
++        GuestHandshake handshake(settings.password, auth);
++        bool session = false;
++        bool finished = false;
++        const Clock::time_point started = Clock::now();
++        Clock::time_point lastReceived = started, lastPing = started, statsStart = started;
++        Clock::time_point nextPad = started;
++        uint32_t padCounter = 0, pingToken = 0, sentPads = 0;
++
++        auto end = [&](GuestState state, const std::string &text, bool bye, ByeReason reason)
++        {
++            if (bye && session)
++            {
++                const uint8_t payload[1] = {static_cast<uint8_t>(reason)};
++                sendAll(s, encodeFrame(MessageType::Bye, payload, 1, &auth));
++            }
++            setStatus(state, text);
++            logLine("%s", text.c_str());
++            finished = true;
++        };
++
++        if (!sendAll(s, handshake.hello()))
++            end(GuestState::Failed, "No se puede enviar el saludo", false, ByeReason::Quit);
++        while (!finished)
++        {
++            if (!running)
++            {
++                end(GuestState::Disconnected, "Desconectado: cerrado por el invitado", true, ByeReason::Quit);
++                break;
++            }
++            fd_set readable;
++            FD_ZERO(&readable);
++            FD_SET(s, &readable);
++            timeval wait{0, 5 * 1000};
++            if (select(0, &readable, nullptr, nullptr, &wait) > 0)
++            {
++                uint8_t buffer[512];
++                const int n = receiveSome(s, buffer, sizeof(buffer));
++                if (n == 0 || n == -2)
++                {
++                    end(session ? GuestState::Disconnected : GuestState::Failed,
++                        session ? "El anfitrion cerro la conexion" : "El anfitrion cerro la conexion en el saludo",
++                        false, ByeReason::Quit);
++                    break;
++                }
++                if (n > 0)
++                {
++                    lastReceived = Clock::now();
++                    if (!reader.feed(buffer, static_cast<size_t>(n)))
++                    {
++                        end(GuestState::Failed, std::string("Mensaje no valido del anfitrion: ") +
++                                                    frameErrorText(reader.error()),
++                            true, ByeReason::Protocol);
++                        break;
++                    }
++                    Frame frame;
++                    FrameReader::Result result;
++                    while (!finished && (result = reader.next(frame)) != FrameReader::Result::NeedMore)
++                    {
++                        if (result == FrameReader::Result::Error)
++                        {
++                            end(GuestState::Failed, std::string("Mensaje no valido del anfitrion: ") +
++                                                        frameErrorText(reader.error()),
++                                true, ByeReason::Protocol);
++                            break;
++                        }
++                        if (!session)
++                        {
++                            std::vector<std::vector<uint8_t>> out;
++                            const GuestHandshake::Result step = handshake.onFrame(frame, out);
++                            for (const std::vector<uint8_t> &bytes : out)
++                                sendAll(s, bytes);
++                            if (step == GuestHandshake::Result::Accepted)
++                            {
++                                session = true;
++                                lastPing = statsStart = nextPad = Clock::now();
++                                setStatus(GuestState::Connected, "Conectado: eres el jugador 2");
++                                logLine("conectado al anfitrion: jugador 2");
++                            }
++                            else if (step == GuestHandshake::Result::Rejected)
++                                end(GuestState::Rejected, "El anfitrion rechaza la conexion: " + handshake.reason(),
++                                    false, ByeReason::Quit);
++                            else if (step == GuestHandshake::Result::Failed)
++                                end(GuestState::Failed, "Saludo fallido: " + handshake.reason(), false,
++                                    ByeReason::Protocol);
++                            continue;
++                        }
++                        switch (static_cast<MessageType>(frame.type))
++                        {
++                        case MessageType::Ping:
++                            sendAll(s, encodeFrame(MessageType::Pong, frame.payload.data(), frame.size, &auth));
++                            break;
++                        case MessageType::Pong:
++                            if (get32(frame.payload.data()) == pingToken)
++                            {
++                                std::lock_guard<std::mutex> lock(mutex);
++                                status.roundTripMs = clockMs() - get32(frame.payload.data() + 4);
++                            }
++                            break;
++                        case MessageType::Bye:
++                            end(GuestState::Disconnected,
++                                std::string("El anfitrion cerro la sesion: ") + byeReasonText(frame.payload[0]), false,
++                                ByeReason::Quit);
++                            break;
++                        default:
++                            end(GuestState::Failed, "Mensaje fuera de lugar del anfitrion", true, ByeReason::Protocol);
++                            break;
++                        }
++                    }
++                }
++            }
++            if (finished)
++                break;
++            const Clock::time_point now = Clock::now();
++            if (!session)
++            {
++                if (elapsedMs(started, now) > kHandshakeTimeoutMs)
++                    end(GuestState::Failed, "El anfitrion no termina el saludo en 5 s", false, ByeReason::Timeout);
++                continue;
++            }
++            if (elapsedMs(lastReceived, now) > kIdleTimeoutMs)
++            {
++                end(GuestState::Disconnected, "Tiempo agotado: el anfitrion no responde", true, ByeReason::Timeout);
++                break;
++            }
++            if (now >= nextPad)
++            {
++                nextPad += std::chrono::microseconds(kPadIntervalUs);
++                if (now > nextPad)
++                    nextPad = now + std::chrono::microseconds(kPadIntervalUs);
++                PadWire current;
++                {
++                    std::lock_guard<std::mutex> lock(mutex);
++                    current = pad;
++                }
++                const auto payload = encodePad(++padCounter, current);
++                if (!sendAll(s, encodeFrame(MessageType::Pad, payload.data(), payload.size(), &auth)))
++                {
++                    end(GuestState::Disconnected, "No se puede enviar al anfitrion", false, ByeReason::Quit);
++                    break;
++                }
++                ++sentPads;
++            }
++            if (elapsedMs(lastPing, now) >= kPingIntervalMs)
++            {
++                lastPing = now;
++                uint8_t payload[8];
++                put32(payload, ++pingToken);
++                put32(payload + 4, clockMs());
++                sendAll(s, encodeFrame(MessageType::Ping, payload, sizeof(payload), &auth));
++            }
++            const int statsMs = elapsedMs(statsStart, now);
++            if (statsMs >= kStatsIntervalMs)
++            {
++                uint32_t rtt;
++                {
++                    std::lock_guard<std::mutex> lock(mutex);
++                    rtt = status.roundTripMs;
++                }
++                logLine("mando enviado: %.1f mensajes/s, ida y vuelta %u ms",
++                        static_cast<double>(sentPads) * 1000.0 / statsMs, static_cast<unsigned>(rtt));
++                statsStart = now;
++                sentPads = 0;
++            }
++        }
++        closesocket(s);
++    }
++
++    Guest::Guest() : m_impl(std::make_unique<Impl>()) {}
++
++    Guest::~Guest()
++    {
++        stop();
++    }
++
++    void Guest::start(const GuestSettings &settings)
++    {
++        stop();
++        m_impl->settings = settings;
++        m_impl->status = GuestStatus{};
++        m_impl->running = true;
++        m_impl->thread = std::thread([impl = m_impl.get()] { impl->run(); });
++    }
++
++    void Guest::setPad(const PadWire &pad)
++    {
++        std::lock_guard<std::mutex> lock(m_impl->mutex);
++        m_impl->pad = pad;
++    }
++
++    GuestStatus Guest::status() const
++    {
++        std::lock_guard<std::mutex> lock(m_impl->mutex);
++        return m_impl->status;
++    }
++
++    void Guest::stop()
++    {
++        m_impl->running = false;
++        if (m_impl->thread.joinable())
++            m_impl->thread.join();
++    }
++#else
++    struct Host::Impl
++    {
++    };
++    Host::Host() : m_impl(std::make_unique<Impl>()) {}
++    Host::~Host() = default;
++    bool Host::start(const HostSettings &, std::string &error)
++    {
++        error = "netplay solo en Windows";
++        return false;
++    }
++    void Host::stop() {}
++    uint16_t Host::port() const { return 0; }
++    bool Host::guestConnected() const { return false; }
++    uint64_t Host::padMessages() const { return 0; }
++    uint64_t Host::rejectedLogins() const { return 0; }
++    struct Guest::Impl
++    {
++        GuestStatus status;
++    };
++    Guest::Guest() : m_impl(std::make_unique<Impl>()) {}
++    Guest::~Guest() = default;
++    void Guest::start(const GuestSettings &)
++    {
++        m_impl->status = {GuestState::Failed, "netplay solo en Windows", 0};
++    }
++    void Guest::setPad(const PadWire &) {}
++    GuestStatus Guest::status() const { return m_impl->status; }
++    void Guest::stop() {}
++#endif
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.h b/ps2xRuntime/src/lib/ps2_netplay.h
+new file mode 100644
+index 0000000..6f076db
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay.h
+@@ -0,0 +1,96 @@
++#pragma once
++
++#include "ps2_netplay_protocol.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++// Fase 5 (T15, netplay N1): own netplay inside F1-06.exe, by IP (LAN or a VPN like Tailscale/ZeroTier, no router
++// ports). The host runs the game and listens on one TCP port for one guest; the guest (no game, a small window) sends
++// its pad, which the host's game reads on the second PS2 port. N2/N3 add the host's picture and sound.
++// Logs: "[red] ...".
++namespace ps2x::netplay
++{
++    struct HostSettings
++    {
++        std::string listenAddress; // empty: every interface (IPv6 and IPv4)
++        uint16_t port = kDefaultPort; // 0: any free port (tests)
++        std::string password;
++    };
++
++    class Host
++    {
++    public:
++        Host();
++        ~Host();
++        Host(const Host &) = delete;
++        Host &operator=(const Host &) = delete;
++
++        // Listens and serves in its own thread; false (error) if it cannot listen.
++        bool start(const HostSettings &settings, std::string &error);
++        void stop();
++        uint16_t port() const;
++        bool guestConnected() const;
++        uint64_t padMessages() const;
++        uint64_t rejectedLogins() const;
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++
++    enum class GuestState
++    {
++        Idle,
++        Connecting,
++        Authenticating,
++        Connected,
++        Rejected,     // the host said no (wrong password, busy, version)
++        Disconnected, // the session ended
++        Failed,       // could not connect, or the host broke the protocol
++    };
++
++    struct GuestStatus
++    {
++        GuestState state = GuestState::Idle;
++        std::string text; // for the window and the log
++        uint32_t roundTripMs = 0;
++    };
++
++    struct GuestSettings
++    {
++        std::string host;
++        uint16_t port = kDefaultPort;
++        std::string password;
++    };
++
++    class Guest
++    {
++    public:
++        Guest();
++        ~Guest();
++        Guest(const Guest &) = delete;
++        Guest &operator=(const Guest &) = delete;
++
++        // Connects and serves in its own thread (status() follows it).
++        void start(const GuestSettings &settings);
++        // The pad sent from now on (~60 times per second).
++        void setPad(const PadWire &pad);
++        GuestStatus status() const;
++        // Says goodbye to the host and closes.
++        void stop();
++
++    private:
++        struct Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++
++    // The guest's pad while a guest is connected to this process's host (the second PS2 port reads it).
++    bool remotePadActive();
++    bool readRemotePad(PadWire &pad);
++
++    // Guest mode of F1-06.exe: its window (state of the connection) and the local pad (player 1 of the guest's own
++    // controles.ini) sent to the host. Returns the process exit code.
++    int runGuestWindow(const GuestSettings &settings);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_crypto.cpp b/ps2xRuntime/src/lib/ps2_netplay_crypto.cpp
+new file mode 100644
+index 0000000..ce2056f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_crypto.cpp
+@@ -0,0 +1,232 @@
++#include "ps2_netplay_crypto.h"
++
++#include <algorithm>
++#include <cstring>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <bcrypt.h>
++#else
++#include <fstream>
++#endif
++
++// Fase 5 (T15, netplay N1): see ps2_netplay_crypto.h.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        constexpr uint32_t kRound[64] = {
++            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
++
++        inline uint32_t rotr(uint32_t x, int n)
++        {
++            return (x >> n) | (x << (32 - n));
++        }
++    }
++
++    Sha256::Sha256()
++        : m_state{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
++          m_buffer{}
++    {
++    }
++
++    void Sha256::block(const uint8_t *data)
++    {
++        uint32_t w[64];
++        for (int i = 0; i < 16; ++i)
++            w[i] = (uint32_t(data[i * 4]) << 24) | (uint32_t(data[i * 4 + 1]) << 16) | (uint32_t(data[i * 4 + 2]) << 8) |
++                   uint32_t(data[i * 4 + 3]);
++        for (int i = 16; i < 64; ++i)
++        {
++            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
++            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
++            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++        }
++        uint32_t a = m_state[0], b = m_state[1], c = m_state[2], d = m_state[3];
++        uint32_t e = m_state[4], f = m_state[5], g = m_state[6], h = m_state[7];
++        for (int i = 0; i < 64; ++i)
++        {
++            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
++            const uint32_t ch = (e & f) ^ (~e & g);
++            const uint32_t t1 = h + s1 + ch + kRound[i] + w[i];
++            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
++            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
++            const uint32_t t2 = s0 + maj;
++            h = g;
++            g = f;
++            f = e;
++            e = d + t1;
++            d = c;
++            c = b;
++            b = a;
++            a = t1 + t2;
++        }
++        m_state[0] += a;
++        m_state[1] += b;
++        m_state[2] += c;
++        m_state[3] += d;
++        m_state[4] += e;
++        m_state[5] += f;
++        m_state[6] += g;
++        m_state[7] += h;
++    }
++
++    void Sha256::update(const void *data, size_t size)
++    {
++        const uint8_t *bytes = static_cast<const uint8_t *>(data);
++        m_length += size;
++        if (m_buffered > 0)
++        {
++            const size_t take = std::min(size, sizeof(m_buffer) - m_buffered);
++            std::memcpy(m_buffer + m_buffered, bytes, take);
++            m_buffered += take;
++            bytes += take;
++            size -= take;
++            if (m_buffered < sizeof(m_buffer))
++                return;
++            block(m_buffer);
++            m_buffered = 0;
++        }
++        while (size >= 64)
++        {
++            block(bytes);
++            bytes += 64;
++            size -= 64;
++        }
++        if (size > 0)
++        {
++            std::memcpy(m_buffer, bytes, size);
++            m_buffered = size;
++        }
++    }
++
++    Digest Sha256::finish()
++    {
++        const uint64_t bits = m_length * 8u;
++        const uint8_t one = 0x80;
++        update(&one, 1);
++        const uint8_t zero = 0;
++        while (m_buffered != 56)
++            update(&zero, 1);
++        uint8_t length[8];
++        for (int i = 0; i < 8; ++i)
++            length[i] = static_cast<uint8_t>(bits >> (56 - 8 * i));
++        update(length, 8);
++        Digest out;
++        for (int i = 0; i < 8; ++i)
++            for (int j = 0; j < 4; ++j)
++                out[static_cast<size_t>(i * 4 + j)] = static_cast<uint8_t>(m_state[i] >> (24 - 8 * j));
++        return out;
++    }
++
++    HmacSha256::HmacSha256(const void *key, size_t keySize) : m_outerKey{}
++    {
++        uint8_t block[64] = {};
++        if (keySize > sizeof(block))
++        {
++            const Digest hashed = sha256(key, keySize);
++            std::memcpy(block, hashed.data(), hashed.size());
++        }
++        else if (keySize > 0)
++            std::memcpy(block, key, keySize);
++        uint8_t inner[64];
++        for (int i = 0; i < 64; ++i)
++        {
++            inner[i] = static_cast<uint8_t>(block[i] ^ 0x36);
++            m_outerKey[i] = static_cast<uint8_t>(block[i] ^ 0x5c);
++        }
++        m_inner.update(inner, sizeof(inner));
++    }
++
++    void HmacSha256::update(const void *data, size_t size)
++    {
++        m_inner.update(data, size);
++    }
++
++    Digest HmacSha256::finish()
++    {
++        const Digest inner = m_inner.finish();
++        Sha256 outer;
++        outer.update(m_outerKey, sizeof(m_outerKey));
++        outer.update(inner.data(), inner.size());
++        return outer.finish();
++    }
++
++    Digest sha256(const void *data, size_t size)
++    {
++        Sha256 h;
++        h.update(data, size);
++        return h.finish();
++    }
++
++    Digest hmacSha256(const void *key, size_t keySize, const void *data, size_t size)
++    {
++        HmacSha256 h(key, keySize);
++        h.update(data, size);
++        return h.finish();
++    }
++
++    void pbkdf2Sha256(const void *password, size_t passwordSize, const void *salt, size_t saltSize, uint32_t iterations,
++                      uint8_t *out, size_t outSize)
++    {
++        // The keyed state is computed once and copied for every HMAC of the chain.
++        const HmacSha256 keyed(password, passwordSize);
++        for (uint32_t blockIndex = 1; outSize > 0; ++blockIndex)
++        {
++            const uint8_t counter[4] = {static_cast<uint8_t>(blockIndex >> 24), static_cast<uint8_t>(blockIndex >> 16),
++                                        static_cast<uint8_t>(blockIndex >> 8), static_cast<uint8_t>(blockIndex)};
++            HmacSha256 first = keyed;
++            first.update(salt, saltSize);
++            first.update(counter, sizeof(counter));
++            Digest u = first.finish();
++            Digest t = u;
++            for (uint32_t i = 1; i < iterations; ++i)
++            {
++                HmacSha256 next = keyed;
++                next.update(u.data(), u.size());
++                u = next.finish();
++                for (size_t j = 0; j < t.size(); ++j)
++                    t[j] ^= u[j];
++            }
++            const size_t take = std::min(outSize, t.size());
++            std::memcpy(out, t.data(), take);
++            out += take;
++            outSize -= take;
++        }
++    }
++
++    bool constantTimeEqual(const void *a, const void *b, size_t size)
++    {
++        const volatile uint8_t *x = static_cast<const volatile uint8_t *>(a);
++        const volatile uint8_t *y = static_cast<const volatile uint8_t *>(b);
++        uint8_t difference = 0;
++        for (size_t i = 0; i < size; ++i)
++            difference = static_cast<uint8_t>(difference | (x[i] ^ y[i]));
++        return difference == 0;
++    }
++
++    bool randomBytes(void *out, size_t size)
++    {
++#if defined(_WIN32)
++        return size <= 0xFFFFFFFFu &&
++               BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), static_cast<ULONG>(size),
++                               BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
++#else
++        std::ifstream random("/dev/urandom", std::ios::binary);
++        return random.read(static_cast<char *>(out), static_cast<std::streamsize>(size)).good();
++#endif
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_crypto.h b/ps2xRuntime/src/lib/ps2_netplay_crypto.h
+new file mode 100644
+index 0000000..33e7cc1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_crypto.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++// Fase 5 (T15, netplay N1): the hashes the netplay session needs, implemented here so the game takes no new
++// dependency: SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104), PBKDF2-HMAC-SHA256 (RFC 8018), a comparison that does not
++// stop at the first difference and random bytes from the system (BCryptGenRandom).
++namespace ps2x::netplay
++{
++    using Digest = std::array<uint8_t, 32>;
++
++    class Sha256
++    {
++    public:
++        Sha256();
++        void update(const void *data, size_t size);
++        Digest finish();
++
++    private:
++        void block(const uint8_t *data);
++
++        uint32_t m_state[8];
++        uint8_t m_buffer[64];
++        size_t m_buffered = 0;
++        uint64_t m_length = 0; // bytes
++    };
++
++    class HmacSha256
++    {
++    public:
++        HmacSha256(const void *key, size_t keySize);
++        void update(const void *data, size_t size);
++        Digest finish();
++
++    private:
++        Sha256 m_inner;
++        uint8_t m_outerKey[64];
++    };
++
++    Digest sha256(const void *data, size_t size);
++    Digest hmacSha256(const void *key, size_t keySize, const void *data, size_t size);
++    void pbkdf2Sha256(const void *password, size_t passwordSize, const void *salt, size_t saltSize, uint32_t iterations,
++                      uint8_t *out, size_t outSize);
++    // Constant time over size bytes.
++    bool constantTimeEqual(const void *a, const void *b, size_t size);
++    // False if the system has no random source.
++    bool randomBytes(void *out, size_t size);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+new file mode 100644
+index 0000000..043878d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -0,0 +1,116 @@
++#include "ps2_netplay.h"
++#include "ps2_host_backend.h"
++#include "runtime/ps2_pad.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++#if defined(_WIN32)
++// Declared by hand: <windows.h> clashes with raylib names (as in ps2_runtime.cpp).
++extern "C" __declspec(dllimport) int __stdcall SetWindowPos(void *hWnd, void *hWndInsertAfter, int x, int y, int cx,
++                                                            int cy, unsigned int flags);
++#endif
++
++// Fase 5 (T15, netplay N1): the guest's window. It does not run the game: it shows the connection and sends the local
++// pad (player 1 of this PC's controles.ini: keys, gamepad, wheel) to the host ~60 times per second. N2 draws the
++// host's picture here.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        const char *stateName(GuestState state)
++        {
++            switch (state)
++            {
++            case GuestState::Idle: return "SIN CONEXION";
++            case GuestState::Connecting: return "CONECTANDO";
++            case GuestState::Authenticating: return "COMPROBANDO LA CONTRASENA";
++            case GuestState::Connected: return "CONECTADO";
++            case GuestState::Rejected: return "RECHAZADO";
++            case GuestState::Disconnected: return "DESCONECTADO";
++            case GuestState::Failed: return "ERROR";
++            }
++            return "?";
++        }
++
++        std::string pressedNames(const PadWire &pad)
++        {
++            static const char *const kNames[16] = {"SELECT", "L3", "R3", "START", "ARRIBA", "DERECHA", "ABAJO",
++                                                   "IZQUIERDA", "L2", "R2", "L1", "R1", "TRIANGULO", "CIRCULO",
++                                                   "CRUZ", "CUADRADO"};
++            std::string out;
++            for (int b = 0; b < 16; ++b)
++                if ((pad.pressed >> b) & 1u)
++                    out += (out.empty() ? "" : " ") + std::string(kNames[b]);
++            return out.empty() ? "-" : out;
++        }
++    }
++
++    int runGuestWindow(const GuestSettings &settings)
++    {
++        // PS2X_BACKGROUND_WINDOW=1 (automated runs), as the game's window: never takes the focus, off-screen.
++        const char *background = std::getenv("PS2X_BACKGROUND_WINDOW");
++        const bool backgroundWindow = background && background[0] != '\0' && background[0] != '0';
++        unsigned int flags = FLAG_WINDOW_RESIZABLE;
++        if (backgroundWindow)
++            flags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED | FLAG_WINDOW_ALWAYS_RUN;
++        SetConfigFlags(flags);
++        SetTraceLogLevel(LOG_WARNING);
++        InitWindow(640, 360, "Formula One 06 - invitado (jugador 2)");
++#if defined(_WIN32)
++        if (backgroundWindow)
++            SetWindowPos(GetWindowHandle(), reinterpret_cast<void *>(1) /* HWND_BOTTOM */, -4000, 0, 0, 0,
++                         0x0001u /* SWP_NOSIZE */ | 0x0010u /* SWP_NOACTIVATE */ | 0x0040u /* SWP_SHOWWINDOW */);
++#endif
++        SetExitKey(KEY_NULL); // ESC may be one of the player's controls
++        SetTargetFPS(60);
++
++        Guest guest;
++        guest.start(settings);
++        PSPadBackend pad;
++        uint8_t report[32] = {};
++        GuestState lastState = GuestState::Idle;
++        while (!WindowShouldClose())
++        {
++            pad.readState(0, 0, report, sizeof(report));
++            const PadWire wire = padWireFromReport(report);
++            guest.setPad(wire);
++            const GuestStatus status = guest.status();
++            if (status.state != lastState)
++            {
++                lastState = status.state;
++                std::fprintf(stderr, "[red] invitado: %s - %s\n", stateName(status.state), status.text.c_str());
++                std::fflush(stderr);
++            }
++
++            BeginDrawing();
++            ClearBackground(Color{18, 22, 30, 255});
++            DrawText("FORMULA ONE 06 - JUEGO EN RED", 24, 20, 24, RAYWHITE);
++            DrawText("Invitado: tu mando es el del jugador 2 del anfitrion", 24, 56, 18, LIGHTGRAY);
++            const Color stateColor = status.state == GuestState::Connected ? GREEN
++                                     : status.state == GuestState::Connecting ||
++                                             status.state == GuestState::Authenticating
++                                         ? YELLOW
++                                         : RED;
++            DrawText(stateName(status.state), 24, 100, 32, stateColor);
++            DrawText(status.text.c_str(), 24, 142, 18, RAYWHITE);
++            if (status.state == GuestState::Connected)
++            {
++                DrawText(TextFormat("Ida y vuelta: %u ms", static_cast<unsigned>(status.roundTripMs)), 24, 176, 18,
++                         LIGHTGRAY);
++                DrawText(TextFormat("Botones: %s", pressedNames(wire).c_str()), 24, 206, 18, LIGHTGRAY);
++                DrawText(TextFormat("Stick izq: %3u %3u   Stick der: %3u %3u", wire.lx, wire.ly, wire.rx, wire.ry), 24,
++                         236, 18, LIGHTGRAY);
++            }
++            DrawText("La imagen del anfitrion llegara en una version proxima. Cierra la ventana para salir.", 24, 320,
++                     14, GRAY);
++            EndDrawing();
++        }
++        guest.stop();
++        const GuestStatus last = guest.status();
++        std::fprintf(stderr, "[red] invitado cerrado: %s - %s\n", stateName(last.state), last.text.c_str());
++        CloseWindow();
++        return last.state == GuestState::Rejected || last.state == GuestState::Failed ? 2 : 0;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+new file mode 100644
+index 0000000..d75d36f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.cpp
+@@ -0,0 +1,606 @@
++#include "ps2_netplay_protocol.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++
++// Fase 5 (T15, netplay N1): see ps2_netplay_protocol.h.
++namespace ps2x::netplay
++{
++    namespace
++    {
++        // Report order of the pressures (bytes 8-19) and the PS2 button of each.
++        constexpr int kPressureButton[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 8, 11, 9};
++
++        constexpr char kKeySalt[] = "F1-06 netplay v1";
++
++        void put16(uint8_t *out, uint16_t value)
++        {
++            out[0] = static_cast<uint8_t>(value & 0xFFu);
++            out[1] = static_cast<uint8_t>(value >> 8);
++        }
++
++        uint16_t get16(const uint8_t *in)
++        {
++            return static_cast<uint16_t>(in[0] | (in[1] << 8));
++        }
++
++        void put32(uint8_t *out, uint32_t value)
++        {
++            for (int i = 0; i < 4; ++i)
++                out[i] = static_cast<uint8_t>(value >> (8 * i));
++        }
++
++        uint32_t get32(const uint8_t *in)
++        {
++            return uint32_t(in[0]) | (uint32_t(in[1]) << 8) | (uint32_t(in[2]) << 16) | (uint32_t(in[3]) << 24);
++        }
++
++        Digest deriveKey(const std::string &password, const uint8_t *hostNonce)
++        {
++            uint8_t salt[sizeof(kKeySalt) - 1 + kNonceSize];
++            std::memcpy(salt, kKeySalt, sizeof(kKeySalt) - 1);
++            std::memcpy(salt + sizeof(kKeySalt) - 1, hostNonce, kNonceSize);
++            Digest key{};
++            pbkdf2Sha256(password.data(), password.size(), salt, sizeof(salt), kKeyIterations, key.data(), key.size());
++            return key;
++        }
++
++        // HMAC(key, label || host nonce || guest nonce).
++        Digest labelled(const Digest &key, const char *label, const uint8_t *hostNonce, const uint8_t *guestNonce)
++        {
++            HmacSha256 h(key.data(), key.size());
++            h.update(label, std::strlen(label));
++            h.update(hostNonce, kNonceSize);
++            h.update(guestNonce, kNonceSize);
++            return h.finish();
++        }
++
++        std::vector<uint8_t> reject(RejectReason reason)
++        {
++            uint8_t payload[3] = {static_cast<uint8_t>(reason)};
++            put16(payload + 1, kProtocolVersion);
++            return encodeFrame(MessageType::Reject, payload, sizeof(payload), nullptr);
++        }
++    }
++
++    int payloadSizeOf(uint8_t type)
++    {
++        switch (static_cast<MessageType>(type))
++        {
++        case MessageType::Hello: return 12;
++        case MessageType::Challenge: return 4 + static_cast<int>(kNonceSize);
++        case MessageType::Auth: return static_cast<int>(kNonceSize) + 32;
++        case MessageType::Welcome: return 33;
++        case MessageType::Reject: return 3;
++        case MessageType::Pad: return static_cast<int>(kPadPayloadSize);
++        case MessageType::Ping: return 8;
++        case MessageType::Pong: return 8;
++        case MessageType::Bye: return 1;
++        }
++        return -1;
++    }
++
++    bool isReservedType(uint8_t type)
++    {
++        return type >= 0x20 && type <= 0x3F;
++    }
++
++    const char *rejectReasonText(uint8_t reason)
++    {
++        switch (static_cast<RejectReason>(reason))
++        {
++        case RejectReason::Version: return "version del protocolo distinta";
++        case RejectReason::Password: return "contrasena incorrecta";
++        case RejectReason::Busy: return "el anfitrion ya tiene un invitado";
++        case RejectReason::Protocol: return "mensaje no valido";
++        }
++        return "motivo desconocido";
++    }
++
++    const char *byeReasonText(uint8_t reason)
++    {
++        switch (static_cast<ByeReason>(reason))
++        {
++        case ByeReason::Quit: return "salio";
++        case ByeReason::Timeout: return "tiempo agotado";
++        case ByeReason::Protocol: return "mensaje no valido";
++        case ByeReason::Shutdown: return "cierre del programa";
++        }
++        return "motivo desconocido";
++    }
++
++    PadWire padWireFromReport(const uint8_t *report)
++    {
++        PadWire pad;
++        pad.pressed = static_cast<uint16_t>(~(report[2] | (report[3] << 8)));
++        pad.rx = report[4];
++        pad.ry = report[5];
++        pad.lx = report[6];
++        pad.ly = report[7];
++        for (int i = 0; i < 12; ++i)
++            pad.pressure[static_cast<size_t>(i)] = (pad.pressed >> kPressureButton[i]) & 1u ? report[8 + i] : 0u;
++        return pad;
++    }
++
++    void padWireToReport(const PadWire &pad, uint8_t *report)
++    {
++        const uint16_t buttons = static_cast<uint16_t>(~pad.pressed);
++        report[2] = static_cast<uint8_t>(buttons & 0xFFu);
++        report[3] = static_cast<uint8_t>(buttons >> 8);
++        report[4] = pad.rx;
++        report[5] = pad.ry;
++        report[6] = pad.lx;
++        report[7] = pad.ly;
++        for (int i = 0; i < 12; ++i)
++            report[8 + i] = (pad.pressed >> kPressureButton[i]) & 1u ? pad.pressure[static_cast<size_t>(i)] : 0u;
++        report[20] = 1u; // pressures valid (Pad.cpp)
++    }
++
++    std::array<uint8_t, kPadPayloadSize> encodePad(uint32_t counter, const PadWire &pad)
++    {
++        std::array<uint8_t, kPadPayloadSize> out{};
++        put32(out.data(), counter);
++        put16(out.data() + 4, pad.pressed);
++        out[6] = pad.rx;
++        out[7] = pad.ry;
++        out[8] = pad.lx;
++        out[9] = pad.ly;
++        std::memcpy(out.data() + 10, pad.pressure.data(), pad.pressure.size());
++        return out;
++    }
++
++    bool decodePad(const uint8_t *payload, size_t size, uint32_t &counter, PadWire &pad)
++    {
++        if (payload == nullptr || size != kPadPayloadSize)
++            return false;
++        counter = get32(payload);
++        pad.pressed = get16(payload + 4);
++        pad.rx = payload[6];
++        pad.ry = payload[7];
++        pad.lx = payload[8];
++        pad.ly = payload[9];
++        std::memcpy(pad.pressure.data(), payload + 10, pad.pressure.size());
++        return true;
++    }
++
++    void MessageAuth::start(const Digest &sessionKey, bool host)
++    {
++        m_key = sessionKey;
++        m_host = host;
++        m_sent = m_received = 0;
++        m_active = true;
++    }
++
++    void MessageAuth::reset()
++    {
++        m_key.fill(0);
++        m_sent = m_received = 0;
++        m_active = false;
++    }
++
++    void MessageAuth::compute(char direction, uint64_t counter, const uint8_t *header, const uint8_t *payload,
++                              size_t size, uint8_t *tag) const
++    {
++        uint8_t prefix[1 + 8];
++        prefix[0] = static_cast<uint8_t>(direction);
++        for (int i = 0; i < 8; ++i)
++            prefix[1 + i] = static_cast<uint8_t>(counter >> (8 * i));
++        HmacSha256 h(m_key.data(), m_key.size());
++        h.update(prefix, sizeof(prefix));
++        h.update(header, kHeaderSize);
++        if (size > 0)
++            h.update(payload, size);
++        const Digest full = h.finish();
++        std::memcpy(tag, full.data(), kTagSize);
++    }
++
++    void MessageAuth::sign(const uint8_t *header, const uint8_t *payload, size_t size, uint8_t *tag)
++    {
++        compute(m_host ? 'H' : 'G', m_sent++, header, payload, size, tag);
++    }
++
++    bool MessageAuth::verify(const uint8_t *header, const uint8_t *payload, size_t size, const uint8_t *tag)
++    {
++        uint8_t expected[kTagSize];
++        compute(m_host ? 'G' : 'H', m_received, header, payload, size, expected);
++        if (!constantTimeEqual(expected, tag, kTagSize))
++            return false;
++        ++m_received;
++        return true;
++    }
++
++    std::vector<uint8_t> encodeFrame(MessageType type, const uint8_t *payload, size_t size, MessageAuth *auth)
++    {
++        const int expected = payloadSizeOf(static_cast<uint8_t>(type));
++        if (expected < 0 || size != static_cast<size_t>(expected) || (size > 0 && payload == nullptr))
++            return {};
++        const bool tagged = auth != nullptr && auth->active();
++        std::vector<uint8_t> out(kHeaderSize + size + (tagged ? kTagSize : 0));
++        out[0] = static_cast<uint8_t>(type);
++        out[1] = 0;
++        put16(out.data() + 2, static_cast<uint16_t>(size));
++        if (size > 0)
++            std::memcpy(out.data() + kHeaderSize, payload, size);
++        if (tagged)
++            auth->sign(out.data(), out.data() + kHeaderSize, size, out.data() + kHeaderSize + size);
++        return out;
++    }
++
++    const char *frameErrorText(FrameError error)
++    {
++        switch (error)
++        {
++        case FrameError::None: return "ninguno";
++        case FrameError::UnknownType: return "tipo desconocido";
++        case FrameError::ReservedType: return "tipo reservado (no existe en esta version)";
++        case FrameError::BadFlags: return "banderas no validas";
++        case FrameError::BadLength: return "longitud no valida";
++        case FrameError::BadTag: return "firma no valida";
++        case FrameError::Overflow: return "demasiados datos pendientes";
++        case FrameError::Truncated: return "mensaje cortado";
++        }
++        return "?";
++    }
++
++    bool FrameReader::feed(const uint8_t *data, size_t size)
++    {
++        if (m_error != FrameError::None)
++            return false;
++        if (size > kPendingLimit || m_pending.size() > kPendingLimit - size)
++        {
++            m_error = FrameError::Overflow;
++            return false;
++        }
++        m_pending.insert(m_pending.end(), data, data + size);
++        return true;
++    }
++
++    FrameReader::Result FrameReader::next(Frame &out)
++    {
++        if (m_error != FrameError::None)
++            return Result::Error;
++        if (m_pending.size() < kHeaderSize)
++            return Result::NeedMore;
++        const uint8_t *h = m_pending.data();
++        const uint8_t type = h[0];
++        const uint16_t length = get16(h + 2);
++        const int expected = payloadSizeOf(type);
++        if (expected < 0)
++            m_error = isReservedType(type) ? FrameError::ReservedType : FrameError::UnknownType;
++        else if (h[1] != 0)
++            m_error = FrameError::BadFlags;
++        else if (length != static_cast<uint16_t>(expected))
++            m_error = FrameError::BadLength;
++        if (m_error != FrameError::None)
++            return Result::Error;
++        const bool tagged = m_auth.active();
++        const size_t total = kHeaderSize + length + (tagged ? kTagSize : 0);
++        if (m_pending.size() < total)
++            return Result::NeedMore;
++        if (tagged && !m_auth.verify(h, h + kHeaderSize, length, h + kHeaderSize + length))
++        {
++            m_error = FrameError::BadTag;
++            return Result::Error;
++        }
++        out.type = type;
++        out.size = static_cast<uint8_t>(length);
++        out.payload.fill(0);
++        std::memcpy(out.payload.data(), h + kHeaderSize, length);
++        m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(total));
++        return Result::Frame;
++    }
++
++    void FrameReader::finish()
++    {
++        if (m_error == FrameError::None && !m_pending.empty())
++            m_error = FrameError::Truncated;
++    }
++
++    void FrameReader::reset()
++    {
++        m_pending.clear();
++        m_error = FrameError::None;
++    }
++
++    HostHandshake::HostHandshake(std::string password, MessageAuth &auth, RandomSource random)
++        : m_password(std::move(password)), m_auth(auth), m_random(std::move(random))
++    {
++    }
++
++    HostHandshake::Result HostHandshake::onFrame(const Frame &frame, std::vector<std::vector<uint8_t>> &send)
++    {
++        const auto type = static_cast<MessageType>(frame.type);
++        if (m_step == Step::Hello && type == MessageType::Hello)
++        {
++            if (std::memcmp(frame.payload.data(), kMagic, sizeof(kMagic)) != 0)
++            {
++                m_reason = "no es un invitado de F1 06";
++                m_step = Step::Done;
++                return Result::Invalid;
++            }
++            const uint16_t version = get16(frame.payload.data() + 8);
++            if (version != kProtocolVersion)
++            {
++                m_reason = "version del invitado " + std::to_string(version) + ", la nuestra " +
++                           std::to_string(kProtocolVersion);
++                m_rejectReason = RejectReason::Version;
++                send.push_back(reject(RejectReason::Version));
++                m_step = Step::Done;
++                return Result::Rejected;
++            }
++            if (!m_random(m_hostNonce, kNonceSize))
++            {
++                m_reason = "sin fuente de numeros aleatorios";
++                m_step = Step::Done;
++                return Result::Invalid;
++            }
++            uint8_t payload[4 + kNonceSize] = {};
++            put16(payload, kProtocolVersion);
++            std::memcpy(payload + 4, m_hostNonce, kNonceSize);
++            send.push_back(encodeFrame(MessageType::Challenge, payload, sizeof(payload), nullptr));
++            m_step = Step::Auth;
++            return Result::Continue;
++        }
++        if (m_step == Step::Auth && type == MessageType::Auth)
++        {
++            m_step = Step::Done;
++            const uint8_t *guestNonce = frame.payload.data();
++            const Digest key = deriveKey(m_password, m_hostNonce);
++            const Digest expected = labelled(key, "guest", m_hostNonce, guestNonce);
++            if (!constantTimeEqual(expected.data(), frame.payload.data() + kNonceSize, expected.size()))
++            {
++                m_reason = "contrasena incorrecta";
++                m_rejectReason = RejectReason::Password;
++                send.push_back(reject(RejectReason::Password));
++                return Result::Rejected;
++            }
++            const Digest proof = labelled(key, "host", m_hostNonce, guestNonce);
++            uint8_t payload[33];
++            std::memcpy(payload, proof.data(), proof.size());
++            payload[32] = 2; // the second PS2 port
++            send.push_back(encodeFrame(MessageType::Welcome, payload, sizeof(payload), nullptr));
++            m_auth.start(labelled(key, "session", m_hostNonce, guestNonce), true);
++            return Result::Accepted;
++        }
++        m_reason = std::string("mensaje 0x") + "0123456789abcdef"[frame.type >> 4] + "0123456789abcdef"[frame.type & 15] +
++                   " fuera de orden en el saludo";
++        m_step = Step::Done;
++        return Result::Invalid;
++    }
++
++    GuestHandshake::GuestHandshake(std::string password, MessageAuth &auth, RandomSource random)
++        : m_password(std::move(password)), m_auth(auth), m_random(std::move(random))
++    {
++    }
++
++    std::vector<uint8_t> GuestHandshake::hello() const
++    {
++        uint8_t payload[12] = {};
++        std::memcpy(payload, kMagic, sizeof(kMagic));
++        put16(payload + 8, kProtocolVersion);
++        return encodeFrame(MessageType::Hello, payload, sizeof(payload), nullptr);
++    }
++
++    GuestHandshake::Result GuestHandshake::onFrame(const Frame &frame, std::vector<std::vector<uint8_t>> &send)
++    {
++        const auto type = static_cast<MessageType>(frame.type);
++        if (m_step != Step::Done && type == MessageType::Reject)
++        {
++            m_step = Step::Done;
++            m_rejectReason = frame.payload[0];
++            m_hostVersion = get16(frame.payload.data() + 1);
++            m_reason = rejectReasonText(m_rejectReason);
++            return Result::Rejected;
++        }
++        if (m_step == Step::Challenge && type == MessageType::Challenge)
++        {
++            m_hostVersion = get16(frame.payload.data());
++            if (m_hostVersion != kProtocolVersion)
++            {
++                m_step = Step::Done;
++                m_reason = "el anfitrion usa la version " + std::to_string(m_hostVersion) + " del protocolo";
++                return Result::Failed;
++            }
++            std::memcpy(m_hostNonce, frame.payload.data() + 4, kNonceSize);
++            if (!m_random(m_guestNonce, kNonceSize))
++            {
++                m_step = Step::Done;
++                m_reason = "sin fuente de numeros aleatorios";
++                return Result::Failed;
++            }
++            m_key = deriveKey(m_password, m_hostNonce);
++            const Digest proof = labelled(m_key, "guest", m_hostNonce, m_guestNonce);
++            uint8_t payload[kNonceSize + 32];
++            std::memcpy(payload, m_guestNonce, kNonceSize);
++            std::memcpy(payload + kNonceSize, proof.data(), proof.size());
++            send.push_back(encodeFrame(MessageType::Auth, payload, sizeof(payload), nullptr));
++            m_step = Step::Welcome;
++            return Result::Continue;
++        }
++        if (m_step == Step::Welcome && type == MessageType::Welcome)
++        {
++            m_step = Step::Done;
++            const Digest expected = labelled(m_key, "host", m_hostNonce, m_guestNonce);
++            if (!constantTimeEqual(expected.data(), frame.payload.data(), expected.size()))
++            {
++                m_reason = "el anfitrion no conoce la contrasena";
++                return Result::Failed;
++            }
++            if (frame.payload[32] != 2)
++            {
++                m_reason = "puerto del mando no valido";
++                return Result::Failed;
++            }
++            m_auth.start(labelled(m_key, "session", m_hostNonce, m_guestNonce), false);
++            m_key.fill(0);
++            return Result::Accepted;
++        }
++        m_step = Step::Done;
++        m_reason = "mensaje fuera de orden en el saludo";
++        return Result::Failed;
++    }
++
++    bool splitHostPort(const std::string &text, std::string &host, uint16_t &port, bool &hasPort, std::string &error)
++    {
++        hasPort = false;
++        std::string portText;
++        if (!text.empty() && text.front() == '[')
++        {
++            const size_t close = text.find(']');
++            if (close == std::string::npos)
++            {
++                error = "falta ']' en " + text;
++                return false;
++            }
++            host = text.substr(1, close - 1);
++            if (close + 1 < text.size())
++            {
++                if (text[close + 1] != ':')
++                {
++                    error = "direccion no valida: " + text;
++                    return false;
++                }
++                portText = text.substr(close + 2);
++                hasPort = true;
++            }
++        }
++        else
++        {
++            const size_t colon = text.find(':');
++            if (colon != std::string::npos && text.find(':', colon + 1) == std::string::npos)
++            {
++                host = text.substr(0, colon);
++                portText = text.substr(colon + 1);
++                hasPort = true;
++            }
++            else
++                host = text; // no port, or a bare IPv6 address
++        }
++        if (host.empty() || host.size() > 253)
++        {
++            error = "direccion no valida: " + text;
++            return false;
++        }
++        for (char c : host)
++            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == ':' || c == '_' || c == '%'))
++            {
++                error = "direccion no valida: " + text;
++                return false;
++            }
++        if (hasPort)
++        {
++            unsigned long value = 0;
++            bool ok = !portText.empty() && portText.size() <= 5;
++            for (char c : portText)
++                ok = ok && c >= '0' && c <= '9';
++            if (ok)
++                value = std::stoul(portText);
++            if (!ok || value < 1 || value > 65535)
++            {
++                error = "puerto no valido: " + portText;
++                return false;
++            }
++            port = static_cast<uint16_t>(value);
++        }
++        return true;
++    }
++
++    bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
++                               std::string &error)
++    {
++        std::vector<std::string> rest;
++        bool host = false, guest = false, portGiven = false, listenGiven = false, passwordGiven = false;
++        std::string guestAddress, portText;
++        for (size_t i = 0; i < args.size(); ++i)
++        {
++            const std::string &a = args[i];
++            auto value = [&](std::string &out) -> bool
++            {
++                if (i + 1 >= args.size() || args[i + 1].rfind("--", 0) == 0)
++                {
++                    error = a + " necesita un valor";
++                    return false;
++                }
++                out = args[++i];
++                return true;
++            };
++            if (a == "--anfitrion")
++                host = true;
++            else if (a == "--invitado")
++            {
++                guest = true;
++                if (!value(guestAddress))
++                    return false;
++            }
++            else if (a == "--puerto")
++            {
++                portGiven = true;
++                if (!value(portText))
++                    return false;
++            }
++            else if (a == "--escuchar")
++            {
++                listenGiven = true;
++                if (!value(options.listenAddress))
++                    return false;
++            }
++            else if (a == "--clave")
++            {
++                passwordGiven = true;
++                if (!value(options.password))
++                    return false;
++            }
++            else
++                rest.push_back(a);
++        }
++        if (!host && !guest)
++        {
++            if (portGiven || listenGiven || passwordGiven)
++            {
++                error = "--puerto, --escuchar y --clave van con --anfitrion o --invitado";
++                return false;
++            }
++            options.mode = NetplayMode::Off;
++            return true;
++        }
++        if (host && guest)
++        {
++            error = "--anfitrion y --invitado no van juntos";
++            return false;
++        }
++        if (guest && listenGiven)
++        {
++            error = "--escuchar es solo para el anfitrion";
++            return false;
++        }
++        if (portGiven)
++        {
++            std::string ignored;
++            bool hasPort = false;
++            if (!splitHostPort("x:" + portText, ignored, options.port, hasPort, error))
++                return false;
++        }
++        if (guest)
++        {
++            std::string address;
++            uint16_t port = options.port;
++            bool hasPort = false;
++            if (!splitHostPort(guestAddress, address, port, hasPort, error))
++                return false;
++            options.hostAddress = address;
++            options.port = port;
++        }
++        if (!passwordGiven && environmentPassword != nullptr)
++            options.password = environmentPassword;
++        if (options.password.size() < kMinPasswordSize || options.password.size() > kMaxPasswordSize)
++        {
++            error = "la contrasena (--clave o PS2X_RED_CLAVE) debe tener entre " + std::to_string(kMinPasswordSize) +
++                    " y " + std::to_string(kMaxPasswordSize) + " caracteres";
++            return false;
++        }
++        options.mode = host ? NetplayMode::Host : NetplayMode::Guest;
++        args = std::move(rest);
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_protocol.h b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+new file mode 100644
+index 0000000..9beb576
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_netplay_protocol.h
+@@ -0,0 +1,270 @@
++#pragma once
++
++#include "ps2_netplay_crypto.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++// Fase 5 (T15, netplay N1): the netplay protocol, without sockets (ps2_netplay.cpp carries it over TCP).
++//
++// Frame: type (1 byte), flags (1, always 0), payload length (2, little endian), payload, and once the session is
++// authenticated a 16-byte tag: HMAC-SHA256(session key, direction 'G'/'H' || frame counter (8, LE) || header ||
++// payload), cut to 16 bytes. Every type has one exact payload size; anything else (unknown or reserved type, flags,
++// another length, a wrong tag) closes the connection before the payload is read.
++//
++// Handshake: guest HELLO (magic "F1-06NP\0", version) -> host CHALLENGE (version, 32-byte host nonce) -> guest AUTH
++// (32-byte guest nonce, proof) -> host WELCOME (proof, port) or REJECT (reason, host version). Both sides derive
++// key = PBKDF2-HMAC-SHA256(password, "F1-06 netplay v1" || host nonce, kKeyIterations); the guest proof is
++// HMAC(key, "guest" || nonces), the host proof HMAC(key, "host" || nonces), the session key HMAC(key, "session" ||
++// nonces). The password never travels; a guest without it gets REJECT, a host without it is refused by the guest.
++//
++// After WELCOME: PAD (guest -> host, ~60 Hz), PING/PONG (keepalive and round trip), BYE. Reserved for later
++// milestones: 0x20-0x2F video (N2), 0x30-0x3F audio (N3); this version rejects them.
++namespace ps2x::netplay
++{
++    constexpr uint16_t kProtocolVersion = 1;
++    constexpr uint16_t kDefaultPort = 50650;
++    constexpr size_t kHeaderSize = 4;
++    constexpr size_t kTagSize = 16;
++    constexpr size_t kNonceSize = 32;
++    constexpr size_t kMaxPayload = 64; // the largest payload of this version (AUTH)
++    constexpr size_t kMaxFrame = kHeaderSize + kMaxPayload + kTagSize;
++    constexpr uint32_t kKeyIterations = 20000;
++    constexpr size_t kMinPasswordSize = 4;
++    constexpr size_t kMaxPasswordSize = 256;
++    constexpr char kMagic[8] = {'F', '1', '-', '0', '6', 'N', 'P', '\0'};
++
++    enum class MessageType : uint8_t
++    {
++        Hello = 0x01,     // guest: magic (8), version (2), reserved (2)
++        Challenge = 0x02, // host: version (2), reserved (2), host nonce (32)
++        Auth = 0x03,      // guest: guest nonce (32), guest proof (32)
++        Welcome = 0x04,   // host: host proof (32), PS2 port of the guest (1: 2 = the second port)
++        Reject = 0x05,    // host: reason (1), host version (2)
++        Pad = 0x10,       // guest: counter (4), pressed buttons (2), rx ry lx ly (4), pressures (12)
++        Ping = 0x11,      // either: token (4), sender time in ms (4)
++        Pong = 0x12,      // either: the ping's payload
++        Bye = 0x13,       // either: reason (1)
++    };
++
++    enum class RejectReason : uint8_t
++    {
++        Version = 1,
++        Password = 2,
++        Busy = 3,
++        Protocol = 4,
++    };
++
++    enum class ByeReason : uint8_t
++    {
++        Quit = 1,
++        Timeout = 2,
++        Protocol = 3,
++        Shutdown = 4,
++    };
++
++    // The payload size of a type of this version; -1 for unknown and reserved types.
++    int payloadSizeOf(uint8_t type);
++    // 0x20-0x3F: video (N2) and audio (N3).
++    bool isReservedType(uint8_t type);
++    const char *rejectReasonText(uint8_t reason);
++    const char *byeReasonText(uint8_t reason);
++
++    // The DualShock 2 state the guest sends: what the game reads from bytes 2-19 of the pad report.
++    struct PadWire
++    {
++        uint16_t pressed = 0;                     // bit = PS2 button (1 = pressed; the report is active low)
++        uint8_t rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
++        std::array<uint8_t, 12> pressure{};       // report order: right left up down triangle circle cross square
++                                                  // l1 l2 r1 r2
++        bool operator==(const PadWire &other) const = default;
++    };
++    constexpr size_t kPadPayloadSize = 22;
++
++    // From / to a pad report (at least 21 bytes, PSPadBackend::readState's layout). A pressure whose button is not
++    // pressed reads 0, as on the real pad.
++    PadWire padWireFromReport(const uint8_t *report);
++    void padWireToReport(const PadWire &pad, uint8_t *report);
++    std::array<uint8_t, kPadPayloadSize> encodePad(uint32_t counter, const PadWire &pad);
++    bool decodePad(const uint8_t *payload, size_t size, uint32_t &counter, PadWire &pad);
++
++    // Per-message tags of an authenticated session (one counter per direction).
++    class MessageAuth
++    {
++    public:
++        void start(const Digest &sessionKey, bool host);
++        void reset();
++        bool active() const { return m_active; }
++        // Tag of the next frame sent / check of the next frame received (each advances its counter).
++        void sign(const uint8_t *header, const uint8_t *payload, size_t size, uint8_t *tag);
++        bool verify(const uint8_t *header, const uint8_t *payload, size_t size, const uint8_t *tag);
++
++    private:
++        void compute(char direction, uint64_t counter, const uint8_t *header, const uint8_t *payload, size_t size,
++                     uint8_t *tag) const;
++
++        bool m_active = false;
++        bool m_host = false;
++        Digest m_key{};
++        uint64_t m_sent = 0;
++        uint64_t m_received = 0;
++    };
++
++    // One frame, tagged when auth is active. The payload must have its type's exact size (otherwise: empty result).
++    std::vector<uint8_t> encodeFrame(MessageType type, const uint8_t *payload, size_t size, MessageAuth *auth);
++
++    enum class FrameError
++    {
++        None,
++        UnknownType,
++        ReservedType,
++        BadFlags,
++        BadLength,
++        BadTag,
++        Overflow,  // more bytes waiting than a frame can hold (the reader is not being drained)
++        Truncated, // the connection closed in the middle of a frame
++    };
++    const char *frameErrorText(FrameError error);
++
++    struct Frame
++    {
++        uint8_t type = 0;
++        uint8_t size = 0;
++        std::array<uint8_t, kMaxPayload> payload{};
++    };
++
++    // Splits the TCP stream into validated frames. Each header is checked before its payload is waited for; the tag
++    // is checked with the auth state of the moment the frame is taken, so a frame that starts the session (WELCOME)
++    // and the tagged ones after it may arrive in the same read.
++    class FrameReader
++    {
++    public:
++        enum class Result
++        {
++            Frame,
++            NeedMore,
++            Error,
++        };
++
++        explicit FrameReader(MessageAuth &auth) : m_auth(auth) {}
++        // False (and error()) if more than kPendingLimit bytes would wait.
++        bool feed(const uint8_t *data, size_t size);
++        Result next(Frame &out);
++        // The connection closed: Truncated if part of a frame was waiting.
++        void finish();
++        FrameError error() const { return m_error; }
++        void reset();
++
++        static constexpr size_t kPendingLimit = 4096;
++
++    private:
++        MessageAuth &m_auth;
++        std::vector<uint8_t> m_pending;
++        FrameError m_error = FrameError::None;
++    };
++
++    using RandomSource = std::function<bool(void *, size_t)>;
++
++    // The handshake of each side, frame by frame. On success both MessageAuth objects are started with the same key.
++    class HostHandshake
++    {
++    public:
++        enum class Result
++        {
++            Continue,
++            Accepted,
++            Rejected, // send the frames and close
++            Invalid,  // close at once
++        };
++
++        HostHandshake(std::string password, MessageAuth &auth, RandomSource random = randomBytes);
++        Result onFrame(const Frame &frame, std::vector<std::vector<uint8_t>> &send);
++        // What went wrong (Rejected / Invalid), for the log.
++        const std::string &reason() const { return m_reason; }
++        RejectReason rejectReason() const { return m_rejectReason; }
++
++    private:
++        enum class Step
++        {
++            Hello,
++            Auth,
++            Done,
++        };
++
++        std::string m_password;
++        MessageAuth &m_auth;
++        RandomSource m_random;
++        Step m_step = Step::Hello;
++        uint8_t m_hostNonce[kNonceSize]{};
++        std::string m_reason;
++        RejectReason m_rejectReason = RejectReason::Protocol;
++    };
++
++    class GuestHandshake
++    {
++    public:
++        enum class Result
++        {
++            Continue,
++            Accepted,
++            Rejected, // the host said no (rejectReason())
++            Failed,   // the host broke the protocol or does not know the password: close
++        };
++
++        GuestHandshake(std::string password, MessageAuth &auth, RandomSource random = randomBytes);
++        std::vector<uint8_t> hello() const;
++        Result onFrame(const Frame &frame, std::vector<std::vector<uint8_t>> &send);
++        const std::string &reason() const { return m_reason; }
++        uint8_t rejectReason() const { return m_rejectReason; }
++        uint16_t hostVersion() const { return m_hostVersion; }
++
++    private:
++        enum class Step
++        {
++            Challenge,
++            Welcome,
++            Done,
++        };
++
++        std::string m_password;
++        MessageAuth &m_auth;
++        RandomSource m_random;
++        Step m_step = Step::Challenge;
++        uint8_t m_hostNonce[kNonceSize]{};
++        uint8_t m_guestNonce[kNonceSize]{};
++        Digest m_key{};
++        std::string m_reason;
++        uint8_t m_rejectReason = 0;
++        uint16_t m_hostVersion = 0;
++    };
++
++    // Command line of the netplay (the game's other arguments stay in args, in order):
++    //   --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
++    //   --invitado <address>[:port] [--puerto N] --clave <password>
++    // Without --clave the password comes from environmentPassword (PS2X_RED_CLAVE), if any. Returns false with
++    // error set when a netplay argument is wrong.
++    enum class NetplayMode
++    {
++        Off,
++        Host,
++        Guest,
++    };
++
++    struct NetplayOptions
++    {
++        NetplayMode mode = NetplayMode::Off;
++        std::string listenAddress; // host: empty = every interface
++        std::string hostAddress;   // guest
++        uint16_t port = kDefaultPort;
++        std::string password;
++    };
++
++    bool parseNetplayArguments(std::vector<std::string> &args, const char *environmentPassword, NetplayOptions &options,
++                               std::string &error);
++    // "1.2.3.4", "1.2.3.4:5000", "name:5000", "[::1]:5000", "::1" (a bare IPv6 address has no port).
++    bool splitHostPort(const std::string &text, std::string &host, uint16_t &port, bool &hasPort, std::string &error);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 7558b6a..9cb7ad0 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_win.h"
+ #include "ps2_pad_players.h"
++#include "ps2_netplay.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_photo_mode.h"
+ #include "ps2_replay_scrub.h"
+@@ -30,6 +31,8 @@
+ // suelto. Antes: mando o teclado fijos y presiones de todo o nada.
+ // Patch 0150 (fase 4): la seccion [jugador2] es el puerto 1 (pantalla partida): su mando de raylib y sus teclas, sin
+ // volante. Sin la seccion, el puerto 1 sigue desconectado (parche 0123) y el jugador 1 queda como antes.
++// Fase 5 (T15, netplay N1): con un invitado conectado al anfitrion (ps2_netplay.h), el puerto 1 es su mando remoto y
++// [jugador2] no cuenta; al irse el invitado, el puerto 1 vuelve a [jugador2] o queda suelto.
+ 
+ namespace
+ {
+@@ -795,6 +798,20 @@ namespace
+         writeReport(data, pressedButtons(value, cfg), value, cfg);
+         debugReport(1, data, f);
+     }
++
++    // Fase 5 (T15): the guest's pad (netplay) on port 1; false without a guest. At rest with the options menu open or
++    // in the photo mode, as player 2's local pad.
++    bool readRemotePlayer(uint8_t *data)
++    {
++        ps2x::netplay::PadWire remote;
++        if (!ps2x::netplay::readRemotePad(remote))
++            return false;
++        if (g_optionsMenuOpen.load(std::memory_order_relaxed) || ps2x::photoModeActive())
++            return true;
++        ps2x::netplay::padWireToReport(remote, data);
++        debugReport(1, data, Frame{});
++        return true;
++    }
+ }
+ 
+ namespace ps2x
+@@ -822,6 +839,8 @@ namespace ps2x
+             return true;
+         if (port != 1)
+             return false;
++        if (netplay::remotePadActive())
++            return true; // Fase 5 (T15): the netplay guest
+         const PadPlayerInfo &second = loadedPlayers().second;
+         const bool connected =
+             secondPadPortConnected(second, second.gamepad >= 0 && IsGamepadAvailable(second.gamepad));
+@@ -959,7 +978,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+     data[2] = 0xFF;
+     data[3] = 0xFF;
+     data[4] = data[5] = data[6] = data[7] = 0x80;
+-    if (port == 1)
++    if (port == 1 && !readRemotePlayer(data))
+         readSecondPlayer(data); // sin [jugador2], suelto
+     if (port != 0)
+         return true;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 6ba2308..6d2eac7 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -1,6 +1,7 @@
+ #include "ps2_runtime.h"
+ #include "games_database.h"
+ #include "ps2_options.h"
++#include "lib/ps2_netplay.h" // Fase 5 (T15): private to the runtime, next to this file
+ #include "ps2_user_paths.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+@@ -160,8 +161,10 @@ namespace
+     // A player starts the .exe by hand, so its output goes to a console window nobody keeps: write it to
+     // <directory>\<exe name>.log instead (the previous run is kept as <exe name>.anterior.log). Runs whose output is
+     // already redirected (the test scripts) are left alone; PS2X_LOG=0 (registro = 0 in opciones.ini) keeps the
+-    // console.
+-    void redirectConsoleToLogFile(const std::filesystem::path &executable, const std::filesystem::path &directory)
++    // console. Fase 5 (T15): the netplay guest writes <exe name>-invitado.log (logName), so a host on the same PC
++    // keeps its own.
++    void redirectConsoleToLogFile(const std::filesystem::path &executable, const std::filesystem::path &directory,
++                                  const std::string &logName)
+     {
+ #if defined(_WIN32)
+         if (_isatty(_fileno(stdout)) == 0)
+@@ -171,9 +174,9 @@ namespace
+             return;
+         std::error_code error;
+         std::filesystem::create_directories(directory, error);
+-        const std::filesystem::path log = directory / (executable.stem().string() + ".log");
++        const std::filesystem::path log = directory / (logName + ".log");
+         if (std::filesystem::exists(log, error))
+-            std::filesystem::rename(log, directory / (executable.stem().string() + ".anterior.log"), error);
++            std::filesystem::rename(log, directory / (logName + ".anterior.log"), error);
+         std::cout << "[registro] " << ps2x::pathForLog(log) << std::endl;
+         FILE *out = nullptr;
+         if (_wfreopen_s(&out, log.c_str(), L"w", stdout) != 0 || out == nullptr)
+@@ -186,6 +189,7 @@ namespace
+ #else
+         (void)executable;
+         (void)directory;
++        (void)logName;
+ #endif
+     }
+ 
+@@ -386,6 +390,12 @@ namespace
+     }
+ }
+ 
++// Fase 5 (T15, netplay N1; ps2_netplay.h). Besides the game's own argument (an ELF or an ISO):
++//   F1-06.exe --anfitrion [--escuchar <address>] [--puerto N] --clave <password>
++//       runs the game and waits for one guest on TCP port N (50650 by default, every interface unless --escuchar).
++//   F1-06.exe --invitado <address>[:port] [--puerto N] --clave <password>
++//       does not run the game: a window that sends this PC's pad (player 1 of controles.ini) as the host's player 2.
++// Without --clave the password comes from PS2X_RED_CLAVE.
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+@@ -396,16 +406,57 @@ int main(int argc, char *argv[])
+     try
+     {
+         const std::filesystem::path executable = runningExecutable(argc >= 1 ? argv[0] : nullptr);
++        // Fase 5 (T15): the netplay arguments go out first; the game sees the rest as before.
++        std::vector<std::string> arguments(argv + std::min(argc, 1), argv + argc);
++        ps2x::netplay::NetplayOptions netplay;
++        std::string netplayError;
++        const bool netplayOk =
++            ps2x::netplay::parseNetplayArguments(arguments, std::getenv("PS2X_RED_CLAVE"), netplay, netplayError);
++        std::vector<char *> gameArgv{argc >= 1 ? argv[0] : nullptr};
++        for (std::string &argument : arguments)
++            gameArgv.push_back(argument.data());
++        const bool guestMode = netplayOk && netplay.mode == ps2x::netplay::NetplayMode::Guest;
+         std::ostringstream bootLines;
+-        const BootSource boot = chooseBootSource(argc, argv, executable, bootLines);
++        BootSource boot;
++        if (guestMode)
++        {
++            // The guest runs no game: the boot source only decides where its files are (and may be missing).
++            try
++            {
++                boot = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
++            }
++            catch (const std::exception &)
++            {
++            }
++        }
++        else
++            boot = chooseBootSource(static_cast<int>(gameArgv.size()), gameArgv.data(), executable, bootLines);
+         // Development: an ELF given by path (argument or PS2X_DEFAULT_BOOT_ELF) keeps the old layout.
+         const bool development = boot.imagePath.empty() && boot.cardDirectory.empty();
+         std::vector<std::string> pathLines;
+         const ps2x::UserPaths userPaths = prepareUserPaths(executable, development, pathLines);
+-        redirectConsoleToLogFile(executable, userPaths.logsDirectory);
+-        std::cout << bootLines.str();
++        redirectConsoleToLogFile(executable, userPaths.logsDirectory,
++                                 executable.stem().string() + (guestMode ? "-invitado" : ""));
++        if (!guestMode)
++            std::cout << bootLines.str();
+         for (const std::string &line : pathLines)
+             std::cout << line << std::endl;
++        if (!netplayOk)
++        {
++            std::cerr << "[red] argumentos no validos: " << netplayError << std::endl
++                      << "[red] uso: --anfitrion [--escuchar <direccion>] [--puerto N] --clave <contrasena>" << std::endl
++                      << "[red]      --invitado <direccion>[:puerto] [--puerto N] --clave <contrasena>" << std::endl;
++            std::cout.flush();
++            std::cerr.flush();
++            std::_Exit(1);
++        }
++        if (guestMode)
++        {
++            const int code = ps2x::netplay::runGuestWindow({netplay.hostAddress, netplay.port, netplay.password});
++            std::cout.flush();
++            std::cerr.flush();
++            std::_Exit(code);
++        }
+ 
+         std::string filePathStr = boot.elfPath.string();
+         std::string elfName = boot.elfPath.filename().string();
+@@ -516,6 +567,16 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
++        // Fase 5 (T15): the host waits for its guest while the game runs (the game reads it on port 2).
++        static ps2x::netplay::Host s_netplayHost;
++        if (netplay.mode == ps2x::netplay::NetplayMode::Host)
++        {
++            std::string error;
++            if (!s_netplayHost.start({netplay.listenAddress, netplay.port, netplay.password}, error))
++                std::cerr << "[red] no se puede escuchar en el puerto " << netplay.port << ": " << error
++                          << " (el juego sigue sin red)" << std::endl;
++        }
++
+         runtime.run();
+ 
+ #ifdef _DEBUG
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 1397b3f..2fe39a0 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -42,6 +42,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_user_paths_tests.cpp
+     src/ps2_display_tests.cpp
+     src/ps2_options_menu_tests.cpp
++    src/ps2_netplay_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index c809c1d..1ff9a88 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -23,6 +23,7 @@ void register_ps2_runtime_expansion_tests();
+ void register_ps2_user_paths_tests();
+ void register_ps2_display_tests();
+ void register_ps2_options_menu_tests();
++void register_ps2_netplay_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -50,6 +51,7 @@ int main()
+     register_ps2_user_paths_tests();
+     register_ps2_display_tests();
+     register_ps2_options_menu_tests();
++    register_ps2_netplay_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+new file mode 100644
+index 0000000..1a57270
+--- /dev/null
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -0,0 +1,637 @@
++#include "MiniTest.h"
++#include "ps2_stubs.h"
++#include "ps2_syscalls.h"
++#include "Stubs/Pad.h"
++#include "runtime/ps2_pad.h"
++#include "ps2_netplay.h"
++#include "ps2_netplay_crypto.h"
++#include "ps2_netplay_protocol.h"
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <functional>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++// Fase 5 (T15, netplay N1): hashes (published vectors), frames, handshake, pad state, command line and a host and a
++// guest talking over 127.0.0.1 in this process.
++namespace
++{
++    using namespace ps2x::netplay;
++
++    std::string hex(const uint8_t *data, size_t size)
++    {
++        static const char *const kDigits = "0123456789abcdef";
++        std::string out;
++        for (size_t i = 0; i < size; ++i)
++        {
++            out += kDigits[data[i] >> 4];
++            out += kDigits[data[i] & 15];
++        }
++        return out;
++    }
++
++    std::string hex(const Digest &d)
++    {
++        return hex(d.data(), d.size());
++    }
++
++    std::string sha(const std::string &text)
++    {
++        return hex(sha256(text.data(), text.size()));
++    }
++
++    std::string hmac(const std::string &key, const std::string &data)
++    {
++        return hex(hmacSha256(key.data(), key.size(), data.data(), data.size()));
++    }
++
++    // Deterministic "random" bytes for the handshakes.
++    RandomSource counting(uint8_t start)
++    {
++        auto next = std::make_shared<uint8_t>(start);
++        return [next](void *out, size_t size)
++        {
++            uint8_t *bytes = static_cast<uint8_t *>(out);
++            for (size_t i = 0; i < size; ++i)
++                bytes[i] = (*next)++;
++            return true;
++        };
++    }
++
++    std::vector<uint8_t> header(uint8_t type, uint8_t flags, uint16_t length)
++    {
++        return {type, flags, static_cast<uint8_t>(length & 0xFFu), static_cast<uint8_t>(length >> 8)};
++    }
++
++    // Feeds bytes and takes one frame.
++    FrameReader::Result readOne(FrameReader &reader, const std::vector<uint8_t> &bytes, Frame &frame)
++    {
++        if (!reader.feed(bytes.data(), bytes.size()))
++            return FrameReader::Result::Error;
++        return reader.next(frame);
++    }
++
++    // Delivers every frame of one side to the other's handshake.
++    struct Pipe
++    {
++        MessageAuth hostAuth, guestAuth;
++        FrameReader toHost{hostAuth}, toGuest{guestAuth};
++    };
++
++    bool deliver(FrameReader &reader, const std::vector<uint8_t> &bytes, Frame &frame)
++    {
++        return readOne(reader, bytes, frame) == FrameReader::Result::Frame;
++    }
++
++    PadWire crossPressed()
++    {
++        PadWire pad;
++        pad.pressed = 1u << 14; // cross
++        pad.pressure[6] = 200;  // cross pressure
++        pad.lx = 0x10;
++        return pad;
++    }
++
++    template <typename Predicate>
++    bool waitFor(Predicate predicate, int milliseconds = 4000)
++    {
++        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
++        while (std::chrono::steady_clock::now() < end)
++        {
++            if (predicate())
++                return true;
++            std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        }
++        return predicate();
++    }
++
++    void setRegU32(R5900Context &ctx, int reg, uint32_t value)
++    {
++        ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
++    }
++
++    uint32_t padPortState(std::vector<uint8_t> &rdram, int port)
++    {
++        R5900Context ctx;
++        setRegU32(ctx, 4, static_cast<uint32_t>(port));
++        setRegU32(ctx, 5, 0u);
++        ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
++        return static_cast<uint32_t>(getRegU32(&ctx, 2));
++    }
++
++    // The game's pad on a test: no physical pads, and a controles.ini that does not exist (no [jugador2]: port 2
++    // is empty without a guest, as in patch 0123).
++    void isolatePads()
++    {
++        static const bool s_done = []
++        {
++            const std::filesystem::path missing =
++                std::filesystem::temp_directory_path() / "ps2x-netplay-tests-sin-controles.ini";
++            std::error_code error;
++            std::filesystem::remove(missing, error);
++            _putenv_s("PS2X_CONTROLES", missing.string().c_str());
++            _putenv_s("PS2X_SIN_MANDOS", "1");
++            return true;
++        }();
++        (void)s_done;
++    }
++}
++
++void register_ps2_netplay_tests()
++{
++    MiniTest::Case("NetplayCrypto", [](TestCase &tc)
++                   {
++        tc.Run("SHA-256 matches the FIPS 180-4 examples", [](TestCase &t)
++        {
++            t.Equals(sha(""), std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), "empty");
++            t.Equals(sha("abc"), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "abc");
++            t.Equals(sha("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
++                     std::string("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"), "448 bits");
++            t.Equals(sha(std::string(1000000, 'a')),
++                     std::string("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"), "a million a");
++        });
++
++        tc.Run("SHA-256 fed in uneven pieces gives the same digest", [](TestCase &t)
++        {
++            const std::string text(1000, 'q');
++            Sha256 h;
++            size_t at = 0, step = 1;
++            while (at < text.size())
++            {
++                const size_t n = std::min(step, text.size() - at);
++                h.update(text.data() + at, n);
++                at += n;
++                step = step * 3 % 97 + 1;
++            }
++            t.Equals(hex(h.finish()), sha(text), "pieces");
++        });
++
++        tc.Run("HMAC-SHA256 matches RFC 4231", [](TestCase &t)
++        {
++            t.Equals(hmac(std::string(20, '\x0b'), "Hi There"),
++                     std::string("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"), "case 1");
++            t.Equals(hmac("Jefe", "what do ya want for nothing?"),
++                     std::string("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "case 2");
++            t.Equals(hmac(std::string(20, '\xaa'), std::string(50, '\xdd')),
++                     std::string("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"), "case 3");
++            std::string key4;
++            for (int i = 1; i <= 25; ++i)
++                key4 += static_cast<char>(i);
++            t.Equals(hmac(key4, std::string(50, '\xcd')),
++                     std::string("82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"), "case 4");
++            t.Equals(hmac(std::string(131, '\xaa'), "Test Using Larger Than Block-Size Key - Hash Key First"),
++                     std::string("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"), "case 6");
++            t.Equals(hmac(std::string(131, '\xaa'),
++                          "This is a test using a larger than block-size key and a larger than block-size data. The key "
++                          "needs to be hashed before being used by the HMAC algorithm."),
++                     std::string("9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"), "case 7");
++        });
++
++        tc.Run("PBKDF2-HMAC-SHA256 matches RFC 7914", [](TestCase &t)
++        {
++            uint8_t out[64] = {};
++            pbkdf2Sha256("passwd", 6, "salt", 4, 1, out, 64);
++            t.Equals(hex(out, 64),
++                     std::string("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b3"
++                                 "9d77ef317c71b845b1e30bd509112041d3a19783"),
++                     "c=1");
++            pbkdf2Sha256("Password", 8, "NaCl", 4, 80000, out, 64);
++            t.Equals(hex(out, 64),
++                     std::string("4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56a1d425a1225833549adb841b"
++                                 "51c9b3176a272bdebba1d078478f62b397f33c8d"),
++                     "c=80000");
++            pbkdf2Sha256("password", 8, "salt", 4, 4096, out, 32);
++            t.Equals(hex(out, 32), std::string("c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"),
++                     "c=4096");
++        });
++
++        tc.Run("constant time comparison and system random bytes", [](TestCase &t)
++        {
++            const uint8_t a[4] = {1, 2, 3, 4}, b[4] = {1, 2, 3, 5};
++            t.IsTrue(constantTimeEqual(a, a, 4), "equal");
++            t.IsFalse(constantTimeEqual(a, b, 4), "different last byte");
++            uint8_t r1[32] = {}, r2[32] = {};
++            t.IsTrue(randomBytes(r1, 32) && randomBytes(r2, 32), "random source");
++            t.IsFalse(std::memcmp(r1, r2, 32) == 0, "two draws differ");
++        }); });
++
++    MiniTest::Case("NetplayProtocol", [](TestCase &tc)
++                   {
++        tc.Run("every type has one exact size; video and audio are reserved", [](TestCase &t)
++        {
++            t.Equals(payloadSizeOf(0x01), 12, "HELLO");
++            t.Equals(payloadSizeOf(0x02), 36, "CHALLENGE");
++            t.Equals(payloadSizeOf(0x03), 64, "AUTH");
++            t.Equals(payloadSizeOf(0x04), 33, "WELCOME");
++            t.Equals(payloadSizeOf(0x05), 3, "REJECT");
++            t.Equals(payloadSizeOf(0x10), 22, "PAD");
++            t.Equals(payloadSizeOf(0x11), 8, "PING");
++            t.Equals(payloadSizeOf(0x12), 8, "PONG");
++            t.Equals(payloadSizeOf(0x13), 1, "BYE");
++            t.Equals(payloadSizeOf(0x00), -1, "0 is no type");
++            t.Equals(payloadSizeOf(0x20), -1, "video is not in this version");
++            t.IsTrue(isReservedType(0x20) && isReservedType(0x2F) && isReservedType(0x30) && isReservedType(0x3F),
++                     "0x20-0x3F reserved");
++            t.IsFalse(isReservedType(0x40) || isReservedType(0x1F), "outside the reserved range");
++        });
++
++        tc.Run("a frame is header + payload and reads back whole", [](TestCase &t)
++        {
++            const uint8_t bye[1] = {static_cast<uint8_t>(ByeReason::Quit)};
++            const std::vector<uint8_t> frame = encodeFrame(MessageType::Bye, bye, 1, nullptr);
++            t.Equals(frame, std::vector<uint8_t>{0x13, 0x00, 0x01, 0x00, 0x01}, "bytes of BYE");
++            t.IsTrue(encodeFrame(MessageType::Bye, bye, 0, nullptr).empty(), "a payload of another size is refused");
++            MessageAuth auth;
++            FrameReader reader(auth);
++            Frame got;
++            t.Equals(readOne(reader, frame, got), FrameReader::Result::Frame, "read");
++            t.Equals(got.type, static_cast<uint8_t>(0x13), "type");
++            t.Equals(got.size, static_cast<uint8_t>(1), "size");
++            t.Equals(got.payload[0], static_cast<uint8_t>(1), "payload");
++            t.Equals(reader.next(got), FrameReader::Result::NeedMore, "nothing else");
++        });
++
++        tc.Run("bad headers are refused before their payload arrives", [](TestCase &t)
++        {
++            struct Bad
++            {
++                std::vector<uint8_t> bytes;
++                FrameError error;
++                const char *name;
++            };
++            const Bad cases[] = {
++                {header(0x7E, 0, 1), FrameError::UnknownType, "unknown type"},
++                {header(0x00, 0, 0), FrameError::UnknownType, "type 0"},
++                {header(0x20, 0, 1000), FrameError::ReservedType, "video (N2) in N1"},
++                {header(0x30, 0, 8), FrameError::ReservedType, "audio (N3) in N1"},
++                {header(0x13, 1, 1), FrameError::BadFlags, "flags"},
++                {header(0x13, 0, 0xFFFF), FrameError::BadLength, "oversized length"},
++                {header(0x01, 0, 11), FrameError::BadLength, "HELLO one byte short"},
++                {header(0x10, 0, 23), FrameError::BadLength, "PAD one byte long"},
++            };
++            for (const Bad &bad : cases)
++            {
++                MessageAuth auth;
++                FrameReader reader(auth);
++                Frame got;
++                t.Equals(readOne(reader, bad.bytes, got), FrameReader::Result::Error, bad.name);
++                t.Equals(reader.error(), bad.error, std::string("error of ") + bad.name);
++            }
++        });
++
++        tc.Run("a frame split in pieces waits; a close in the middle is truncated", [](TestCase &t)
++        {
++            const uint8_t ping[8] = {1, 2, 3, 4, 5, 6, 7, 8};
++            const std::vector<uint8_t> frame = encodeFrame(MessageType::Ping, ping, 8, nullptr);
++            MessageAuth auth;
++            FrameReader reader(auth);
++            Frame got;
++            for (size_t i = 0; i + 1 < frame.size(); ++i)
++            {
++                reader.feed(&frame[i], 1);
++                t.Equals(reader.next(got), FrameReader::Result::NeedMore, "partial frame " + std::to_string(i));
++            }
++            reader.feed(&frame.back(), 1);
++            t.Equals(reader.next(got), FrameReader::Result::Frame, "last byte completes it");
++            t.Equals(std::memcmp(got.payload.data(), ping, 8), 0, "payload intact");
++
++            FrameReader cut(auth);
++            cut.feed(frame.data(), 6);
++            t.Equals(cut.next(got), FrameReader::Result::NeedMore, "half a frame");
++            cut.finish();
++            t.Equals(cut.error(), FrameError::Truncated, "closed in the middle");
++            FrameReader clean(auth);
++            clean.feed(frame.data(), frame.size());
++            clean.next(got);
++            clean.finish();
++            t.Equals(clean.error(), FrameError::None, "closed between frames");
++        });
++
++        tc.Run("a reader that is not drained refuses more than its limit", [](TestCase &t)
++        {
++            MessageAuth auth;
++            FrameReader reader(auth);
++            const std::vector<uint8_t> lots(FrameReader::kPendingLimit + 1, 0x13);
++            t.IsFalse(reader.feed(lots.data(), lots.size()), "over the limit");
++            t.Equals(reader.error(), FrameError::Overflow, "overflow");
++        });
++
++        tc.Run("authenticated frames: tampering, replay and reflection fail", [](TestCase &t)
++        {
++            Digest key{};
++            key[0] = 7;
++            MessageAuth guest, host;
++            guest.start(key, false);
++            host.start(key, true);
++            const uint8_t ping[8] = {9, 9, 9, 9, 0, 0, 0, 1};
++            const std::vector<uint8_t> first = encodeFrame(MessageType::Ping, ping, 8, &guest);
++            t.Equals(first.size(), kHeaderSize + 8 + kTagSize, "tag appended");
++            FrameReader reader(host);
++            Frame got;
++            t.Equals(readOne(reader, first, got), FrameReader::Result::Frame, "genuine frame");
++
++            t.Equals(readOne(reader, first, got), FrameReader::Result::Error, "the same frame again (replay)");
++            t.Equals(reader.error(), FrameError::BadTag, "replay error");
++
++            MessageAuth host2;
++            host2.start(key, true);
++            MessageAuth guest2;
++            guest2.start(key, false);
++            std::vector<uint8_t> changed = encodeFrame(MessageType::Ping, ping, 8, &guest2);
++            changed[5] ^= 1u;
++            FrameReader reader2(host2);
++            t.Equals(readOne(reader2, changed, got), FrameReader::Result::Error, "payload changed");
++            t.Equals(reader2.error(), FrameError::BadTag, "tamper error");
++
++            MessageAuth host3, hostSender;
++            host3.start(key, true);
++            hostSender.start(key, true);
++            const std::vector<uint8_t> reflected = encodeFrame(MessageType::Ping, ping, 8, &hostSender);
++            FrameReader reader3(host3);
++            t.Equals(readOne(reader3, reflected, got), FrameReader::Result::Error, "host frame sent back to the host");
++
++            MessageAuth host4;
++            host4.start(key, true);
++            FrameReader reader4(host4);
++            const std::vector<uint8_t> untagged = encodeFrame(MessageType::Ping, ping, 8, nullptr);
++            t.Equals(readOne(reader4, untagged, got), FrameReader::Result::NeedMore, "no tag: waits for it");
++            reader4.finish();
++            t.Equals(reader4.error(), FrameError::Truncated, "and never gets it");
++        });
++
++        tc.Run("pad state: bytes on the wire and the PS2 report", [](TestCase &t)
++        {
++            PadWire pad = crossPressed();
++            pad.rx = 1;
++            pad.ry = 2;
++            pad.ly = 0xFF;
++            const auto bytes = encodePad(0x01020304u, pad);
++            const std::vector<uint8_t> expected = {0x04, 0x03, 0x02, 0x01, 0x00, 0x40, 1, 2, 0x10, 0xFF,
++                                                   0, 0, 0, 0, 0, 0, 200, 0, 0, 0, 0, 0};
++            t.Equals(std::vector<uint8_t>(bytes.begin(), bytes.end()), expected, "PAD payload");
++            uint32_t counter = 0;
++            PadWire back;
++            t.IsTrue(decodePad(bytes.data(), bytes.size(), counter, back), "decode");
++            t.Equals(counter, 0x01020304u, "counter");
++            t.IsTrue(back == pad, "same pad");
++            t.IsFalse(decodePad(bytes.data(), bytes.size() - 1, counter, back), "short payload");
++
++            uint8_t report[32] = {};
++            padWireToReport(pad, report);
++            t.Equals(report[2], static_cast<uint8_t>(0xFF), "buttons low byte (active low)");
++            t.Equals(report[3], static_cast<uint8_t>(0xBF), "cross bit low");
++            t.Equals(report[4], static_cast<uint8_t>(1), "rx");
++            t.Equals(report[7], static_cast<uint8_t>(0xFF), "ly");
++            t.Equals(report[14], static_cast<uint8_t>(200), "cross pressure");
++            t.Equals(report[20], static_cast<uint8_t>(1), "pressures valid");
++            t.IsTrue(padWireFromReport(report) == pad, "report back to the pad");
++
++            PadWire ghost;
++            ghost.pressure[0] = 255; // right pressure without the right button
++            padWireToReport(ghost, report);
++            t.Equals(report[8], static_cast<uint8_t>(0), "pressure of a released button reads 0");
++        });
++
++        tc.Run("handshake: same password -> both sides authenticated", [](TestCase &t)
++        {
++            Pipe p;
++            HostHandshake host("clave-larga", p.hostAuth, counting(0));
++            GuestHandshake guest("clave-larga", p.guestAuth, counting(100));
++            std::vector<std::vector<uint8_t>> toGuest, toHost;
++            Frame f;
++            t.IsTrue(deliver(p.toHost, guest.hello(), f), "HELLO");
++            t.Equals(host.onFrame(f, toGuest), HostHandshake::Result::Continue, "host -> CHALLENGE");
++            t.Equals(toGuest.size(), static_cast<size_t>(1), "one CHALLENGE");
++            t.IsTrue(deliver(p.toGuest, toGuest[0], f), "CHALLENGE");
++            t.Equals(guest.onFrame(f, toHost), GuestHandshake::Result::Continue, "guest -> AUTH");
++            t.IsTrue(deliver(p.toHost, toHost[0], f), "AUTH");
++            toGuest.clear();
++            t.Equals(host.onFrame(f, toGuest), HostHandshake::Result::Accepted, "host accepts");
++            t.IsTrue(p.hostAuth.active(), "host session");
++            t.IsTrue(deliver(p.toGuest, toGuest[0], f), "WELCOME");
++            t.Equals(f.payload[32], static_cast<uint8_t>(2), "the guest is port 2");
++            toHost.clear();
++            t.Equals(guest.onFrame(f, toHost), GuestHandshake::Result::Accepted, "guest accepts the host");
++            t.IsTrue(p.guestAuth.active(), "guest session");
++            const auto pad = encodePad(1, crossPressed());
++            t.IsTrue(deliver(p.toHost, encodeFrame(MessageType::Pad, pad.data(), pad.size(), &p.guestAuth), f),
++                     "tagged PAD accepted by the host");
++            t.Equals(f.type, static_cast<uint8_t>(MessageType::Pad), "PAD");
++        });
++
++        tc.Run("handshake: wrong password -> REJECT, nobody authenticated", [](TestCase &t)
++        {
++            Pipe p;
++            HostHandshake host("clave-buena", p.hostAuth, counting(0));
++            GuestHandshake guest("clave-mala", p.guestAuth, counting(100));
++            std::vector<std::vector<uint8_t>> toGuest, toHost;
++            Frame f;
++            deliver(p.toHost, guest.hello(), f);
++            host.onFrame(f, toGuest);
++            deliver(p.toGuest, toGuest[0], f);
++            guest.onFrame(f, toHost);
++            deliver(p.toHost, toHost[0], f);
++            toGuest.clear();
++            t.Equals(host.onFrame(f, toGuest), HostHandshake::Result::Rejected, "host rejects");
++            t.Equals(host.rejectReason(), RejectReason::Password, "because of the password");
++            t.IsFalse(p.hostAuth.active(), "no host session");
++            t.IsTrue(deliver(p.toGuest, toGuest[0], f), "REJECT arrives");
++            t.Equals(f.type, static_cast<uint8_t>(MessageType::Reject), "REJECT");
++            toHost.clear();
++            t.Equals(guest.onFrame(f, toHost), GuestHandshake::Result::Rejected, "guest rejected");
++            t.Equals(guest.rejectReason(), static_cast<uint8_t>(RejectReason::Password), "password reason");
++            t.IsFalse(p.guestAuth.active(), "no guest session");
++        });
++
++        tc.Run("handshake: wrong version, wrong magic and out of order", [](TestCase &t)
++        {
++            {
++                Pipe p;
++                HostHandshake host("clave", p.hostAuth, counting(0));
++                uint8_t hello[12] = {'F', '1', '-', '0', '6', 'N', 'P', 0, 2, 0, 0, 0}; // version 2
++                Frame f;
++                deliver(p.toHost, encodeFrame(MessageType::Hello, hello, 12, nullptr), f);
++                std::vector<std::vector<uint8_t>> out;
++                t.Equals(host.onFrame(f, out), HostHandshake::Result::Rejected, "newer guest");
++                t.Equals(host.rejectReason(), RejectReason::Version, "version reason");
++                t.IsTrue(deliver(p.toGuest, out.at(0), f), "REJECT");
++                t.Equals(f.payload[0], static_cast<uint8_t>(RejectReason::Version), "reason byte");
++                t.Equals(f.payload[1], static_cast<uint8_t>(kProtocolVersion), "host version");
++            }
++            {
++                Pipe p;
++                HostHandshake host("clave", p.hostAuth, counting(0));
++                uint8_t hello[12] = {'X', '1', '-', '0', '6', 'N', 'P', 0, 1, 0, 0, 0};
++                Frame f;
++                deliver(p.toHost, encodeFrame(MessageType::Hello, hello, 12, nullptr), f);
++                std::vector<std::vector<uint8_t>> out;
++                t.Equals(host.onFrame(f, out), HostHandshake::Result::Invalid, "not an F1 06 guest");
++                t.IsTrue(out.empty(), "nothing sent back");
++            }
++            {
++                Pipe p;
++                HostHandshake host("clave", p.hostAuth, counting(0));
++                const auto pad = encodePad(1, PadWire{});
++                Frame f;
++                deliver(p.toHost, encodeFrame(MessageType::Pad, pad.data(), pad.size(), nullptr), f);
++                std::vector<std::vector<uint8_t>> out;
++                t.Equals(host.onFrame(f, out), HostHandshake::Result::Invalid, "PAD before logging in");
++                t.IsFalse(p.hostAuth.active(), "no session");
++            }
++        });
++
++        tc.Run("handshake: the guest refuses a host that does not know the password", [](TestCase &t)
++        {
++            Pipe p;
++            GuestHandshake guest("clave", p.guestAuth, counting(100));
++            uint8_t challenge[36] = {1, 0, 0, 0};
++            Frame f;
++            deliver(p.toGuest, encodeFrame(MessageType::Challenge, challenge, 36, nullptr), f);
++            std::vector<std::vector<uint8_t>> out;
++            t.Equals(guest.onFrame(f, out), GuestHandshake::Result::Continue, "AUTH sent");
++            uint8_t welcome[33] = {};
++            welcome[32] = 2;
++            deliver(p.toGuest, encodeFrame(MessageType::Welcome, welcome, 33, nullptr), f);
++            t.Equals(guest.onFrame(f, out), GuestHandshake::Result::Failed, "fake host");
++            t.IsFalse(p.guestAuth.active(), "no session");
++        });
++
++        tc.Run("command line: host, guest, password and the game's own arguments", [](TestCase &t)
++        {
++            std::vector<std::string> args = {"juego\\SCES_539.50", "--anfitrion", "--puerto", "50700", "--clave",
++                                             "secreto", "--escuchar", "127.0.0.1"};
++            NetplayOptions o;
++            std::string error;
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "host parses: " + error);
++            t.Equals(o.mode, NetplayMode::Host, "host");
++            t.Equals(o.port, static_cast<uint16_t>(50700), "port");
++            t.Equals(o.password, std::string("secreto"), "password");
++            t.Equals(o.listenAddress, std::string("127.0.0.1"), "listen address");
++            t.Equals(args, std::vector<std::string>{"juego\\SCES_539.50"}, "the ELF stays");
++
++            args = {"--invitado", "100.64.1.2:50999", "--clave", "secreto"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, nullptr, o, error), "guest parses");
++            t.Equals(o.mode, NetplayMode::Guest, "guest");
++            t.Equals(o.hostAddress, std::string("100.64.1.2"), "host address");
++            t.Equals(o.port, static_cast<uint16_t>(50999), "port from the address");
++            t.IsTrue(args.empty(), "nothing left");
++
++            args = {"--invitado", "[fd7a::1]", "--puerto", "40000"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, "desde-variable", o, error), "IPv6 guest");
++            t.Equals(o.hostAddress, std::string("fd7a::1"), "IPv6 address");
++            t.Equals(o.port, static_cast<uint16_t>(40000), "--puerto");
++            t.Equals(o.password, std::string("desde-variable"), "password from PS2X_RED_CLAVE");
++
++            args = {"juego\\SCES_539.50"};
++            o = {};
++            t.IsTrue(parseNetplayArguments(args, "x", o, error), "no netplay");
++            t.Equals(o.mode, NetplayMode::Off, "off");
++
++            const std::vector<std::vector<std::string>> bad = {
++                {"--anfitrion"},                                           // no password
++                {"--anfitrion", "--clave", "abc"},                         // too short
++                {"--anfitrion", "--invitado", "1.2.3.4", "--clave", "abcd"}, // both
++                {"--anfitrion", "--puerto", "0", "--clave", "abcd"},
++                {"--anfitrion", "--puerto", "70000", "--clave", "abcd"},
++                {"--anfitrion", "--puerto", "12x", "--clave", "abcd"},
++                {"--invitado", "--clave", "abcd"},                         // no address
++                {"--invitado", "1.2.3.4:99999", "--clave", "abcd"},
++                {"--anfitrion", "--clave"},                                // missing value
++                {"--invitado", "1.2.3.4", "--escuchar", "0.0.0.0", "--clave", "abcd"},
++                {"--anfitrion", "--clave", std::string(300, 'k')},
++            };
++            for (const auto &b : bad)
++            {
++                std::vector<std::string> a = b;
++                NetplayOptions bo;
++                std::string e;
++                std::string line;
++                for (const std::string &s : b)
++                    line += s.substr(0, 20) + " ";
++                t.IsFalse(parseNetplayArguments(a, nullptr, bo, e), "refused: " + line);
++                t.IsFalse(e.empty(), "with a message: " + line);
++            }
++        }); });
++
++    MiniTest::Case("NetplayLoopback", [](TestCase &tc)
++                   {
++        tc.Run("a guest's press reaches port 2 and its disconnect empties port 2", [](TestCase &t)
++        {
++            isolatePads();
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++            R5900Context ctx;
++            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
++            setRegU32(ctx, 4, 1u);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 0x1200u);
++            ps2_stubs::scePadPortOpen(rdram.data(), &ctx, nullptr);
++            t.Equals(padPortState(rdram, 1), 0u, "port 2 empty before the guest");
++
++            Host host;
++            std::string error;
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-de-prueba"}, error), "host listens: " + error);
++            t.IsTrue(host.port() != 0, "a port");
++            Guest guest;
++            guest.start({"127.0.0.1", host.port(), "clave-de-prueba"});
++            t.IsTrue(waitFor([&] { return guest.status().state == GuestState::Connected; }), "guest connected");
++            t.IsTrue(waitFor([&] { return host.guestConnected() && remotePadActive(); }), "host has the guest");
++            t.Equals(padPortState(rdram, 1), 6u, "port 2 STABLE (a pad) with the guest");
++
++            guest.setPad(crossPressed());
++            uint8_t report[32] = {};
++            PSPadBackend backend;
++            t.IsTrue(waitFor([&]
++                             {
++                                 backend.readState(1, 0, report, sizeof(report));
++                                 return report[3] == 0xBF;
++                             }),
++                     "cross pressed on port 2");
++            t.Equals(report[2], static_cast<uint8_t>(0xFF), "no other button");
++            t.Equals(report[14], static_cast<uint8_t>(200), "cross pressure");
++            t.Equals(report[6], static_cast<uint8_t>(0x10), "left stick x");
++            t.IsTrue(host.padMessages() > 0, "pad messages counted");
++
++            guest.stop();
++            t.IsTrue(waitFor([&] { return !host.guestConnected() && !remotePadActive(); }), "host sees the goodbye");
++            t.Equals(padPortState(rdram, 1), 0u, "port 2 empty again");
++            backend.readState(1, 0, report, sizeof(report));
++            t.Equals(report[3], static_cast<uint8_t>(0xFF), "no button left pressed");
++            t.Equals(report[14], static_cast<uint8_t>(0), "no pressure left");
++            host.stop();
++        });
++
++        tc.Run("a wrong password is rejected and the host keeps listening", [](TestCase &t)
++        {
++            Host host;
++            std::string error;
++            t.IsTrue(host.start({"127.0.0.1", 0, "clave-buena"}, error), "host listens: " + error);
++            Guest bad;
++            bad.start({"127.0.0.1", host.port(), "clave-mala"});
++            t.IsTrue(waitFor([&] { return bad.status().state == GuestState::Rejected; }), "rejected");
++            t.IsTrue(host.rejectedLogins() == 1u, "counted on the host");
++            t.IsFalse(remotePadActive(), "no remote pad");
++            bad.stop();
++
++            Guest good;
++            good.start({"127.0.0.1", host.port(), "clave-buena"});
++            t.IsTrue(waitFor([&] { return good.status().state == GuestState::Connected; }), "the right one gets in");
++
++            Guest second;
++            second.start({"127.0.0.1", host.port(), "clave-buena"});
++            t.IsTrue(waitFor([&] { return second.status().state == GuestState::Rejected; }), "one guest at a time");
++            t.IsTrue(good.status().state == GuestState::Connected, "the first stays");
++            second.stop();
++            good.stop();
++            host.stop();
++            t.IsFalse(remotePadActive(), "nothing left after stop");
++        }); });
++}

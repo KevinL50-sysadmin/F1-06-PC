@@ -1,0 +1,999 @@
+diff --git a/ps2xRuntime/src/lib/ps2_lgdev.h b/ps2xRuntime/src/lib/ps2_lgdev.h
+index 9d0df23..7bdfcd1 100644
+--- a/ps2xRuntime/src/lib/ps2_lgdev.h
++++ b/ps2xRuntime/src/lib/ps2_lgdev.h
+@@ -7,8 +7,11 @@
+ #include <atomic>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
++#include <string>
+ #include <vector>
+ 
+ // T2 of the native wheel (F1 06, patch 0174, odd/tasks/volante-nativo.md): the game's Logitech library (liblgdev 1.11,
+@@ -232,6 +235,246 @@ namespace ps2x::lgdev
+         return in;
+     }
+ 
++    // T4 (patch 0175): the game's force effects on the PC wheel. The 0x3C-byte effect of DownloadForceEffect and
++    // UpdateForceEffect (analisis/volante-liblgdev.md section 4): +0x00 u8 type, +0x04 duration in ms (0xFFFFFFFF =
++    // infinite), +0x08 0; type 0 constant (+0x0C magnitude +-255, +0x10 direction in degrees, envelope +0x14 attack
++    // time, +0x18 attack level, +0x1C fade time, +0x20 fade level); 1 ramp (+0x0C start, +0x10 end, +0x14 direction);
++    // 2 sine, 3 square, 4 triangle, 5 sawtooth up, 6 sawtooth down (+0x0C magnitude 0..255, +0x10 direction, +0x14
++    // period in ms (16 at least), +0x18 phase in degrees, +0x1C offset +-127, envelope at +0x20..+0x2C); 7 spring and
++    // 8 damper (+0x0C offset +-32767 in steering units, +0x10 dead band 0..65536, +0x14/+0x18 positive/negative
++    // saturation 0..255, +0x1C/+0x20 positive/negative coefficient +-255).
++    constexpr size_t kEffectSize = 0x3Cu;
++    constexpr uint32_t kInfinite = 0xFFFFFFFFu; // DirectInput's INFINITE
++    constexpr int32_t kForceMax = 10000;        // DI_FFNOMINALMAX
++
++    enum class ForceKind : uint8_t
++    {
++        None, Constant, Ramp, Sine, Square, Triangle, SawtoothUp, SawtoothDown, Spring, Damper
++    };
++
++    // An effect as DirectInput plays it on the steering axis alone (X): forces in -10000..10000, times in us, the phase
++    // in hundredths of a degree. The direction of the game's effect becomes the sign of the force on that axis (its
++    // sine: 90 = all of it towards +X, -90 towards -X, 0 none).
++    struct ForceParams
++    {
++        ForceKind kind = ForceKind::None;
++        uint32_t durationUs = kInfinite;
++        int32_t magnitude = 0; // constant: signed; periodic: 0..10000
++        int32_t rampStart = 0, rampEnd = 0;
++        int32_t offset = 0; // periodic or condition offset
++        uint32_t periodUs = 0, phase = 0;
++        int32_t positiveCoefficient = 0, negativeCoefficient = 0;
++        uint32_t positiveSaturation = 0, negativeSaturation = 0, deadBand = 0;
++        bool envelope = false;
++        uint32_t attackLevel = 0, attackTimeUs = 0, fadeLevel = 0, fadeTimeUs = 0;
++
++        bool operator==(const ForceParams &o) const
++        {
++            return kind == o.kind && durationUs == o.durationUs && magnitude == o.magnitude &&
++                   rampStart == o.rampStart && rampEnd == o.rampEnd && offset == o.offset && periodUs == o.periodUs &&
++                   phase == o.phase && positiveCoefficient == o.positiveCoefficient &&
++                   negativeCoefficient == o.negativeCoefficient && positiveSaturation == o.positiveSaturation &&
++                   negativeSaturation == o.negativeSaturation && deadBand == o.deadBand && envelope == o.envelope &&
++                   attackLevel == o.attackLevel && attackTimeUs == o.attackTimeUs && fadeLevel == o.fadeLevel &&
++                   fadeTimeUs == o.fadeTimeUs;
++        }
++        bool operator!=(const ForceParams &o) const { return !(*this == o); }
++    };
++
++    inline int32_t effectWord(const uint8_t *effect, size_t offset)
++    {
++        int32_t v = 0;
++        std::memcpy(&v, effect + offset, 4);
++        return v;
++    }
++
++    // v of full (clamped to +-full, or 0..full) as -10000..10000.
++    inline int32_t forceScale(double v, double full)
++    {
++        return static_cast<int32_t>(std::lround(std::clamp(v / full, -1.0, 1.0) * kForceMax));
++    }
++
++    inline uint32_t millisToMicros(int32_t ms)
++    {
++        return static_cast<uint32_t>(std::clamp<int64_t>(ms, 0, 4294967)) * 1000u;
++    }
++
++    // The share of a force on the steering axis: the sine of its direction (degrees), as the IRX's split into two
++    // axes (0x6510, the first one).
++    inline double axisShare(int32_t degrees)
++    {
++        const int32_t d = ((degrees % 360) + 360) % 360;
++        if (d == 0 || d == 180)
++            return 0.0;
++        if (d == 90)
++            return 1.0;
++        if (d == 270)
++            return -1.0;
++        return std::sin(static_cast<double>(d) * 3.14159265358979323846 / 180.0);
++    }
++
++    inline void effectEnvelope(const uint8_t *effect, size_t at, ForceParams &p)
++    {
++        const int32_t attackTime = effectWord(effect, at), fadeTime = effectWord(effect, at + 8);
++        if (attackTime <= 0 && fadeTime <= 0)
++            return;
++        p.envelope = true;
++        p.attackTimeUs = millisToMicros(attackTime);
++        p.attackLevel = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, at + 4), 0, 255), 255.0));
++        p.fadeTimeUs = millisToMicros(fadeTime);
++        p.fadeLevel = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, at + 12), 0, 255), 255.0));
++    }
++
++    // invert (F1_VOLANTE_INVERTIR_FUERZA=1): the forces the other way (constant, ramp and periodic; the spring and the
++    // damper act around a position and keep their sign).
++    inline ForceParams translateEffect(const uint8_t *effect, bool invert = false)
++    {
++        ForceParams p;
++        const uint8_t type = effect[0];
++        const uint32_t duration = static_cast<uint32_t>(effectWord(effect, 0x04));
++        p.durationUs = duration == 0xFFFFFFFFu ? kInfinite : millisToMicros(static_cast<int32_t>(
++                                                                 std::min<uint32_t>(duration, 0x7FFFFFFFu)));
++        const double sign = invert ? -1.0 : 1.0;
++        if (type == 0u)
++        {
++            p.kind = ForceKind::Constant;
++            const double magnitude = std::clamp(effectWord(effect, 0x0C), -255, 255);
++            p.magnitude = forceScale(sign * magnitude * axisShare(effectWord(effect, 0x10)), 255.0);
++            effectEnvelope(effect, 0x14, p);
++        }
++        else if (type == 1u)
++        {
++            p.kind = ForceKind::Ramp;
++            const double share = sign * axisShare(effectWord(effect, 0x14));
++            p.rampStart = forceScale(std::clamp(effectWord(effect, 0x0C), -255, 255) * share, 255.0);
++            p.rampEnd = forceScale(std::clamp(effectWord(effect, 0x10), -255, 255) * share, 255.0);
++        }
++        else if (type >= 2u && type <= 6u)
++        {
++            const ForceKind waves[5] = {ForceKind::Sine, ForceKind::Square, ForceKind::Triangle, ForceKind::SawtoothUp,
++                                        ForceKind::SawtoothDown};
++            p.kind = waves[type - 2u];
++            const double share = sign * axisShare(effectWord(effect, 0x10));
++            const double magnitude = std::clamp(effectWord(effect, 0x0C), 0, 255);
++            p.magnitude = forceScale(magnitude * std::fabs(share), 255.0);
++            p.offset = forceScale(std::clamp(effectWord(effect, 0x1C), -127, 127) * share, 255.0);
++            p.periodUs = millisToMicros(std::max(effectWord(effect, 0x14), 16));
++            const int32_t phase = ((effectWord(effect, 0x18) % 360) + 360) % 360;
++            p.phase = static_cast<uint32_t>((phase * 100 + (share < 0.0 ? 18000 : 0)) % 36000);
++            effectEnvelope(effect, 0x20, p);
++        }
++        else if (type == 7u || type == 8u)
++        {
++            p.kind = type == 7u ? ForceKind::Spring : ForceKind::Damper;
++            p.offset = forceScale(effectWord(effect, 0x0C), 32767.0);
++            const int32_t band = std::clamp(effectWord(effect, 0x10), 0, 0x10000);
++            p.deadBand = static_cast<uint32_t>(forceScale(band / 2, 32767.0));
++            p.positiveSaturation = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, 0x14), 0, 255), 255.0));
++            p.negativeSaturation = static_cast<uint32_t>(forceScale(std::clamp(effectWord(effect, 0x18), 0, 255), 255.0));
++            p.positiveCoefficient = forceScale(effectWord(effect, 0x1C), 255.0);
++            p.negativeCoefficient = forceScale(effectWord(effect, 0x20), 255.0);
++        }
++        return p;
++    }
++
++    // The diagnostic text of an effect (F1_VOLANTE_DIAG=1): its type and fields as the game wrote them.
++    inline std::string describeEffect(const uint8_t *effect)
++    {
++        static const char *const kNames[9] = {"constante", "rampa",  "seno",   "cuadrada", "triangulo",
++                                              "sierra+",   "sierra-", "muelle", "amortiguador"};
++        const uint8_t type = effect[0];
++        auto w = [effect](size_t offset) { return static_cast<long>(effectWord(effect, offset)); };
++        char text[256];
++        if (type == 0u)
++            std::snprintf(text, sizeof(text), "constante magnitud=%ld direccion=%ld", w(0x0C), w(0x10));
++        else if (type == 1u)
++            std::snprintf(text, sizeof(text), "rampa inicio=%ld fin=%ld direccion=%ld", w(0x0C), w(0x10), w(0x14));
++        else if (type <= 6u)
++            std::snprintf(text, sizeof(text), "%s magnitud=%ld direccion=%ld periodo=%ld fase=%ld desplazamiento=%ld",
++                          kNames[type], w(0x0C), w(0x10), w(0x14), w(0x18), w(0x1C));
++        else if (type <= 8u)
++            std::snprintf(text, sizeof(text), "%s centro=%ld zona=%ld saturacion=%ld/%ld coeficiente=%ld/%ld",
++                          kNames[type], w(0x0C), w(0x10), w(0x14), w(0x18), w(0x1C), w(0x20));
++        else
++            std::snprintf(text, sizeof(text), "tipo %u desconocido", static_cast<unsigned>(type));
++        std::string out = text;
++        const uint32_t duration = static_cast<uint32_t>(effectWord(effect, 0x04));
++        out += duration == 0xFFFFFFFFu ? " duracion=inf" : " duracion=" + std::to_string(duration);
++        return out;
++    }
++
++    // The gain of every effect (0..10000): the game's (property 3, 0..255) times opciones.ini vibracion (0-100 %);
++    // 0 with controles.ini vibracion = 0 (enabled false), as the wheel rumble of patch 0107.
++    inline uint32_t forceGain(uint32_t gameGain, bool enabled, int percent)
++    {
++        if (!enabled)
++            return 0u;
++        const double gain = std::min(gameGain, 255u) / 255.0 * std::clamp(percent, 0, 100) / 100.0;
++        return static_cast<uint32_t>(std::lround(gain * kForceMax));
++    }
++
++    // Patch 0107: the DualShock 2 motors as a vibration of the wheel (0..10000, the large motor and half the small).
++    // With the native wheel the game drives the wheel's force itself: 0 (no second effect on the wheel).
++    inline int wheelRumble(float smallMotor, float largeMotor, bool nativeWheel)
++    {
++        if (nativeWheel)
++            return 0;
++        return static_cast<int>(std::clamp(std::max(largeMotor, smallMotor * 0.5f), 0.0f, 1.0f) * 10000.0f);
++    }
++
++    // One effect of the game on the host: its id, the DirectInput parameters, whether it plays and how many times the
++    // game started it (a start of a playing effect restarts it).
++    struct NativeForce
++    {
++        uint32_t id = 0u;
++        ForceParams params;
++        bool playing = false;
++        uint32_t starts = 0u;
++    };
++
++    // What the wheel must do now: the effects, the game's gain (property 3) and the wheel's own centring spring
++    // (property 2; on while the device is closed).
++    struct ForceState
++    {
++        std::vector<NativeForce> effects;
++        uint32_t gain = 255u;
++        bool autocenter = true;
++    };
++
++    // From the game's thread (publish) to the thread that drives the wheel (take): take gives the state when it changed
++    // since the version the caller saw.
++    class ForceBoard
++    {
++    public:
++        void publish(const ForceState &state)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_state = state;
++            ++m_version;
++        }
++
++        bool take(ForceState &out, uint32_t &seen)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (seen == m_version)
++                return false;
++            out = m_state;
++            seen = m_version;
++            return true;
++        }
++
++    private:
++        std::mutex m_mutex;
++        ForceState m_state;
++        uint32_t m_version = 0u;
++    };
++
++    inline ForceBoard &forceBoard()
++    {
++        static ForceBoard board;
++        return board;
++    }
++
+     // The library's state on the host: one wheel (index 0) in slot 0. present: whether the wheel is there now. Not
+     // thread safe (the caller locks).
+     class HostLibrary
+@@ -270,6 +513,7 @@ namespace ps2x::lgdev
+             m_handle = static_cast<int32_t>((++m_counter & 0x7FFFFFFu) << 4);
+             m_props = {0u, 0u, 0u, 255u, 0u, 0u}; // the IRX sets the gain to 255 on open
+             m_effects = 0u;
++            m_store.clear();
+             handle = m_handle;
+             return 0;
+         }
+@@ -279,6 +523,7 @@ namespace ps2x::lgdev
+             if (!valid(handle))
+                 return static_cast<int32_t>(kErrInvalid);
+             m_open = false;
++            m_store.clear();
+             return 0;
+         }
+ 
+@@ -313,22 +558,108 @@ namespace ps2x::lgdev
+             return 0;
+         }
+ 
+-        // Force effects (T4 will drive them): id = (handle << 16) | n.
+-        int32_t downloadEffect(int32_t handle, uint32_t &id)
++        // DownloadForceEffect: id = (handle << 16) | n. effect: the 0x3C bytes (nullptr: an empty constant force).
++        // Types above 8 are refused (the IRX fails them too).
++        int32_t downloadEffect(int32_t handle, uint32_t &id, const uint8_t *effect = nullptr)
+         {
+-            if (!valid(handle))
++            if (!valid(handle) || (effect != nullptr && effect[0] > 8u))
+                 return static_cast<int32_t>(kErrInvalid);
+             m_effects = (m_effects % 0xFFFFu) + 1u;
+             id = (static_cast<uint32_t>(handle) << 16) | m_effects;
++            StoredEffect stored;
++            stored.id = id;
++            if (effect != nullptr)
++                std::memcpy(stored.bytes.data(), effect, kEffectSize);
++            else
++                put32(stored.bytes.data() + 4, 0xFFFFFFFFu);
++            m_store.push_back(stored);
+             return 0;
+         }
+ 
++        int32_t updateEffect(uint32_t id, const uint8_t *effect)
++        {
++            StoredEffect *stored = find(id);
++            if (stored == nullptr || effect == nullptr || effect[0] > 8u)
++                return static_cast<int32_t>(kErrInvalid);
++            std::memcpy(stored->bytes.data(), effect, kEffectSize);
++            return 0;
++        }
++
++        // StartForceEffectMulti: every known id starts (again, if it plays); the last error for the unknown ones.
++        int32_t startEffects(const uint32_t *ids, uint32_t count)
++        {
++            int32_t result = 0;
++            for (uint32_t i = 0; i < count; ++i)
++                if (StoredEffect *stored = find(ids[i]))
++                {
++                    stored->playing = true;
++                    ++stored->starts;
++                }
++                else
++                    result = static_cast<int32_t>(kErrInvalid);
++            return result;
++        }
++
++        // StopForceEffect and StopForceEffectMulti.
++        int32_t stopEffects(const uint32_t *ids, uint32_t count)
++        {
++            int32_t result = 0;
++            for (uint32_t i = 0; i < count; ++i)
++                if (StoredEffect *stored = find(ids[i]))
++                    stored->playing = false;
++                else
++                    result = static_cast<int32_t>(kErrInvalid);
++            return result;
++        }
++
++        // DestroyForceEffect: stopped and forgotten.
++        int32_t destroyEffect(uint32_t id)
++        {
++            for (auto it = m_store.begin(); it != m_store.end(); ++it)
++                if (it->id == id)
++                {
++                    m_store.erase(it);
++                    return 0;
++                }
++            return static_cast<int32_t>(kErrInvalid);
++        }
++
++        // The effects as the wheel must play them (none while closed: Close stops and forgets them).
++        ForceState forceState(bool invert = false) const
++        {
++            ForceState state;
++            if (!m_open)
++                return state;
++            state.gain = m_props[3];
++            state.autocenter = m_props[2] != 0u;
++            for (const StoredEffect &stored : m_store)
++                state.effects.push_back({stored.id, translateEffect(stored.bytes.data(), invert), stored.playing,
++                                         stored.starts});
++            return state;
++        }
++
+         bool isOpen() const { return m_open; }
+         int32_t handle() const { return m_open ? m_handle : -1; }
+ 
+     private:
++        struct StoredEffect
++        {
++            uint32_t id = 0u;
++            std::array<uint8_t, kEffectSize> bytes{};
++            bool playing = false;
++            uint32_t starts = 0u;
++        };
++
+         bool valid(int32_t handle) const { return m_open && handle == m_handle; }
+ 
++        StoredEffect *find(uint32_t id)
++        {
++            for (StoredEffect &stored : m_store)
++                if (stored.id == id)
++                    return &stored;
++            return nullptr;
++        }
++
+         bool m_firstHint = true;
+         bool m_hintPresent = false;
+         bool m_open = false;
+@@ -336,6 +667,7 @@ namespace ps2x::lgdev
+         uint32_t m_counter = 0u;
+         uint32_t m_effects = 0u;
+         std::array<uint32_t, 6> m_props{};
++        std::vector<StoredEffect> m_store;
+     };
+ 
+     // Whether the game reads the wheel through the replaced library (set by the game's overrides before the first pad
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 4c33517..2284c31 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -998,6 +998,11 @@ namespace ps2x
+         g_rumblePercent.store(std::clamp(percent, 0, 100), std::memory_order_relaxed);
+     }
+ 
++    int rumbleIntensity()
++    {
++        return rumblePercent();
++    }
++
+     void setPadPortRumble(int port, float smallMotor, float largeMotor)
+     {
+         const int percent = rumblePercent();
+diff --git a/ps2xRuntime/src/lib/ps2_pad_players.h b/ps2xRuntime/src/lib/ps2_pad_players.h
+index 7c633aa..6e2477c 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_players.h
++++ b/ps2xRuntime/src/lib/ps2_pad_players.h
+@@ -49,6 +49,8 @@ namespace ps2x
+     float scaledRumble(float motor, int percent);
+     int rumbleIntensityFromText(const char *text);
+     void setRumbleIntensity(int percent);
++    // Patch 0175: that percentage now (the native wheel's force follows it too).
++    int rumbleIntensity();
+ 
+     // Patch 0174 (T2 of odd/tasks/volante-nativo.md): bytes 0-20 of player 1's DualShock 2 report from a wheel state
+     // alone (no keys, no gamepad), as the game's pad gets it with controles.ini = iniText. wheelFeedsPad: the wheel as
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+index 3b58cce..aae2243 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -10,6 +10,9 @@
+ #include <setupapi.h>
+ #include <hidsdi.h>
+ 
++#include "ps2_lgdev.h"
++#include "ps2_pad_players.h"
++
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -17,6 +20,7 @@
+ #include <vector>
+ #include <cctype>
+ #include <cstdio>
++#include <cstdlib>
+ #include <condition_variable>
+ #include <mutex>
+ #include <thread>
+@@ -39,6 +43,28 @@ namespace
+     std::atomic<int> g_wheelRumble{0}; // 0..10000 (DI_FFNOMINALMAX)
+     int g_wheelRumbleApplied = -1;
+ 
++    // Parche 0175 (T4 de odd/tasks/volante-nativo.md): con el volante nativo, la fuerza de respuesta es la del propio
++    // juego (sus efectos de liblgdev, ps2x::lgdev::forceBoard) y la vibracion del 0107 no se crea. Cada efecto del juego
++    // es un efecto de DirectInput sobre el eje X; se aplican desde el hilo que lee el volante (readWheel), y al salir del
++    // juego se paran todos.
++    struct NativeEffect
++    {
++        uint32_t id = 0u;
++        IDirectInputEffect *effect = nullptr;
++        ps2x::lgdev::ForceParams params;
++        bool playing = false;
++        uint32_t starts = 0u;
++    };
++    bool g_nativeForces = false;
++    bool g_forceDiag = false; // F1_VOLANTE_DIAG=1
++    std::timed_mutex g_forceMutex;
++    std::atomic<bool> g_forcesStopped{false}; // al salir
++    std::vector<NativeEffect> g_nativeEffects;
++    ps2x::lgdev::ForceState g_nativeState;
++    uint32_t g_nativeSeen = 0u;
++    uint32_t g_nativeGain = 0xFFFFFFFFu;
++    int g_autocenterApplied = -1;
++
+     std::string narrow(const wchar_t *text)
+     {
+         if (!text)
+@@ -405,6 +431,213 @@ namespace
+         return *s_instance;
+     }
+ 
++    const GUID &forceGuid(ps2x::lgdev::ForceKind kind)
++    {
++        using ps2x::lgdev::ForceKind;
++        switch (kind)
++        {
++        case ForceKind::Ramp: return GUID_RampForce;
++        case ForceKind::Sine: return GUID_Sine;
++        case ForceKind::Square: return GUID_Square;
++        case ForceKind::Triangle: return GUID_Triangle;
++        case ForceKind::SawtoothUp: return GUID_SawtoothUp;
++        case ForceKind::SawtoothDown: return GUID_SawtoothDown;
++        case ForceKind::Spring: return GUID_Spring;
++        case ForceKind::Damper: return GUID_Damper;
++        default: return GUID_ConstantForce;
++        }
++    }
++
++    // Un DIEFFECT de un solo eje (X) con sus parametros; se rellena en su sitio (apunta a sus propios campos).
++    struct EffectData
++    {
++        DWORD axes[1] = {DIJOFS_X};
++        LONG directions[1] = {0};
++        DICONSTANTFORCE constant{};
++        DIRAMPFORCE ramp{};
++        DIPERIODIC periodic{};
++        DICONDITION condition{};
++        DIENVELOPE envelope{};
++        DIEFFECT effect{};
++
++        EffectData(const ps2x::lgdev::ForceParams &p, DWORD gain)
++        {
++            using ps2x::lgdev::ForceKind;
++            effect.dwSize = sizeof(effect);
++            effect.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTOFFSETS;
++            effect.dwDuration = p.durationUs;
++            effect.dwGain = gain;
++            effect.dwTriggerButton = DIEB_NOTRIGGER;
++            effect.cAxes = 1;
++            effect.rgdwAxes = axes;
++            effect.rglDirection = directions;
++            if (p.envelope)
++            {
++                envelope.dwSize = sizeof(envelope);
++                envelope.dwAttackLevel = p.attackLevel;
++                envelope.dwAttackTime = p.attackTimeUs;
++                envelope.dwFadeLevel = p.fadeLevel;
++                envelope.dwFadeTime = p.fadeTimeUs;
++                effect.lpEnvelope = &envelope;
++            }
++            switch (p.kind)
++            {
++            case ForceKind::Constant:
++                constant.lMagnitude = p.magnitude;
++                effect.cbTypeSpecificParams = sizeof(constant);
++                effect.lpvTypeSpecificParams = &constant;
++                break;
++            case ForceKind::Ramp:
++                ramp.lStart = p.rampStart;
++                ramp.lEnd = p.rampEnd;
++                effect.cbTypeSpecificParams = sizeof(ramp);
++                effect.lpvTypeSpecificParams = &ramp;
++                break;
++            case ForceKind::Spring:
++            case ForceKind::Damper:
++                condition.lOffset = p.offset;
++                condition.lPositiveCoefficient = p.positiveCoefficient;
++                condition.lNegativeCoefficient = p.negativeCoefficient;
++                condition.dwPositiveSaturation = p.positiveSaturation;
++                condition.dwNegativeSaturation = p.negativeSaturation;
++                condition.lDeadBand = static_cast<LONG>(p.deadBand);
++                effect.cbTypeSpecificParams = sizeof(condition);
++                effect.lpvTypeSpecificParams = &condition;
++                break;
++            default:
++                periodic.dwMagnitude = static_cast<DWORD>(std::max(p.magnitude, 0));
++                periodic.lOffset = p.offset;
++                periodic.dwPhase = p.phase;
++                periodic.dwPeriod = p.periodUs;
++                effect.cbTypeSpecificParams = sizeof(periodic);
++                effect.lpvTypeSpecificParams = &periodic;
++                break;
++            }
++        }
++    };
++
++    void releaseNativeEffect(NativeEffect &e)
++    {
++        if (e.effect)
++        {
++            e.effect->Stop();
++            e.effect->Unload();
++            e.effect->Release();
++            e.effect = nullptr;
++        }
++    }
++
++    // Propiedad 2 del juego: el muelle de centrado propio del volante (DIPROP_AUTOCENTER). Hay controladores que solo
++    // la aceptan sin adquirir: entonces se suelta el volante, se cambia y se vuelven a cargar los efectos.
++    void setAutocenter(bool on)
++    {
++        DIPROPDWORD prop{};
++        prop.diph.dwSize = sizeof(prop);
++        prop.diph.dwHeaderSize = sizeof(prop.diph);
++        prop.diph.dwHow = DIPH_DEVICE;
++        prop.dwData = on ? DIPROPAUTOCENTER_ON : DIPROPAUTOCENTER_OFF;
++        HRESULT hr = g_wheel->SetProperty(DIPROP_AUTOCENTER, &prop.diph);
++        if (hr == DIERR_ACQUIRED)
++        {
++            g_wheel->Unacquire();
++            hr = g_wheel->SetProperty(DIPROP_AUTOCENTER, &prop.diph);
++            g_wheel->Acquire();
++            for (NativeEffect &e : g_nativeEffects)
++                if (e.effect)
++                {
++                    e.effect->Download();
++                    if (e.playing)
++                        e.effect->Start(1, 0);
++                }
++        }
++        if (g_forceDiag)
++            std::fprintf(stderr, "[volante] centrado propio del volante: %s%s\n", on ? "si" : "no",
++                         SUCCEEDED(hr) ? "" : " (no se pudo cambiar)");
++    }
++
++    // Los efectos del juego en el volante: crea, cambia, arranca, para y quita los de DirectInput para que coincidan con
++    // los del juego, con su ganancia por la de opciones.ini (vibracion) y controles.ini (vibracion = 0: ninguna).
++    void applyNativeForces()
++    {
++        std::unique_lock<std::timed_mutex> lock(g_forceMutex, std::try_to_lock);
++        if (!lock.owns_lock() || g_forcesStopped.load(std::memory_order_relaxed))
++            return;
++        const bool changed = ps2x::lgdev::forceBoard().take(g_nativeState, g_nativeSeen);
++        const uint32_t gain = ps2x::lgdev::forceGain(g_nativeState.gain, g_rumbleEnabled.load(std::memory_order_relaxed),
++                                                     ps2x::rumbleIntensity());
++        const bool gainChanged = gain != g_nativeGain;
++        if (!changed && !gainChanged)
++            return;
++        g_nativeGain = gain;
++        const ps2x::lgdev::ForceState &state = g_nativeState;
++        // Los que el juego ya no tiene, o que cambian de tipo.
++        for (auto it = g_nativeEffects.begin(); it != g_nativeEffects.end();)
++        {
++            const auto wanted = std::find_if(state.effects.begin(), state.effects.end(),
++                                             [&](const ps2x::lgdev::NativeForce &f) { return f.id == it->id; });
++            if (wanted == state.effects.end() || wanted->params.kind != it->params.kind)
++            {
++                releaseNativeEffect(*it);
++                it = g_nativeEffects.erase(it);
++            }
++            else
++                ++it;
++        }
++        for (const ps2x::lgdev::NativeForce &f : state.effects)
++        {
++            if (f.params.kind == ps2x::lgdev::ForceKind::None)
++                continue;
++            auto it = std::find_if(g_nativeEffects.begin(), g_nativeEffects.end(),
++                                   [&](const NativeEffect &e) { return e.id == f.id; });
++            if (it == g_nativeEffects.end())
++            {
++                EffectData data(f.params, gain);
++                NativeEffect e;
++                e.id = f.id;
++                e.params = f.params;
++                const HRESULT hr = g_wheel->CreateEffect(forceGuid(f.params.kind), &data.effect, &e.effect, nullptr);
++                if (FAILED(hr))
++                {
++                    std::fprintf(stderr, "[volante] no se pudo crear el efecto 0x%x en el volante (0x%08lx)\n",
++                                 static_cast<unsigned>(f.id), static_cast<unsigned long>(hr));
++                    continue;
++                }
++                g_nativeEffects.push_back(e);
++                it = g_nativeEffects.end() - 1;
++            }
++            else if (it->params != f.params || gainChanged)
++            {
++                EffectData data(f.params, gain);
++                const bool condition = f.params.kind == ps2x::lgdev::ForceKind::Spring ||
++                                       f.params.kind == ps2x::lgdev::ForceKind::Damper;
++                it->effect->SetParameters(&data.effect, DIEP_DURATION | DIEP_GAIN | DIEP_TYPESPECIFICPARAMS |
++                                                            (condition ? 0u : static_cast<DWORD>(DIEP_ENVELOPE)));
++                it->params = f.params;
++            }
++            if (f.playing && (!it->playing || f.starts != it->starts))
++                it->effect->Start(1, 0);
++            else if (!f.playing && it->playing)
++                it->effect->Stop();
++            it->playing = f.playing;
++            it->starts = f.starts;
++        }
++        if (static_cast<int>(state.autocenter) != g_autocenterApplied)
++        {
++            g_autocenterApplied = state.autocenter ? 1 : 0;
++            setAutocenter(state.autocenter);
++        }
++    }
++
++    // Al salir del juego: ningun efecto se queda sonando en el volante (ni los del juego ni la vibracion del 0107).
++    void stopWheelForces()
++    {
++        std::unique_lock<std::timed_mutex> lock(g_forceMutex, std::defer_lock);
++        (void)lock.try_lock_for(std::chrono::milliseconds(200)); // aunque el lector no lo suelte, se paran igual
++        g_forcesStopped.store(true, std::memory_order_relaxed);
++        if (g_wheel)
++            g_wheel->SendForceFeedbackCommand(DISFFC_STOPALL);
++    }
++
+     using XInputSetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
+     XInputSetStateFn loadXInputSetState()
+     {
+@@ -494,7 +727,13 @@ namespace ps2_pad_win
+         deadzone.dwData = 0;
+         device->SetProperty(DIPROP_DEADZONE, &deadzone.diph);
+         device->Acquire();
+-        if (exclusive)
++        // Parche 0175: con el volante nativo la fuerza es la del juego; sin el, la vibracion del 0107.
++        const bool native = ps2x::lgdev::nativeWheelEnabled();
++        if (const char *diag = std::getenv("F1_VOLANTE_DIAG"); diag != nullptr && std::atoi(diag) != 0)
++            g_forceDiag = true;
++        if (exclusive && native)
++            g_nativeForces = true;
++        else if (exclusive)
+         {
+             DWORD axes[1] = {DIJOFS_X};
+             LONG directions[1] = {0};
+@@ -516,9 +755,14 @@ namespace ps2_pad_win
+                 g_wheelEffect = nullptr;
+         }
+         std::fprintf(stderr, "[pad] volante: fuerza de respuesta %s\n",
+-                     g_wheelEffect ? "si (vibracion)" : forceFeedback ? "no (no se pudo crear el efecto)" : "no (no la tiene)");
++                     g_nativeForces  ? "si (la del juego)"
++                     : g_wheelEffect ? "si (vibracion)"
++                     : forceFeedback ? "no (no se pudo crear el efecto)"
++                                     : "no (no la tiene)");
+         g_wheel = device;
+         g_wheelName = chosen->name;
++        if (g_nativeForces || g_wheelEffect)
++            std::atexit(stopWheelForces);
+         return true;
+     }
+ 
+@@ -527,7 +771,9 @@ namespace ps2_pad_win
+         out = JoystickState{};
+         if (!g_wheel)
+             return false;
+-        if (g_wheelEffect)
++        if (g_nativeForces)
++            applyNativeForces();
++        if (g_wheelEffect && !g_forcesStopped.load(std::memory_order_relaxed))
+         {
+             const int rumble = g_rumbleEnabled.load(std::memory_order_relaxed) ? g_wheelRumble.load(std::memory_order_relaxed) : 0;
+             if (rumble != g_wheelRumbleApplied)
+@@ -599,7 +845,7 @@ namespace ps2_pad_win
+             v.wLeftMotorSpeed = static_cast<WORD>(std::clamp(largeMotor, 0.0f, 1.0f) * 65535.0f);
+             fn(0, &v);
+         }
+-        g_wheelRumble.store(static_cast<int>(std::clamp(std::max(largeMotor, smallMotor * 0.5f), 0.0f, 1.0f) * 10000.0f),
++        g_wheelRumble.store(ps2x::lgdev::wheelRumble(smallMotor, largeMotor, ps2x::lgdev::nativeWheelEnabled()),
+                             std::memory_order_relaxed);
+         dualSense().set(static_cast<uint8_t>(std::clamp(smallMotor, 0.0f, 1.0f) * 255.0f),
+                         static_cast<uint8_t>(std::clamp(largeMotor, 0.0f, 1.0f) * 255.0f));
+diff --git a/ps2xTest/src/ps2_lgdev_tests.cpp b/ps2xTest/src/ps2_lgdev_tests.cpp
+index 4166faf..bf2808f 100644
+--- a/ps2xTest/src/ps2_lgdev_tests.cpp
++++ b/ps2xTest/src/ps2_lgdev_tests.cpp
+@@ -5,7 +5,9 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
++#include <initializer_list>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ // T2 of odd/tasks/volante-nativo.md (F1 06, patch 0174): the game's Logitech library (liblgdev 1.11) replaced by the
+@@ -49,6 +51,25 @@ namespace
+         return pos;
+     }
+ 
++    // A 0x3C-byte effect of the game: type, duration (ms, 0xFFFFFFFF infinite) and words at their offsets.
++    using Effect = std::array<uint8_t, ps2x::lgdev::kEffectSize>;
++    Effect gameEffect(uint8_t type, std::initializer_list<std::pair<size_t, int32_t>> fields,
++                      uint32_t duration = 0xFFFFFFFFu)
++    {
++        Effect e{};
++        e[0] = type;
++        std::memcpy(e.data() + 4, &duration, 4);
++        for (const auto &f : fields)
++            std::memcpy(e.data() + f.first, &f.second, 4);
++        return e;
++    }
++
++    // The i-th effect of a state (an empty one if it has fewer).
++    ps2x::lgdev::NativeForce effectAt(const ps2x::lgdev::ForceState &state, size_t i)
++    {
++        return i < state.effects.size() ? state.effects[i] : ps2x::lgdev::NativeForce{};
++    }
++
+     // A G29 at rest as DirectInput reports it: wheel centred, pedals released (+1 with the "~" mode), POV centred.
+     ps2_pad_win::JoystickState g29AtRest()
+     {
+@@ -401,6 +422,214 @@ namespace
+                 t.Equals(report[8 + 6], uint8_t{0}, "no cross pressure");
+             });
+ 
++            tc.Run("T4: a constant force becomes a signed force on the steering axis", [](TestCase &t)
++                   {
++                using ps2x::lgdev::ForceKind;
++                // The game's steady force (0x1F3A54): magnitude 255, direction +-90 (all of it on X).
++                ps2x::lgdev::ForceParams p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 255}, {0x10, 90}}).data());
++                t.IsTrue(p.kind == ForceKind::Constant, "type 0: constant");
++                t.Equals(p.magnitude, 10000, "255 at 90 degrees: +10000");
++                t.Equals(p.durationUs, ps2x::lgdev::kInfinite, "duration -1: infinite");
++                t.IsFalse(p.envelope, "no envelope");
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 255}, {0x10, -90}}).data());
++                t.Equals(p.magnitude, -10000, "-90 degrees: -10000");
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 255}, {0x10, 0}}).data());
++                t.Equals(p.magnitude, 0, "0 degrees: nothing on X");
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 128}, {0x10, 450}}).data());
++                t.Equals(p.magnitude, 5020, "128 at 450 = 90 degrees: 128/255");
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, -400}, {0x10, 90}}).data());
++                t.Equals(p.magnitude, -10000, "magnitude clamped to -255");
++                // The collision kick (0x1F3C24): 100 ms.
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 255}, {0x10, -90}}, 100u).data());
++                t.Equals(p.durationUs, 100000u, "100 ms: 100000 us");
++                p = ps2x::lgdev::translateEffect(gameEffect(0, {{0x0C, 255}, {0x10, 90}}).data(), true);
++                t.Equals(p.magnitude, -10000, "F1_VOLANTE_INVERTIR_FUERZA: the other way");
++                p = ps2x::lgdev::translateEffect(
++                    gameEffect(0, {{0x0C, 255}, {0x10, 90}, {0x14, 200}, {0x18, 0}, {0x1C, 300}, {0x20, 255}}).data());
++                t.IsTrue(p.envelope, "attack and fade times: an envelope");
++                t.Equals(p.attackTimeUs, 200000u, "attack 200 ms");
++                t.Equals(p.attackLevel, 0u, "attack level 0");
++                t.Equals(p.fadeTimeUs, 300000u, "fade 300 ms");
++                t.Equals(p.fadeLevel, 10000u, "fade level 255");
++            });
++
++            tc.Run("T4: ramp, the five periodic waves and the conditions", [](TestCase &t)
++                   {
++                using ps2x::lgdev::ForceKind;
++                ps2x::lgdev::ForceParams p =
++                    ps2x::lgdev::translateEffect(gameEffect(1, {{0x0C, 25}, {0x10, 255}, {0x14, 90}}).data());
++                t.IsTrue(p.kind == ForceKind::Ramp, "type 1: ramp");
++                t.Equals(p.rampStart, 980, "start 25");
++                t.Equals(p.rampEnd, 10000, "end 255");
++
++                const ForceKind waves[5] = {ForceKind::Sine, ForceKind::Square, ForceKind::Triangle,
++                                            ForceKind::SawtoothUp, ForceKind::SawtoothDown};
++                for (uint8_t type = 2; type <= 6; ++type)
++                {
++                    p = ps2x::lgdev::translateEffect(
++                        gameEffect(type, {{0x0C, 255}, {0x10, 90}, {0x14, 50}, {0x18, 0}, {0x1C, 0}}).data());
++                    t.IsTrue(p.kind == waves[type - 2], "types 2-6: sine, square, triangle, sawtooth up and down");
++                    t.Equals(p.magnitude, 10000, "magnitude 255");
++                    t.Equals(p.periodUs, 50000u, "period 50 ms");
++                    t.Equals(p.phase, 0u, "phase 0");
++                    t.Equals(p.offset, 0, "offset 0");
++                }
++                // The kerb vibration (0x1F3EF0): square, magnitude 45 at 45 degrees, 100 ms.
++                p = ps2x::lgdev::translateEffect(gameEffect(3, {{0x0C, 45}, {0x10, 45}, {0x14, 100}}).data());
++                t.Equals(p.magnitude, 1248, "45 * sin 45 degrees");
++                t.Equals(p.periodUs, 100000u, "100 ms");
++                p = ps2x::lgdev::translateEffect(
++                    gameEffect(2, {{0x0C, 255}, {0x10, -90}, {0x14, 5}, {0x18, 90}, {0x1C, 100}}).data());
++                t.Equals(p.magnitude, 10000, "a periodic magnitude is never negative");
++                t.Equals(p.phase, 27000u, "-90 degrees: half a turn more of phase (90 + 180)");
++                t.Equals(p.offset, -3922, "offset 100 the other way");
++                t.Equals(p.periodUs, 16000u, "period below 16 ms: 16 ms, as the IRX");
++
++                // The game's centring spring (0x1F4478): offset in steering units, saturations 255.
++                p = ps2x::lgdev::translateEffect(gameEffect(7, {{0x0C, 16384}, {0x10, 0}, {0x14, 255}, {0x18, 255},
++                                                                {0x1C, 50}, {0x20, 50}}).data());
++                t.IsTrue(p.kind == ForceKind::Spring, "type 7: spring");
++                t.Equals(p.offset, 5000, "offset 16384 of 32767");
++                t.Equals(p.positiveCoefficient, 1961, "coefficient 50");
++                t.Equals(p.negativeCoefficient, 1961, "coefficient 50");
++                t.Equals(p.positiveSaturation, 10000u, "saturation 255");
++                t.Equals(p.negativeSaturation, 10000u, "saturation 255");
++                t.Equals(p.deadBand, 0u, "no dead band");
++                p = ps2x::lgdev::translateEffect(gameEffect(8, {{0x0C, 0}, {0x10, 6554}, {0x14, 255}, {0x18, 0},
++                                                                {0x1C, -255}, {0x20, 255}}).data(), true);
++                t.IsTrue(p.kind == ForceKind::Damper, "type 8: damper");
++                t.Equals(p.deadBand, 1000u, "dead band 6554: +-3277 around the offset");
++                t.Equals(p.positiveCoefficient, -10000, "coefficient -255 (inversion does not touch conditions)");
++                t.Equals(p.negativeSaturation, 0u, "saturation 0");
++                p = ps2x::lgdev::translateEffect(gameEffect(9, {}).data());
++                t.IsTrue(p.kind == ForceKind::None, "type 9: unknown");
++            });
++
++            tc.Run("T4: the gain is the game's times the vibracion option", [](TestCase &t)
++                   {
++                t.Equals(ps2x::lgdev::forceGain(255, true, 100), 10000u, "255 at 100 %");
++                t.Equals(ps2x::lgdev::forceGain(200, true, 100), 7843u, "200 (the game's weaker setting)");
++                t.Equals(ps2x::lgdev::forceGain(0, true, 100), 0u, "0: the game silences the wheel");
++                t.Equals(ps2x::lgdev::forceGain(255, true, 50), 5000u, "opciones.ini vibracion 50 %");
++                t.Equals(ps2x::lgdev::forceGain(200, true, 50), 3922u, "both");
++                t.Equals(ps2x::lgdev::forceGain(255, false, 100), 0u, "controles.ini vibracion = 0");
++                t.Equals(ps2x::lgdev::forceGain(999, true, 150), 10000u, "clamped");
++            });
++
++            tc.Run("T4: download, update, start, stop and destroy keep the wheel's effects", [](TestCase &t)
++                   {
++                using ps2x::lgdev::ForceKind;
++                ps2x::lgdev::HostLibrary lib;
++                ps2x::lgdev::ForceState state = lib.forceState();
++                t.IsTrue(state.effects.empty() && state.autocenter && state.gain == 255u, "closed: nothing, centring");
++                int32_t handle = 0;
++                lib.open(0, true, handle);
++                lib.setProperty(handle, 2, 1);
++                t.IsTrue(lib.forceState().autocenter, "property 2 = 1: the wheel's centring spring");
++                lib.setProperty(handle, 2, 0);
++                t.IsFalse(lib.forceState().autocenter, "property 2 = 0: off (the game plays its own spring)");
++                lib.setProperty(handle, 3, 200);
++                t.Equals(lib.forceState().gain, 200u, "property 3: the gain");
++
++                const Effect constant = gameEffect(0, {{0x0C, 255}, {0x10, 90}});
++                const Effect sine = gameEffect(2, {{0x0C, 255}, {0x10, 90}, {0x14, 50}});
++                uint32_t a = 0, b = 0;
++                t.Equals(lib.downloadEffect(handle, a, constant.data()), 0, "download a constant force");
++                t.Equals(lib.downloadEffect(handle, b, sine.data()), 0, "and a sine");
++                const Effect unknown = gameEffect(9, {});
++                uint32_t c = 0;
++                t.Equals(static_cast<uint32_t>(lib.downloadEffect(handle, c, unknown.data())), ps2x::lgdev::kErrInvalid,
++                         "type 9: refused");
++                state = lib.forceState();
++                t.Equals(state.effects.size(), size_t{2}, "two effects");
++                t.IsTrue(state.effects.size() == 2 && effectAt(state, 0).id == a && effectAt(state, 1).id == b, "by id");
++                t.IsTrue(state.effects.size() == 2 && !effectAt(state, 0).playing && !effectAt(state, 1).playing,
++                         "downloaded, not playing");
++                t.IsTrue(state.effects.size() == 2 && effectAt(state, 0).params.kind == ForceKind::Constant &&
++                             effectAt(state, 1).params.kind == ForceKind::Sine, "translated");
++
++                t.Equals(lib.startEffects(&a, 1), 0, "StartForceEffectMulti(1, &a)");
++                state = lib.forceState();
++                t.IsTrue(effectAt(state, 0).playing && effectAt(state, 0).starts == 1u, "a plays");
++                t.IsFalse(effectAt(state, 1).playing, "b does not");
++                lib.startEffects(&a, 1);
++                t.Equals(effectAt(lib.forceState(), 0).starts, 2u, "started again: restarted");
++
++                const Effect left = gameEffect(0, {{0x0C, 255}, {0x10, -90}});
++                t.Equals(lib.updateEffect(a, left.data()), 0, "UpdateForceEffect");
++                state = lib.forceState();
++                t.Equals(effectAt(state, 0).params.magnitude, -10000, "the new parameters");
++                t.IsTrue(effectAt(state, 0).playing, "still playing");
++                t.Equals(effectAt(lib.forceState(true), 0).params.magnitude, 10000, "inverted");
++
++                const uint32_t both[2] = {a, b};
++                lib.startEffects(both, 2);
++                t.Equals(lib.stopEffects(&a, 1), 0, "StopForceEffect(a)");
++                state = lib.forceState();
++                t.IsFalse(effectAt(state, 0).playing, "a stopped");
++                t.IsTrue(effectAt(state, 1).playing, "b plays");
++                t.Equals(lib.destroyEffect(b), 0, "DestroyForceEffect(b)");
++                state = lib.forceState();
++                t.Equals(state.effects.size(), size_t{1}, "b gone");
++                t.Equals(static_cast<uint32_t>(lib.destroyEffect(b)), ps2x::lgdev::kErrInvalid, "destroyed twice");
++                t.Equals(static_cast<uint32_t>(lib.updateEffect(b, sine.data())), ps2x::lgdev::kErrInvalid,
++                         "update of an unknown id");
++                t.Equals(static_cast<uint32_t>(lib.startEffects(&b, 1)), ps2x::lgdev::kErrInvalid,
++                         "start of an unknown id");
++                t.Equals(static_cast<uint32_t>(lib.stopEffects(&b, 1)), ps2x::lgdev::kErrInvalid,
++                         "stop of an unknown id");
++
++                lib.startEffects(&a, 1);
++                lib.close(handle);
++                state = lib.forceState();
++                t.IsTrue(state.effects.empty(), "Close: every effect stops and goes");
++                t.IsTrue(state.autocenter && state.gain == 255u, "the wheel back to its own centring");
++                t.Equals(static_cast<uint32_t>(lib.updateEffect(a, left.data())), ps2x::lgdev::kErrInvalid,
++                         "the old ids are gone");
++            });
++
++            tc.Run("T4: the force board hands over each new state once", [](TestCase &t)
++                   {
++                ps2x::lgdev::ForceBoard board;
++                ps2x::lgdev::ForceState state, out;
++                uint32_t seen = 0u;
++                t.IsFalse(board.take(out, seen), "nothing published");
++                state.gain = 7u;
++                board.publish(state);
++                t.IsTrue(board.take(out, seen), "the new state");
++                t.Equals(out.gain, 7u, "its gain");
++                t.IsFalse(board.take(out, seen), "not twice");
++            });
++
++            tc.Run("T4: the diagnostic text of an effect", [](TestCase &t)
++                   {
++                t.Equals(ps2x::lgdev::describeEffect(gameEffect(0, {{0x0C, 255}, {0x10, -90}}, 100u).data()),
++                         std::string("constante magnitud=255 direccion=-90 duracion=100"), "constant");
++                t.Equals(ps2x::lgdev::describeEffect(
++                             gameEffect(3, {{0x0C, 45}, {0x10, 45}, {0x14, 100}, {0x18, 0}, {0x1C, 0}}).data()),
++                         std::string("cuadrada magnitud=45 direccion=45 periodo=100 fase=0 desplazamiento=0 duracion=inf"),
++                         "square");
++                t.Equals(ps2x::lgdev::describeEffect(gameEffect(7, {{0x0C, -1200}, {0x14, 255}, {0x18, 255},
++                                                                    {0x1C, 128}, {0x20, 128}}).data()),
++                         std::string("muelle centro=-1200 zona=0 saturacion=255/255 coeficiente=128/128 duracion=inf"),
++                         "spring");
++            });
++
++            tc.Run("T4: with the native wheel the DualShock 2 rumble (patch 0107) does not move the wheel",
++                   [](TestCase &t)
++                   {
++                t.Equals(ps2x::lgdev::wheelRumble(0.2f, 0.6f, true), 0, "large motor: nothing on the wheel");
++                t.Equals(ps2x::lgdev::wheelRumble(1.0f, 1.0f, true), 0, "both motors: nothing");
++            });
++
++            // PRESERVE: F1_VOLANTE_STICK=1 (no native wheel) keeps patch 0107: the rumble as a wheel vibration.
++            tc.Run("with the wheel as stick the DualShock 2 rumble still drives the wheel (patch 0107)", [](TestCase &t)
++                   {
++                t.Equals(ps2x::lgdev::wheelRumble(0.2f, 0.6f, false), 6000, "the large motor");
++                t.Equals(ps2x::lgdev::wheelRumble(1.0f, 0.1f, false), 5000, "half the small one");
++                t.Equals(ps2x::lgdev::wheelRumble(0.0f, 2.0f, false), 10000, "clamped");
++            });
++
+             // PRESERVE: F1_VOLANTE_STICK=1 (and every game without the native wheel) keeps the wheel on the stick.
+             tc.Run("with the wheel as stick the previous mapping holds: X steering, Y~ cross, B5 r1", [](TestCase &t)
+                    {

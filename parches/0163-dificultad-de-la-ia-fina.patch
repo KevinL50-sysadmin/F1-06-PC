@@ -1,0 +1,296 @@
+diff --git a/ps2xRuntime/src/lib/ps2_ai_difficulty.h b/ps2xRuntime/src/lib/ps2_ai_difficulty.h
+new file mode 100644
+index 0000000..3688e4a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_ai_difficulty.h
+@@ -0,0 +1,91 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++// Fase 5 (T16, F1 06): a finer opponent AI level (opciones.ini dificultad_ia: 0 = the game's own three levels; 1 to
++// 100 = a level between them, where 0 is EASY, 50 MEDIUM and 100 HARD). The game keeps its own level (OPPONENT AI in
++// DIFFICULTY, game.aidifficulty: a byte of the profile per game mode, copied to the race setup *0x3FE588 + 0x11C);
++// the fine value only counts while the game's level is the nearest of the three to it, so a level changed somewhere
++// else (OVERALL DIFFICULTY, another profile) is never overridden by a stale value. The race reads the level in
++// func_1823C0 (offsets added to each AI driver's stats) and func_372E10 (constants of each AI car); src/f1_overrides.cpp
++// calls them as they are and then moves what they wrote to the blend of the two levels around the fine value.
++namespace ps2x
++{
++    constexpr int kAiDifficultyMax = 100;
++    constexpr int kAiDifficultyStep = 50; // fine units between two of the game's levels
++
++    // A value written by the game for each of its levels (0 EASY, 1 MEDIUM, 2 HARD) at an offset of its object.
++    struct AiDifficultyField
++    {
++        uint32_t offset;
++        float perLevel[3];
++    };
++
++    // func_1823C0: added to the AI driver's stats (the driver object, + 0x24 to + 0x38) for EASY and MEDIUM.
++    constexpr AiDifficultyField kAiDriverOffsets[] = {
++        {0x24u, {0.5f, 0.4f, 0.0f}},  {0x28u, {0.2f, 0.2f, 0.0f}},   {0x2Cu, {0.4f, 0.25f, 0.0f}},
++        {0x30u, {0.3f, 0.2f, 0.0f}},  {0x34u, {0.15f, 0.15f, 0.0f}}, {0x38u, {0.15f, 0.15f, 0.0f}},
++    };
++    // func_372E10: written to an AI car (the car object; + 0xD0 bit 0) for each level; the other values it writes are
++    // the same for the three.
++    constexpr AiDifficultyField kAiCarValues[] = {
++        {0x208u, {86.0f, 96.0f, 96.0f}},
++        {0x20Cu, {7.0f, 10.0f, 10.0f}},
++        {0x21Cu, {0.84f, 0.95f, 0.98f}},
++        {0x220u, {0.8f, 0.92f, 1.0f}},
++    };
++
++    // The game's level nearest to a fine value: 0-24 EASY (0), 25-74 MEDIUM (1), 75-100 HARD (2).
++    inline int aiDifficultyNearestLevel(int fine)
++    {
++        return (std::clamp(fine, 0, kAiDifficultyMax) + kAiDifficultyStep / 2) / kAiDifficultyStep;
++    }
++
++    // Where the race goes between the game's levels (0 = EASY, 1 = MEDIUM, 2 = HARD): fine / 50 when fine is 1..100
++    // and its nearest level is the game's; otherwise the game's level as it is. -1 for a level that is not one of the
++    // three (the game is left alone).
++    inline float aiDifficultyPosition(int fine, int gameLevel)
++    {
++        if (gameLevel < 0 || gameLevel > 2)
++            return -1.0f;
++        if (fine <= 0 || fine > kAiDifficultyMax || aiDifficultyNearestLevel(fine) != gameLevel)
++            return static_cast<float>(gameLevel);
++        return static_cast<float>(fine) / static_cast<float>(kAiDifficultyStep);
++    }
++
++    // A field's value at a position: exactly the game's at 0, 1 and 2, a straight line between them.
++    inline float aiDifficultyBlend(const AiDifficultyField &field, float position)
++    {
++        const float clamped = std::clamp(position, 0.0f, 2.0f);
++        const int low = std::min(static_cast<int>(std::floor(clamped)), 2);
++        const float fraction = clamped - static_cast<float>(low);
++        if (fraction <= 0.0f)
++            return field.perLevel[low];
++        return field.perLevel[low] + (field.perLevel[low + 1] - field.perLevel[low]) * fraction;
++    }
++
++    // The OPPONENT AI row of DIFFICULTY goes from 0 (EASY) to 100 (HARD) in steps of 10 (50 = MEDIUM). Its value for a
++    // fine value and the game's level: the fine value rounded to the step when it counts, otherwise the game's level.
++    inline int aiDifficultyRowValue(int fine, int gameLevel)
++    {
++        const float position = aiDifficultyPosition(fine, gameLevel);
++        if (position < 0.0f)
++            return 0;
++        return static_cast<int>(std::lround(position * kAiDifficultyStep / 10.0f)) * 10;
++    }
++
++    // What choosing a value of the row stores: the game's level (the nearest) and the fine value (0 for EASY, MEDIUM
++    // and HARD themselves: the game's own).
++    struct AiDifficultyChoice
++    {
++        int gameLevel;
++        int fine;
++    };
++    inline AiDifficultyChoice aiDifficultyChoice(int rowValue)
++    {
++        const int value = std::clamp(rowValue, 0, kAiDifficultyMax);
++        return {aiDifficultyNearestLevel(value), value % kAiDifficultyStep == 0 ? 0 : value};
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 163feb0..580e6c8 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -197,6 +197,12 @@ namespace ps2x
+              "Tecla del modo foto (f8, f5, p o no): en carrera congela el juego, quita el HUD y deja mover la camara\n"
+              "(W S A D, R F, flechas, Q E, Z X; con el mando, los sticks). La tecla de foto la saca; la misma tecla\n"
+              "vuelve a la carrera."},
++            // Fase 5 (T16): also the OPPONENT AI row of the game's DIFFICULTY menu; the race reads it when it sets up
++            // the AI drivers and cars (src/f1_overrides.cpp, ps2_ai_difficulty.h).
++            {"dificultad_ia", "PS2X_DIFICULTAD_IA", "0", {}, 0, 100,
++             "Dificultad de los rivales mas fina: 0 = la del juego (FACIL, MEDIA o DIFICIL en DIFFICULTY > OPPONENT AI);\n"
++             "de 1 a 100, un punto entre ellas (0 FACIL, 50 MEDIA, 100 DIFICIL). Solo cuenta mientras la del juego sea\n"
++             "la mas cercana (la fila del juego pone las dos)."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index e6c7a35..4618f57 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -127,7 +127,13 @@ namespace
+               // Fase 5 (T13).
+               {"tecla_modo_foto", "Tecla del modo foto", {{"f8", "F8"}, {"f5", "F5"}, {"p", "P"}, {"no", "Ninguna"}},
+                "En carrera: congela el juego, quita el HUD y deja mover la cámara (W S A D, R F, flechas, Q E, Z X o "
+-               "los sticks). La tecla de foto la saca; la misma tecla vuelve a la carrera."}}},
++               "los sticks). La tecla de foto la saca; la misma tecla vuelve a la carrera."},
++              // Fase 5 (T16).
++              {"dificultad_ia", "Dificultad de los rivales",
++               {{"0", "La del juego"}, {"10", "10"}, {"20", "20"}, {"30", "30"}, {"40", "40"}, {"50", "50 (media)"},
++                {"60", "60"}, {"70", "70"}, {"80", "80"}, {"90", "90"}, {"100", "100 (difícil)"}},
++               "0: la del juego (DIFFICULTY > OPPONENT AI). De 1 a 100, un punto entre fácil (0), media (50) y difícil "
++               "(100); solo cuenta mientras la del juego sea la más cercana."}}},
+         };
+         return list;
+     }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index eedc045..172b1c2 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1,5 +1,6 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
++#include "ps2_ai_difficulty.h"
+ #include "ps2_camera_fov.h"
+ #include "ps2_hud.h"
+ #include "ps2_photo_mode.h"
+@@ -516,6 +517,138 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "hud"), std::string("completo"), "the other options keep their values");
+         });
+ 
++        // Fase 5 (T16): a finer opponent AI (dificultad_ia = 0, the game's three levels, or 1 to 100).
++        tc.Run("the dificultad_ia option has its default, variable, checks and number", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("dificultad_ia"), std::string("0"), "the game's by default");
++            t.Equals(fileValue("", "dificultad_ia", true), std::string("0"), "also in development");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "dificultad_ia = 0\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "fov = 0\n"), "and keeps fov");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("dificultad_ia = 37\n");
++            t.IsTrue(file.warnings.empty(), "any value from 0 to 100 gives no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            std::string variable = "<none>";
++            for (const ps2x::EnvironmentSetting &setting : settings)
++                if (setting.variable == "PS2X_DIFICULTAD_IA")
++                    variable = setting.value;
++            t.Equals(variable, std::string("37"), "dificultad_ia -> PS2X_DIFICULTAD_IA");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("dificultad_ia = 101\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "past 100 warns");
++            t.Equals(bad.values.at("dificultad_ia"), std::string("0"), "and takes the default");
++            t.Equals(ps2x::parseOptions("dificultad_ia = -1\n").values.at("dificultad_ia"), std::string("0"), "below 0 too");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "dificultad_ia", value), "a number for the game's row");
++            t.Equals(value, 0.0f, "0");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "dificultad_ia", 30.0f), "30");
++            t.Equals(model.current.at("dificultad_ia"), std::string("30"), "is 30");
++            t.IsTrue(ps2x::menuOptionNumber(model, "dificultad_ia", value), "read back");
++            t.Equals(value, 30.0f, "as the value itself");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "dificultad_ia"), std::string("30"), "saving writes it");
++            t.Equals(fileValue(saved, "fov"), std::string("0"), "the other options keep their values");
++        });
++
++        tc.Run("the fine AI level belongs to the nearest of the game's three and only counts with it", [](TestCase &t)
++        {
++            t.Equals(ps2x::aiDifficultyNearestLevel(0), 0, "0: EASY");
++            t.Equals(ps2x::aiDifficultyNearestLevel(24), 0, "24: EASY");
++            t.Equals(ps2x::aiDifficultyNearestLevel(25), 1, "25: MEDIUM");
++            t.Equals(ps2x::aiDifficultyNearestLevel(50), 1, "50: MEDIUM");
++            t.Equals(ps2x::aiDifficultyNearestLevel(74), 1, "74: MEDIUM");
++            t.Equals(ps2x::aiDifficultyNearestLevel(75), 2, "75: HARD");
++            t.Equals(ps2x::aiDifficultyNearestLevel(100), 2, "100: HARD");
++            t.Equals(ps2x::aiDifficultyNearestLevel(-5), 0, "below 0: EASY");
++            t.Equals(ps2x::aiDifficultyNearestLevel(140), 2, "past 100: HARD");
++
++            t.Equals(ps2x::aiDifficultyPosition(0, 0), 0.0f, "0 with EASY: the game's EASY");
++            t.Equals(ps2x::aiDifficultyPosition(0, 1), 1.0f, "0 with MEDIUM: the game's MEDIUM");
++            t.Equals(ps2x::aiDifficultyPosition(0, 2), 2.0f, "0 with HARD: the game's HARD");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyPosition(10, 0) - 0.2f) < 1e-6f, "10 with EASY: a fifth of the way to MEDIUM");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyPosition(30, 1) - 0.6f) < 1e-6f, "30 with MEDIUM");
++            t.Equals(ps2x::aiDifficultyPosition(50, 1), 1.0f, "50 with MEDIUM: MEDIUM");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyPosition(90, 2) - 1.8f) < 1e-6f, "90 with HARD");
++            t.Equals(ps2x::aiDifficultyPosition(100, 2), 2.0f, "100 with HARD: HARD");
++            t.Equals(ps2x::aiDifficultyPosition(30, 0), 0.0f, "30 with EASY (changed elsewhere): EASY");
++            t.Equals(ps2x::aiDifficultyPosition(90, 1), 1.0f, "90 with MEDIUM: MEDIUM");
++            t.Equals(ps2x::aiDifficultyPosition(10, 2), 2.0f, "10 with HARD: HARD");
++            t.Equals(ps2x::aiDifficultyPosition(101, 2), 2.0f, "past 100: the game's");
++            t.Equals(ps2x::aiDifficultyPosition(-3, 0), 0.0f, "below 0: the game's");
++            t.Equals(ps2x::aiDifficultyPosition(30, 3), -1.0f, "an unknown level: left alone");
++            t.Equals(ps2x::aiDifficultyPosition(0, -1), -1.0f, "a negative level too");
++        });
++
++        tc.Run("aiDifficultyBlend gives the game's values at its levels and a straight line between them", [](TestCase &t)
++        {
++            const ps2x::AiDifficultyField &grip = ps2x::kAiCarValues[3];
++            t.Equals(grip.offset, 0x220u, "the car's + 0x220");
++            t.Equals(ps2x::aiDifficultyBlend(grip, 0.0f), 0.8f, "EASY: the game's 0.8, exactly");
++            t.Equals(ps2x::aiDifficultyBlend(grip, 1.0f), 0.92f, "MEDIUM: 0.92, exactly");
++            t.Equals(ps2x::aiDifficultyBlend(grip, 2.0f), 1.0f, "HARD: 1.0, exactly");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyBlend(grip, 0.5f) - 0.86f) < 1e-6f, "halfway EASY-MEDIUM");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyBlend(grip, 1.25f) - 0.94f) < 1e-6f, "a quarter MEDIUM-HARD");
++            t.Equals(ps2x::aiDifficultyBlend(grip, -1.0f), 0.8f, "below EASY: EASY");
++            t.Equals(ps2x::aiDifficultyBlend(grip, 3.0f), 1.0f, "past HARD: HARD");
++            const ps2x::AiDifficultyField &stat = ps2x::kAiDriverOffsets[0];
++            t.Equals(stat.offset, 0x24u, "the driver's + 0x24");
++            t.IsTrue(std::fabs(ps2x::aiDifficultyBlend(stat, 1.6f) - 0.16f) < 1e-6f, "60 % of MEDIUM-HARD");
++            for (const ps2x::AiDifficultyField &field : ps2x::kAiCarValues)
++            {
++                float previous = ps2x::aiDifficultyBlend(field, 0.0f);
++                bool rises = true;
++                for (int step = 1; step <= 20; ++step)
++                {
++                    const float now = ps2x::aiDifficultyBlend(field, step / 10.0f);
++                    rises = rises && now >= previous;
++                    previous = now;
++                }
++                t.IsTrue(rises, "each car value never falls from EASY to HARD");
++            }
++        });
++
++        tc.Run("the OPPONENT AI row shows the fine value or the game's level, and choosing stores both", [](TestCase &t)
++        {
++            t.Equals(ps2x::aiDifficultyRowValue(0, 0), 0, "the game's EASY: 0");
++            t.Equals(ps2x::aiDifficultyRowValue(0, 1), 50, "the game's MEDIUM: 50");
++            t.Equals(ps2x::aiDifficultyRowValue(0, 2), 100, "the game's HARD: 100");
++            t.Equals(ps2x::aiDifficultyRowValue(30, 1), 30, "30 with MEDIUM: 30");
++            t.Equals(ps2x::aiDifficultyRowValue(30, 0), 0, "30 with EASY (changed elsewhere): EASY");
++            t.Equals(ps2x::aiDifficultyRowValue(37, 1), 40, "37 from opciones.ini: the nearest step");
++            t.Equals(ps2x::aiDifficultyRowValue(25, 1), 30, "25 rounds to 30, still MEDIUM");
++            t.Equals(ps2x::aiDifficultyRowValue(74, 1), 70, "74 rounds to 70, still MEDIUM");
++            t.Equals(ps2x::aiDifficultyRowValue(75, 2), 80, "75 rounds to 80, still HARD");
++            t.Equals(ps2x::aiDifficultyRowValue(0, 5), 0, "an unknown level: EASY");
++
++            const ps2x::AiDifficultyChoice easy = ps2x::aiDifficultyChoice(0);
++            t.Equals(easy.gameLevel, 0, "EASY: the game's EASY");
++            t.Equals(easy.fine, 0, "and no fine value");
++            const ps2x::AiDifficultyChoice medium = ps2x::aiDifficultyChoice(50);
++            t.Equals(medium.gameLevel, 1, "MEDIUM");
++            t.Equals(medium.fine, 0, "the game's own");
++            const ps2x::AiDifficultyChoice hard = ps2x::aiDifficultyChoice(100);
++            t.Equals(hard.gameLevel, 2, "HARD");
++            t.Equals(hard.fine, 0, "the game's own");
++            const ps2x::AiDifficultyChoice twenty = ps2x::aiDifficultyChoice(20);
++            t.Equals(twenty.gameLevel, 0, "20: EASY in the game");
++            t.Equals(twenty.fine, 20, "and 20");
++            const ps2x::AiDifficultyChoice thirty = ps2x::aiDifficultyChoice(30);
++            t.Equals(thirty.gameLevel, 1, "30: MEDIUM in the game");
++            t.Equals(thirty.fine, 30, "and 30");
++            const ps2x::AiDifficultyChoice eighty = ps2x::aiDifficultyChoice(80);
++            t.Equals(eighty.gameLevel, 2, "80: HARD in the game");
++            t.Equals(eighty.fine, 80, "and 80");
++            t.Equals(ps2x::aiDifficultyChoice(130).gameLevel, 2, "past 100: HARD");
++            t.Equals(ps2x::aiDifficultyChoice(130).fine, 0, "the game's own");
++            for (int row = 0; row <= 100; row += 10)
++            {
++                const ps2x::AiDifficultyChoice choice = ps2x::aiDifficultyChoice(row);
++                t.Equals(ps2x::aiDifficultyRowValue(choice.fine, choice.gameLevel), row, "the row shows what was chosen");
++            }
++        });
++
+         tc.Run("widenedCameraFov widens the game's half angle by the percent, within its limits", [](TestCase &t)
+         {
+             t.Equals(ps2x::widenedCameraFov(0.260804f, 0), 0.260804f, "0 %: the game's angle, exactly");
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 2d0fbf7..0896c28 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{22}, "twenty-two options (fase 5: eleven more)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{23}, "twenty-three options (fase 5: twelve more)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

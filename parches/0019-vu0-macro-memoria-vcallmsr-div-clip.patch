@@ -1,0 +1,275 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..d663909 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -8,6 +8,59 @@
+ 
+ namespace ps2recomp
+ {
++    // Macro-mode VU0 memory accesses (VLQI/VSQI/VLQD/VSQD/VILWR/VISWR) address VU0 data memory, 4 KB seen from
++    // the EE at 0x11004000: the VI register holds a quadword index that wraps at 256. VI0 stays 0 and VF0 is
++    // read-only. Encodings: VLQI/VLQD ft, (is) use ft = rt, is = rd; VSQI/VSQD fs, (it) use fs = rd, it = rt.
++    namespace
++    {
++        std::string vu0MemAddress(uint8_t vi)
++        {
++            return fmt::format("(0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4))", vi);
++        }
++
++        std::string vu0StepVi(uint8_t vi, int delta)
++        {
++            if (vi == 0)
++                return "";
++            return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] {} 1); ", vi, vi, delta > 0 ? '+' : '-');
++        }
++
++        std::string vu0LoadInto(uint8_t vft, uint8_t dest_mask, const std::string &addrExpr)
++        {
++            if (vft == 0)
++                return "";
++            return fmt::format("{{ __m128 res = _mm_castsi128_ps(READ128({})); "
++                               "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
++                               "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }} ",
++                               addrExpr,
++                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
++                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
++                               vft, vft);
++        }
++
++        std::string vu0StoreFrom(uint8_t vfs, uint8_t dest_mask, const std::string &addrExpr)
++        {
++            return fmt::format("{{ const uint32_t addr = {}; __m128i old_val = READ128(addr); "
++                               "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
++                               "WRITE128(addr, _mm_castps_si128(res)); }} ",
++                               addrExpr, vfs,
++                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
++                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++        }
++
++        // Byte offset of the single field selected by the dest mask (x=8, y=4, z=2, w=1).
++        uint32_t vu0FieldOffset(uint8_t dest_mask)
++        {
++            if (dest_mask & 0x8)
++                return 0u;
++            if (dest_mask & 0x4)
++                return 4u;
++            if (dest_mask & 0x2)
++                return 8u;
++            return 12u;
++        }
++    }
++
+     std::string CodeGenerator::translateVU_VADD_Field(const Instruction &inst)
+     {
+         uint8_t vfd = inst.sa;
+@@ -75,21 +128,44 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        // PS2 semantics (as PCSX2 _vuDIV): denormals count as zero, x/0 (also 0/0) gives +-MAX with the XOR of
++        // the signs, and the result never becomes an infinity.
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE(0,0,0,{1}))); "
++                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{2}], ctx->vu0_vf[{2}], _MM_SHUFFLE(0,0,0,{3}))); "
++                           "uint32_t fs_bits, ft_bits, q_bits; std::memcpy(&fs_bits, &fs, 4); std::memcpy(&ft_bits, &ft, 4); "
++                           "if ((ft_bits & 0x7F800000u) == 0u) q_bits = ((fs_bits ^ ft_bits) & 0x80000000u) | 0x7F7FFFFFu; "
++                           "else {{ const float q = ((fs_bits & 0x7F800000u) == 0u) ? 0.0f : fs / ft; std::memcpy(&q_bits, &q, 4); "
++                           "if ((q_bits & 0x7F800000u) == 0x7F800000u) q_bits = (q_bits & 0x80000000u) | 0x7F7FFFFFu; }} "
++                           "std::memcpy(&ctx->vu0_q, &q_bits, 4); }}",
++                           fs_reg, fsf, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        // PS2: Q = sqrt(|ft|) (a negative operand only sets the invalid flag); denormals count as zero.
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE(0,0,0,{1}))); "
++                           "uint32_t ft_bits; std::memcpy(&ft_bits, &ft, 4); "
++                           "ctx->vu0_q = ((ft_bits & 0x7F800000u) == 0u) ? 0.0f : sqrtf(fabsf(ft)); }}",
++                           ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        // PS2 semantics (as PCSX2 _vuRSQRT): Q = fs / sqrt(|ft|); with ft = 0 it is +-MAX (or +-0 when fs is 0).
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE(0,0,0,{1}))); "
++                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{2}], ctx->vu0_vf[{2}], _MM_SHUFFLE(0,0,0,{3}))); "
++                           "uint32_t fs_bits, ft_bits, q_bits; std::memcpy(&fs_bits, &fs, 4); std::memcpy(&ft_bits, &ft, 4); "
++                           "if ((ft_bits & 0x7F800000u) == 0u) q_bits = ((fs_bits ^ ft_bits) & 0x80000000u) | (((fs_bits & 0x7F800000u) != 0u) ? 0x7F7FFFFFu : 0u); "
++                           "else {{ const float q = ((fs_bits & 0x7F800000u) == 0u) ? 0.0f : fs / sqrtf(fabsf(ft)); std::memcpy(&q_bits, &q, 4); "
++                           "if ((q_bits & 0x7F800000u) == 0x7F800000u) q_bits = (q_bits & 0x80000000u) | 0x7F7FFFFFu; }} "
++                           "std::memcpy(&ctx->vu0_q, &q_bits, 4); }}",
++                           fs_reg, fsf, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+@@ -113,12 +189,18 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        // VILWR.<f> vit, (vis): 16-bit load from the selected field of a VU0 data memory quadword.
++        if (inst.rt == 0)
++            return "// VILWR to VI0 ignored";
++        return fmt::format("{{ ctx->vi[{}] = static_cast<uint16_t>(READ32({} + {}u)); }}",
++                           inst.rt, vu0MemAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField));
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        // VISWR.<f> vit, (vis): stores vit zero-extended into the selected field of a VU0 data memory quadword.
++        return fmt::format("{{ WRITE32({} + {}u, (uint32_t)ctx->vi[{}]); }}",
++                           vu0MemAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField), inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+@@ -164,17 +246,15 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
+     {
+-        // VCALLMSR calls a VU0 microprogram at address stored in integer register
+-        uint8_t vis_reg_idx = inst.rd; // Source integer register (vis)
+-
+-        return fmt::format(
+-            "{{ "
+-            "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
+-            "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
+-            "    ctx->vu0_pc = target_byte_addr; "
+-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+-            "}}",
+-            vis_reg_idx);
++        // VCALLMSR (written "vcallmsr $vi27") starts the VU0 microprogram whose address (in 8-byte units) is in
++        // CMSAR0, control register 27. It used to read ctx->vi[27], past the end of the 16 VI registers.
++        (void)inst;
++        return "{ "
++               "    uint16_t instr_index = static_cast<uint16_t>(ctx->vu0_cmsar0 & 0x1FFu); "
++               "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; "
++               "    ctx->vu0_pc = target_byte_addr; "
++               "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
++               "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+@@ -767,66 +847,26 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt,
+-                           vis, vis);
++        const uint8_t vis = inst.rd;
++        return "{ " + vu0LoadInto(inst.rt, inst.vectorInfo.vectorField, vu0MemAddress(vis)) + vu0StepVi(vis, +1) + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++        const uint8_t vit = inst.rt;
++        return "{ " + vu0StoreFrom(inst.rd, inst.vectorInfo.vectorField, vu0MemAddress(vit)) + vu0StepVi(vit, +1) + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vis, vis,
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
++        const uint8_t vis = inst.rd;
++        return "{ " + vu0StepVi(vis, -1) + vu0LoadInto(inst.rt, inst.vectorInfo.vectorField, vu0MemAddress(vis)) + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++        const uint8_t vit = inst.rt;
++        return "{ " + vu0StepVi(vit, -1) + vu0StoreFrom(inst.rd, inst.vectorInfo.vectorField, vu0MemAddress(vit)) + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..13bcdda 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -263,22 +263,20 @@ namespace ps2recomp
+                 }
+                 case VU0_S2_VCLIPw:
+                 {
+-                    uint8_t field = inst.function & 0x3;
+-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
+-
++                    // Judgement against |ft.w| like the VU1 interpreter (integer compare of the float bits, a
++                    // denormal w counts as the smallest normal): bit 0 +x (x > +|w|), bit 1 -x (x < -|w|), then
++                    // +y, -y, +z, -z. The old code had each +/- pair swapped and compared against w, not |w|.
+                     return fmt::format(
+-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
+-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
+-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
+-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
+-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
+-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
+-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
+-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
+-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
++                        "{{ uint32_t w_bits; const float w_val = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE(3,3,3,3))); "
++                        "std::memcpy(&w_bits, &w_val, sizeof(w_bits)); "
++                        "const int32_t limit = (w_bits & 0x7F800000u) != 0u ? static_cast<int32_t>(w_bits & 0x7FFFFFFFu) : 0x007FFFFF; "
++                        "alignas(16) uint32_t fs_bits[4]; _mm_store_si128(reinterpret_cast<__m128i *>(fs_bits), _mm_castps_si128(ctx->vu0_vf[{1}])); "
++                        "uint32_t flags = 0u; "
++                        "for (int c = 0; c < 3; ++c) {{ "
++                        "if (static_cast<int32_t>(fs_bits[c]) > limit) flags |= 1u << (c * 2); "
++                        "if (static_cast<int32_t>(fs_bits[c] ^ 0x80000000u) > limit) flags |= 2u << (c * 2); }} "
++                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFFu; }}",
++                        inst.rt, inst.rd);
+                 }
+                 case VU0_S2_VNOP:
+                     return fmt::format("// NOP operation, no action needed for VU0");

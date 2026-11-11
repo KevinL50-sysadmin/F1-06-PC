@@ -1,0 +1,597 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index d03f800..d5470b8 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -24,7 +24,8 @@
+ // adding ones field by field (before patch 0051), 25 the VU1 pairs cached by content in 4 versions per address instead of 8 (before patch 0051), 26 the VU1 block flag
+ // commits reading their entry again before each test (before patch 0051), 27 the VU1 schedules run by the copy that
+ // tests the A/B mode on every pair (before patch 0056; mode 0 runs one without the tests), 28 the EE
+-// timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056). A
++// timers advanced on every checkpoint instead of when a register is accessed or an interrupt is due (before patch 0056), 29 the VU1
++// schedules run by runScheduleBody instead of their compiled x64 code (before patch 0057). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 1acbe70..1682786 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -28,6 +28,12 @@
+ // reserved, a branch in a delay slot, an E bit with an unusual neighbour, the D/T bits when they are enabled, the end
+ // of the cycle budget. run() converts the state both ways (toEngine / toNative) at those points.
+ 
++// For the compiled schedules (ps2_vu1_jit.h); <windows.h> is not included here.
++#include <cstddef>
++#include <intrin.h>
++extern "C" __declspec(dllimport) void *__stdcall VirtualAlloc(void *address, size_t size, unsigned long type,
++                                                              unsigned long protect);
++
+ namespace
+ {
+     constexpr uint32_t kBlockMaxPairs = 128u;
+@@ -181,6 +187,8 @@ namespace
+         uint32_t fdivDi = 0u;
+         float efuValue[2] = {};
+         uint64_t xgkickThrough = 0; // last cycle boundary at which the XGKICK transfer has progressed
++        FmacResult jitUp{};         // compiled schedules (ps2_vu1_jit.h): an upper result waiting for its pair's lower
++        int32_t jitOldVi = 0;       // ... and the VI before the lower instruction, for the branch backup
+     };
+ 
+     // ---------------------------------------------------------------------------------------------------------
+@@ -579,6 +587,13 @@ namespace
+         EndProgram // E bit: the program ends after the last pair
+     };
+ 
++    // Commits a compiled schedule applies in one call (ps2_vu1_jit.h).
++    struct JitCommitRange
++    {
++        const BlockCommit *first;
++        uint32_t count;
++    };
++
+     struct Schedule
+     {
+         uint32_t pc = 0u;
+@@ -603,6 +618,11 @@ namespace
+         // Another schedule for the same pc and timing state, made for other code: the game loads several
+         // microprograms in turn at the same addresses.
+         struct Schedule *variant = nullptr;
++        // x64 code of the schedule (ps2_vu1_jit.h; null: not compiled, or the arena was full) and the commit ranges
++        // it points into.
++        void *jit = nullptr;
++        bool jitTried = false;
++        std::vector<JitCommitRange> jitRanges;
+     };
+ 
+     // The schedule was made for the code now in micro memory (its pairs are the same).
+@@ -1259,6 +1279,20 @@ namespace
+         uint64_t fallbacks = 0u; // returns to the interpreter
+         uint64_t xgkickWaits = 0u;
+         uint64_t rebuilt = 0u;   // variants: schedules for other code at a (pc, timing state) already seen
++        uint64_t jitBlocks = 0u; // blocks run as compiled code (ps2_vu1_jit.h)
++    };
++
++    // Executable memory for the compiled schedules of one engine (ps2_vu1_jit.h): one block, allocated in order and
++    // emptied with the schedules (BlockEngine::clear).
++    struct JitArena
++    {
++        uint8_t *base = nullptr;
++        size_t size = 0u;
++        size_t used = 0u;
++        bool full = false;
++
++        uint8_t *alloc(size_t bytes);
++        void reset() { used = 0u; full = false; }
+     };
+ 
+     // Schedules of one interpreter (one per unit).
+@@ -1273,9 +1307,11 @@ namespace
+         uint8_t fallbackAt[0x4000u / 8u] = {}; // pairs whose block always starts in the interpreter
+         Schedule *emptyEntry[0x4000u / 8u] = {}; // schedule of the block at each pc entered with nothing in flight
+         BlockStats stats;
++        JitArena jit;
+ 
+         void clear()
+         {
++            jit.reset(); // the schedules that point into it go too
+             heads.clear();
+             storage.clear();
+             sigs.clear();
+@@ -1815,6 +1851,8 @@ namespace
+         runScheduleBody<Host, true>(s, st, host, abMode);
+     }
+ 
++#include "ps2_vu1_jit.h"
++
+     enum class BlockRunEnd : uint8_t
+     {
+         Interpreter, // the next pair needs the interpreter
+@@ -1922,8 +1960,13 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            if (abMode == 0)
+-                runScheduleBody<Host, false, false>(*s, st, host, 0);
++            if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s))))
++            {
++                reinterpret_cast<JitCode>(s->jit)(&vu, &st, &host); // compiled (patch 0057)
++                ++engine.stats.jitBlocks;
++            }
++            else if (abMode == 0 || abMode == 29)
++                runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+             else
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 6272381..1e75559 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3881,7 +3881,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             const uint64_t paresBloques = bloques.pairs - s_bloquesAntes.pairs;
+             std::fprintf(stderr,
+                          "[vu1:ritmo] pares/s=%.0f ns/par=%.1f ocupado=%.0f%% bloques=%.0f%% esquemas=%zu(+%llu, "
+-                         "variantes +%llu) estados=%zu esperasXgkick=%llu vueltas=%llu pares/bloque=%.1f\n",
++                         "variantes +%llu) estados=%zu esperasXgkick=%llu vueltas=%llu pares/bloque=%.1f jit=%.0f%% (%zu KB)\n",
+                          s_ritmoPares / segundos,
+                          s_ritmoPares != 0u ? 1e9 * ocupado / static_cast<double>(s_ritmoPares) : 0.0,
+                          100.0 * ocupado / segundos,
+@@ -3894,7 +3894,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          static_cast<unsigned long long>(bloques.fallbacks - s_bloquesAntes.fallbacks),
+                          bloques.blocks != s_bloquesAntes.blocks
+                              ? static_cast<double>(paresBloques) / static_cast<double>(bloques.blocks - s_bloquesAntes.blocks)
+-                             : 0.0);
++                             : 0.0,
++                         bloques.blocks != s_bloquesAntes.blocks
++                             ? 100.0 * static_cast<double>(bloques.jitBlocks - s_bloquesAntes.jitBlocks) /
++                                   static_cast<double>(bloques.blocks - s_bloquesAntes.blocks)
++                             : 0.0,
++                         s_blockEngines[1].jit.used / 1024u);
+             if (s_countLower)
+             {
+                 // The 12 kinds of lower instruction run most through execLower in the last 10 s.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+new file mode 100644
+index 0000000..c68094f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -0,0 +1,440 @@
++// VU1 block schedules compiled to x64 code (F1 06 port, patch 0057).
++//
++// Private to ps2_vu1_blocks.h, which includes it after runScheduleBody. Not a standalone header.
++//
++// runScheduleBody walks the pairs of a schedule and, on every pair, decides again what the schedule fixed when it was
++// built: whether there are commits before it, which upper path, which lower path, whether the branch backup, the
++// late upper result or the pc need anything. In a race that loop was about a fifth of the EE thread (15 ns per pair
++// in all). Here each schedule is turned once into straight x64 code: per pair, direct calls to the step it needs
++// (upperEarly, kLowerFast, or small helpers for the rarer steps), with the pair as an immediate argument. The steps
++// are the same functions and expressions as runScheduleBody with A/B mode 0, in the same order.
++//
++// The generated code: void(VU1State *vu, BlockState *st, Host *host). It keeps vu, st and host in rbx, rsi and rdi
++// (callee-saved) and calls each step as step(data, vu, st, host) (Windows x64: rcx, rdx, r8, r9). Windows x64 only.
++// It has no unwind data: nothing it calls may throw (none of the steps does).
++
++// Included inside ps2_vu1_blocks.h's unnamed namespace.
++
++    // PS2X_VU1_JIT=0: never compile (runScheduleBody, as before).
++    const bool s_jitEnabled = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT");
++        return value == nullptr || value[0] != '0';
++    }();
++
++    using JitCode = void (*)(VU1State *, BlockState *, void *);
++
++    // x64 code of one schedule, built in a byte buffer and copied to the engine's arena.
++    class JitEmitter
++    {
++    public:
++        void bytes(std::initializer_list<uint8_t> list) { m_code.insert(m_code.end(), list.begin(), list.end()); }
++        void imm64(uint64_t value)
++        {
++            for (int i = 0; i < 8; ++i)
++                m_code.push_back(static_cast<uint8_t>(value >> (i * 8)));
++        }
++        void prologue()
++        {
++            bytes({0x53, 0x56, 0x57});             // push rbx; push rsi; push rdi
++            bytes({0x48, 0x83, 0xEC, 0x20});       // sub rsp, 32 (shadow space; rsp is 16-aligned again)
++            bytes({0x48, 0x89, 0xCB});             // mov rbx, rcx (vu)
++            bytes({0x48, 0x89, 0xD6});             // mov rsi, rdx (st)
++            bytes({0x4C, 0x89, 0xC7});             // mov rdi, r8  (host)
++        }
++        // fn(data, vu, st, host)
++        void call(const void *fn, const void *data)
++        {
++            bytes({0x48, 0xB9});                   // mov rcx, imm64
++            imm64(reinterpret_cast<uint64_t>(data));
++            bytes({0x48, 0x89, 0xDA});             // mov rdx, rbx
++            bytes({0x49, 0x89, 0xF0});             // mov r8, rsi
++            bytes({0x49, 0x89, 0xF9});             // mov r9, rdi
++            bytes({0x48, 0xB8});                   // mov rax, imm64
++            imm64(reinterpret_cast<uint64_t>(fn));
++            bytes({0xFF, 0xD0});                   // call rax
++        }
++        void epilogue()
++        {
++            bytes({0x48, 0x83, 0xC4, 0x20});       // add rsp, 32
++            bytes({0x5F, 0x5E, 0x5B});             // pop rdi; pop rsi; pop rbx
++            bytes({0xC3});                         // ret
++        }
++        // Register-memory forms on the three base registers (rbx = vu, rsi = st, rdi = host) with a 32-bit
++        // displacement (mod 10: no SIB for these bases). reg: eax 0, ecx 1, edx 2; xmm0 0, xmm1 1.
++        enum Base : uint8_t
++        {
++            Vu = 3,
++            St = 6,
++            HostReg = 7
++        };
++        void modrm(uint8_t reg, Base base, uint32_t disp)
++        {
++            m_code.push_back(static_cast<uint8_t>(0x80u | ((reg & 7u) << 3) | base));
++            for (int i = 0; i < 4; ++i)
++                m_code.push_back(static_cast<uint8_t>(disp >> (i * 8)));
++        }
++        void load32(uint8_t reg, Base base, size_t disp) { bytes({0x8B}); modrm(reg, base, static_cast<uint32_t>(disp)); }
++        void store32(Base base, size_t disp, uint8_t reg) { bytes({0x89}); modrm(reg, base, static_cast<uint32_t>(disp)); }
++        void loadXmm(uint8_t xmm, Base base, size_t disp) { bytes({0x0F, 0x10}); modrm(xmm, base, static_cast<uint32_t>(disp)); }
++        void storeXmm(Base base, size_t disp, uint8_t xmm) { bytes({0x0F, 0x11}); modrm(xmm, base, static_cast<uint32_t>(disp)); }
++        void blendXmm0Xmm1(uint8_t imm) { bytes({0x66, 0x0F, 0x3A, 0x0C, 0xC1, imm}); } // blendps xmm0, xmm1, imm
++        void movsxEaxAx() { bytes({0x0F, 0xBF, 0xC0}); }                                 // movsx eax, ax
++        void andEax(uint32_t imm)
++        {
++            bytes({0x25});
++            imm32(imm);
++        }
++        void andEcx(uint32_t imm)
++        {
++            bytes({0x81, 0xE1});
++            imm32(imm);
++        }
++        void orEaxEcx() { bytes({0x09, 0xC8}); }     // or eax, ecx
++        void shlEcx(uint8_t n) { bytes({0xC1, 0xE1, n}); }
++        void imm32(uint32_t value)
++        {
++            for (int i = 0; i < 4; ++i)
++                m_code.push_back(static_cast<uint8_t>(value >> (i * 8)));
++        }
++        const std::vector<uint8_t> &code() const { return m_code; }
++
++    private:
++        std::vector<uint8_t> m_code;
++    };
++
++    // ---------------------------------------------------------------------------------------------------------
++    // Steps. The first argument is what the schedule fixed (a pair, a commit range, the schedule); st.cycle is the
++    // block entry until jitEnd, as in runScheduleBody.
++
++    template <typename Host>
++    void jitCommits(const JitCommitRange &range, VU1State &vu, BlockState &st, Host &)
++    {
++        const uint64_t entry = st.cycle;
++        for (uint32_t k = 0; k < range.count; ++k)
++        {
++            const BlockCommit &c = range.first[k];
++            switch (c.kind)
++            {
++            case CommitVf:
++                blendLanes(vu.vf[c.reg], st.pendingVf[c.reg], c.lanes);
++                break;
++            case CommitFlag:
++                applyFlagSlot(st.flags[(entry + c.due) & 7u][c.reg], vu);
++                break;
++            case CommitQ:
++            {
++                vu.q = st.fdivValue;
++                const uint32_t di = st.fdivDi & 0x30u;
++                vu.status = (vu.status & 0xFCFu) | di | (di << 6);
++                break;
++            }
++            case CommitP:
++                vu.p = st.efuValue[c.reg];
++                break;
++            default: // CommitVi
++                vu.vi[c.reg] = static_cast<int16_t>(st.pendingVi[c.reg]);
++                break;
++            }
++        }
++    }
++
++    template <typename Host>
++    void jitCommitFlag(const BlockCommit &c, VU1State &vu, BlockState &st, Host &)
++    {
++        applyFlagSlot(st.flags[(st.cycle + c.due) & 7u][c.reg], vu);
++    }
++
++    // blendps (SSE4.1) for the VF commits; without it they go through jitCommits.
++    const bool s_jitSse41 = []()
++    {
++        int info[4] = {};
++        __cpuid(info, 1);
++        return (info[2] & (1 << 19)) != 0;
++    }();
++
++    // One commit as code: VF, VI, Q and P inline (the same values as jitCommits), flags through jitCommitFlag.
++    template <typename Host>
++    void jitEmitCommit(JitEmitter &e, const BlockCommit &c)
++    {
++        using B = JitEmitter;
++        switch (c.kind)
++        {
++        case CommitVf:
++        {
++            const size_t dst = offsetof(VU1State, vf) + 16u * c.reg;
++            const size_t src = offsetof(BlockState, pendingVf) + 16u * c.reg;
++            // blendLanes' mask: x = bit 3 (lane 0); blendps: lane i = bit i.
++            const uint8_t imm = static_cast<uint8_t>(((c.lanes >> 3) & 1u) | (((c.lanes >> 2) & 1u) << 1) |
++                                                     (((c.lanes >> 1) & 1u) << 2) | ((c.lanes & 1u) << 3));
++            if (imm == 0xFu)
++            {
++                e.loadXmm(0, B::St, src);
++                e.storeXmm(B::Vu, dst, 0);
++            }
++            else
++            {
++                e.loadXmm(0, B::Vu, dst);
++                e.loadXmm(1, B::St, src);
++                e.blendXmm0Xmm1(imm);
++                e.storeXmm(B::Vu, dst, 0);
++            }
++            break;
++        }
++        case CommitFlag:
++            e.call(reinterpret_cast<const void *>(&jitCommitFlag<Host>), &c);
++            break;
++        case CommitQ:
++            e.load32(0, B::St, offsetof(BlockState, fdivValue));
++            e.store32(B::Vu, offsetof(VU1State, q), 0);
++            e.load32(1, B::St, offsetof(BlockState, fdivDi));
++            e.andEcx(0x30u);
++            e.load32(0, B::Vu, offsetof(VU1State, status));
++            e.andEax(0xFCFu);
++            e.orEaxEcx();
++            e.shlEcx(6);
++            e.orEaxEcx();
++            e.store32(B::Vu, offsetof(VU1State, status), 0);
++            break;
++        case CommitP:
++            e.load32(0, B::St, offsetof(BlockState, efuValue) + 4u * c.reg);
++            e.store32(B::Vu, offsetof(VU1State, p), 0);
++            break;
++        default: // CommitVi
++            e.load32(0, B::St, offsetof(BlockState, pendingVi) + 4u * c.reg);
++            e.movsxEaxAx();
++            e.store32(B::Vu, offsetof(VU1State, vi) + 4u * c.reg, 0);
++            break;
++        }
++    }
++
++    // Upper through upperFn: the result waits in st.jitUp until after the lower instruction (jitUpperDst).
++    template <typename Host>
++    void jitUpperLate(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
++    {
++        p.upperFn(p, vu, st.jitUp);
++        if (p.upperFlags != 0u)
++            setFlagSlot(st.flags[(st.cycle + p.issue + 4u) & 7u][0], st.jitUp.mac, st.jitUp.status, st.jitUp.sticky, 0u,
++                        p.upperFlags);
++    }
++
++    template <typename Host>
++    void jitUpperDst(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
++    {
++        switch (p.upperDst)
++        {
++        case DstVf:
++            blendLanes(vu.vf[p.upperReg], st.jitUp.value, p.upperLanes);
++            break;
++        case DstVfPending:
++            blendLanes(st.pendingVf[p.upperReg], st.jitUp.value, p.upperLanes);
++            break;
++        case DstAcc:
++            blendLanes(vu.acc, st.jitUp.value, p.upperLanes);
++            break;
++        default:
++            break;
++        }
++    }
++
++    template <typename Host>
++    void jitClip(const BlockPair &p, VU1State &vu, BlockState &st, Host &host)
++    {
++        uint32_t &workingClip = host.workingClip();
++        workingClip = ((workingClip << 6) | (vuClipFlags(vu.vf[p.simple.fs], vu.vf[p.simple.ft][3]) & 0x3Fu)) &
++                      0xFFFFFFu;
++        setFlagSlot(st.flags[(st.cycle + p.issue + 4u) & 7u][0], 0u, 0u, 0u, workingClip, kFlagClip);
++    }
++
++    template <typename Host>
++    void jitImmediate(const BlockPair &p, VU1State &vu, BlockState &, Host &)
++    {
++        float immediate = 0.0f;
++        std::memcpy(&immediate, &p.lower, sizeof(immediate));
++        vu.i = vuNormalizeOperand(immediate);
++    }
++
++    // The branch "old value": the VI before the lower instruction, recorded after it (runScheduleBody's oldVi).
++    template <typename Host>
++    void jitSaveOldVi(const BlockPair &p, VU1State &vu, BlockState &st, Host &)
++    {
++        st.jitOldVi = vu.vi[p.viReg];
++    }
++
++    template <typename Host>
++    void jitBackup(const BlockPair &p, VU1State &, BlockState &st, Host &host)
++    {
++        host.setBranchBackup(p.backupReg, st.jitOldVi);
++    }
++
++    // A lower instruction through execLower, with its backup: runScheduleBody's LowerExec path (Old = false).
++    template <typename Host>
++    void jitLowerExec(const BlockPair &p, VU1State &vu, BlockState &st, Host &host)
++    {
++        const int32_t oldVi = vu.vi[p.viReg];
++        const uint64_t issue = st.cycle + p.issue;
++        BlockRedirect redirect;
++        redirect.state = &st;
++        redirect.issue = issue;
++        redirect.efuSlot = p.efuSlot;
++        redirect.upperFlag = p.upperFlags != 0u;
++        alignas(16) float oldVf[4];
++        if (p.lowerDst == DstVfPending || p.lowerDst == DstDiscard)
++            std::memcpy(oldVf, vu.vf[p.lowerReg], sizeof(oldVf));
++        if (p.branch)
++            vu.pc = p.pc; // the target and the BAL/JALR link come from it
++        if (s_countLower)
++        {
++            const uint32_t kind = lowerKind(p.lower);
++            ++s_lowerExecCount[kind];
++            s_lowerExecSample[kind] = p.lower;
++        }
++        s_blockRedirect = &redirect;
++        host.execLower(p.lower, p.upper);
++        s_blockRedirect = nullptr;
++        if (p.xgkick)
++            st.xgkickThrough = issue; // the transfer moves its first qword at the next cycle boundary
++        if (p.lowerDst == DstVfPending)
++        {
++            blendLanes(st.pendingVf[p.lowerReg], vu.vf[p.lowerReg], p.lowerLanes);
++            std::memcpy(vu.vf[p.lowerReg], oldVf, sizeof(oldVf));
++        }
++        else if (p.lowerDst == DstDiscard)
++            std::memcpy(vu.vf[p.lowerReg], oldVf, sizeof(oldVf));
++        if (p.viMode == ViNow)
++            vu.vi[p.viReg] = static_cast<int16_t>(vu.vi[p.viReg]);
++        else if (p.viMode == ViPending)
++        {
++            st.pendingVi[p.viReg] = vu.vi[p.viReg];
++            vu.vi[p.viReg] = oldVi;
++        }
++        // A lower write to vf0 or vi0 does not stay.
++        _mm_storeu_ps(vu.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
++        vu.vi[0] = 0;
++        if (p.backup != 0u)
++            host.setBranchBackup(p.backupReg, oldVi);
++    }
++
++    // pc after a branch or the last pair.
++    template <typename Host>
++    void jitPc(const BlockPair &p, VU1State &vu, BlockState &, Host &host)
++    {
++        uint32_t nextPc = p.pc + 8u;
++        if (nextPc >= host.codeSize())
++            nextPc = 0u;
++        vu.pc = nextPc;
++        if (vu.branchPending)
++        {
++            if (vu.branchDelay == 0u)
++            {
++                vu.pc = vu.branchTarget & host.pcMask();
++                vu.branchPending = false;
++            }
++            else
++                --vu.branchDelay;
++        }
++    }
++
++    template <typename Host>
++    void jitEnd(const Schedule &s, VU1State &, BlockState &st, Host &host)
++    {
++        st.cycle += s.exitCycle;
++        st.sig = s.exitSig;
++        host.catchUpXgkick(st.cycle);
++    }
++
++    // ---------------------------------------------------------------------------------------------------------
++    // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
++    template <typename Host>
++    bool jitCompile(BlockEngine &engine, Schedule &s)
++    {
++        s.jitTried = true;
++        s.jitRanges.clear();
++        s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
++        JitEmitter e;
++        e.prologue();
++        size_t nextCommit = 0u;
++        const auto commitsUpTo = [&](size_t end)
++        {
++            if (nextCommit >= end)
++                return;
++            if (s_jitSse41)
++            {
++                for (; nextCommit < end; ++nextCommit)
++                    jitEmitCommit<Host>(e, s.commits[nextCommit]);
++                return;
++            }
++            s.jitRanges.push_back({&s.commits[nextCommit], static_cast<uint32_t>(end - nextCommit)});
++            e.call(reinterpret_cast<const void *>(&jitCommits<Host>), &s.jitRanges.back());
++            nextCommit = end;
++        };
++        for (const BlockPair &p : s.pairs)
++        {
++            commitsUpTo(p.commitEnd);
++            const bool upperDone = p.upperEarly != nullptr;
++            if (upperDone)
++                e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
++            else if (p.upperFn != nullptr)
++                e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
++            else if (p.upperPath == UpperClip)
++                e.call(reinterpret_cast<const void *>(&jitClip<Host>), &p);
++
++            if (p.lowerExec == LowerExec)
++                e.call(reinterpret_cast<const void *>(&jitLowerExec<Host>), &p); // its backup too
++            else
++            {
++                if (p.backup != 0u)
++                {
++                    // jitSaveOldVi inline.
++                    e.load32(0, JitEmitter::Vu, offsetof(VU1State, vi) + 4u * p.viReg);
++                    e.store32(JitEmitter::St, offsetof(BlockState, jitOldVi), 0);
++                }
++                if (p.lowerExec == LowerFast)
++                    e.call(reinterpret_cast<const void *>(kLowerFast<Host>[p.fastOp]), &p);
++                else if (p.lowerExec == LowerImmediate)
++                    e.call(reinterpret_cast<const void *>(&jitImmediate<Host>), &p);
++                if (p.backup != 0u)
++                    e.call(reinterpret_cast<const void *>(&jitBackup<Host>), &p);
++            }
++
++            if (!upperDone && p.upperFn != nullptr &&
++                (p.upperDst == DstVf || p.upperDst == DstVfPending || p.upperDst == DstAcc))
++                e.call(reinterpret_cast<const void *>(&jitUpperDst<Host>), &p);
++
++            if (p.branch || &p == &s.pairs.back())
++                e.call(reinterpret_cast<const void *>(&jitPc<Host>), &p);
++        }
++        commitsUpTo(s.commits.size());
++        e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
++        e.epilogue();
++
++        uint8_t *const code = engine.jit.alloc(e.code().size());
++        if (code == nullptr)
++            return false;
++        std::memcpy(code, e.code().data(), e.code().size());
++        s.jit = code;
++        return true;
++    }
++
++    // The arena is reserved and committed at the first compile (64 MB, read-write-execute).
++    uint8_t *JitArena::alloc(size_t bytes)
++    {
++        constexpr size_t kArenaBytes = 64u << 20;
++        if (base == nullptr && !full)
++        {
++            base = static_cast<uint8_t *>(VirtualAlloc(nullptr, kArenaBytes, 0x3000u /* MEM_COMMIT | MEM_RESERVE */,
++                                                       0x40u /* PAGE_EXECUTE_READWRITE */));
++            size = base != nullptr ? kArenaBytes : 0u;
++        }
++        bytes = (bytes + 15u) & ~static_cast<size_t>(15u);
++        if (base == nullptr || used + bytes > size)
++        {
++            if (!full)
++                std::fprintf(stderr, "[vu1:jit] sin sitio para mas codigo (%zu bytes usados): el resto sin compilar\n", used);
++            full = true;
++            return nullptr;
++        }
++        uint8_t *const out = base + used;
++        used += bytes;
++        return out;
++    }

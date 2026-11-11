@@ -1,0 +1,1022 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 71e127a..8a8b3a1 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -388,6 +388,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_ipu.cpp
+     src/lib/ps2_pad.cpp
++    src/lib/ps2_pad_win.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 0edf8c1..91cf504 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,7 @@
+ #include "Common.h"
+ #include "Pad.h"
++#include "../../ps2_pad_win.h"
++#include <cstring>
+ 
+ namespace ps2_stubs
+ {
+@@ -40,6 +42,9 @@ namespace ps2_stubs
+             uint8_t ry = kPadAnalogCenter;
+             uint8_t lx = kPadAnalogCenter;
+             uint8_t ly = kPadAnalogCenter;
++            // Patch 0105: the pressures from the backend (bytes 8-19 of the DualShock 2 report) when it gives them.
++            bool hasPressure = false;
++            uint8_t pressure[12] = {};
+         };
+ 
+         struct PadPortState
+@@ -239,7 +244,20 @@ namespace ps2_stubs
+             {
+                 return 0u;
+             }
+-            return ((state.buttons & mask) == 0u) ? 0xFFu : 0u;
++            if ((state.buttons & mask) != 0u)
++            {
++                return 0u;
++            }
++            if (state.hasPressure)
++            {
++                static constexpr uint16_t kOrder[12] = {kPadBtnRight, kPadBtnLeft, kPadBtnUp, kPadBtnDown,
++                                                        kPadBtnTriangle, kPadBtnCircle, kPadBtnCross, kPadBtnSquare,
++                                                        kPadBtnL1, kPadBtnL2, kPadBtnR1, kPadBtnR2};
++                for (int i = 0; i < 12; ++i)
++                    if (kOrder[i] == mask)
++                        return state.pressure[i] != 0u ? state.pressure[i] : 0xFFu;
++            }
++            return 0xFFu;
+         }
+ 
+         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
+@@ -306,6 +324,8 @@ namespace ps2_stubs
+                     state.ry = backendData[5];
+                     state.lx = backendData[6];
+                     state.ly = backendData[7];
++                    state.hasPressure = backendData[20] != 0u;
++                    std::memcpy(state.pressure, backendData + 8, sizeof(state.pressure));
+                     usedBackend = true;
+                 }
+                 else
+@@ -692,17 +712,44 @@ namespace ps2_stubs
+         setReturnS32(ctx, 0);
+     }
+ 
++    // Patch 0105: the DualShock 2 motors on the host pad (port 0). SetActAlign says which byte of SetActDirect's data
++    // drives each motor (0 = the small one, on or off; 1 = the large one, 0-255; 0xFF = none).
++    namespace
++    {
++        uint8_t g_actAlign[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
++        float g_lastSmall = -1.0f, g_lastLarge = -1.0f;
++    }
++
+     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        if (getRegU32(ctx, 4) == 0u)
++            if (const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6)))
++                std::memcpy(g_actAlign, align, sizeof(g_actAlign));
+         setReturnS32(ctx, 1);
+     }
+ 
+     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        if (getRegU32(ctx, 4) == 0u)
++            if (const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6)))
++            {
++                float motorSmall = 0.0f, motorLarge = 0.0f;
++                for (int i = 0; i < 6; ++i)
++                {
++                    if (g_actAlign[i] == 0u)
++                        motorSmall = data[i] != 0u ? 1.0f : 0.0f;
++                    else if (g_actAlign[i] == 1u)
++                        motorLarge = static_cast<float>(data[i]) / 255.0f;
++                }
++                if (motorSmall != g_lastSmall || motorLarge != g_lastLarge)
++                {
++                    g_lastSmall = motorSmall;
++                    g_lastLarge = motorLarge;
++                    ps2_pad_win::setRumble(motorSmall * 0.6f, motorLarge);
++                }
++            }
+         setReturnS32(ctx, 1);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..f5037a9 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,31 +1,419 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include "ps2_pad_win.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
+ 
++// Patch 0105 (F1 06, fase 3): el mando del PS2 sale de un mapeo configurable en controles.ini, junto al .exe (se crea
++// con los valores por defecto si no existe). Cada control del DualShock 2 (16 botones, cada uno con su presion, y los
++// dos sticks como medios ejes) toma el maximo de sus entradas: teclas (raylib), botones, ejes y gatillos del mando
++// (raylib/XInput) y ejes, botones y cruceta del volante (DirectInput, ps2_pad_win.cpp). Solo el puerto 0; el 1 queda
++// suelto. Antes: mando o teclado fijos y presiones de todo o nada.
+ namespace
+ {
+     constexpr uint8_t kPadAnalogMarker = 0x73;
+-    constexpr uint8_t kPadStickCenter = 0x80;
+-
+-    constexpr uint16_t PAD_LEFT = 0x0080u;
+-    constexpr uint16_t PAD_DOWN = 0x0040u;
+-    constexpr uint16_t PAD_RIGHT = 0x0020u;
+-    constexpr uint16_t PAD_UP = 0x0010u;
+-    constexpr uint16_t PAD_START = 0x0008u;
+-    constexpr uint16_t PAD_R3 = 0x0004u;
+-    constexpr uint16_t PAD_L3 = 0x0002u;
+-    constexpr uint16_t PAD_SELECT = 0x0001u;
+-    constexpr uint16_t PAD_SQUARE = 0x8000u;
+-    constexpr uint16_t PAD_CROSS = 0x4000u;
+-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
+-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
+-    constexpr uint16_t PAD_R1 = 0x0800u;
+-    constexpr uint16_t PAD_L1 = 0x0400u;
+-    constexpr uint16_t PAD_R2 = 0x0200u;
+-    constexpr uint16_t PAD_L2 = 0x0100u;
++
++    // Controles de destino: 16 botones (bit del PS2 = indice) y 8 medios ejes.
++    enum Target : int
++    {
++        kSelect = 0, kL3, kR3, kStart, kUp, kRight, kDown, kLeft, kL2, kR2, kL1, kR1, kTriangle, kCircle, kCross, kSquare,
++        kLsLeft, kLsRight, kLsUp, kLsDown, kRsLeft, kRsRight, kRsUp, kRsDown,
++        kTargetCount
++    };
++    const char *const kTargetNames[kTargetCount] = {
++        "select", "l3", "r3", "start", "arriba", "derecha", "abajo", "izquierda", "l2", "r2", "l1", "r1",
++        "triangulo", "circulo", "cruz", "cuadrado",
++        "stick_izq_izquierda", "stick_izq_derecha", "stick_izq_arriba", "stick_izq_abajo",
++        "stick_der_izquierda", "stick_der_derecha", "stick_der_arriba", "stick_der_abajo"};
++
++    enum class SourceKind
++    {
++        Key,
++        PadButton,
++        PadAxis,    // medio eje del mando: sign = +1/-1
++        PadTrigger, // gatillo: 0..1
++        WheelAxis,  // modo: '+', '-', '~' (pedal suelto en +1), '=' (pedal suelto en -1)
++        WheelButton,
++        WheelPov
++    };
++
++    struct Source
++    {
++        SourceKind kind = SourceKind::Key;
++        int code = 0;
++        char mode = '+';
++    };
++
++    struct Config
++    {
++        std::array<std::vector<Source>, kTargetCount> map;
++        std::string wheel = "auto";
++        int gamepad = 0;
++        float deadzone = 0.15f;
++        float wheelDeadzone = 0.02f;
++        float wheelSensitivity = 1.0f;
++        float buttonThreshold = 0.1f;
++        bool rumble = true;
++    };
++
++    const char *const kDefaultConfig =
++        "# Controles de F1 06 (PC). Este archivo se crea solo junto al .exe; borralo para volver a los valores por\n"
++        "# defecto. Formato: <control del mando de PS2> = <entrada>, <entrada>, ...  (sin entradas = nada).\n"
++        "#\n"
++        "# Controles del mando de PS2: cruz circulo cuadrado triangulo l1 l2 r1 r2 l3 r3 start select\n"
++        "#   arriba abajo izquierda derecha (la cruceta), y los sticks por mitades: stick_izq_izquierda\n"
++        "#   stick_izq_derecha stick_izq_arriba stick_izq_abajo (y lo mismo con stick_der_...).\n"
++        "# En F1 06: cruz = acelerar y cuadrado = frenar (los dos con presion, como en el DualShock 2), stick\n"
++        "#   izquierdo o cruceta = direccion, r1/l1 = subir/bajar marcha. En los menus: cruceta, cruz (aceptar) y\n"
++        "#   triangulo (atras). El mando va como el de la PS2: los gatillos son l2 y r2 (con presion).\n"
++        "#\n"
++        "# Entradas:\n"
++        "#   tecla:<tecla>   A..Z, 0..9, ARRIBA ABAJO IZQUIERDA DERECHA, ESPACIO INTRO TAB ESC RETROCESO\n"
++        "#                   MAYUS_IZQ MAYUS_DER CTRL_IZQ CTRL_DER ALT_IZQ ALT_DER, NUM0..NUM9\n"
++        "#   mando:<...>     mando XInput o compatible: botones A B X Y LB RB LS RS BACK START, cruceta ARRIBA\n"
++        "#                   ABAJO IZQUIERDA DERECHA, gatillos LT RT (analogicos), ejes LX+ LX- LY+ LY- RX+ RX- RY+ RY-\n"
++        "#   volante:<...>   volante y pedales (DirectInput): ejes X Y Z RX RY RZ S0 S1 seguidos de + o - (medio\n"
++        "#                   eje), ~ (pedal que suelto da +1) o = (pedal que suelto da -1); botones B1..B128;\n"
++        "#                   cruceta POV_ARRIBA POV_ABAJO POV_IZQUIERDA POV_DERECHA. Al arrancar, el registro del\n"
++        "#                   juego lista los mandos que ve DirectInput ([pad] ...).\n"
++        "\n"
++        "# Volante: auto (el primero cuyo nombre parezca un volante), ninguno, o parte de su nombre.\n"
++        "volante = auto\n"
++        "# Mando de raylib que se lee (0 = el primero; -1 = ninguno).\n"
++        "mando = 0\n"
++        "zona_muerta = 0.15\n"
++        "zona_muerta_volante = 0.02\n"
++        "# Giro del volante: 2 = media vuelta del volante ya es todo el giro del stick.\n"
++        "sensibilidad_volante = 1.0\n"
++        "# A partir de que valor una entrada analogica cuenta como boton pulsado (0 a 1).\n"
++        "umbral_boton = 0.1\n"
++        "vibracion = 1\n"
++        "\n"
++        "cruz = tecla:X, tecla:ESPACIO, mando:A, volante:Y~\n"
++        "cuadrado = tecla:Z, mando:X, volante:RZ~\n"
++        "circulo = tecla:C, tecla:RETROCESO, mando:B\n"
++        "triangulo = tecla:V, mando:Y\n"
++        "l1 = tecla:Q, mando:LB, volante:B6\n"
++        "r1 = tecla:E, mando:RB, volante:B5\n"
++        "l2 = tecla:MAYUS_IZQ, mando:LT\n"
++        "r2 = tecla:MAYUS_DER, mando:RT\n"
++        "l3 = mando:LS\n"
++        "r3 = mando:RS\n"
++        "start = tecla:INTRO, mando:START, volante:B10\n"
++        "select = tecla:TAB, mando:BACK, volante:B9\n"
++        "arriba = tecla:ARRIBA, tecla:W, mando:ARRIBA, volante:POV_ARRIBA\n"
++        "abajo = tecla:ABAJO, tecla:S, mando:ABAJO, volante:POV_ABAJO\n"
++        "izquierda = tecla:IZQUIERDA, tecla:A, mando:IZQUIERDA, volante:POV_IZQUIERDA\n"
++        "derecha = tecla:DERECHA, tecla:D, mando:DERECHA, volante:POV_DERECHA\n"
++        "stick_izq_izquierda = tecla:IZQUIERDA, mando:LX-, volante:X-\n"
++        "stick_izq_derecha = tecla:DERECHA, mando:LX+, volante:X+\n"
++        "stick_izq_arriba = mando:LY-\n"
++        "stick_izq_abajo = mando:LY+\n"
++        "stick_der_izquierda = mando:RX-\n"
++        "stick_der_derecha = mando:RX+\n"
++        "stick_der_arriba = mando:RY-\n"
++        "stick_der_abajo = mando:RY+\n";
++
++    struct Named
++    {
++        const char *name;
++        int code;
++    };
++
++    int keyCode(const std::string &name)
++    {
++        static const Named kKeys[] = {
++            {"ARRIBA", KEY_UP}, {"ABAJO", KEY_DOWN}, {"IZQUIERDA", KEY_LEFT}, {"DERECHA", KEY_RIGHT},
++            {"ESPACIO", KEY_SPACE}, {"INTRO", KEY_ENTER}, {"TAB", KEY_TAB}, {"ESC", KEY_ESCAPE},
++            {"RETROCESO", KEY_BACKSPACE}, {"MAYUS_IZQ", KEY_LEFT_SHIFT}, {"MAYUS_DER", KEY_RIGHT_SHIFT},
++            {"CTRL_IZQ", KEY_LEFT_CONTROL}, {"CTRL_DER", KEY_RIGHT_CONTROL}, {"ALT_IZQ", KEY_LEFT_ALT},
++            {"ALT_DER", KEY_RIGHT_ALT}};
++        for (const Named &k : kKeys)
++            if (name == k.name)
++                return k.code;
++        if (name.size() == 1u && name[0] >= 'A' && name[0] <= 'Z')
++            return KEY_A + (name[0] - 'A');
++        if (name.size() == 1u && name[0] >= '0' && name[0] <= '9')
++            return KEY_ZERO + (name[0] - '0');
++        if (name.size() == 4u && name.compare(0, 3, "NUM") == 0 && name[3] >= '0' && name[3] <= '9')
++            return KEY_KP_0 + (name[3] - '0');
++        return -1;
++    }
++
++    bool parseSource(const std::string &text, Source &out)
++    {
++        const size_t colon = text.find(':');
++        if (colon == std::string::npos)
++            return false;
++        std::string device = text.substr(0, colon);
++        std::string what = text.substr(colon + 1u);
++        for (char &c : device)
++            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        for (char &c : what)
++            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++        if (device == "tecla")
++        {
++            out.kind = SourceKind::Key;
++            out.code = keyCode(what);
++            return out.code >= 0;
++        }
++        if (device == "mando")
++        {
++            static const Named kButtons[] = {
++                {"A", GAMEPAD_BUTTON_RIGHT_FACE_DOWN}, {"B", GAMEPAD_BUTTON_RIGHT_FACE_RIGHT},
++                {"X", GAMEPAD_BUTTON_RIGHT_FACE_LEFT}, {"Y", GAMEPAD_BUTTON_RIGHT_FACE_UP},
++                {"LB", GAMEPAD_BUTTON_LEFT_TRIGGER_1}, {"RB", GAMEPAD_BUTTON_RIGHT_TRIGGER_1},
++                {"LS", GAMEPAD_BUTTON_LEFT_THUMB}, {"RS", GAMEPAD_BUTTON_RIGHT_THUMB},
++                {"BACK", GAMEPAD_BUTTON_MIDDLE_LEFT}, {"START", GAMEPAD_BUTTON_MIDDLE_RIGHT},
++                {"ARRIBA", GAMEPAD_BUTTON_LEFT_FACE_UP}, {"ABAJO", GAMEPAD_BUTTON_LEFT_FACE_DOWN},
++                {"IZQUIERDA", GAMEPAD_BUTTON_LEFT_FACE_LEFT}, {"DERECHA", GAMEPAD_BUTTON_LEFT_FACE_RIGHT}};
++            for (const Named &b : kButtons)
++                if (what == b.name)
++                {
++                    out.kind = SourceKind::PadButton;
++                    out.code = b.code;
++                    return true;
++                }
++            if (what == "LT" || what == "RT")
++            {
++                out.kind = SourceKind::PadTrigger;
++                out.code = what == "LT" ? GAMEPAD_AXIS_LEFT_TRIGGER : GAMEPAD_AXIS_RIGHT_TRIGGER;
++                return true;
++            }
++            static const Named kAxes[] = {{"LX", GAMEPAD_AXIS_LEFT_X}, {"LY", GAMEPAD_AXIS_LEFT_Y},
++                                          {"RX", GAMEPAD_AXIS_RIGHT_X}, {"RY", GAMEPAD_AXIS_RIGHT_Y}};
++            if (what.size() == 3u && (what[2] == '+' || what[2] == '-'))
++                for (const Named &a : kAxes)
++                    if (what.compare(0, 2, a.name) == 0)
++                    {
++                        out.kind = SourceKind::PadAxis;
++                        out.code = a.code;
++                        out.mode = what[2];
++                        return true;
++                    }
++            return false;
++        }
++        if (device == "volante")
++        {
++            if (what.size() >= 2u && what[0] == 'B' && std::isdigit(static_cast<unsigned char>(what[1])))
++            {
++                const int n = std::atoi(what.c_str() + 1);
++                if (n < 1 || n > 128)
++                    return false;
++                out.kind = SourceKind::WheelButton;
++                out.code = n - 1;
++                return true;
++            }
++            static const Named kPov[] = {{"POV_ARRIBA", 0}, {"POV_DERECHA", 9000}, {"POV_ABAJO", 18000},
++                                         {"POV_IZQUIERDA", 27000}};
++            for (const Named &p : kPov)
++                if (what == p.name)
++                {
++                    out.kind = SourceKind::WheelPov;
++                    out.code = p.code;
++                    return true;
++                }
++            static const char *const kWheelAxes[] = {"X", "Y", "Z", "RX", "RY", "RZ", "S0", "S1"};
++            if (what.size() >= 2u)
++            {
++                const char mode = what.back();
++                const std::string name = what.substr(0, what.size() - 1u);
++                if (mode == '+' || mode == '-' || mode == '~' || mode == '=')
++                    for (int i = 0; i < 8; ++i)
++                        if (name == kWheelAxes[i])
++                        {
++                            out.kind = SourceKind::WheelAxis;
++                            out.code = i;
++                            out.mode = mode;
++                            return true;
++                        }
++            }
++            return false;
++        }
++        return false;
++    }
++
++    std::string trim(const std::string &s)
++    {
++        size_t a = 0u, b = s.size();
++        while (a < b && std::isspace(static_cast<unsigned char>(s[a])))
++            ++a;
++        while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1u])))
++            --b;
++        return s.substr(a, b - a);
++    }
++
++    void parseConfig(const std::string &text, Config &cfg)
++    {
++        std::istringstream in(text);
++        std::string line;
++        int lineNumber = 0;
++        while (std::getline(in, line))
++        {
++            ++lineNumber;
++            const size_t hash = line.find('#');
++            if (hash != std::string::npos)
++                line.resize(hash);
++            const size_t eq = line.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string key = trim(line.substr(0, eq));
++            const std::string value = trim(line.substr(eq + 1u));
++            for (char &c : key)
++                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            if (key == "volante")
++                cfg.wheel = value;
++            else if (key == "mando")
++                cfg.gamepad = std::atoi(value.c_str());
++            else if (key == "zona_muerta")
++                cfg.deadzone = static_cast<float>(std::atof(value.c_str()));
++            else if (key == "zona_muerta_volante")
++                cfg.wheelDeadzone = static_cast<float>(std::atof(value.c_str()));
++            else if (key == "sensibilidad_volante")
++                cfg.wheelSensitivity = static_cast<float>(std::atof(value.c_str()));
++            else if (key == "umbral_boton")
++                cfg.buttonThreshold = static_cast<float>(std::atof(value.c_str()));
++            else if (key == "vibracion")
++                cfg.rumble = std::atoi(value.c_str()) != 0;
++            else
++            {
++                int target = -1;
++                for (int i = 0; i < kTargetCount; ++i)
++                    if (key == kTargetNames[i])
++                        target = i;
++                if (target < 0)
++                {
++                    std::fprintf(stderr, "[pad] controles.ini:%d: control desconocido '%s'\n", lineNumber, key.c_str());
++                    continue;
++                }
++                cfg.map[static_cast<size_t>(target)].clear();
++                std::istringstream items(value);
++                std::string item;
++                while (std::getline(items, item, ','))
++                {
++                    item = trim(item);
++                    if (item.empty())
++                        continue;
++                    Source src;
++                    if (parseSource(item, src))
++                        cfg.map[static_cast<size_t>(target)].push_back(src);
++                    else
++                        std::fprintf(stderr, "[pad] controles.ini:%d: entrada desconocida '%s'\n", lineNumber,
++                                     item.c_str());
++                }
++            }
++        }
++    }
++
++    Config &config()
++    {
++        static Config cfg = []()
++        {
++            Config c;
++            parseConfig(kDefaultConfig, c);
++            const char *override = std::getenv("PS2X_CONTROLES"); // otro archivo (pruebas)
++            const std::string path = override ? std::string(override) : ps2_pad_win::exeDirectory() + "controles.ini";
++            std::ifstream file(path, std::ios::binary);
++            if (file)
++            {
++                std::stringstream text;
++                text << file.rdbuf();
++                parseConfig(text.str(), c);
++                std::fprintf(stderr, "[pad] controles: %s\n", path.c_str());
++            }
++            else if (!override)
++            {
++                std::ofstream out(path, std::ios::binary);
++                out << kDefaultConfig;
++                std::fprintf(stderr, "[pad] controles: %s creado con los valores por defecto\n", path.c_str());
++            }
++            ps2_pad_win::setRumbleEnabled(c.rumble);
++            return c;
++        }();
++        return cfg;
++    }
++
++    float deadzoned(float v, float dz)
++    {
++        const float a = std::fabs(v);
++        if (a <= dz)
++            return 0.0f;
++        return std::min(1.0f, (a - dz) / std::max(1e-3f, 1.0f - dz));
++    }
++
++    struct Frame
++    {
++        bool gamepad = false;
++        int pad = 0;
++        ps2_pad_win::JoystickState wheel;
++    };
++
++    float sourceValue(const Source &s, const Config &cfg, const Frame &f)
++    {
++        switch (s.kind)
++        {
++        case SourceKind::Key:
++            return IsKeyDown(s.code) ? 1.0f : 0.0f;
++        case SourceKind::PadButton:
++            return f.gamepad && IsGamepadButtonDown(f.pad, s.code) ? 1.0f : 0.0f;
++        case SourceKind::PadTrigger:
++            // raylib: -1 suelto, 1 a fondo.
++            return f.gamepad ? deadzoned(std::clamp((GetGamepadAxisMovement(f.pad, s.code) + 1.0f) * 0.5f, 0.0f, 1.0f), 0.05f)
++                             : 0.0f;
++        case SourceKind::PadAxis:
++        {
++            if (!f.gamepad)
++                return 0.0f;
++            const float v = GetGamepadAxisMovement(f.pad, s.code) * (s.mode == '-' ? -1.0f : 1.0f);
++            return v > 0.0f ? deadzoned(v, cfg.deadzone) : 0.0f;
++        }
++        case SourceKind::WheelAxis:
++        {
++            if (!f.wheel.present)
++                return 0.0f;
++            const float v = f.wheel.axes[s.code];
++            float out = 0.0f;
++            if (s.mode == '+' || s.mode == '-')
++            {
++                const float half = (s.mode == '-' ? -v : v) * cfg.wheelSensitivity;
++                out = half > 0.0f ? deadzoned(std::min(half, 1.0f), cfg.wheelDeadzone) : 0.0f;
++            }
++            else
++            {
++                const float pedal = s.mode == '~' ? (1.0f - v) * 0.5f : (v + 1.0f) * 0.5f;
++                out = deadzoned(std::clamp(pedal, 0.0f, 1.0f), cfg.wheelDeadzone);
++            }
++            return out;
++        }
++        case SourceKind::WheelButton:
++            return f.wheel.present && f.wheel.buttons[s.code] ? 1.0f : 0.0f;
++        case SourceKind::WheelPov:
++        {
++            if (!f.wheel.present || f.wheel.pov < 0)
++                return 0.0f;
++            int diff = std::abs(f.wheel.pov - s.code) % 36000;
++            diff = std::min(diff, 36000 - diff);
++            return diff <= 4500 ? 1.0f : 0.0f; // las diagonales cuentan para las dos direcciones
++        }
++        }
++        return 0.0f;
++    }
++
++    std::once_flag g_wheelOnce;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+         return false;
+@@ -35,91 +423,80 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     data[1] = kPadAnalogMarker;
+     data[2] = 0xFF;
+     data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
+-
+-    if (useGamepad)
+-    {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+-    }
+-    else
+-    {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
++    data[4] = data[5] = data[6] = data[7] = 0x80;
++    if (port != 0)
++        return true; // el segundo mando, suelto
++
++    const Config &cfg = config();
++    std::call_once(g_wheelOnce, [&cfg]()
++                   {
++        for (const std::string &name : ps2_pad_win::listGameControllers())
++            std::fprintf(stderr, "[pad] DirectInput: %s\n", name.c_str());
++        if (ps2_pad_win::openWheel(cfg.wheel))
++            std::fprintf(stderr, "[pad] volante: %s\n", ps2_pad_win::wheelName().c_str());
++        else
++            std::fprintf(stderr, "[pad] sin volante (volante = %s)\n", cfg.wheel.c_str()); });
++
++    Frame f;
++    f.pad = cfg.gamepad;
++    f.gamepad = cfg.gamepad >= 0 && IsGamepadAvailable(cfg.gamepad);
++    ps2_pad_win::readWheel(f.wheel);
++
++    float value[kTargetCount] = {};
++    for (int t = 0; t < kTargetCount; ++t)
++        for (const Source &s : cfg.map[static_cast<size_t>(t)])
++            value[t] = std::max(value[t], sourceValue(s, cfg, f));
++
++    uint16_t buttons = 0xFFFFu;
++    for (int b = 0; b < 16; ++b)
++        if (value[b] >= cfg.buttonThreshold)
++            buttons &= static_cast<uint16_t>(~(1u << b));
++    data[2] = static_cast<uint8_t>(buttons & 0xFFu);
++    data[3] = static_cast<uint8_t>(buttons >> 8);
++
++    auto stick = [&value](int negative, int positive)
++    {
++        const float v = std::clamp(value[positive] - value[negative], -1.0f, 1.0f);
++        return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(127.5f + v * 127.5f)), 0, 255));
++    };
++    data[4] = stick(kRsLeft, kRsRight);
++    data[5] = stick(kRsUp, kRsDown);
++    data[6] = stick(kLsLeft, kLsRight);
++    data[7] = stick(kLsUp, kLsDown);
++
++    // Presiones (bytes 8-19 del DualShock 2): derecha, izquierda, arriba, abajo, triangulo, circulo, cruz,
++    // cuadrado, l1, l2, r1, r2. Solo con el boton pulsado (como el mando real).
++    static const int kPressureOrder[12] = {kRight, kLeft, kUp, kDown, kTriangle, kCircle, kCross, kSquare,
++                                           kL1, kL2, kR1, kR2};
++    for (int i = 0; i < 12; ++i)
++    {
++        const float v = value[kPressureOrder[i]];
++        data[8 + i] = v >= cfg.buttonThreshold
++                          ? static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 255.0f)), 1, 255))
++                          : 0u;
+     }
++    data[20] = 1u; // presiones validas (Pad.cpp)
+ 
+-    data[2] = static_cast<uint8_t>(btns & 0xFF);
+-    data[3] = static_cast<uint8_t>(btns >> 8);
++    // PS2X_PAD_DEPURAR=1: el informe cada vez que cambia (botones, sticks y presiones), las 2.000 primeras veces.
++    static const bool s_debug = []()
++    {
++        const char *v = std::getenv("PS2X_PAD_DEPURAR");
++        return v && v[0] != '0';
++    }();
++    if (s_debug)
++    {
++        static uint8_t s_last[21] = {};
++        static unsigned s_count = 0u;
++        if (std::memcmp(s_last, data, sizeof(s_last)) != 0 && s_count < 2000u)
++        {
++            ++s_count;
++            std::memcpy(s_last, data, sizeof(s_last));
++            std::fprintf(stderr, "[pad] botones=%04x stick_izq=(%u,%u) stick_der=(%u,%u) presiones=", buttons, data[6],
++                         data[7], data[4], data[5]);
++            for (int i = 8; i < 20; ++i)
++                std::fprintf(stderr, "%s%u", i == 8 ? "" : ",", data[i]);
++            std::fprintf(stderr, " mando=%d volante=%d\n", f.gamepad ? 1 : 0, f.wheel.present ? 1 : 0);
++        }
++    }
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.cpp b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+new file mode 100644
+index 0000000..e46c5b9
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pad_win.cpp
+@@ -0,0 +1,258 @@
++#include "ps2_pad_win.h"
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#define DIRECTINPUT_VERSION 0x0800
++#include <windows.h>
++#include <dinput.h>
++#include <xinput.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <cstdio>
++#include <mutex>
++
++#pragma comment(lib, "dinput8.lib")
++#pragma comment(lib, "dxguid.lib")
++
++namespace
++{
++    IDirectInput8W *g_di = nullptr;
++    IDirectInputDevice8W *g_wheel = nullptr;
++    std::string g_wheelName;
++    std::atomic<bool> g_rumbleEnabled{true};
++
++    std::string narrow(const wchar_t *text)
++    {
++        if (!text)
++            return {};
++        const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
++        std::string out(size > 0 ? static_cast<size_t>(size - 1) : 0u, '\0');
++        if (size > 1)
++            WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
++        return out;
++    }
++
++    std::string lower(std::string text)
++    {
++        for (char &c : text)
++            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        return text;
++    }
++
++    bool initDirectInput()
++    {
++        if (g_di)
++            return true;
++        return SUCCEEDED(DirectInput8Create(GetModuleHandleW(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8W,
++                                            reinterpret_cast<void **>(&g_di), nullptr));
++    }
++
++    struct Device
++    {
++        GUID guid{};
++        std::string name;
++    };
++
++    BOOL CALLBACK enumDevice(LPCDIDEVICEINSTANCEW instance, LPVOID context)
++    {
++        auto *devices = static_cast<std::vector<Device> *>(context);
++        devices->push_back({instance->guidInstance, narrow(instance->tszProductName)});
++        return DIENUM_CONTINUE;
++    }
++
++    std::vector<Device> enumerate()
++    {
++        std::vector<Device> devices;
++        if (initDirectInput())
++            g_di->EnumDevices(DI8DEVCLASS_GAMECTRL, enumDevice, &devices, DIEDFL_ATTACHEDONLY);
++        return devices;
++    }
++
++    // DirectInput quiere una ventana de nivel superior del proceso (la del juego, de raylib).
++    BOOL CALLBACK findWindow(HWND hwnd, LPARAM param)
++    {
++        DWORD pid = 0;
++        GetWindowThreadProcessId(hwnd, &pid);
++        if (pid == GetCurrentProcessId() && GetWindow(hwnd, GW_OWNER) == nullptr && IsWindowVisible(hwnd))
++        {
++            *reinterpret_cast<HWND *>(param) = hwnd;
++            return FALSE;
++        }
++        return TRUE;
++    }
++
++    bool looksLikeWheel(const std::string &name)
++    {
++        const std::string n = lower(name);
++        for (const char *word : {"wheel", "racing", "volant", "driving", "g29", "g920", "g923", "g27", "g25",
++                                 "t300", "t150", "tmx", "t248", "fanatec", "momo", "dfgt"})
++            if (n.find(word) != std::string::npos)
++                return true;
++        return false;
++    }
++
++    float axis(LONG value)
++    {
++        return std::clamp(static_cast<float>(value) / 32767.0f, -1.0f, 1.0f);
++    }
++
++    using XInputSetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
++    XInputSetStateFn loadXInputSetState()
++    {
++        static XInputSetStateFn fn = []() -> XInputSetStateFn
++        {
++            for (const char *dll : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"})
++                if (HMODULE module = LoadLibraryA(dll))
++                    if (auto f = reinterpret_cast<XInputSetStateFn>(GetProcAddress(module, "XInputSetState")))
++                        return f;
++            return nullptr;
++        }();
++        return fn;
++    }
++}
++
++namespace ps2_pad_win
++{
++    std::string exeDirectory()
++    {
++        wchar_t path[MAX_PATH] = {};
++        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
++        std::string dir = narrow(path);
++        if (length == 0u)
++            return {};
++        const size_t slash = dir.find_last_of("\\/");
++        return slash == std::string::npos ? std::string() : dir.substr(0, slash + 1u);
++    }
++
++    std::vector<std::string> listGameControllers()
++    {
++        std::vector<std::string> names;
++        for (const Device &d : enumerate())
++            names.push_back(d.name);
++        return names;
++    }
++
++    bool openWheel(const std::string &match)
++    {
++        if (g_wheel)
++            return true;
++        const std::string wanted = lower(match);
++        if (wanted == "ninguno" || wanted == "no" || wanted.empty())
++            return false;
++        const std::vector<Device> devices = enumerate();
++        const Device *chosen = nullptr;
++        for (const Device &d : devices)
++            if (wanted == "auto" ? looksLikeWheel(d.name) : lower(d.name).find(wanted) != std::string::npos)
++            {
++                chosen = &d;
++                break;
++            }
++        if (!chosen)
++            return false;
++        IDirectInputDevice8W *device = nullptr;
++        if (FAILED(g_di->CreateDevice(chosen->guid, &device, nullptr)))
++            return false;
++        HWND window = nullptr;
++        EnumWindows(findWindow, reinterpret_cast<LPARAM>(&window));
++        if (FAILED(device->SetDataFormat(&c_dfDIJoystick2)) ||
++            (window && FAILED(device->SetCooperativeLevel(window, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))))
++        {
++            device->Release();
++            return false;
++        }
++        DIPROPRANGE range{};
++        range.diph.dwSize = sizeof(range);
++        range.diph.dwHeaderSize = sizeof(range.diph);
++        range.diph.dwHow = DIPH_DEVICE;
++        range.lMin = -32767;
++        range.lMax = 32767;
++        device->SetProperty(DIPROP_RANGE, &range.diph);
++        DIPROPDWORD deadzone{};
++        deadzone.diph.dwSize = sizeof(deadzone);
++        deadzone.diph.dwHeaderSize = sizeof(deadzone.diph);
++        deadzone.diph.dwHow = DIPH_DEVICE;
++        deadzone.dwData = 0;
++        device->SetProperty(DIPROP_DEADZONE, &deadzone.diph);
++        device->Acquire();
++        g_wheel = device;
++        g_wheelName = chosen->name;
++        return true;
++    }
++
++    bool readWheel(JoystickState &out)
++    {
++        out = JoystickState{};
++        if (!g_wheel)
++            return false;
++        DIJOYSTATE2 js{};
++        HRESULT hr = g_wheel->Poll();
++        hr = g_wheel->GetDeviceState(sizeof(js), &js);
++        if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED)
++        {
++            g_wheel->Acquire();
++            hr = g_wheel->GetDeviceState(sizeof(js), &js);
++        }
++        if (FAILED(hr))
++            return false;
++        out.present = true;
++        out.axes[0] = axis(js.lX);
++        out.axes[1] = axis(js.lY);
++        out.axes[2] = axis(js.lZ);
++        out.axes[3] = axis(js.lRx);
++        out.axes[4] = axis(js.lRy);
++        out.axes[5] = axis(js.lRz);
++        out.axes[6] = axis(js.rglSlider[0]);
++        out.axes[7] = axis(js.rglSlider[1]);
++        for (int i = 0; i < 128; ++i)
++            out.buttons[i] = (js.rgbButtons[i] & 0x80u) != 0u ? 1u : 0u;
++        out.pov = LOWORD(js.rgdwPOV[0]) == 0xFFFFu ? -1 : static_cast<int>(js.rgdwPOV[0]);
++        return true;
++    }
++
++    std::string wheelName()
++    {
++        return g_wheelName;
++    }
++
++    void setRumbleEnabled(bool enabled)
++    {
++        g_rumbleEnabled.store(enabled, std::memory_order_relaxed);
++        if (!enabled)
++            if (XInputSetStateFn fn = loadXInputSetState())
++            {
++                XINPUT_VIBRATION off{};
++                fn(0, &off);
++            }
++    }
++
++    void setRumble(float smallMotor, float largeMotor)
++    {
++        if (!g_rumbleEnabled.load(std::memory_order_relaxed))
++            return;
++        if (XInputSetStateFn fn = loadXInputSetState())
++        {
++            XINPUT_VIBRATION v{};
++            v.wRightMotorSpeed = static_cast<WORD>(std::clamp(smallMotor, 0.0f, 1.0f) * 65535.0f); // el pequeno, agudo
++            v.wLeftMotorSpeed = static_cast<WORD>(std::clamp(largeMotor, 0.0f, 1.0f) * 65535.0f);
++            fn(0, &v);
++        }
++    }
++}
++
++#else
++
++namespace ps2_pad_win
++{
++    std::string exeDirectory() { return {}; }
++    std::vector<std::string> listGameControllers() { return {}; }
++    bool openWheel(const std::string &) { return false; }
++    bool readWheel(JoystickState &out) { out = JoystickState{}; return false; }
++    std::string wheelName() { return {}; }
++    void setRumbleEnabled(bool) {}
++    void setRumble(float, float) {}
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad_win.h b/ps2xRuntime/src/lib/ps2_pad_win.h
+new file mode 100644
+index 0000000..fc4be5e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pad_win.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Entrada de Windows para el mando del PS2 (ps2_pad.cpp), aparte porque windows.h choca con raylib.h:
++// volantes y pedales por DirectInput 8 y vibracion del mando XInput.
++namespace ps2_pad_win
++{
++    struct JoystickState
++    {
++        bool present = false;
++        float axes[8] = {}; // X Y Z RX RY RZ S0 S1, de -1 a 1
++        uint8_t buttons[128] = {};
++        int pov = -1; // centesimas de grado, -1 = centrado
++    };
++
++    std::string exeDirectory(); // carpeta del .exe, con la barra final
++
++    // Los mandos de juego que ve DirectInput (para el log y para elegir el volante).
++    std::vector<std::string> listGameControllers();
++    // match: "auto" (el primero cuyo nombre parezca un volante), "ninguno", o parte del nombre. Llamar desde el hilo
++    // que lo va a leer.
++    bool openWheel(const std::string &match);
++    bool readWheel(JoystickState &out);
++    std::string wheelName();
++
++    // Vibracion del mando XInput 0 (motor pequeno y grande, de 0 a 1).
++    void setRumbleEnabled(bool enabled);
++    void setRumble(float smallMotor, float largeMotor);
++}

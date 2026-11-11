@@ -1,0 +1,257 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index b06435f..e86c210 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -167,6 +167,10 @@ private:
+     GSPresentationRequest m_presentRequest{};
+     uint64_t m_presentSerial = 0u;
+     PresentationFrame m_presentFrame;
++    // Patch 0078: the image upload copies, emptied by the worker and taken again by UploadImage (a new vector for each
++    // upload was a heap allocation on the EE thread and a free on the worker; A/B mode 67: as before).
++    std::mutex m_uploadPoolMutex;
++    std::vector<std::vector<uint8_t>> m_uploadPool;
+ };
+ 
+ // Backend used by the GS front-end: GSThreadedBackend, or GSCpuBackend with PS2X_GS_THREAD=0.
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 946a5f8..7c18ce9 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -54,7 +54,9 @@
+ // writePixelBody, with the frame and Z addresses worked out for each access and the blend per channel (before patch
+ // 0076), 62 modes 59 and 60 together (patches 0075 and 0076 off at once; with 0077, also
+ // the untextured triangles of mode 64), 63 the GS diagnostic texts of the waits (requestText) written always, 64 the GS
+-// untextured CT32/Z24 triangles through rasterTriangleSpan4 (both before patch 0077).
++// untextured CT32/Z24 triangles through rasterTriangleSpan4 (both before patch 0077), 65 the VU decode cache
++// compared pair by pair after a code change, 66 the VU run timing with steady_clock, 67 the GS upload copies without
++// the pool, 69 modes 65, 66 and 67 together (all before patch 0078).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 912054a..bd0c3d8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -621,7 +621,16 @@ void GSThreadedBackend::Execute(Command &command, uint64_t index)
+                    else if constexpr (std::is_same_v<T, std::vector<uint8_t>>)
+                    {
+                        m_cpu->UploadImage(payload.data(), static_cast<uint32_t>(payload.size()));
+-                       // Release the copy now; the slot may stay unused for a long time.
++                       // Release the copy now; the slot may stay unused for a long time. Patch 0078: into the pool
++                       // when it is small enough (and the pool not full).
++                       if ((g_ps2AbMode.load(std::memory_order_relaxed) != 67 && g_ps2AbMode.load(std::memory_order_relaxed) != 69) && payload.capacity() <= (1u << 20))
++                       {
++                           std::vector<uint8_t> spare = std::move(payload);
++                           spare.clear();
++                           std::lock_guard<std::mutex> lock(m_uploadPoolMutex);
++                           if (m_uploadPool.size() < 32u)
++                               m_uploadPool.push_back(std::move(spare));
++                       }
+                        std::vector<uint8_t>().swap(payload);
+                    }
+                    else if constexpr (std::is_same_v<T, TextureFlushCommand>)
+@@ -739,7 +748,18 @@ void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (data == nullptr || sizeBytes == 0u)
+         return;
+-    Push(std::vector<uint8_t>(data, data + sizeBytes), sizeBytes / 2u);
++    std::vector<uint8_t> copy;
++    if ((g_ps2AbMode.load(std::memory_order_relaxed) != 67 && g_ps2AbMode.load(std::memory_order_relaxed) != 69))
++    {
++        std::lock_guard<std::mutex> lock(m_uploadPoolMutex);
++        if (!m_uploadPool.empty())
++        {
++            copy = std::move(m_uploadPool.back());
++            m_uploadPool.pop_back();
++        }
++    }
++    copy.assign(data, data + sizeBytes);
++    Push(std::move(copy), sizeBytes / 2u);
+ }
+ 
+ void GSThreadedBackend::Flush()
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 48ae88b..7f567c4 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -30,7 +30,10 @@
+ 
+ // For the compiled schedules (ps2_vu1_jit.h); <windows.h> is not included here.
+ #include <cstddef>
++#include <cstdio>
++#include <cstdlib>
+ #include <intrin.h>
++#include <mutex>
+ extern "C" __declspec(dllimport) void *__stdcall VirtualAlloc(void *address, size_t size, unsigned long type,
+                                                               unsigned long protect);
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 311d583..028e296 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -19,6 +19,8 @@
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
++#include <emmintrin.h>
++#include <intrin.h>
+ #include <ps2_log.h>
+ 
+ // The FMAC fast path computes the four lanes with SSE2. It does the same IEEE operations as the scalar code (float for
+@@ -2772,6 +2774,47 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+     return decoded;
+ }
+ 
++namespace
++{
++    // Patch 0078: the clock of the per-run host time ([vu1:ritmo], g_ps2Vu1HostNs): the time-stamp counter scaled to
++    // nanoseconds (calibrated once against steady_clock over 20 ms, and counted from the same origin), instead of a
++    // QueryPerformanceCounter call at both ends of every run (~0.8 % of the EE thread). A/B mode 66: steady_clock.
++    struct VuRunClock
++    {
++        using rep = int64_t;
++        using period = std::nano;
++        using duration = std::chrono::nanoseconds;
++        using time_point = std::chrono::time_point<VuRunClock>;
++        static constexpr bool is_steady = true;
++
++        static time_point now()
++        {
++            struct Calibration
++            {
++                int64_t steadyNs;
++                uint64_t tsc;
++                double nsPerTick;
++            };
++            static const Calibration c = []()
++            {
++                const auto t0 = std::chrono::steady_clock::now();
++                const uint64_t c0 = __rdtsc();
++                auto t1 = t0;
++                while (t1 - t0 < std::chrono::milliseconds(20))
++                    t1 = std::chrono::steady_clock::now();
++                const uint64_t c1 = __rdtsc();
++                const double ns = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++                return Calibration{std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count(), c1,
++                                   c1 > c0 ? ns / static_cast<double>(c1 - c0) : 1.0};
++            }();
++            if ((g_ps2AbMode.load(std::memory_order_relaxed) == 66 || g_ps2AbMode.load(std::memory_order_relaxed) == 69))
++                return time_point(std::chrono::duration_cast<duration>(std::chrono::steady_clock::now().time_since_epoch()));
++            const int64_t ticks = static_cast<int64_t>(__rdtsc() - c.tsc);
++            return time_point(duration(c.steadyNs + static_cast<int64_t>(static_cast<double>(ticks) * c.nsPerTick)));
++        }
++    };
++}
++
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+@@ -2786,8 +2829,26 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     if (incremental)
+     {
+         const bool variants = pairVariantsOn(m_unit == Unit::VU1);
++        // Patch 0078: eight pairs (64 bytes) at a time while they are unchanged (A/B mode 65: pair by pair, as before;
++        // the same pairs decode again either way).
++        const bool chunks = (g_ps2AbMode.load(std::memory_order_relaxed) != 65 && g_ps2AbMode.load(std::memory_order_relaxed) != 69);
+         for (uint32_t i = 0; i < pairCount; ++i)
+         {
++            if (chunks && (i & 7u) == 0u && i + 8u <= pairCount)
++            {
++                const auto *a = reinterpret_cast<const __m128i *>(snapshot.code + i * 8u);
++                const auto *b = reinterpret_cast<const __m128i *>(vuCode + i * 8u);
++                const __m128i diff = _mm_or_si128(
++                    _mm_or_si128(_mm_xor_si128(_mm_loadu_si128(a), _mm_loadu_si128(b)),
++                                 _mm_xor_si128(_mm_loadu_si128(a + 1), _mm_loadu_si128(b + 1))),
++                    _mm_or_si128(_mm_xor_si128(_mm_loadu_si128(a + 2), _mm_loadu_si128(b + 2)),
++                                 _mm_xor_si128(_mm_loadu_si128(a + 3), _mm_loadu_si128(b + 3))));
++                if (_mm_movemask_epi8(_mm_cmpeq_epi8(diff, _mm_setzero_si128())) == 0xFFFF)
++                {
++                    i += 7u; // the loop's ++i moves to the next eight
++                    continue;
++                }
++            }
+             if (std::memcmp(snapshot.code + i * 8u, vuCode + i * 8u, 8u) == 0)
+                 continue;
+             snapshot.changed[i >> 6] |= 1ull << (i & 63u);
+@@ -3020,7 +3081,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     bool programEnded = false;
+     const uint64_t cicloInicioTraza = m_cycle;
+     const uint32_t pcInicioTraza = m_state.pc;
+-    const auto inicioRitmo = std::chrono::steady_clock::now();
++    const auto inicioRitmo = VuRunClock::now();
+     const uint64_t esperaGsAntes = g_ps2GsEeWaitNs.load(std::memory_order_relaxed);
+     uint64_t paresEjecutados = 0u;
+     if (m_unit == Unit::VU1)
+@@ -3900,9 +3961,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         // "[vu1:ritmo]" every 10 s: VU1 instruction pairs per second and host time per pair. Each run includes the
+         // GIF packets it kicks to the GS front-end, so this is what the EE thread pays per pair.
+         static auto s_ritmoDesde = inicioRitmo;
+-        static std::chrono::steady_clock::duration s_ritmoTiempo{};
++        static VuRunClock::duration s_ritmoTiempo{};
+         static uint64_t s_ritmoPares = 0u;
+-        const auto finRitmo = std::chrono::steady_clock::now();
++        const auto finRitmo = VuRunClock::now();
+         s_ritmoTiempo += finRitmo - inicioRitmo;
+         s_ritmoPares += paresEjecutados;
+         g_ps2Vu1HostNs.store(g_ps2Vu1HostNs.load(std::memory_order_relaxed) +
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 1279be5..88c7ec4 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -1119,6 +1119,20 @@
+         e.bind(skip);
+     }
+ 
++    // PS2X_JIT_MAPA=<file> (diagnostic, patch 0078): every compiled schedule is appended to that file, so that a
++    // profile's addresses without a symbol can be put down to VU instruction pairs (scripts/jit_mapa.py): a line
++    // "B <code address> <bytes> <micro memory bytes> <pc>" and then, for each pair, "P <code offset> <pc> <lower>
++    // <upper>" (the offset where its code starts, after the commits due before it).
++    inline std::FILE *jitMapFile()
++    {
++        static std::FILE *const file = []() -> std::FILE *
++        {
++            const char *path = std::getenv("PS2X_JIT_MAPA");
++            return path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
++        }();
++        return file;
++    }
++
+     // ---------------------------------------------------------------------------------------------------------
+     // Compiles s into engine.jit. False (and s keeps running through runScheduleBody) when the arena is full.
+     // alternative: the second compile of A/B modes 30 (FMAC through upperEarly calls), 31 (LQ, SQ, the pc and the end
+@@ -1164,6 +1178,8 @@
+             nextCommit = end;
+         };
+         JitKnownNormal known;
++        std::FILE *const mapFile = jitMapFile();
++        std::vector<uint32_t> pairOffsets;
+         for (const BlockPair &p : s.pairs)
+         {
+             // Commits before the pair may write VF registers: forget those.
+@@ -1171,6 +1187,8 @@
+                 if (s.commits[c].kind == CommitVf)
+                     known.vf[s.commits[c].reg] = 0u;
+             commitsUpTo(p.commitEnd);
++            if (mapFile != nullptr)
++                pairOffsets.push_back(static_cast<uint32_t>(e.code().size()));
+             const bool upperDone = p.upperEarly != nullptr;
+             // The entry this pair queues (upperEarly, the inline FMAC, jitUpperLate: upperFlags; jitClip: clip).
+             // Unknown when the lower instruction is FSSET or FCSET: they drop the status or clip of that entry.
+@@ -1266,6 +1284,17 @@
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+         (alternative == 0 ? s.jit : s.jitCalls) = code;
++        if (mapFile != nullptr)
++        {
++            static std::mutex s_mapMutex; // the VU0 and VU1 engines may compile on different threads
++            const std::lock_guard<std::mutex> lock(s_mapMutex);
++            std::fprintf(mapFile, "B %p %zu %u %u\n", static_cast<void *>(code), e.code().size(),
++                         static_cast<unsigned>(host.codeSize()), s.pc);
++            for (size_t i = 0; i < s.pairs.size(); ++i)
++                std::fprintf(mapFile, "P %u %u %08x %08x\n", pairOffsets[i], s.pairs[i].pc, s.pairs[i].lower,
++                             s.pairs[i].upper);
++            std::fflush(mapFile);
++        }
+         return true;
+     }
+ 

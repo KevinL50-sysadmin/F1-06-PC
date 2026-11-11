@@ -1,0 +1,43 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 17374ab..e98c9c0 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -36,8 +36,8 @@
+ // (the draws wait in the band workers), 38 the GS bilinear samples reading each texel through samplerPoint (before
+ // patch 0064), 39 the GS upload jobs spread over the band workers and every dependency waiting for all of them
+ // (before patch 0065), 40 modes 35, 36 and 38 together (everything of patches 0062 to 0065 off at once), 41 the GS triangle rows one pixel at a time
+-// (before patch 0066), 42 the presentation copy of the GS local memory made by the GS thread after waiting for
+-// every band job (before patch 0067), 43 the compiled VU1 schedules with IADDIU, MOVE, B, IBEQ, IBNE, the
++// (before patch 0066), 42 the presentation copy of the GS local memory made as a band job (patch 0067; before patch
++// 0070 that was the default and mode 42 made it on the GS thread after waiting for every band job), 43 the compiled VU1 schedules with IADDIU, MOVE, B, IBEQ, IBNE, the
+ // branch backup and the pending branch of the pc through calls (before patch 0068), 44 modes 41, 42 and 43 together
+ // (everything of patches 0066 to 0068 off at once), 46 (experiment, not exact) the GS CLUT loads without waiting for
+ // the band jobs, 47 (game hook) the EE thread on a core of its own (ps2EeOwnCore; with F1_EE_PROPIO=1, the other
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1453b38..5f8cce4 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4576,9 +4576,11 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+ {
+     // Patch 0067: the copy of local memory for the presentation as a band job, so that this thread does not wait for
+-    // every pending job (the "directo" waits of [gs:bandas], one per presented frame). A/B modes 42 and 44: here, as before;
+-    // also without band workers, in A/B modes 36, 37 and 40 (the coordinator waits there), while F1_GS_VERIFICAR_BANDAS
+-    // checks batches, and when the caller needs it now. 0: copied already.
++    // every pending job (the "directo" waits of [gs:bandas], one per presented frame). Only in A/B mode 42 since patch
++    // 0070: measured with the VU1 JIT on in every A/B window (patch 0069) it gained nothing (+0,2 % +-0,8 in 51 pairs)
++    // and shows the frame one presentation late, so the GS thread copies here, after waiting for the bands, as before
++    // 0067. Also here without band workers, in A/B modes 36, 37 and 40 (the coordinator waits there), while
++    // F1_GS_VERIFICAR_BANDAS checks batches, and when the caller needs it now. 0: copied already.
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || m_vramSize == 0u)
+     {
+@@ -4588,7 +4590,7 @@ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+     out.resize(m_vramSize);
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+     BandState *bands = m_bands.get();
+-    if (!defer || bands == nullptr || mode == 42 || mode == 44 || mode == 36 || mode == 37 || mode == 40 || bands->verifyLeft != 0u ||
++    if (!defer || bands == nullptr || mode != 42 || bands->verifyLeft != 0u ||
+         bands->RefreshMinDone() >= bands->prepared)
+     {
+         WaitBandsUnlocked();

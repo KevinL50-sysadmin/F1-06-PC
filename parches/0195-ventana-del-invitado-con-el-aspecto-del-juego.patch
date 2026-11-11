@@ -1,0 +1,1273 @@
+diff --git a/ps2xRuntime/include/ps2_host_overlay.h b/ps2xRuntime/include/ps2_host_overlay.h
+index 95e1770..5f3832c 100644
+--- a/ps2xRuntime/include/ps2_host_overlay.h
++++ b/ps2xRuntime/include/ps2_host_overlay.h
+@@ -248,6 +248,22 @@ namespace ps2x
+     // Draws the bar at the bottom of the game's picture (alpha: hostNoticeAlpha); the box it takes on screen.
+     HostOverlayBox drawHostHelpBar(const HelpBar &bar, float alpha = 1.0f);
+ 
++    // Ventana del invitado T2: a page like the game's option pages, drawn by the guest's window in the game's 512 x 512
++    // frame (stretched to currentGamePictureRect as the game's own picture). The menus' letter (italic Eurostile)
++    // when the game has read it, here or from the cache (loadGameFileCache): the guest's own letter until then.
++    bool hostMenuLetterReady();
++    // A text's width in the frame at a line height of the frame (0 without the letter).
++    float measureHostMenuText(const std::string &text, float lineHeight);
++    // The text as it is (hostOverlayCaps first for the game's capitals) from frameX, its capitals' ink centred on
++    // frameMiddle; shadow: a dark drop shadow, as the game's white texts. Nothing without the letter.
++    void drawHostMenuText(const std::string &text, float frameX, float frameMiddle, float lineHeight,
++                          HostOverlayColor color, float alpha = 1.0f, bool shadow = false);
++    // The game's ticker band (Ticker_Bar.pct, tiled at the frame's scale; else the dark panel) over a rectangle of the
++    // frame (it may go past the frame's sides: the window's edges); the bottom band (New_Border_Bot.pct, else its
++    // blue-black) from frameTop to the frame's bottom, its middle stretched across.
++    void drawHostTickerBand(const HostOverlayRect &frameRect, float alpha = 1.0f);
++    void drawHostBottomBand(float frameX, float frameWidth, float frameTop, float alpha = 1.0f);
++
+     // Camaras y pilotos T2: the driver's caption of the photo mode as the game's replay draws its own (logs/cyp-t2, at
+     // the game's 512 x 512 frame): the name black on a white row, a chrome line, the team white on the tower's blue and
+     // a dark edge, in the race HUD's letter; on its left a cell with the race position (white on the same blue, as the
+diff --git a/ps2xRuntime/src/lib/ps2_game_font.cpp b/ps2xRuntime/src/lib/ps2_game_font.cpp
+index e628654..1a3d37f 100644
+--- a/ps2xRuntime/src/lib/ps2_game_font.cpp
++++ b/ps2xRuntime/src/lib/ps2_game_font.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_game_font.h"
++#include "ps2_game_graphics.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ 
+@@ -7,6 +8,9 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstring>
++#include <fstream>
++#include <iostream>
++#include <iterator>
+ #include <map>
+ #include <mutex>
+ 
+@@ -244,21 +248,139 @@ namespace ps2x
+         };
+         std::mutex g_storeMutex;
+         std::map<std::string, StoredFont, std::less<>> g_store;
++        std::filesystem::path g_cacheFolder; // under g_storeMutex
++
++        std::vector<uint8_t> readWholeFile(const std::filesystem::path &path)
++        {
++            std::ifstream in(path, std::ios::binary);
++            if (!in)
++                return {};
++            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++        }
++
++        // The copy on disk, unless it already has these bytes: a temporary file, then renamed over the old one.
++        void writeCacheCopy(const std::filesystem::path &folder, std::string_view name, const std::vector<uint8_t> &bytes)
++        {
++            namespace fs = std::filesystem;
++            const fs::path target = folder / fs::path(std::string(name)).make_preferred();
++            std::error_code error;
++            if (fs::exists(target, error) && readWholeFile(target) == bytes)
++                return;
++            fs::create_directories(target.parent_path(), error);
++            fs::path temporary = target;
++            temporary += ".tmp";
++            {
++                std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++                out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++                if (!out)
++                {
++                    out.close();
++                    fs::remove(temporary, error);
++                    std::cerr << "[avisos] no se pudo guardar en la cache " << name << std::endl;
++                    return;
++                }
++            }
++            fs::rename(temporary, target, error);
++            if (error)
++            {
++                fs::remove(temporary, error);
++                std::cerr << "[avisos] no se pudo guardar en la cache " << name << std::endl;
++            }
++        }
+     }
+ 
+     bool storeGameFontFile(std::string_view name, std::vector<uint8_t> bytes)
+     {
+-        std::lock_guard<std::mutex> lock(g_storeMutex);
+-        auto it = g_store.find(name);
+-        if (it == g_store.end())
+-            it = g_store.emplace(std::string(name), StoredFont{}).first;
+-        if (it->second.version != 0u && it->second.bytes == bytes)
++        std::filesystem::path folder;
++        std::vector<uint8_t> copy;
++        {
++            std::lock_guard<std::mutex> lock(g_storeMutex);
++            auto it = g_store.find(name);
++            if (it == g_store.end())
++                it = g_store.emplace(std::string(name), StoredFont{}).first;
++            if (it->second.version != 0u && it->second.bytes == bytes)
++                return false;
++            it->second.bytes = std::move(bytes);
++            ++it->second.version;
++            if (!g_cacheFolder.empty() && gameFileCacheName(name))
++            {
++                folder = g_cacheFolder;
++                copy = it->second.bytes;
++            }
++        }
++        if (!folder.empty())
++            writeCacheCopy(folder, name, copy);
++        return true;
++    }
++
++    bool gameFileCacheName(std::string_view name)
++    {
++        const auto endsWith = [&](std::string_view ending)
++        {
++            if (name.size() <= ending.size())
++                return false;
++            for (size_t i = 0; i < ending.size(); ++i)
++            {
++                const char c = name[name.size() - ending.size() + i];
++                if ((c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c) != ending[i])
++                    return false;
++            }
++            return true;
++        };
++        if (!endsWith(".bft") && !endsWith(".pct"))
+             return false;
+-        it->second.bytes = std::move(bytes);
+-        ++it->second.version;
++        for (size_t start = 0; start <= name.size();)
++        {
++            const size_t slash = name.find('/', start);
++            const std::string_view part = name.substr(start, slash == std::string_view::npos ? slash : slash - start);
++            if (part.empty() || part == "." || part == "..")
++                return false;
++            for (const char c : part)
++                if (static_cast<unsigned char>(c) < 0x20u || c == '\\' || c == ':' || c == '*' || c == '?' ||
++                    c == '"' || c == '<' || c == '>' || c == '|')
++                    return false;
++            if (slash == std::string_view::npos)
++                break;
++            start = slash + 1;
++        }
+         return true;
+     }
+ 
++    void setGameFileCache(const std::filesystem::path &folder)
++    {
++        std::lock_guard<std::mutex> lock(g_storeMutex);
++        g_cacheFolder = folder;
++    }
++
++    size_t loadGameFileCache(const std::filesystem::path &folder)
++    {
++        namespace fs = std::filesystem;
++        constexpr uintmax_t kMaxFile = 8u * 1024u * 1024u;
++        size_t loaded = 0;
++        std::error_code error;
++        if (folder.empty() || !fs::is_directory(folder, error))
++            return 0;
++        for (fs::recursive_directory_iterator it(folder, error), end; !error && it != end; it.increment(error))
++        {
++            if (!it->is_regular_file(error) || it->file_size(error) > kMaxFile)
++                continue;
++            const std::string name = it->path().lexically_relative(folder).generic_string();
++            if (!gameFileCacheName(name))
++                continue;
++            std::vector<uint8_t> bytes = readWholeFile(it->path());
++            if (bytes.empty())
++                continue;
++            const char kind = name[name.size() - 3]; // .pct or .bft (gameFileCacheName)
++            const bool picture = kind == 'p' || kind == 'P';
++            if (picture)
++                storeGameTextureFile(name, std::move(bytes));
++            else
++                storeGameFontFile(name, std::move(bytes));
++            ++loaded;
++        }
++        return loaded;
++    }
++
+     bool gameFontFile(std::string_view name, std::vector<uint8_t> &bytes, uint32_t &version)
+     {
+         std::lock_guard<std::mutex> lock(g_storeMutex);
+diff --git a/ps2xRuntime/src/lib/ps2_game_font.h b/ps2xRuntime/src/lib/ps2_game_font.h
+index d4cedf2..19ddeb6 100644
+--- a/ps2xRuntime/src/lib/ps2_game_font.h
++++ b/ps2xRuntime/src/lib/ps2_game_font.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <filesystem>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -60,6 +61,15 @@ namespace ps2x
+     // says whether they changed (the game reads its letters again on many screens).
+     bool storeGameFontFile(std::string_view name, std::vector<uint8_t> bytes);
+     bool gameFontFile(std::string_view name, std::vector<uint8_t> &bytes, uint32_t &version);
++
++    // Ventana del invitado T1: a copy on disk of what the store gets, for the guest's window (it never runs the game):
++    // <folder>\<the name as stored>, written when the bytes under a name change (never half: a temporary file renamed),
++    // only for names gameFileCacheName accepts. setGameFileCache: the folder (empty, the default: nothing is written).
++    // loadGameFileCache: every file of a folder with such a name into the store (the .pct ones as
++    // storeGameTextureFile), how many. Deleting the folder is always safe.
++    bool gameFileCacheName(std::string_view name); // relative, '/' between plain parts, ending in .bft or .pct
++    void setGameFileCache(const std::filesystem::path &folder);
++    size_t loadGameFileCache(const std::filesystem::path &folder);
+     // The game's letters the notices use, from the smallest to the largest: the menus' (italic Eurostile) and the race
+     // HUD's (straight Frutiger; the position tower and "Current" use fruitigerMedium: 9 row capitals in the 512 row
+     // frame, 12-13 rows in a 720 row window, logs/aspecto-t2/carrera-torre-x3.png).
+diff --git a/ps2xRuntime/src/lib/ps2_host_overlay.cpp b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+index aabb1cc..62ca3d1 100644
+--- a/ps2xRuntime/src/lib/ps2_host_overlay.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_overlay.cpp
+@@ -1001,6 +1001,92 @@ namespace ps2x
+         return box;
+     }
+ 
++    bool hostMenuLetterReady()
++    {
++        return menuLetter(kHelpBarLineHeight) != nullptr;
++    }
++
++    float measureHostMenuText(const std::string &text, float lineHeight)
++    {
++        const GameLetter *letter = menuLetter(lineHeight);
++        return letter == nullptr ? 0.0f : measureWith(LetterFor{letter->font, 0.0f, 1.0f}, text, lineHeight);
++    }
++
++    void drawHostMenuText(const std::string &text, float frameX, float frameMiddle, float lineHeight,
++                          HostOverlayColor color, float alpha, bool shadow)
++    {
++        const GameLetter *letter = menuLetter(lineHeight);
++        if (letter == nullptr || letter->lineHeight <= 0 || text.empty() || !(alpha > 0.0f))
++            return;
++        const GamePictureRect picture = currentGamePictureRect(GetScreenWidth(), GetScreenHeight());
++        const float sx = picture.width / kGameFrameWidth, sy = picture.height / kGameFrameHeight;
++        const LetterFor screenLetter{letter->font, 0.0f, sx / sy};
++        const float size = lineHeight * sy;
++        const float inkMiddle = (letter->inkTop + letter->inkBottom + 1) / 2.0f / letter->lineHeight;
++        const Vector2 at{std::round(picture.x + frameX * sx), std::round(picture.y + frameMiddle * sy - inkMiddle * size)};
++        if (shadow)
++        {
++            const float offset = std::max(1.0f, std::round(sy));
++            drawWith(screenLetter, text, Vector2{at.x + offset, at.y + offset}, size,
++                     toColor(HostOverlayColor{0, 0, 0, 0xA0}, alpha));
++        }
++        drawWith(screenLetter, text, at, size, toColor(color, alpha));
++    }
++
++    void drawHostTickerBand(const HostOverlayRect &frameRect, float alpha)
++    {
++        if (!(alpha > 0.0f) || frameRect.width <= 0.0f || frameRect.height <= 0.0f)
++            return;
++        refreshGameGraphics();
++        const GamePictureRect picture = currentGamePictureRect(GetScreenWidth(), GetScreenHeight());
++        const float sx = picture.width / kGameFrameWidth, sy = picture.height / kGameFrameHeight;
++        const Rectangle where{picture.x + frameRect.x * sx, picture.y + frameRect.y * sy, frameRect.width * sx,
++                              frameRect.height * sy};
++        if (g_graphics.ticker.ready)
++            DrawTexturePro(g_graphics.ticker.texture, Rectangle{frameRect.x, 0.0f, frameRect.width, frameRect.height},
++                           where, Vector2{0.0f, 0.0f}, 0.0f, toColor(HostOverlayColor{255, 255, 255, 255}, alpha));
++        else
++            DrawRectangleRec(where, toColor(HostOverlayColor{kHostOverlayPanel.r, kHostOverlayPanel.g, kHostOverlayPanel.b, 0xFF},
++                                            alpha));
++    }
++
++    void drawHostBottomBand(float frameX, float frameWidth, float frameTop, float alpha)
++    {
++        if (!(alpha > 0.0f) || frameWidth <= 0.0f || frameTop >= kGameFrameHeight)
++            return;
++        refreshGameGraphics();
++        const GamePictureRect picture = currentGamePictureRect(GetScreenWidth(), GetScreenHeight());
++        const float sx = picture.width / kGameFrameWidth, sy = picture.height / kGameFrameHeight;
++        const auto screen = [&](float y, float h)
++        { return Rectangle{picture.x + frameX * sx, picture.y + y * sy, frameWidth * sx, h * sy}; };
++        if (!g_graphics.band.ready)
++        {
++            DrawRectangleRec(screen(frameTop, kGameFrameHeight - frameTop), toColor(HostOverlayColor{0x0C, 0x14, 0x24, 0xFF}, alpha));
++            return;
++        }
++        // Past the frame's sides its edge columns stretched, else its middle ones; its last rows below, as
++        // drawHostHelpBar draws it.
++        const Texture2D &band = g_graphics.band.texture;
++        const float bandW = static_cast<float>(band.width), bandH = static_cast<float>(band.height);
++        constexpr float kEdge = 2.0f;
++        const Rectangle middle = frameX + frameWidth <= 0.0f ? Rectangle{0.0f, 0.0f, kEdge, bandH}
++                                 : frameX >= kGameFrameWidth ? Rectangle{bandW - kEdge, 0.0f, kEdge, bandH}
++                                                             : Rectangle{bandW * 0.4f, 0.0f, bandW * 0.2f, bandH};
++        const float height = std::min(kHelpBarBorderHeight, kGameFrameHeight - frameTop);
++        DrawTexturePro(band, Rectangle{middle.x, 0.0f, middle.width, bandH * height / kHelpBarBorderHeight},
++                       screen(frameTop, height), Vector2{0.0f, 0.0f}, 0.0f,
++                       toColor(HostOverlayColor{255, 255, 255, 255}, alpha));
++        const float below = kGameFrameHeight - frameTop - kHelpBarBorderHeight;
++        if (below > 0.0f)
++        {
++            const float slice = std::min(bandH, static_cast<float>(kBandSlice));
++            const unsigned char shade = static_cast<unsigned char>(std::lround(255.0f * g_graphics.bandSliceShade));
++            DrawTexturePro(band, Rectangle{middle.x, bandH - slice, middle.width, slice},
++                           screen(frameTop + kHelpBarBorderHeight, below), Vector2{0.0f, 0.0f}, 0.0f,
++                           Color{shade, shade, shade, static_cast<unsigned char>(std::lround(255.0f * alpha))});
++        }
++    }
++
+     HostFpsCounterLayout hostFpsCounterLayout(const std::string &value, const std::string &label, int windowWidth,
+                                               int windowHeight, const HostTextMeasure &measure, const HostTextInk *ink)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+index 450bbdd..eee10ee 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_guest.cpp
+@@ -1,6 +1,9 @@
+ #include "ps2_netplay.h"
+ #include "ps2_netplay_session.h"
+ #include "ps2_host_backend.h"
++#include "ps2_host_overlay.h"
++#include "ps2_game_font.h"
++#include "ps2_user_paths.h"
+ #include "runtime/ps2_pad.h"
+ 
+ #include <algorithm>
+@@ -11,6 +14,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -107,47 +111,373 @@ namespace ps2x::netplay
+             return out + line;
+         }
+ 
++        // Ventana del invitado T2 (S3): the form and the connection screen as the game's option pages
++        // (logs/explorar-nat-t14-invitado-04-DisplaySettings_1_41.5.png, OPTIONS > PC OPTIONS > PC NETPLAY): in the
++        // game's 512 x 512 frame on a 4:3 picture fitted in the window, the page's background, header and bands out to
++        // the window's edges. The game's menu letter when the cache has it (T1); else Segoe UI with the same colours
++        // and bands (S1).
++        constexpr float kPageHeader = 60.0f; // the dark blue band, then a light chrome line
++        constexpr float kPageMargin = 20.0f;
++        constexpr float kTitleLine = 25.0f; // eurostyleLargePx
++        constexpr float kRowLine = 20.0f;
++        constexpr float kSmallLine = 15.0f; // the help bar's letter (eurostyleSmallPx), as the game's value boxes
++        constexpr float kSubtitleTop = 84.0f;
++        constexpr float kRowFirst = 150.0f, kRowStep = 36.0f;
++        constexpr float kSelectX = 18.0f, kLabelX = 56.0f;
++        constexpr float kBoxLeft = 280.0f, kBoxRight = 462.0f, kBoxHalf = 9.0f, kBoxPoint = 6.0f;
++        constexpr float kTickerText = 24.0f, kTickerLineStep = 16.0f;
++        // Segoe UI drawn at this times the game letter's line: its capitals as high, their middle at kSegoeMiddle of it.
++        constexpr float kSegoeScale = 1.1f, kSegoeMiddle = 0.55f;
++
++        constexpr HostOverlayColor kPageBackground{0xF4, 0xF4, 0xF4, 0xFF};
++        constexpr HostOverlayColor kPageChevron{0xE6, 0xE6, 0xE6, 0xFF};
++        constexpr HostOverlayColor kHeaderTop{0x0B, 0x1A, 0x33, 0xFF};
++        constexpr HostOverlayColor kHeaderBottom{0x1E, 0x3B, 0x66, 0xFF};
++        constexpr HostOverlayColor kHeaderChrome[] = {{0xE4, 0xE6, 0xEC, 0xFF}, {0xC2, 0xC6, 0xD0, 0xFF},
++                                                      {0x98, 0x9E, 0xAE, 0xFF}, {0x6A, 0x72, 0x88, 0xFF}};
++        constexpr HostOverlayColor kLabelGrey{0x8C, 0x8C, 0x8C, 0xFF};
++        constexpr HostOverlayColor kLabelBlack{0x00, 0x00, 0x00, 0xFF};
++        constexpr HostOverlayColor kSubtitleGrey{0x7A, 0x7A, 0x7A, 0xFF};
++        constexpr HostOverlayColor kBoxGrey{0x7B, 0x7B, 0x7B, 0xFF}; // the game's grey 123 value boxes
++        constexpr HostOverlayColor kBoxBlack{0x00, 0x00, 0x00, 0xFF};
++        constexpr HostOverlayColor kBoxArrows{0x9A, 0x9A, 0x9A, 0xFF};
++        constexpr HostOverlayColor kBelowFrame{0x0C, 0x14, 0x24, 0xFF};
++
++        Color toRaylib(HostOverlayColor c)
++        {
++            return Color{c.r, c.g, c.b, c.a};
++        }
++
++        struct Page
++        {
++            GamePictureRect rect;
++            float sx = 1.0f, sy = 1.0f;
++            float width = 0.0f, height = 0.0f; // the window
++            const Font *font = nullptr;        // when the game's letter is not there
++            bool gameLetter = false;
++
++            Rectangle screen(float x, float y, float w, float h) const
++            {
++                return Rectangle{rect.x + x * sx, rect.y + y * sy, w * sx, h * sy};
++            }
++            Vector2 point(float x, float y) const
++            {
++                return Vector2{rect.x + x * sx, rect.y + y * sy};
++            }
++            float left() const // the window's edges in the frame
++            {
++                return -rect.x / sx;
++            }
++            float right() const
++            {
++                return (width - rect.x) / sx;
++            }
++            float measure(const std::string &text, float line) const
++            {
++                if (gameLetter)
++                    return measureHostMenuText(text, line);
++                return MeasureTextEx(*font, text.c_str(), line * kSegoeScale * sy, 1.0f).x / sx;
++            }
++            // From x, the capitals' middle on middle.
++            void text(const std::string &s, float x, float middle, float line, HostOverlayColor colour,
++                      bool shadow = false) const
++            {
++                if (gameLetter)
++                {
++                    drawHostMenuText(s, x, middle, line, colour, 1.0f, shadow);
++                    return;
++                }
++                const float size = line * kSegoeScale * sy;
++                const Vector2 at{std::round(rect.x + x * sx), std::round(rect.y + middle * sy - kSegoeMiddle * size)};
++                if (shadow)
++                {
++                    const float offset = std::max(1.0f, std::round(sy));
++                    DrawTextEx(*font, s.c_str(), Vector2{at.x + offset, at.y + offset}, size, 1.0f, Color{0, 0, 0, 0xA0});
++                }
++                DrawTextEx(*font, s.c_str(), at, size, 1.0f, toRaylib(colour));
++            }
++        };
++
++        // The 4:3 picture fitted and centred in the window, noted for drawHostHelpBar and the game's letter.
++        Page pageFor(const Font &font)
++        {
++            Page page;
++            page.width = static_cast<float>(std::max(1, GetScreenWidth()));
++            page.height = static_cast<float>(std::max(1, GetScreenHeight()));
++            const float w = std::min(page.width, page.height * 4.0f / 3.0f), h = w * 0.75f;
++            page.rect = GamePictureRect{std::floor((page.width - w) / 2.0f), std::floor((page.height - h) / 2.0f), w, h};
++            noteGamePicture(page.rect.x, page.rect.y, page.rect.width, page.rect.height);
++            page.sx = w / kGameFrameWidth;
++            page.sy = h / kGameFrameHeight;
++            page.font = &font;
++            page.gameLetter = hostMenuLetterReady();
++            return page;
++        }
++
++        // raylib draws a triangle only with its corners counter-clockwise on screen: both orders, one is culled.
++        void triangle(Vector2 a, Vector2 b, Vector2 c, Color colour)
++        {
++            DrawTriangle(a, b, c, colour);
++            DrawTriangle(a, c, b, colour);
++        }
++
++        void quad(Vector2 a, Vector2 b, Vector2 c, Vector2 d, Color colour)
++        {
++            triangle(a, b, c, colour);
++            triangle(a, c, d, colour);
++        }
++
++        // A chevron in the frame from x to x + width, its point at middle (right or left), arms thickness across.
++        void chevron(const Page &page, float x, float middle, float width, float half, float thickness, bool right,
++                     HostOverlayColor colour)
++        {
++            const auto at = [&](float u, float y) { return page.point(right ? x + u : x + width - u, y); };
++            const Color c = toRaylib(colour);
++            quad(at(0.0f, middle - half), at(thickness, middle - half), at(width, middle), at(width - thickness, middle), c);
++            quad(at(width - thickness, middle), at(width, middle), at(thickness, middle + half), at(0.0f, middle + half), c);
++        }
++
++        float rowMiddle(int row)
++        {
++            return kRowFirst + row * kRowStep;
++        }
++
++        // A row's place on screen (a click on it).
++        Rectangle rowRect(const Page &page, int row)
++        {
++            return page.screen(kSelectX - 4.0f, rowMiddle(row) - kRowStep / 2.0f, kGameFrameWidth - 2.0f * kSelectX + 8.0f,
++                               kRowStep);
++        }
++
++        // The text cut to room: from the left ("...", the tail shown: the address being typed), else from the right.
++        std::string fitted(const Page &page, const std::string &text, float line, float room, bool tail)
++        {
++            if (page.measure(text, line) <= room)
++                return text;
++            std::string cut = text;
++            while (!cut.empty())
++            {
++                if (tail)
++                    cut.erase(0, 1);
++                else
++                    cut.pop_back();
++                while (!cut.empty() && (static_cast<unsigned char>(tail ? cut.front() : cut.back()) & 0xC0u) == 0x80u)
++                {
++                    if (tail)
++                        cut.erase(0, 1);
++                    else
++                        cut.pop_back();
++                }
++                const std::string shown = tail ? "..." + cut : cut + "...";
++                if (page.measure(shown, line) <= room)
++                    return shown;
++            }
++            return {};
++        }
++
++        // A row as the game's: the label (grey; selected: black with the red arrow) and the value box (grey with
++        // white text and grey arrows; selected: black with red arrows; fill: a colour of its own, the state's).
++        void drawRow(const Page &page, int row, const std::string &label, const std::string &value, bool selected,
++                     bool tail, const HostOverlayColor *fill = nullptr)
++        {
++            const float middle = rowMiddle(row);
++            if (selected)
++                chevron(page, kSelectX, middle, 16.0f, 9.0f, 7.0f, true, kHostOverlayRed);
++            const std::string caps = hostOverlayCaps(label);
++            const float labelRoom = kBoxLeft - 30.0f - kLabelX;
++            const float labelWidth = page.measure(caps, kRowLine);
++            const float labelLine = labelWidth > labelRoom ? kRowLine * labelRoom / labelWidth : kRowLine;
++            page.text(caps, kLabelX, middle, labelLine, selected ? kLabelBlack : kLabelGrey);
++
++            const Color box = toRaylib(fill != nullptr ? *fill : selected ? kBoxBlack : kBoxGrey);
++            DrawRectangleRec(page.screen(kBoxLeft + kBoxPoint, middle - kBoxHalf, kBoxRight - kBoxLeft - 2.0f * kBoxPoint,
++                                         2.0f * kBoxHalf),
++                             box);
++            triangle(page.point(kBoxLeft, middle), page.point(kBoxLeft + kBoxPoint, middle - kBoxHalf),
++                     page.point(kBoxLeft + kBoxPoint, middle + kBoxHalf), box);
++            triangle(page.point(kBoxRight, middle), page.point(kBoxRight - kBoxPoint, middle - kBoxHalf),
++                     page.point(kBoxRight - kBoxPoint, middle + kBoxHalf), box);
++            const HostOverlayColor arrows = selected ? kHostOverlayRed : kBoxArrows;
++            for (int i = 0; i < 2; ++i)
++            {
++                chevron(page, kBoxLeft - 26.0f + i * 10.0f, middle, 9.0f, 8.0f, 4.5f, false, arrows);
++                chevron(page, kBoxRight + 7.0f + i * 10.0f, middle, 9.0f, 8.0f, 4.5f, true, arrows);
++            }
++
++            // The value centred, smaller if it does not fit (not below 12 rows), then cut.
++            const float room = kBoxRight - kBoxLeft - 2.0f * kBoxPoint - 4.0f;
++            float line = kSmallLine;
++            const float width = page.measure(value, line);
++            if (width > room)
++                line = std::max(12.0f, line * room / width);
++            const std::string shown = fitted(page, value, line, room, tail);
++            const float x = (kBoxLeft + kBoxRight - page.measure(shown, line)) / 2.0f;
++            page.text(shown, x, middle, line, kHostOverlayText);
++        }
++
++        // The lines of a text broken by wrapped.
++        std::vector<std::string> lineList(const std::string &text)
++        {
++            std::vector<std::string> out;
++            for (size_t start = 0; start <= text.size();)
++            {
++                const size_t end = std::min(text.find('\n', start), text.size());
++                out.push_back(text.substr(start, end - start));
++                start = end + 1;
++            }
++            return out;
++        }
++
++        // The page: background with the game's pale chevrons, the header band and its title, the subtitle.
++        void drawPage(const Page &page, const std::string &title, const std::string &subtitle)
++        {
++            ClearBackground(toRaylib(kPageBackground));
++            chevron(page, -50.0f, 268.0f, 190.0f, 155.0f, 85.0f, true, kPageChevron);
++            chevron(page, 150.0f, 268.0f, 105.0f, 120.0f, 55.0f, true, kPageChevron);
++            const Rectangle header = page.screen(page.left(), 0.0f, page.right() - page.left(), kPageHeader);
++            if (header.y > 0.0f)
++                DrawRectangle(0, 0, static_cast<int>(page.width), static_cast<int>(std::ceil(header.y)), toRaylib(kHeaderTop));
++            DrawRectangleGradientV(0, static_cast<int>(header.y), static_cast<int>(page.width),
++                                   static_cast<int>(std::ceil(header.height)), toRaylib(kHeaderTop), toRaylib(kHeaderBottom));
++            for (size_t i = 0; i < std::size(kHeaderChrome); ++i)
++                DrawRectangleRec(page.screen(page.left(), kPageHeader + i, page.right() - page.left(), 1.0f),
++                                 toRaylib(kHeaderChrome[i]));
++            page.text(hostOverlayCaps(title), kPageMargin, kPageHeader / 2.0f + 2.0f, kTitleLine, kHostOverlayText, true);
++            const auto measure = [&](const std::string &s) { return page.measure(s, kSmallLine); };
++            float middle = kSubtitleTop;
++            for (const std::string &line :
++                 lineList(wrapped(hostOverlayCaps(subtitle), kGameFrameWidth - 2.0f * kPageMargin, measure)))
++            {
++                page.text(line, kPageMargin, middle, kSmallLine, kSubtitleGrey);
++                middle += kTickerLineStep;
++            }
++        }
++
++        // The game's ticker band out to the window's edges with its lines, its bottom at bottom; an error with a red
++        // stripe.
++        void drawTicker(const Page &page, const std::string &text, bool error, float bottom)
++        {
++            if (text.empty())
++                return;
++            const auto measure = [&](const std::string &s) { return page.measure(s, kSmallLine); };
++            const std::vector<std::string> lines =
++                lineList(wrapped(hostOverlayCaps(text), kGameFrameWidth - kTickerText - kPageMargin, measure));
++            const float height = lines.size() * kTickerLineStep + 8.0f;
++            const float top = bottom - height;
++            drawHostTickerBand(HostOverlayRect{page.left(), top, page.right() - page.left(), height});
++            if (error)
++                DrawRectangleRec(page.screen(14.0f, top, 4.0f, height), toRaylib(kHostOverlayRed));
++            float middle = top + 4.0f + kTickerLineStep / 2.0f;
++            for (const std::string &line : lines)
++            {
++                page.text(line, kTickerText, middle, kSmallLine, kHostOverlayText, true);
++                middle += kTickerLineStep;
++            }
++        }
++
++        // The bottom band out to the window's edges and the help bar on it (the game's when its pictures and letter
++        // are there; without the game's letter, its line of text in Segoe UI); bandTop: where the band starts in the
++        // frame, for the ticker band of the next frame.
++        void drawBottom(const Page &page, const HelpBar &bar, float &bandTop)
++        {
++            const float oneRow = kGameFrameHeight - kHelpBarBorderHeight;
++            drawHostBottomBand(page.left(), page.right() - page.left(), oneRow);
++            const float below = page.rect.y + page.rect.height;
++            if (below < page.height)
++                DrawRectangle(0, static_cast<int>(below), static_cast<int>(page.width),
++                              static_cast<int>(std::ceil(page.height - below)), toRaylib(kBelowFrame));
++            bandTop = oneRow;
++            if (!page.gameLetter)
++            {
++                if (bar.left.empty() && bar.right.empty())
++                    return;
++                const std::string text = hostOverlayCaps(helpBarText(bar, HostLanguage::Spanish));
++                const float line = std::min(kSmallLine, kSmallLine * (kGameFrameWidth - 2.0f * kHelpBarMargin) /
++                                                            std::max(1.0f, page.measure(text, kSmallLine)));
++                page.text(text, (kGameFrameWidth - page.measure(text, line)) / 2.0f, kHelpBarRowCentre, line,
++                          kHostOverlayText, true);
++                return;
++            }
++            const HostOverlayBox box = drawHostHelpBar(bar);
++            if (box.width > 0.0f && std::abs(box.width - page.rect.width) < 1.0f)
++            {
++                bandTop = (box.y - page.rect.y) / page.sy;
++                drawHostBottomBand(page.left(), -page.left(), bandTop);
++                drawHostBottomBand(kGameFrameWidth, page.right() - kGameFrameWidth, bandTop);
++            }
++        }
++
++        const char *const kGuestTitle = "Juego en red PC - Invitado";
++        const char *const kGuestSubtitle = "Juegas como jugador 2 en el PC del anfitrión. Cierra la ventana para salir.";
++
++        // The state as the window writes it (stateName: the log's, plain ASCII).
++        const char *stateLabel(GuestState state)
++        {
++            switch (state)
++            {
++            case GuestState::Idle: return "SIN CONEXIÓN";
++            case GuestState::Connecting: return "CONECTANDO";
++            case GuestState::Authenticating: return "COMPROBANDO LA CONTRASEÑA";
++            case GuestState::Connected: return "CONECTADO";
++            case GuestState::Rejected: return "RECHAZADO";
++            case GuestState::Disconnected: return "DESCONECTADO";
++            case GuestState::Failed: return "ERROR";
++            }
++            return "?";
++        }
++
++        bool sessionEnded(GuestState state)
++        {
++            return state == GuestState::Rejected || state == GuestState::Disconnected || state == GuestState::Failed;
++        }
++
++        // "host:port" (an IPv6 address in brackets).
++        std::string targetText(const std::string &host, uint16_t port)
++        {
++            const bool ipv6 = host.find(':') != std::string::npos;
++            return (ipv6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
++        }
++
+         // The connection screen (before the first picture, or when the session ends). canReturn: the form is there.
+-        void drawStatus(const GuestStatus &status, const PadWire &wire, int screenHeight, bool canReturn)
+-        {
+-            ClearBackground(Color{18, 22, 30, 255});
+-            DrawText("FORMULA ONE 06 - JUEGO EN RED", 24, 20, 24, RAYWHITE);
+-            DrawText("Invitado: tu mando es el del jugador 2 del anfitrion", 24, 56, 18, LIGHTGRAY);
+-            const Color stateColor = status.state == GuestState::Connected ? GREEN
+-                                     : status.state == GuestState::Connecting ||
+-                                             status.state == GuestState::Authenticating
+-                                         ? YELLOW
+-                                         : RED;
+-            DrawText(stateName(status.state), 24, 100, 32, stateColor);
+-            const auto measure = [](const std::string &s) { return static_cast<float>(MeasureText(s.c_str(), 18)); };
+-            const std::string text = wrapped(status.text, static_cast<float>(GetScreenWidth() - 48), measure);
+-            DrawText(text.c_str(), 24, 142, 18, RAYWHITE);
++        void drawStatus(const Page &page, const GuestStatus &status, const PadWire &wire, const std::string &target,
++                        bool canReturn, HelpInput input, float &bandTop)
++        {
++            drawPage(page, kGuestTitle, kGuestSubtitle);
++            const bool ended = sessionEnded(status.state);
++            const HostOverlayColor stateColour = status.state == GuestState::Connected ? kHostOverlayGreen
++                                                 : status.state == GuestState::Connecting ||
++                                                         status.state == GuestState::Authenticating
++                                                     ? kHostOverlayOrange
++                                                 : ended ? kHostOverlayRed
++                                                         : kBoxGrey;
++            drawRow(page, 0, "Estado", stateLabel(status.state), false, false, &stateColour);
++            drawRow(page, 1, "Anfitrión", target, false, true);
+             if (status.state == GuestState::Connected)
+             {
+-                DrawText(TextFormat("Ida y vuelta: %u ms", static_cast<unsigned>(status.roundTripMs)), 24, 176, 18,
+-                         LIGHTGRAY);
+-                DrawText(TextFormat("Botones: %s", pressedNames(wire).c_str()), 24, 206, 18, LIGHTGRAY);
+-                DrawText(TextFormat("Stick izq: %3u %3u   Stick der: %3u %3u", wire.lx, wire.ly, wire.rx, wire.ry), 24,
+-                         236, 18, LIGHTGRAY);
+-                DrawText("Esperando la imagen del anfitrion...", 24, 270, 18, YELLOW);
++                drawRow(page, 2, "Ida y vuelta", TextFormat("%u MS", static_cast<unsigned>(status.roundTripMs)), false,
++                        false);
++                drawRow(page, 3, "Botones", pressedNames(wire), false, false);
++                drawRow(page, 4, "Sticks", TextFormat("%u %u / %u %u", wire.lx, wire.ly, wire.rx, wire.ry), false, false);
+             }
+-            const bool ended = status.state == GuestState::Rejected || status.state == GuestState::Disconnected ||
+-                               status.state == GuestState::Failed;
++            std::string ticker = status.text;
++            if (status.state == GuestState::Connected)
++                ticker += (ticker.empty() ? "" : " ") + std::string("Esperando la imagen del anfitrión...");
++            drawTicker(page, ticker, ended, bandTop);
++            HelpBar bar;
+             if (canReturn && ended)
+-                DrawText("Pulsa Intro para volver a la conexion (direccion, puerto y contrasena).", 24, 186, 18, YELLOW);
+-            DrawText("Cierra la ventana para salir.", 24, screenHeight - 30, 14, GRAY);
++                bar.right.push_back(HelpEntry{{input == HelpInput::Pad ? padKey(PadIcon::Cross) : keyboardKey("INTRO")},
++                                              "volver"});
++            drawBottom(page, bar, bandTop);
+         }
+ 
+-        // N4: the form. Its texts carry accents: Segoe UI from the Windows fonts folder with the Spanish letters
+-        // (raylib's own font when it is missing).
++        // N4: the form. Its texts carry accents: without the game's letter, Segoe UI from the Windows fonts folder with
++        // the Spanish letters (raylib's own font when it is missing).
+         struct GuestFormScreen
+         {
+             GuestForm fields;
+-            int focus = 0; // 0 address, 1 port, 2 password
++            int focus = 0; // 0 address, 1 port, 2 password, 3 connect
+             bool showPassword = false;
+             std::string error;
+-            Font font{};
+-            bool ownFont = false;
+         };
+ 
+         Font loadFormFont()
+@@ -176,8 +506,8 @@ namespace ps2x::netplay
+             return GetFontDefault();
+         }
+ 
+-        // Typed characters, Backspace, Ctrl+V, Tab and the arrows, Enter or a click on Conectar. True: connect.
+-        bool updateForm(GuestFormScreen &form, const Rectangle (&boxes)[3], const Rectangle &button)
++        // Typed characters, Backspace, Ctrl+V, Tab and the arrows, Enter or a click on the connect row. True: connect.
++        bool updateForm(GuestFormScreen &form, const Page &page)
+         {
+             std::string *fields[3] = {&form.fields.address, &form.fields.port, &form.fields.password};
+             const size_t limits[3] = {253, 5, kMaxPasswordSize};
+@@ -193,6 +523,8 @@ namespace ps2x::netplay
+             };
+             const auto add = [&](int c)
+             {
++                if (form.focus >= 3)
++                    return;
+                 std::string &field = *fields[form.focus];
+                 if (accept(c) && field.size() < limits[form.focus])
+                     field += static_cast<char>(c);
+@@ -204,66 +536,79 @@ namespace ps2x::netplay
+                 if (const char *clip = GetClipboardText())
+                     for (const char *p = clip; *p != '\0'; ++p)
+                         add(static_cast<unsigned char>(*p));
+-            if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && !fields[form.focus]->empty())
++            if (form.focus < 3 && (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) &&
++                !fields[form.focus]->empty())
+                 fields[form.focus]->pop_back();
+             const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+             if ((IsKeyPressed(KEY_TAB) && !shift) || IsKeyPressed(KEY_DOWN))
+-                form.focus = (form.focus + 1) % 3;
++                form.focus = (form.focus + 1) % kGuestFormRows;
+             if ((IsKeyPressed(KEY_TAB) && shift) || IsKeyPressed(KEY_UP))
+-                form.focus = (form.focus + 2) % 3;
++                form.focus = (form.focus + kGuestFormRows - 1) % kGuestFormRows;
+             if (IsKeyPressed(KEY_F4))
+                 form.showPassword = !form.showPassword;
+             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+             {
+                 const Vector2 mouse = GetMousePosition();
+-                for (int i = 0; i < 3; ++i)
+-                    if (CheckCollisionPointRec(mouse, boxes[i]))
++                for (int i = 0; i < kGuestFormRows; ++i)
++                    if (CheckCollisionPointRec(mouse, rowRect(page, i)))
++                    {
+                         form.focus = i;
+-                if (CheckCollisionPointRec(mouse, button))
+-                    return true;
++                        if (i == 3)
++                            return true;
++                    }
+             }
+             return IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+         }
+ 
+-        void drawForm(const GuestFormScreen &form, const Rectangle (&boxes)[3], const Rectangle &button, int screenHeight)
++        HelpBar formHelp(HelpInput input)
+         {
+-            const Font &font = form.font;
+-            const auto text = [&](const char *s, float x, float y, float size, Color color)
+-            { DrawTextEx(font, s, Vector2{x, y}, size, 1.0f, color); };
+-            ClearBackground(Color{18, 22, 30, 255});
+-            text("FORMULA ONE 06 - JUEGO EN RED", 24, 16, 30, RAYWHITE);
+-            text("Invitado: juegas como jugador 2 en el PC del anfitrión, a pantalla partida. Ves y oyes su juego.", 24,
+-                 56, 19, LIGHTGRAY);
+-            static const char *const kLabels[3] = {"Dirección IP del anfitrión", "Puerto", "Contraseña"};
++            HelpBar bar;
++            if (input == HelpInput::Pad)
++            {
++                bar.left.push_back(HelpEntry{{padKey(PadIcon::DpadUp), padKey(PadIcon::DpadDown)}, "cambiar"});
++                bar.right.push_back(HelpEntry{{padKey(PadIcon::Cross)}, "conectar"});
++            }
++            else
++            {
++                bar.left.push_back(HelpEntry{{keyboardKey("TAB")}, "cambiar"});
++                bar.left.push_back(HelpEntry{{keyboardKey("CTRL"), keyboardKey("V")}, "pegar"});
++                bar.left.push_back(HelpEntry{{keyboardKey("F4")}, "ver contraseña"});
++                bar.right.push_back(HelpEntry{{keyboardKey("INTRO")}, "conectar"});
++            }
++            return bar;
++        }
++
++        void drawForm(const GuestFormScreen &form, const Page &page, HelpInput input, float &bandTop)
++        {
++            drawPage(page, kGuestTitle, kGuestSubtitle);
++            static const char *const kLabels[3] = {"Dirección del anfitrión", "Puerto", "Contraseña"};
+             const std::string *values[3] = {&form.fields.address, &form.fields.port, &form.fields.password};
+             const bool blink = static_cast<int>(GetTime() * 2.0) % 2 == 0;
+             for (int i = 0; i < 3; ++i)
+             {
+-                const Rectangle &box = boxes[i];
+-                text(kLabels[i], 24, box.y + 8, 22, RAYWHITE);
+-                DrawRectangleRec(box, form.focus == i ? Color{38, 56, 96, 255} : Color{30, 36, 50, 255});
+-                DrawRectangleLinesEx(box, 2, form.focus == i ? Color{120, 160, 240, 255} : Color{70, 80, 100, 255});
+                 std::string shown = i == 2 && !form.showPassword ? std::string(values[i]->size(), '*') : *values[i];
+                 if (form.focus == i && blink)
+                     shown += "_";
+-                text(shown.c_str(), box.x + 10, box.y + 8, 24, RAYWHITE);
+-            }
+-            DrawRectangleRec(button, Color{26, 64, 148, 255});
+-            DrawRectangleLinesEx(button, 2, Color{120, 160, 240, 255});
+-            const Vector2 size = MeasureTextEx(font, "Conectar", 24, 1.0f);
+-            text("Conectar", button.x + (button.width - size.x) * 0.5f, button.y + (button.height - size.y) * 0.5f, 24,
+-                 RAYWHITE);
+-            if (!form.error.empty())
+-            {
+-                const auto measure = [&](const std::string &s) { return MeasureTextEx(font, s.c_str(), 20, 1.0f).x; };
+-                const std::string error = wrapped(form.error, static_cast<float>(GetScreenWidth() - 48), measure);
+-                text(error.c_str(), 24, button.y + button.height + 18, 20, Color{255, 110, 110, 255});
+-            }
+-            text("Tab o flechas: cambiar de campo  ·  Intro: conectar  ·  Ctrl+V: pegar  ·  F4: ver la contraseña", 24,
+-                 static_cast<float>(screenHeight) - 92, 18, LIGHTGRAY);
+-            text("El anfitrión ve su dirección y la contraseña en OPCIONES > OPCIONES PC > JUEGO EN RED PC.", 24,
+-                 static_cast<float>(screenHeight) - 66, 18, LIGHTGRAY);
+-            text("Cierra la ventana para salir.", 24, static_cast<float>(screenHeight) - 36, 16, GRAY);
++                drawRow(page, i, kLabels[i], shown, form.focus == i, true);
++            }
++            // Where it connects: the address and port as validateGuestForm reads them (the password aside).
++            std::string target = "PULSA PARA CONECTAR";
++            if (!form.fields.address.empty())
++            {
++                GuestForm where = form.fields;
++                where.password = std::string(kMinPasswordSize, 'x');
++                GuestSettings chosen;
++                std::string ignored;
++                target = validateGuestForm(where, chosen, ignored) ? targetText(chosen.host, chosen.port)
++                                                                   : form.fields.address;
++            }
++            drawRow(page, 3, "Conectar", target, form.focus == 3, true);
++            const bool error = !form.error.empty();
++            drawTicker(page,
++                       error ? form.error
++                             : "El anfitrión ve su dirección y la contraseña en OPCIONES > OPCIONES PC > JUEGO EN RED PC.",
++                       error, bandTop);
++            drawBottom(page, formHelp(input), bandTop);
+         }
+ 
+         // PS2X_CAPTURA_PETICION=<file>, as in the game's window (ps2_runtime.cpp): when the file exists, the window as
+@@ -319,6 +664,16 @@ namespace ps2x::netplay
+         SetExitKey(KEY_NULL); // ESC may be one of the player's controls
+         SetTargetFPS(120);    // a new picture shows at most ~8 ms after it was decoded
+ 
++        // Ventana del invitado T2 (S1): the game's letter and pictures from the cache an earlier game run on this PC
++        // left; without them Segoe UI.
++        const size_t cached = loadGameFileCache(userCacheDirectory() / "juego");
++        if (cached > 0)
++            std::fprintf(stderr, "[red] invitado: letra y graficos del juego de la cache: %zu\n", cached);
++        else
++            std::fprintf(stderr, "[red] invitado: letra y graficos del juego de la cache: ninguno (Segoe UI)\n");
++        const Font font = loadFormFont();
++        const bool ownFont = font.texture.id != GetFontDefault().texture.id;
++
+         // N4: the form first when something is missing; the address and port of red.ini fill what the command line
+         // did not give.
+         GuestFormScreen form;
+@@ -331,13 +686,12 @@ namespace ps2x::netplay
+             form.fields.port = std::to_string(port);
+             form.fields.password = settings.password;
+             form.focus = !form.fields.address.empty() && form.fields.password.empty() ? 2 : 0;
+-            form.font = loadFormFont();
+-            form.ownFont = form.font.texture.id != GetFontDefault().texture.id;
+             std::fprintf(stderr, "[red] invitado: formulario de conexion%s\n",
+                          memory.address.empty() ? "" : " (direccion y puerto de red.ini)");
+             std::fflush(stderr);
+         }
+         std::unique_ptr<Guest> guest = std::make_unique<Guest>();
++        std::string target = targetText(settings.host, settings.port);
+         if (!inForm)
+             guest->start(settings);
+         // N3: the host's sound. The automated runs (background window) keep it silent so they do not play over the
+@@ -372,6 +726,9 @@ namespace ps2x::netplay
+         double soundMessageUntil = 0.0;
+         PSPadBackend pad;
+         uint8_t report[32] = {};
++        uint16_t padBefore = 0; // S2: the pad's buttons the frame before, for press edges in the form and back to it
++        HelpInputMemory helpInput;
++        float bandTop = kGameFrameHeight - kHelpBarBorderHeight;
+         GuestState lastState = GuestState::Idle;
+         Texture2D picture{};
+         RenderTexture2D canvas{};
+@@ -387,14 +744,34 @@ namespace ps2x::netplay
+                 canvas = LoadRenderTexture(screenWidth, screenHeight);
+             }
+ 
+-            // A session that ended: Enter goes back to the form, the fields as they were and what went wrong under them.
+-            // That Enter must not also send the form: raylib only sees it released after the next drawn frame.
++            // S2: the pad every frame. Its edges are ignored while a keyboard key is down: controles.ini may map keys to
++            // its buttons. The help bar shows the controls used last.
++            pad.readState(0, 0, report, sizeof(report));
++            const PadWire wire = padWireFromReport(report);
++            const uint16_t before = padBefore;
++            padBefore = wire.pressed;
++            bool keyboardBusy = false;
++            for (int key = KEY_SPACE; key <= KEY_KB_MENU && !keyboardBusy; ++key)
++                keyboardBusy = IsKeyDown(key);
++            bool keyboardUsed = false;
++            while (GetKeyPressed() != 0)
++                keyboardUsed = true;
++            if (keyboardUsed)
++                helpInput = HelpInputMemory{true, HelpInput::Keyboard};
++            else if (!keyboardBusy && (wire.pressed & ~before) != 0u)
++                helpInput = HelpInputMemory{true, HelpInput::Pad};
++            const HelpInput shownInput = helpInputShown(helpInput, IsGamepadAvailable(0));
++            const Page page = pageFor(font);
++
++            // A session that ended: Enter or the cross goes back to the form, the fields as they were and what went
++            // wrong under them. That Enter or cross must not also send the form: raylib only sees Enter released after
++            // the next drawn frame, and the cross's edge is gone by then.
+             bool returning = false;
+-            if (askFirst && !inForm && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)))
++            if (askFirst && !inForm &&
++                guestFormReturn(IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER), wire.pressed, before, keyboardBusy))
+             {
+                 const GuestStatus ended = guest->status();
+-                if (ended.state == GuestState::Rejected || ended.state == GuestState::Disconnected ||
+-                    ended.state == GuestState::Failed)
++                if (sessionEnded(ended.state))
+                 {
+                     form.error = ended.text;
+                     inForm = true;
+@@ -407,9 +784,11 @@ namespace ps2x::netplay
+ 
+             if (inForm)
+             {
+-                const Rectangle boxes[3] = {{330, 100, 400, 44}, {330, 156, 160, 44}, {330, 212, 400, 44}};
+-                const Rectangle button{330, 276, 200, 48};
+-                if (updateForm(form, boxes, button) && !returning)
++                bool connect = updateForm(form, page);
++                const GuestFormPad padStep = guestFormPad(form.focus, wire.pressed, before, keyboardBusy);
++                form.focus = padStep.focus;
++                connect = connect || padStep.connect;
++                if (connect && !returning)
+                 {
+                     GuestSettings chosen;
+                     if (validateGuestForm(form.fields, chosen, form.error))
+@@ -429,6 +808,7 @@ namespace ps2x::netplay
+                         guest->setAudioVolume(volume);
+                         guest->setAudioMuted(muted);
+                         guest->start(chosen);
++                        target = targetText(chosen.host, chosen.port);
+                         if (soundReady)
+                             g_audioGuest.store(guest.get(), std::memory_order_release);
+                         lastState = GuestState::Idle;
+@@ -446,7 +826,7 @@ namespace ps2x::netplay
+                 if (inForm)
+                 {
+                     BeginTextureMode(canvas);
+-                    drawForm(form, boxes, button, screenHeight);
++                    drawForm(form, page, shownInput, bandTop);
+                     EndTextureMode();
+                     saveRequestedCapture(canvas);
+                     BeginDrawing();
+@@ -459,8 +839,6 @@ namespace ps2x::netplay
+                 }
+             }
+ 
+-            pad.readState(0, 0, report, sizeof(report));
+-            const PadWire wire = padWireFromReport(report);
+             guest->setPad(wire);
+             const GuestStatus status = guest->status();
+             if (status.state != lastState)
+@@ -544,7 +922,7 @@ namespace ps2x::netplay
+                 }
+             }
+             else
+-                drawStatus(status, wire, screenHeight, askFirst);
++                drawStatus(page, status, wire, target, askFirst, shownInput, bandTop);
+             if (GetTime() < soundMessageUntil)
+             {
+                 const char *message = guest->audioMuted()
+@@ -574,8 +952,8 @@ namespace ps2x::netplay
+             UnloadAudioStream(sound);
+         }
+         CloseAudioDevice();
+-        if (form.ownFont)
+-            UnloadFont(form.font);
++        if (ownFont)
++            UnloadFont(font);
+         if (g_guestWav)
+         {
+             std::fclose(g_guestWav);
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.cpp b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+index 25de940..81b5097 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.cpp
+@@ -161,6 +161,36 @@ namespace ps2x::netplay
+         return true;
+     }
+ 
++    namespace
++    {
++        constexpr uint16_t kPadUp = 1u << 4, kPadDown = 1u << 6, kPadCross = 1u << 14;
++
++        bool padEdge(uint16_t pressed, uint16_t before, uint16_t button)
++        {
++            return (pressed & button) != 0u && (before & button) == 0u;
++        }
++    }
++
++    GuestFormPad guestFormPad(int focus, uint16_t pressed, uint16_t before, bool keyboardBusy)
++    {
++        GuestFormPad out{focus, false, false};
++        if (keyboardBusy)
++            return out;
++        const bool up = padEdge(pressed, before, kPadUp), down = padEdge(pressed, before, kPadDown);
++        if (down && !up)
++            out.focus = (focus + 1) % kGuestFormRows;
++        if (up && !down)
++            out.focus = (focus + kGuestFormRows - 1) % kGuestFormRows;
++        out.connect = padEdge(pressed, before, kPadCross);
++        out.used = up || down || out.connect;
++        return out;
++    }
++
++    bool guestFormReturn(bool enterPressed, uint16_t pressed, uint16_t before, bool keyboardBusy)
++    {
++        return enterPressed || (!keyboardBusy && padEdge(pressed, before, kPadCross));
++    }
++
+     GuestMemory rememberedFrom(const GuestSettings &settings)
+     {
+         return {settings.host, settings.port};
+diff --git a/ps2xRuntime/src/lib/ps2_netplay_session.h b/ps2xRuntime/src/lib/ps2_netplay_session.h
+index 0c94ae6..c88323a 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay_session.h
++++ b/ps2xRuntime/src/lib/ps2_netplay_session.h
+@@ -44,6 +44,22 @@ namespace ps2x::netplay
+     };
+     bool validateGuestForm(const GuestForm &form, GuestSettings &settings, std::string &error);
+ 
++    // Ventana del invitado T2 (S2): the pad in the guest's window, from PadWire.pressed now and the frame before (bit 4
++    // up, bit 6 down, bit 14 cross, 1 = pressed). Only press edges count, and nothing while a keyboard key is down
++    // (controles.ini may map keys to the pad's buttons: no double steps, no connecting while typing). Up and down move
++    // the focus over the form's rows (address, port, password, connect), wrapping; the cross connects from any row.
++    // used: the pad did something (for the help bar's controls).
++    inline constexpr int kGuestFormRows = 4;
++    struct GuestFormPad
++    {
++        int focus = 0;
++        bool connect = false;
++        bool used = false;
++    };
++    GuestFormPad guestFormPad(int focus, uint16_t pressed, uint16_t before, bool keyboardBusy);
++    // A session that ended goes back to the form with Enter or the cross's press edge (not while a key is down).
++    bool guestFormReturn(bool enterPressed, uint16_t pressed, uint16_t before, bool keyboardBusy);
++
+     // config\red.ini of the guest: the last address and port that connected. Never the password.
+     struct GuestMemory
+     {
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 9964cb1..e4295b4 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_options.h"
+ #include "lib/ps2_netplay.h" // Fase 5 (T15): private to the runtime, next to this file
+ #include "lib/ps2_netplay_session.h"
++#include "lib/ps2_game_font.h"
+ #include "ps2_user_paths.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+@@ -458,6 +459,10 @@ int main(int argc, char *argv[])
+             std::cerr.flush();
+             std::_Exit(1);
+         }
++        // Ventana del invitado T1: the game's letters and pictures as it reads them go to the cache too, for the guest's
++        // window of this PC (which reads them back instead).
++        if (!guestMode && !userPaths.cacheDirectory.empty())
++            ps2x::setGameFileCache(userPaths.cacheDirectory / "juego");
+         if (guestMode)
+         {
+             const int code = ps2x::netplay::runGuestWindow({netplay.hostAddress, netplay.port, netplay.password},
+diff --git a/ps2xTest/src/ps2_game_font_tests.cpp b/ps2xTest/src/ps2_game_font_tests.cpp
+index 2debc4e..6ca1d1b 100644
+--- a/ps2xTest/src/ps2_game_font_tests.cpp
++++ b/ps2xTest/src/ps2_game_font_tests.cpp
+@@ -1,12 +1,16 @@
+ #include "MiniTest.h"
+ #include "ps2_display.h"
+ #include "ps2_game_font.h"
++#include "ps2_game_graphics.h"
+ #include "ps2_host_overlay.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ 
+ #include <cmath>
+ #include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <limits>
+ #include <string>
+ #include <vector>
+@@ -285,6 +289,63 @@ void register_ps2_game_font_tests()
+             t.IsFalse(ps2x::gameFontFile("Fonts/test-b.bft", bytes, version), "another name is apart");
+         });
+ 
++        // Ventana del invitado T1 (S1): the copy on disk the guest's window reads.
++        tc.Run("game file cache: only the names of the game's letters and pictures", [](TestCase &t)
++        {
++            for (const char *good : {"Fonts/eurostyleSmallPx.bft", "Frontend/Textures/Btn_Grey_End.pct",
++                                     "FrontEnd/Textures/Btn_Cross.PCT", "a.bft"})
++                t.IsTrue(ps2x::gameFileCacheName(good), std::string("accepted: ") + good);
++            for (const char *bad : {"", ".bft", "Fonts/", "Fonts/a.txt", "Fonts/a.bft.tmp", "../a.bft",
++                                    "Fonts/../../a.bft", "Fonts/./a.bft", "/Fonts/a.bft", "C:/a.bft", "Fonts\\a.bft",
++                                    "Fonts//a.bft", "a:b.bft", "Fonts/a\x01.bft"})
++                t.IsFalse(ps2x::gameFileCacheName(bad), std::string("refused: ") + bad);
++        });
++
++        tc.Run("game file cache: written when the store gets new bytes, read back by the guest", [](TestCase &t)
++        {
++            namespace fs = std::filesystem;
++            const fs::path dir = fs::temp_directory_path() / "ps2x-test-cache-juego";
++            std::error_code error;
++            fs::remove_all(dir, error);
++            const auto readFile = [](const fs::path &path)
++            {
++                std::ifstream in(path, std::ios::binary);
++                return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++            };
++
++            ps2x::setGameFileCache(dir);
++            t.IsTrue(ps2x::storeGameFontFile("Fonts/cache-a.bft", {7u, 8u, 9u}), "stored");
++            t.IsTrue(readFile(dir / "Fonts" / "cache-a.bft") == std::vector<uint8_t>{7u, 8u, 9u}, "written to disk");
++            t.IsFalse(fs::exists(dir / "Fonts" / "cache-a.bft.tmp"), "no temporary file left");
++            t.IsTrue(ps2x::storeGameFontFile("Fonts/cache-a.bft", {1u}), "other bytes");
++            t.IsTrue(readFile(dir / "Fonts" / "cache-a.bft") == std::vector<uint8_t>{1u}, "the copy follows them");
++            t.IsTrue(ps2x::storeGameTextureFile("frontend/textures/btn_cross.pct", {5u}), "a picture");
++            t.IsTrue(readFile(dir / "FrontEnd" / "Textures" / "Btn_Cross.pct") == std::vector<uint8_t>{5u},
++                     "under the list's spelling");
++            t.IsTrue(ps2x::storeGameFontFile("../cache-out.bft", {2u}), "an odd name is still stored in memory");
++            t.IsFalse(fs::exists(dir.parent_path() / "cache-out.bft"), "but never written outside the folder");
++            ps2x::setGameFileCache({});
++            t.IsTrue(ps2x::storeGameFontFile("Fonts/cache-b.bft", {3u}), "stored without a folder");
++            t.IsFalse(fs::exists(dir / "Fonts" / "cache-b.bft"), "without a folder nothing is written");
++
++            // The guest's process: what is in the folder goes into the store (pictures under the list's spelling).
++            fs::create_directories(dir / "Fonts");
++            fs::create_directories(dir / "frontend" / "textures");
++            { std::ofstream(dir / "Fonts" / "cache-load.bft", std::ios::binary) << "LETRA"; }
++            { std::ofstream(dir / "frontend" / "textures" / "btn_grey_mid.pct", std::ios::binary) << "TECLA"; }
++            { std::ofstream(dir / "Fonts" / "notas.txt", std::ios::binary) << "no"; }
++            t.Equals(ps2x::loadGameFileCache(dir), static_cast<size_t>(4), "the four letters and pictures, not the note");
++            std::vector<uint8_t> bytes;
++            uint32_t version = 0u;
++            t.IsTrue(ps2x::gameFontFile("Fonts/cache-load.bft", bytes, version), "a letter loaded");
++            t.IsTrue(bytes == std::vector<uint8_t>{'L', 'E', 'T', 'R', 'A'}, "its bytes");
++            t.IsTrue(ps2x::gameTextureFile(ps2x::kKeyCapMidFile, bytes, version), "a picture loaded");
++            t.IsTrue(bytes == std::vector<uint8_t>{'T', 'E', 'C', 'L', 'A'}, "its bytes");
++            t.IsFalse(ps2x::gameFontFile("Fonts/notas.txt", bytes, version), "the note is not");
++            t.Equals(ps2x::loadGameFileCache(dir / "no-existe"), static_cast<size_t>(0), "no folder: nothing");
++            fs::remove_all(dir, error);
++        });
++
+         tc.Run("which game letter for a text size, and the fallback", [](TestCase &t)
+         {
+             const std::vector<int> heights = {15, 20, 25}; // Small, Medium, Large
+diff --git a/ps2xTest/src/ps2_netplay_tests.cpp b/ps2xTest/src/ps2_netplay_tests.cpp
+index b1ba8a5..529ca17 100644
+--- a/ps2xTest/src/ps2_netplay_tests.cpp
++++ b/ps2xTest/src/ps2_netplay_tests.cpp
+@@ -1734,6 +1734,67 @@ void register_ps2_netplay_tests()
+             }
+         });
+ 
++        // Ventana del invitado T2 (S2): the pad in the guest's window. PadWire.pressed: bit 4 up, bit 6 down, bit 14
++        // cross, 1 = pressed.
++        constexpr uint16_t kUp = 1u << 4, kDown = 1u << 6, kCross = 1u << 14;
++
++        tc.Run("guest form pad: up and down move the focus on the press edge, wrapping over the 4 rows", [=](TestCase &t)
++        {
++            t.Equals(kGuestFormRows, 4, "address, port, password and connect");
++            GuestFormPad r = guestFormPad(0, kDown, 0u, false);
++            t.IsTrue(r.focus == 1 && !r.connect && r.used, "down: the next row");
++            r = guestFormPad(3, kDown, 0u, false);
++            t.IsTrue(r.focus == 0 && !r.connect && r.used, "down from the last row: the first");
++            r = guestFormPad(2, kUp, 0u, false);
++            t.IsTrue(r.focus == 1 && !r.connect && r.used, "up: the row before");
++            r = guestFormPad(0, kUp, 0u, false);
++            t.IsTrue(r.focus == 3 && !r.connect && r.used, "up from the first row: the last");
++            r = guestFormPad(1, kDown, kDown, false);
++            t.IsTrue(r.focus == 1 && !r.connect && !r.used, "down held: nothing");
++            r = guestFormPad(1, kUp, kUp, false);
++            t.IsTrue(r.focus == 1 && !r.connect && !r.used, "up held: nothing");
++            r = guestFormPad(2, 0u, kDown, false);
++            t.IsTrue(r.focus == 2 && !r.connect && !r.used, "released: nothing");
++            r = guestFormPad(2, 0u, 0u, false);
++            t.IsTrue(r.focus == 2 && !r.connect && !r.used, "nothing pressed: nothing");
++            r = guestFormPad(1, kUp | kDown, 0u, false);
++            t.IsTrue(r.focus == 1 && r.used, "up and down together: they cancel");
++        });
++
++        tc.Run("guest form pad: the cross connects on its press edge from any row", [=](TestCase &t)
++        {
++            for (int focus = 0; focus < kGuestFormRows; ++focus)
++            {
++                const GuestFormPad r = guestFormPad(focus, kCross, 0u, false);
++                t.IsTrue(r.connect && r.used && r.focus == focus, "cross: connect, focus kept, row " + std::to_string(focus));
++            }
++            GuestFormPad r = guestFormPad(3, kCross, kCross, false);
++            t.IsTrue(!r.connect && !r.used && r.focus == 3, "cross held: nothing");
++            r = guestFormPad(0, kCross | kDown, kDown, false);
++            t.IsTrue(r.connect && r.focus == 0, "cross pressed while down is held: connect only");
++        });
++
++        tc.Run("guest form pad: nothing while a keyboard key is down", [=](TestCase &t)
++        {
++            for (const uint16_t pressed : {kUp, kDown, kCross, static_cast<uint16_t>(kUp | kCross)})
++            {
++                const GuestFormPad r = guestFormPad(2, pressed, 0u, true);
++                t.IsTrue(r.focus == 2 && !r.connect && !r.used, "keyboard busy: ignored " + std::to_string(pressed));
++            }
++            t.IsFalse(guestFormReturn(false, kCross, 0u, true), "keyboard busy: the cross does not return");
++        });
++
++        tc.Run("guest window: back to the form with Enter or the cross's press edge", [=](TestCase &t)
++        {
++            t.IsTrue(guestFormReturn(true, 0u, 0u, false), "Enter");
++            t.IsTrue(guestFormReturn(true, 0u, 0u, true), "Enter while keys are down (it is one of them)");
++            t.IsTrue(guestFormReturn(false, kCross, 0u, false), "cross pressed");
++            t.IsFalse(guestFormReturn(false, kCross, kCross, false), "cross held: not again");
++            t.IsFalse(guestFormReturn(false, 0u, kCross, false), "cross released");
++            t.IsFalse(guestFormReturn(false, kUp | kDown, 0u, false), "other buttons");
++            t.IsFalse(guestFormReturn(false, 0u, 0u, false), "nothing");
++        });
++
+         tc.Run("red.ini keeps the last address and port, never the password", [](TestCase &t)
+         {
+             const GuestSettings settings{"192.168.1.40", 50700, "SECRETO99"};

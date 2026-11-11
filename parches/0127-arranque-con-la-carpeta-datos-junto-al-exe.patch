@@ -1,0 +1,284 @@
+diff --git a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+index 414d8d7..44c61e6 100644
+--- a/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
++++ b/ps2xIOP/include/ps2x/iop/ps2_iso_image.h
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -348,4 +349,49 @@ namespace ps2x::iop
+             name = name.substr(0u, semicolon);
+         return std::string(name);
+     }
++
++    // The regular file in `directory` whose name equals `name` ignoring ASCII case, with its on-disk name.
++    inline std::optional<std::filesystem::path> findFileIgnoringCase(const std::filesystem::path &directory,
++                                                                     std::string_view name)
++    {
++        const auto equalsIgnoringCase = [](std::string_view left, std::string_view right)
++        {
++            return left.size() == right.size() &&
++                   std::equal(left.begin(), left.end(), right.begin(), [](unsigned char a, unsigned char b)
++                              { return std::toupper(a) == std::toupper(b); });
++        };
++        std::error_code error;
++        for (const auto &entry : std::filesystem::directory_iterator(directory, error))
++        {
++            if (entry.is_regular_file(error) && equalsIgnoringCase(entry.path().filename().string(), name))
++                return entry.path();
++        }
++        return std::nullopt;
++    }
++
++    // Folder mode of a packaged game: the disc files extracted into a "datos" folder next to the .exe.
++    struct DataFolderBoot
++    {
++        std::filesystem::path dataDirectory;
++        std::filesystem::path elfPath;
++        std::string boot2;
++    };
++
++    // `exeDirectory`/datos with a SYSTEM.CNF whose BOOT2 ELF is in that folder (both names in any case).
++    inline std::optional<DataFolderBoot> findDataFolderBoot(const std::filesystem::path &exeDirectory)
++    {
++        const std::filesystem::path dataDirectory = exeDirectory / "datos";
++        const std::optional<std::filesystem::path> systemCnf = findFileIgnoringCase(dataDirectory, "SYSTEM.CNF");
++        if (!systemCnf)
++            return std::nullopt;
++        std::ifstream stream(*systemCnf, std::ios::binary);
++        const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
++        const std::optional<std::string> boot2 = parseSystemCnfBoot2(text);
++        if (!boot2)
++            return std::nullopt;
++        const std::optional<std::filesystem::path> elf = findFileIgnoringCase(dataDirectory, bootElfName(*boot2));
++        if (!elf)
++            return std::nullopt;
++        return DataFolderBoot{dataDirectory, *elf, *boot2};
++    }
+ }
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 936c464..0cbaad6 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -361,7 +361,9 @@ public:
+ 
+     static const IoPaths &getIoPaths();
+     static void setIoPaths(const IoPaths &paths);
+-    static void configureIoPathsFromElf(const std::string &elfPath);
++    // A non-empty cardDirectory puts mc0/mc1 there instead of next to the ELF (PS2X_TARJETAS still wins).
++    static void configureIoPathsFromElf(const std::string &elfPath,
++                                        const std::filesystem::path &cardDirectory = {});
+     // Image mode: the disc is the ISO at imageOffset inside imagePath; host:, mc0/mc1 live in baseDirectory.
+     static void configureIoPathsForImage(const std::filesystem::path &imagePath,
+                                          uint64_t imageOffset,
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 621eeb3..25008e5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1239,7 +1239,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     syncSharedCdImage(normalized.cdImage, normalized.cdImageOffset);
+ }
+ 
+-void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
++void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath, const std::filesystem::path &cardDirectory)
+ {
+     IoPaths paths = runtimeIoPaths();
+     paths.elfPath = normalizeAbsolutePath(std::filesystem::path(elfPath));
+@@ -1254,6 +1254,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.cdRoot = paths.elfDirectory;
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
++    // Packaged game: the disc files are in datos\ but the cards live next to the .exe.
++    if (!cardDirectory.empty())
++    {
++        paths.mcRoot = cardDirectory / "mc0";
++    }
+ 
+     // PS2X_TARJETAS=<dir>: memory cards in <dir>/mc0 and <dir>/mc1 (tests keep the user's cards untouched).
+     if (const char *cards = std::getenv("PS2X_TARJETAS"); cards && *cards)
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index c631d02..8125dad 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -16,6 +16,8 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstdint>
++#include <fstream>
++#include <iterator>
+ #include <vector>
+ 
+ #if defined(__ANDROID__)
+@@ -171,16 +173,18 @@ namespace
+         return extension == ".iso";
+     }
+ 
+-    // Where the game comes from: an ELF file (folder mode) or an ISO image (image mode).
++    // Where the game comes from: an ELF file (folder mode) or an ISO image (image mode). A non-empty
++    // cardDirectory (the datos folder next to the .exe) keeps the memory cards there instead of next to the ELF.
+     struct BootSource
+     {
+         std::filesystem::path elfPath;
+         std::filesystem::path imagePath;
+         uint64_t imageOffset = 0u;
++        std::filesystem::path cardDirectory;
+     };
+ 
+-    // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, an ISO appended to the .exe,
+-    // exactly one .iso next to the .exe, PS2X_DEFAULT_BOOT_ELF.
++    // Priority: argv[1] (an .iso is an image, anything else an ELF), PS2X_ISO, a datos folder next to the .exe,
++    // an ISO appended to the .exe, exactly one .iso next to the .exe, PS2X_DEFAULT_BOOT_ELF.
+     BootSource chooseBootSource(int argc, char *argv[], const std::filesystem::path &executable)
+     {
+         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+@@ -202,6 +206,14 @@ namespace
+         }
+         if (!executable.empty())
+         {
++            if (const std::optional<ps2x::iop::DataFolderBoot> data =
++                    ps2x::iop::findDataFolderBoot(executable.parent_path()))
++            {
++                std::cout << "[arranque] carpeta datos junto al .exe: " << data->dataDirectory.string() << " (ELF "
++                          << data->elfPath.filename().string() << ")" << std::endl;
++                return {data->elfPath, {}, 0u, executable.parent_path()};
++            }
++
+             if (const std::optional<ps2x::iop::AppendedIso> appended = ps2x::iop::findAppendedIso(executable))
+             {
+                 std::cout << "[arranque] ISO pegada al .exe (desplazamiento=" << appended->offset << ")" << std::endl;
+@@ -307,6 +319,19 @@ int main(int argc, char *argv[])
+             elfBytes = prepareImageBoot(boot, baseDirectory, elfName);
+             filePathStr = elfName;
+         }
++        else if (!boot.cardDirectory.empty())
++        {
++            PS2Runtime::configureIoPathsFromElf(filePathStr, boot.cardDirectory);
++            std::ifstream file(boot.elfPath, std::ios::binary);
++            if (file)
++            {
++                elfBytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++            }
++            if (elfBytes.empty())
++            {
++                throw std::runtime_error("Unable to read the ELF: " + filePathStr);
++            }
++        }
+         std::string normalizedId = normalizeGameId(elfName);
+ 
+         std::string windowTitle = "PS2-Recomp | ";
+@@ -350,7 +375,9 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
+-        const bool loaded = boot.imagePath.empty() ? runtime.loadELF(filePathStr) : runtime.loadELF(elfBytes, elfName);
++        // Folder mode reads the ELF itself (and sets the I/O paths); image and datos modes already did both.
++        const bool loaded = elfBytes.empty() ? runtime.loadELF(filePathStr)
++                                             : runtime.loadELF(elfBytes, boot.imagePath.empty() ? filePathStr : elfName);
+         if (!loaded)
+         {
+             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
+diff --git a/ps2xTest/src/ps2_iso_image_tests.cpp b/ps2xTest/src/ps2_iso_image_tests.cpp
+index eda85b8..3d4f1bc 100644
+--- a/ps2xTest/src/ps2_iso_image_tests.cpp
++++ b/ps2xTest/src/ps2_iso_image_tests.cpp
+@@ -791,5 +791,96 @@ void register_ps2_iso_image_tests()
+             t.IsFalse(ps2x::iop::detail::IopModuleLoader::readWholeHostFile(host, "cdrom0:\\DIR\\NOPE.IRX;1", bytes),
+                       "a missing module fails");
+         });
++
++        tc.Run("findDataFolderBoot finds the BOOT2 ELF in the datos folder next to the .exe", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::filesystem::path data = dir.path / "datos";
++            std::filesystem::create_directories(data);
++            const std::string cnf = "BOOT2 = cdrom0:\\SCES_539.50;1\r\nVER = 1.00\r\nVMODE = PAL\r\n";
++            writeFile(data / "SYSTEM.CNF", std::vector<uint8_t>(cnf.begin(), cnf.end()));
++            writeFile(data / "SCES_539.50", std::vector<uint8_t>(16u, 'E'));
++
++            const std::optional<ps2x::iop::DataFolderBoot> found = ps2x::iop::findDataFolderBoot(dir.path);
++            t.IsTrue(found.has_value(), "a datos folder with SYSTEM.CNF and the ELF is found");
++            if (found)
++            {
++                t.Equals(found->dataDirectory.lexically_normal().string(), data.lexically_normal().string(),
++                         "the data directory is <exe dir>/datos");
++                t.Equals(found->elfPath.lexically_normal().string(), (data / "SCES_539.50").lexically_normal().string(),
++                         "the ELF is the BOOT2 file inside datos");
++                t.Equals(found->boot2, std::string("cdrom0:\\SCES_539.50;1"), "the BOOT2 value is kept");
++            }
++        });
++
++        tc.Run("findDataFolderBoot matches the ELF name case-insensitively", [](TestCase &t)
++        {
++            TempDir dir;
++            const std::filesystem::path data = dir.path / "datos";
++            std::filesystem::create_directories(data);
++            const std::string cnf = "BOOT2 = cdrom0:\\SCES_539.50;1\r\n";
++            writeFile(data / "system.cnf", std::vector<uint8_t>(cnf.begin(), cnf.end()));
++            writeFile(data / "sces_539.50", std::vector<uint8_t>(16u, 'E'));
++
++            const std::optional<ps2x::iop::DataFolderBoot> found = ps2x::iop::findDataFolderBoot(dir.path);
++            t.IsTrue(found.has_value(), "lower-case system.cnf and ELF names are found");
++            if (found)
++            {
++                t.Equals(found->elfPath.filename().string(), std::string("sces_539.50"),
++                         "the ELF path uses the name stored on disk");
++            }
++        });
++
++        tc.Run("findDataFolderBoot rejects folders without SYSTEM.CNF or without the ELF", [](TestCase &t)
++        {
++            TempDir dir;
++            t.IsFalse(ps2x::iop::findDataFolderBoot(dir.path).has_value(), "no datos folder is not found");
++
++            const std::filesystem::path data = dir.path / "datos";
++            std::filesystem::create_directories(data);
++            writeFile(data / "SCES_539.50", std::vector<uint8_t>(16u, 'E'));
++            t.IsFalse(ps2x::iop::findDataFolderBoot(dir.path).has_value(), "datos without SYSTEM.CNF is not found");
++
++            const std::string cnf = "BOOT2 = cdrom0:\\SLES_000.01;1\r\n";
++            writeFile(data / "SYSTEM.CNF", std::vector<uint8_t>(cnf.begin(), cnf.end()));
++            t.IsFalse(ps2x::iop::findDataFolderBoot(dir.path).has_value(),
++                      "SYSTEM.CNF naming a missing ELF is not found");
++
++            const std::string noBoot = "VER = 1.00\r\n";
++            writeFile(data / "SYSTEM.CNF", std::vector<uint8_t>(noBoot.begin(), noBoot.end()));
++            t.IsFalse(ps2x::iop::findDataFolderBoot(dir.path).has_value(), "SYSTEM.CNF without BOOT2 is not found");
++        });
++
++        tc.Run("Data folder I/O paths: CD root in datos, cards next to the .exe", [](TestCase &t)
++        {
++            IoPathsGuard guard;
++            TempDir dir;
++            const std::filesystem::path elf = dir.path / "datos" / "SCES_539.50";
++            const std::string dataText = std::filesystem::absolute(dir.path / "datos").lexically_normal().string();
++
++            _putenv_s("PS2X_TARJETAS", "");
++            _putenv_s("PS2X_ISO", "");
++            PS2Runtime::configureIoPathsFromElf(elf.string(), dir.path);
++            const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
++            t.Equals(paths.cdRoot.lexically_normal().string(), dataText, "the CD root is datos");
++            t.Equals(paths.hostRoot.lexically_normal().string(), dataText, "host: is datos");
++            t.Equals(paths.mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(dir.path) / "mc0").lexically_normal().string(),
++                     "the memory card sits next to the .exe");
++            t.IsTrue(paths.cdImage.empty(), "the folder mode has no CD image");
++
++            const std::filesystem::path cards = dir.path / "cards";
++            _putenv_s("PS2X_TARJETAS", cards.string().c_str());
++            PS2Runtime::configureIoPathsFromElf(elf.string(), dir.path);
++            _putenv_s("PS2X_TARJETAS", "");
++            t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(cards) / "mc0").lexically_normal().string(),
++                     "PS2X_TARJETAS still moves the cards in the data folder mode");
++
++            PS2Runtime::configureIoPathsFromElf(elf.string());
++            t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
++                     (std::filesystem::absolute(dir.path / "datos") / "mc0").lexically_normal().string(),
++                     "without a card directory the card stays next to the ELF");
++        });
+     });
+ }

@@ -1,0 +1,393 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_intc_queue.h b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+index e3ff905..f158ebd 100644
+--- a/ps2xRuntime/include/runtime/ps2_intc_queue.h
++++ b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+@@ -11,4 +11,24 @@ constexpr uint32_t kPs2QueuedIntcCauseFlag = 0x80000000u;
+ constexpr uint32_t kPs2IntcCauseVif0 = 4u;
+ constexpr uint32_t kPs2IntcCauseVif1 = 5u;
+ 
++// VIF1 stall after a VIFcode with the 'i' bit, until VIF1_FBRST.STC (ps2_vif1_interpreter.cpp).
++bool ps2Vif1IsStalled();
++bool ps2Vif1HasStalledData();
++void ps2Vif1SetDmaEndPending();
++bool ps2Vif1TakeDmaEndPending();
++// Hands out the data waiting behind the stall (it stays owned by the interpreter) and clears the stall.
++bool ps2Vif1TakeStall(const uint8_t *&data, uint32_t &size);
++void ps2Vif1ReleaseStallData();
++void ps2Vif1ResetStall();
++
++// A DMA completion or a hardware INTC cause was queued (ps2_memory.cpp). The EE scheduler then stops at its next
++// checkpoint and dispatches it: a guest loop that only reads (waiting for an interrupt) never reaches the drain that
++// follows guest stores, so the interrupt waited for a timeout.
++bool ps2DmacCausePending();
++bool ps2TakeDmacCausePending();
++
++// Debug (F1 06): record and dump the last VIF1 'i' bits with their mark (ps2_vif1_interpreter.cpp).
++void ps2DebugNoteVif1Irq(uint32_t cmd, uint32_t mark);
++void ps2DebugDumpVif1Irqs();
++
+ #endif // PS2_INTC_QUEUE_H
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 46341ce..c09970c 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
++#include "runtime/ps2_intc_queue.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -374,7 +375,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     accountCycles(cycles);
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+-        m_stopRequested.load(std::memory_order_acquire))
++        m_stopRequested.load(std::memory_order_acquire) ||
++        ps2DmacCausePending())
+     {
+         return true;
+     }
+@@ -1791,6 +1793,10 @@ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
+     processDueDeadlines();
++    // DMA completions and hardware INTC causes (VIF 'i' bits) queued since the last guest store: deliver them now,
++    // so a guest loop that only reads (waiting for that interrupt) sees it.
++    if (ps2TakeDmacCausePending())
++        m_runtime.drainCompletedDmacHandlers(m_rdram);
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+     for (uint32_t timer = 0u; timer < 4u; ++timer)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 80408fb..f259e3f 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "runtime/ps2_intc_queue.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <cstring>
+@@ -1232,12 +1233,37 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
+                 m_path3Masked = false;
++                ps2Vif1ResetStall();
+                 if (wasPath3Masked)
+                     flushMaskedPath3Packets();
+             }
+             if (value & 0x8u) // STC
+             {
+                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
++                // Resume the VIF1 after an 'i' bit stall. The rest of the packet may stall again; the DMA that
++                // carried it ends once nothing is left behind the stall.
++                const uint8_t *remainder = nullptr;
++                uint32_t remainderSize = 0u;
++                if (ps2Vif1TakeStall(remainder, remainderSize))
++                {
++                    if (remainderSize != 0u)
++                        processVIF1Data(remainder, remainderSize);
++                    ps2Vif1ReleaseStallData();
++                    if (!ps2Vif1HasStalledData() && ps2Vif1TakeDmaEndPending())
++                    {
++                        constexpr uint32_t kDStat = 0x1000E010u;
++                        uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
++                        dstat |= 1u << 1u; // CIS1
++                        if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
++                            dstat |= 1u << 31;
++                        else
++                            dstat &= ~(1u << 31);
++                        m_ioRegisters[kDStat] = dstat;
++                        queueCompletedDmacCause(1u);
++                        m_ioRegisters[0x10009000u] &= ~0x100u;
++                        m_ioRegisters[0x10009020u] = 0u;
++                    }
++                }
+             }
+             break;
+         case 0x10003C30u:
+@@ -1330,6 +1356,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         m_pendingVif0Transfers.push_back(pt);
+                 };
+ 
++                // A DMA ends (and raises its channel interrupt) even when it moves no data, e.g. a chain that starts
++                // at an END tag with QWC=0: F1 06 restarts its PATH3 texture chain like that and waits for the GIF
++                // interrupt to resume the VIF1. An empty transfer below makes processPendingTransfers signal it.
++                auto &channelTransfers = channelBase == 0x1000A000u   ? m_pendingGifTransfers
++                                         : channelBase == 0x10009000u ? m_pendingVif1Transfers
++                                                                      : m_pendingVif0Transfers;
++                const size_t transfersBefore = channelTransfers.size();
++
+                 uint32_t chcr = value;
+                 uint32_t mode = (chcr >> 2) & 0x3;
+ 
+@@ -1344,7 +1378,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Only a guard against looping chains: hardware has no limit, and a race in F1 06 sends VIF1
++                    // chains with more than 4096 tags (cutting them lost the end-of-packet mark).
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1521,6 +1557,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static uint32_t s_cutChains = 0u;
++                        if (s_cutChains++ < 10u)
++                            std::cerr << "[dma] chain cut after " << tagsProcessed << " tags: channel=0x" << std::hex
++                                      << channelBase << " tadr=0x" << tagAddr << std::dec << std::endl;
++                    }
++                    {
++                        // Debug (F1 06): longest chain seen per channel, to size the guard above.
++                        static int s_longest[3] = {0, 0, 0};
++                        const int index = channelBase == 0x10008000u ? 0 : channelBase == 0x10009000u ? 1 : 2;
++                        if (tagsProcessed > s_longest[index] && tagsProcessed > 1024)
++                        {
++                            s_longest[index] = tagsProcessed;
++                            std::cerr << "[dma] longest chain so far: channel=0x" << std::hex << channelBase << std::dec
++                                      << " tags=" << tagsProcessed << " bytes=" << chainBuf.size() << std::endl;
++                        }
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1557,6 +1611,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 {
+                     enqueueTransfer(madr, qwc);
+                 }
++                if (channelTransfers.size() == transfersBefore)
++                    channelTransfers.push_back(PendingTransfer{});
+ 
+                 const bool autoProcessTransfers =
+                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+@@ -1896,7 +1952,12 @@ void PS2Memory::processPendingTransfers()
+         m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
+         m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
+     }
+-    if (hadVif1)
++    if (hadVif1 && ps2Vif1HasStalledData())
++    {
++        // Part of the transfer waits behind an 'i' bit stall: the DMA ends when VIF1_FBRST.STC lets it through.
++        ps2Vif1SetDmaEndPending();
++    }
++    else if (hadVif1)
+     {
+         raiseDStatChannel(1u); // VIF1 channel
+         queueCompletedDmacCause(1u);
+@@ -1905,10 +1966,26 @@ void PS2Memory::processPendingTransfers()
+     }
+ }
+ 
++namespace
++{
++    std::atomic<bool> g_dmacCausePending{false};
++}
++
++bool ps2DmacCausePending()
++{
++    return g_dmacCausePending.load(std::memory_order_acquire);
++}
++
++bool ps2TakeDmacCausePending()
++{
++    return g_dmacCausePending.exchange(false, std::memory_order_acq_rel);
++}
++
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     m_completedDmacCauses.push_back(cause);
++    g_dmacCausePending.store(true, std::memory_order_release);
+ }
+ 
+ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index ff77753..d646c6a 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -290,6 +290,107 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+     }
+ }
+ 
++// Debug (F1 06): last VIF1 'i' bits with the mark that belongs to each one (a MARK with the 'i' bit sets its own
++// value first). The interrupt handler runs after the whole transfer and reads VIF1_MARK then.
++namespace
++{
++    struct Vif1IrqNote
++    {
++        uint64_t index = 0;
++        uint32_t cmd = 0;
++        uint32_t mark = 0;
++    };
++    Vif1IrqNote g_vif1IrqNotes[64];
++    uint64_t g_vif1IrqCount = 0;
++}
++
++void ps2DebugNoteVif1Irq(uint32_t cmd, uint32_t mark)
++{
++    Vif1IrqNote &note = g_vif1IrqNotes[g_vif1IrqCount % 64u];
++    note.index = g_vif1IrqCount++;
++    note.cmd = cmd;
++    note.mark = mark;
++}
++
++void ps2DebugDumpVif1Irqs()
++{
++    const uint64_t first = g_vif1IrqCount > 64u ? g_vif1IrqCount - 64u : 0u;
++    std::cerr << "[vif1:irqs] total=" << g_vif1IrqCount << std::hex << std::endl;
++    for (uint64_t i = first; i < g_vif1IrqCount; ++i)
++    {
++        const Vif1IrqNote &note = g_vif1IrqNotes[i % 64u];
++        std::cerr << "[vif1:irqs]   n=" << std::dec << note.index << std::hex << " cmd=0x" << note.cmd << " mark=0x"
++                  << note.mark << std::endl;
++    }
++    std::cerr << std::dec;
++}
++
++// VIF1 stall after a VIFcode with the 'i' bit (hardware behaviour): the VIF raises INTC cause 5 and processes nothing
++// else until VIF1_FBRST.STC. The handler reads VIF1_MARK and reacts in the middle of the packet: F1 06 marks
++// 0x9000 to upload the next textures through PATH3 and 0x1000 to count the end of the packet. Without the stall the
++// handlers ran after the whole packet and all saw the last mark, so textures arrived late and, if the last mark was
++// 0x9000, the end of the packet was never counted and the game waited for it forever.
++// State lives here (not in PS2Memory) so the stall does not change ps2_memory.h.
++namespace
++{
++    // Data waiting behind the stall, in order: [g_vif1StallOffset, end). Resuming processes it in place and a new
++    // stall inside it only moves the offset, so a packet with many 'i' bits is not copied again at each one.
++    std::vector<uint8_t> g_vif1StallBuffer;
++    size_t g_vif1StallOffset = 0;
++    bool g_vif1Stalled = false;
++    bool g_vif1DmaEndPending = false; // the DMA ended while stalled: signal it once the remainder is processed
++}
++
++bool ps2Vif1IsStalled()
++{
++    return g_vif1Stalled;
++}
++
++bool ps2Vif1HasStalledData()
++{
++    return g_vif1Stalled && g_vif1StallOffset < g_vif1StallBuffer.size();
++}
++
++void ps2Vif1SetDmaEndPending()
++{
++    g_vif1DmaEndPending = true;
++}
++
++bool ps2Vif1TakeDmaEndPending()
++{
++    const bool pending = g_vif1DmaEndPending;
++    g_vif1DmaEndPending = false;
++    return pending;
++}
++
++bool ps2Vif1TakeStall(const uint8_t *&data, uint32_t &size)
++{
++    if (!g_vif1Stalled)
++        return false;
++    g_vif1Stalled = false;
++    data = g_vif1StallBuffer.data() + g_vif1StallOffset;
++    size = static_cast<uint32_t>(g_vif1StallBuffer.size() - g_vif1StallOffset);
++    return true;
++}
++
++void ps2Vif1ReleaseStallData()
++{
++    // Called after processing what ps2Vif1TakeStall handed out: drop it unless a new stall kept part of it.
++    if (!g_vif1Stalled)
++    {
++        g_vif1StallBuffer.clear();
++        g_vif1StallOffset = 0;
++    }
++}
++
++void ps2Vif1ResetStall()
++{
++    g_vif1Stalled = false;
++    g_vif1DmaEndPending = false;
++    g_vif1StallBuffer.clear();
++    g_vif1StallOffset = 0;
++}
++
+ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -306,8 +407,33 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
++    if (g_vif1Stalled)
++    {
++        // Stalled by an 'i' bit: the data waits behind the stall, in order, until VIF1_FBRST.STC.
++        g_vif1StallBuffer.insert(g_vif1StallBuffer.end(), data, data + sizeBytes);
++        return;
++    }
+ 
+     uint32_t pos = 0;
++    bool stallAfterCommand = false;
++    const auto stall = [&](uint32_t from)
++    {
++        from = std::min(from, sizeBytes);
++        const uint8_t *own = g_vif1StallBuffer.data();
++        if (!g_vif1StallBuffer.empty() && data >= own && data + sizeBytes <= own + g_vif1StallBuffer.size())
++        {
++            // Resuming from the stall buffer: keep it and just move past what was processed.
++            g_vif1StallOffset = static_cast<size_t>(data - own) + from;
++        }
++        else
++        {
++            g_vif1StallBuffer.assign(data + from, data + sizeBytes);
++            g_vif1StallOffset = 0;
++        }
++        g_vif1Stalled = true;
++        vif1_regs.stat |= (1u << 10); // VIS: stalled by an 'i' bit
++        queueCompletedDmacCause(kPs2IntcCauseVif1 | kPs2QueuedIntcCauseFlag);
++    };
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+@@ -337,6 +463,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             }
+             continue;
+         }
++        if (stallAfterCommand)
++        {
++            // The previous VIFcode (and its data) carried the 'i' bit: stop here until VIF1_FBRST.STC.
++            stall(pos);
++            return;
++        }
+ 
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
+@@ -353,9 +485,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         if (irq)
+         {
+             vif1_regs.stat |= (1u << 11); // INT
+-            // The 'i' bit raises INTC cause 5 (VIF1). Hardware also stalls the VIF until VIF1_FBRST.STC;
+-            // this interpreter does not stall, so the handler runs after the transfer.
+-            queueCompletedDmacCause(kPs2IntcCauseVif1 | kPs2QueuedIntcCauseFlag);
++            // The 'i' bit raises INTC cause 5 (VIF1) once this VIFcode is done, and the VIF stalls until
++            // VIF1_FBRST.STC (see stall above).
++            stallAfterCommand = true;
++            ps2DebugNoteVif1Irq(cmd, opcode == VIF_MARK ? imm : vif1_regs.mark);
+             static uint32_t s_irqLogCount = 0u;
+             if (s_irqLogCount < 32u)
+             {
+@@ -826,4 +959,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+     }
++    if (stallAfterCommand)
++        stall(pos); // the 'i' bit was on the last VIFcode of this data: stalled with nothing behind yet
+ }

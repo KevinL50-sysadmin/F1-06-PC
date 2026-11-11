@@ -1,0 +1,261 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 798bf09..ecf5be2 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -16,7 +16,8 @@
+ // pages instead of blocks (before patch 0045), 16 the VU1 block lower instructions through one switch (runFastLower)
+ // instead of a function per operation, 17 the VU1 block BAL, JR, JALR, FCSET, MFP, XTOP, XITOP and XGKICK through
+ // execLower (before patch 0045), 18 the VU1 block schedules run through a call of their own (runSchedule) instead of
+-// inside runBlocks. A
++// inside runBlocks, 19 the GS band dependencies by the unions of the pending blocks instead of the last job of each
++// block (before patch 0046). A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+ // load varies a lot between runs).
+ extern std::atomic<int> g_ps2AbMode;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index c72dabf..ddf39fe 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2808,6 +2808,124 @@ struct GSCpuBackend::BandState
+     std::array<uint32_t, kPageCount> pendingReadBlocks{};
+     BlockMasks requestBlocks, transferBlocks, targetBlocks, textureBlocks;
+     bool textureBlocksApplied = false; // textureBlocks are in pendingReadBlocks
++    // Of each block (patch 0046): 1 + the last job writing it, and reading it as a texture (the reads of the current
++    // texture state stay in textureLastJob until it changes, see TexturePagesOf). A request waits for the last jobs of
++    // the blocks it touches, which are often long done although the unions above still have those blocks: in a race
++    // the job queue is hardly ever empty, so the unions never clear. Recorded in every mode, so that switching modes
++    // stays exact. A/B mode 19: the unions, as before.
++    std::unique_ptr<uint64_t[]> blockWriteJob{new uint64_t[kPageCount * 32u]()};
++    std::unique_ptr<uint64_t[]> blockReadJob{new uint64_t[kPageCount * 32u]()};
++    std::array<uint32_t, kPageCount> textureMask{}; // textureBlocks by page
++    uint64_t textureWriteJob = 0u; // the last job writing any of textureBlocks
++
++    // PS2X_GS_COMPROBAR_ESPERAS=1 (diagnostic): every job keeps the blocks it writes and reads as a texture, and every
++    // wait checks that no job still pending after it touches what it asked for ("[gs:bandas] comprobar: ... fallos";
++    // F1_GS_VERIFICAR_BANDAS cannot see this: it empties the bands before every request and transfer).
++    const bool checkWaits = []()
++    {
++        const char *value = std::getenv("PS2X_GS_COMPROBAR_ESPERAS");
++        return value != nullptr && value[0] == '1';
++    }();
++    std::vector<BlockMasks> checkWrites, checkReads; // by job slot
++    std::array<uint32_t, kPageCount> checkScratch{};
++    uint64_t checkCount = 0u, checkFailures = 0u;
++    void CheckRecord(uint64_t tag, const BlockMasks &writes, const BlockMasks *reads)
++    {
++        if (!checkWaits)
++            return;
++        if (checkWrites.empty())
++        {
++            checkWrites.resize(kJobCapacity);
++            checkReads.resize(kJobCapacity);
++        }
++        const size_t slot = static_cast<size_t>((tag - 1u) % kJobCapacity);
++        checkWrites[slot] = writes;
++        if (reads != nullptr)
++            checkReads[slot] = *reads;
++        else
++            checkReads[slot].clear();
++    }
++    // After waiting for the jobs up to `need`: none of the pending ones may write `blocks` (or, with againstReads,
++    // read them as a texture).
++    void CheckNeed(const BlockMasks &blocks, bool againstWrites, bool againstReads, uint64_t need, const char *what)
++    {
++        if (!checkWaits || checkWrites.empty())
++            return;
++        RefreshMinDone();
++        ++checkCount;
++        for (const auto &[page, mask] : blocks)
++            checkScratch[page] |= mask;
++        const auto touches = [&](const BlockMasks &other)
++        {
++            for (const auto &[page, mask] : other)
++                if ((mask & checkScratch[page]) != 0u)
++                    return true;
++            return false;
++        };
++        for (uint64_t tag = std::max(need, minDone) + 1u; tag <= prepared; ++tag)
++        {
++            const size_t slot = static_cast<size_t>((tag - 1u) % kJobCapacity);
++            const bool writes = againstWrites && touches(checkWrites[slot]);
++            const bool reads = againstReads && touches(checkReads[slot]);
++            if (writes || reads)
++            {
++                if (++checkFailures <= 20u)
++                    std::fprintf(stderr, "[gs:bandas] comprobar: FALLO %s: el trabajo %llu, pendiente, %s lo pedido "
++                                         "(se espero hasta %llu)\n",
++                                 what, static_cast<unsigned long long>(tag), writes ? "escribe" : "lee",
++                                 static_cast<unsigned long long>(need));
++                break;
++            }
++        }
++        for (const auto &[page, mask] : blocks)
++            checkScratch[page] = 0u;
++    }
++
++    static bool LastJobs()
++    {
++        const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++        return mode != 15 && mode != 19;
++    }
++    void RecordBlockWrites(const BlockMasks &blocks, uint64_t tag)
++    {
++        for (const auto &[page, mask] : blocks)
++        {
++            for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u)
++                blockWriteJob[page * 32u + static_cast<uint32_t>(std::countr_zero(bits))] = tag;
++            if ((mask & textureMask[page]) != 0u)
++                textureWriteJob = tag;
++        }
++    }
++    // The last job writing any of `blocks` (and its page).
++    uint64_t LastBlockWrite(const BlockMasks &blocks, uint32_t &atPage) const
++    {
++        uint64_t last = 0u;
++        for (const auto &[page, mask] : blocks)
++            for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u)
++            {
++                const uint64_t job = blockWriteJob[page * 32u + static_cast<uint32_t>(std::countr_zero(bits))];
++                if (job > last)
++                    last = job, atPage = page;
++            }
++        return last;
++    }
++    // The last job reading any of `blocks` as a texture (and its page).
++    uint64_t LastBlockRead(const BlockMasks &blocks, uint32_t &atPage) const
++    {
++        uint64_t last = 0u;
++        for (const auto &[page, mask] : blocks)
++        {
++            if ((mask & textureMask[page]) != 0u && textureLastJob > last)
++                last = textureLastJob, atPage = page;
++            for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u)
++            {
++                const uint64_t job = blockReadJob[page * 32u + static_cast<uint32_t>(std::countr_zero(bits))];
++                if (job > last)
++                    last = job, atPage = page;
++            }
++        }
++        return last;
++    }
+     char transferText[160] = {};
+     // Palettes of the jobs: copies of m_palette, reused once the jobs reading them are done.
+     std::unique_ptr<std::array<uint32_t, 256>[]> palettes;
+@@ -2935,8 +3053,20 @@ struct GSCpuBackend::BandState
+         const int maxU = (clamp & 0x3u) >= 2u ? 1023 : std::max<int>(state.textureWidth, 1) - 1;
+         const int maxV = ((clamp >> 2) & 0x3u) >= 2u ? 1023 : std::max<int>(state.textureHeight, 1) - 1;
+         addRectPages(texturePages, tex.tbp0, tex.tbw, tex.psm, 0, 0, maxU, maxV);
++        // The reads of the old texture state go to its blocks (textureLastJob is newer than any of them).
++        for (const auto &[page, mask] : textureBlocks)
++        {
++            textureMask[page] = 0u;
++            if (texturePagesValid && textureLastJob != 0u)
++                for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u)
++                    blockReadJob[page * 32u + static_cast<uint32_t>(std::countr_zero(bits))] = textureLastJob;
++        }
+         textureBlocks.clear();
+         addRectBlocks(textureBlocks, tex.tbp0, tex.tbw, tex.psm, 0, 0, maxU, maxV);
++        for (const auto &[page, mask] : textureBlocks)
++            textureMask[page] |= mask;
++        uint32_t ignoredPage = 0u;
++        textureWriteJob = LastBlockWrite(textureBlocks, ignoredPage);
+         textureBlocksApplied = false;
+         textureKey0 = key0;
+         textureKey1 = clamp;
+@@ -2998,6 +3128,14 @@ struct GSCpuBackend::BandState
+         uint64_t need = 0u;
+         uint32_t needPage = 0u;
+         bool needRead = false;
++        if (LastJobs())
++        {
++            need = LastBlockWrite(blocks, needPage);
++            uint32_t readPage = 0u;
++            if (const uint64_t read = write ? LastBlockRead(blocks, readPage) : 0u; read > need)
++                need = read, needPage = readPage, needRead = true;
++        }
++        else
+         for (const auto &[page, mask] : blocks)
+         {
+             if ((mask & pendingWriteBlocks[page]) != 0u && pageWriteJob[page] > need)
+@@ -3016,6 +3154,7 @@ struct GSCpuBackend::BandState
+         if (need > minDone)
+             NoteWait(reason, needPage, need, needRead);
+         WaitDone(need, reason);
++        CheckNeed(blocks, true, write, need, kWaitReasonNames[reason]);
+         requestText[0] = '\0';
+     }
+ 
+@@ -3110,6 +3249,9 @@ struct GSCpuBackend::BandState
+                                     chunks != 0u ? 100u * onEfficiency / chunks : 0u);
+         }
+         std::fprintf(stderr, "%s\n", line);
++        if (checkWaits)
++            std::fprintf(stderr, "[gs:bandas] comprobar: %llu esperas comprobadas, %llu fallos\n",
++                         static_cast<unsigned long long>(checkCount), static_cast<unsigned long long>(checkFailures));
+         reportStart = now;
+         jobsSinceReport = 0u;
+         waits.fill(0u);
+@@ -3334,11 +3476,13 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     }
+ 
+     // Wait for the pending jobs it conflicts with. Reading what a pending job writes, and writing what a pending job
+-    // reads as a texture, by blocks (A/B mode 15: by pages); writing a page a pending job writes with another layout,
+-    // by pages (a pending job of the same layout as the last one may have written it with another).
++    // reads as a texture, by the last jobs of the blocks (A/B mode 19: the unions of the pending blocks; 15: by
++    // pages); writing a page a pending job writes with another layout, by pages (a pending job of the same layout as
++    // the last one may have written it with another).
+     const bool byBlocks = g_ps2AbMode.load(std::memory_order_relaxed) != 15;
++    const bool lastJobs = BandState::LastJobs();
+     bs.targetBlocks.clear();
+-    if (byBlocks && ztest != 0u)
++    if (ztest != 0u)
+     {
+         addRectBlocks(bs.targetBlocks, job.pp.fbp, job.pp.fbw, job.pp.fpsm, job.minX, job.minY, job.maxX, job.maxY);
+         if (ztest >= 2u || !job.pp.zmask)
+@@ -3347,7 +3491,9 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     uint64_t needTexture = 0u, needLayout = 0u, needRead = 0u;
+     if (texturePages != nullptr)
+     {
+-        if (byBlocks)
++        if (lastJobs)
++            needTexture = bs.textureWriteJob;
++        else if (byBlocks)
+         {
+             for (const auto &[page, mask] : bs.textureBlocks)
+                 if ((mask & bs.pendingWriteBlocks[page]) != 0u)
+@@ -3369,7 +3515,12 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+     };
+     checkTarget(colorPages, colorLayout);
+     checkTarget(depthPages, depthLayout);
+-    if (byBlocks)
++    if (lastJobs)
++    {
++        uint32_t ignoredPage = 0u;
++        needRead = bs.LastBlockRead(bs.targetBlocks, ignoredPage);
++    }
++    else if (byBlocks)
+         for (const auto &[page, mask] : bs.targetBlocks)
+             if ((mask & bs.pendingReadBlocks[page]) != 0u)
+                 needRead = std::max(needRead, bs.ReadJobOf(page));
+@@ -3384,6 +3535,12 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+         bs.NoteWait(reason, 0u, need, reason == kWaitTextureRead);
+         bs.WaitDone(need, reason);
+     }
++    if (bs.checkWaits)
++    {
++        if (texturePages != nullptr)
++            bs.CheckNeed(bs.textureBlocks, true, false, need, "textura");
++        bs.CheckNeed(bs.targetBlocks, false, true, need, "destino");
++    }
+ 
+     // F1_GS_VERIFICAR_BANDAS: a batch starts from local memory with nothing pending.
+     if (bs.verifyLeft != 0u &&
+@@ -3405,6 +3562,8 @@ void GSCpuBackend::SubmitBandJob(const GSPrimitiveBatch &batch, bool sprite)
+                        { bs.pageWriteJob[page] = tag; bs.pageWriteLayout[page] = depthLayout; });
+     bs.pendingWrites |= colorPages;
+     bs.pendingWrites |= depthPages;
++    bs.RecordBlockWrites(bs.targetBlocks, tag);
++    bs.CheckRecord(tag, bs.targetBlocks, texturePages != nullptr ? &bs.textureBlocks : nullptr);
+     if (byBlocks)
+         for (const auto &[page, mask] : bs.targetBlocks)
+             bs.pendingWriteBlocks[page] |= mask;

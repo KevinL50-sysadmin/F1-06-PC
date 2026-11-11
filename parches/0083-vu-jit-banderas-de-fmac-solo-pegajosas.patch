@@ -1,0 +1,290 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 685ef45..4a6ab3f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -1889,11 +1889,11 @@ namespace
+         const int abModeAll = g_ps2AbMode.load(std::memory_order_relaxed);
+         const int abMode = abModeAll < 36 || abModeAll == 40 || abModeAll == 43 || abModeAll == 44 || abModeAll == 70 ||
+                                    abModeAll == 71 || abModeAll == 73 || abModeAll == 74 ||
+-                                   abModeAll == 76
++                                   abModeAll == 76 || abModeAll == 77 || abModeAll == 78
+                                ? abModeAll
+                                : 0;
+         // A/B modes 72 and 73: XGKICK waited for cycle by cycle (before patch 0081).
+-        const bool oldXgkick = abModeAll == 72 || abModeAll == 73 || abModeAll == 76;
++        const bool oldXgkick = abModeAll == 72 || abModeAll == 73 || abModeAll == 76 || abModeAll == 78;
+         // What compiled code checks before it jumps on to the next schedule (patch 0081; the D and T bits stay as
+         // they are while the VU runs).
+         st.budgetEnd = budgetEnd;
+@@ -2004,7 +2004,8 @@ namespace
+                 ++engine.stats.jitBlocks;
+             }
+             else if ((abMode == 30 || abMode == 31 || abMode == 32 || abMode == 34 || abMode == 35 || abMode == 40 ||
+-                      abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76) &&
++                      abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76 ||
++                      abMode == 77 || abMode == 78) &&
+                      s_jitEnabled &&
+                      (s->jitCalls != nullptr || (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, abMode))))
+             {
+@@ -2013,7 +2014,8 @@ namespace
+                 ++engine.stats.jitBlocks;
+             }
+             else if (abMode == 0 || (abMode >= 29 && abMode <= 32) || abMode == 34 || abMode == 35 || abMode == 40 ||
+-                     abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76)
++                     abMode == 43 || abMode == 44 || abMode == 70 || abMode == 71 || abMode == 73 || abMode == 74 || abMode == 76 ||
++                     abMode == 77 || abMode == 78)
+                 runScheduleBody<Host, false, false>(*s, st, host, 0); // A/B mode 29: not compiled
+             else if (abMode == 18)
+                 runSchedule(*s, st, host, abMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index cc6c761..c15a622 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3434,7 +3434,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         PS2_VU_NOINLINE void catchUpXgkickTransfer(uint64_t cycle)
+         {
+             const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
+-            if (abMode != 72 && abMode != 73 && abMode != 76)
++            if (abMode != 72 && abMode != 73 && abMode != 76 && abMode != 78)
+             {
+                 // Patch 0081: the cycles at once (A/B modes 72 and 73: cycle by cycle, as before).
+                 progressXgkickCycles(cycle - blockState.xgkickThrough);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 32850ab..9e486ea 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -24,6 +24,13 @@
+ 
+     using JitCode = void (*)(VU1State *, BlockState *, void *);
+ 
++    // Patch 0083: PS2X_VU1_JIT_PEGAJOSAS=0: every FMAC flag entry worked out and committed whole (as before).
++    const bool s_jitStickyFlags = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_JIT_PEGAJOSAS");
++        return value == nullptr || value[0] != '0';
++    }();
++
+     // PS2X_VU1_JIT_INFERIORES=0: LQ, SQ, the pc and the end of the block through calls (patch 0058's JIT).
+     const bool s_jitInlineLower = []()
+     {
+@@ -290,10 +297,33 @@
+         return true;
+     }
+ 
++    // Patch 0083: the commit of a flag entry that a later one of the schedule overwrites before anything reads MAC or
++    // status (see jitCompile): only what it adds to the sticky status bits, status |= ((current | sticky) & 0xF) << 6,
++    // as applyFlagSlot would leave them; the next commit writes MAC and the current bits.
++    inline void jitEmitStickyCommit(JitEmitter &e, const BlockCommit &c)
++    {
++        using B = JitEmitter;
++        jitEmitFlagRow(e, c.due);
++        const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags) + c.reg * sizeof(FlagSlot));
++        e.bytes({0x8B, 0x88}); // mov ecx, [rax + slot + status]
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, status)));
++        e.bytes({0x0B, 0x88}); // or ecx, [rax + slot + sticky]
++        e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, sticky)));
++        e.andEcx(0xFu);
++        e.shlEcx(6);
++        e.bytes({0x09}); // or [rbx + status], ecx
++        e.modrm(1, B::Vu, static_cast<uint32_t>(offsetof(VU1State, status)));
++    }
++
+     template <typename Host>
+-    void jitEmitCommit(JitEmitter &e, const BlockCommit &c, uint8_t knownFlagKind = 0u)
++    void jitEmitCommit(JitEmitter &e, const BlockCommit &c, uint8_t knownFlagKind = 0u, bool stickyOnly = false)
+     {
+         using B = JitEmitter;
++        if (stickyOnly && c.kind == CommitFlag)
++        {
++            jitEmitStickyCommit(e, c);
++            return;
++        }
+         switch (c.kind)
+         {
+         case CommitVf:
+@@ -433,8 +463,11 @@
+     // own range test still applies.
+     // lateSlow (patch 0081): a pair whose upper result waits until after its lower instruction (jitUpperLate): the
+     // result goes whole to st.jitUp.value, the flag entry as there, and the slow path calls lateSlow instead.
++    // stickyOnly (patch 0083): a later entry of the schedule overwrites this one before anything reads MAC or status
++    // (jitCompile): the entry only gets its status (Z if a written lane of the value or, for MADD/MSUB, of the product
++    // is zero, S if one is negative; the same bits as current | sticky) and a zero sticky, for jitEmitStickyCommit.
+     inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
+-                            const void *lateSlow = nullptr)
++                            const void *lateSlow = nullptr, bool stickyOnly = false)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -584,7 +617,43 @@
+         e.imm32(op.components);
+         const size_t toSlow = e.jne32();
+ 
+-        if (p.upperFlags != 0u)
++        if (p.upperFlags != 0u && stickyOnly)
++        {
++            jitEmitFlagRow(e, p.issue + 4u);
++            const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
++            if (madd)
++            {
++                e.movaps(5, 3);
++                e.rr({0x66, 0x0F, 0xEB}, 5, 4); // por: the signs of value and product
++                e.movmskps(1, 5);
++                e.rr({0x0F, 0x57}, 0, 0);       // xorps xmm0, xmm0
++                e.rr({0x0F, 0xC2}, 0, 3);       // cmpeqps: value == 0
++                e.bytes({0x00});
++                e.rr({0x0F, 0x57}, 1, 1);       // xorps xmm1, xmm1
++                e.rr({0x0F, 0xC2}, 1, 4);       // cmpeqps: product == 0
++                e.bytes({0x00});
++                e.rr({0x0F, 0x56}, 0, 1);       // orps
++            }
++            else
++            {
++                e.movmskps(1, 3);               // ecx: the signs
++                e.rr({0x0F, 0x57}, 0, 0);       // xorps xmm0, xmm0
++                e.rr({0x0F, 0xC2}, 0, 3);       // cmpeqps: value == 0
++                e.bytes({0x00});
++            }
++            e.movmskps(2, 0);                   // edx: the zeros
++            e.andEcx(op.components);
++            e.bytes({0x81, 0xE2});              // and edx, components
++            e.imm32(op.components);
++            e.bytes({0xF7, 0xD9, 0x19, 0xC9, 0x83, 0xE1, 0x02}); // ecx = ecx != 0 ? 2 : 0 (neg, sbb, and)
++            e.bytes({0xF7, 0xDA, 0x83, 0xD1, 0x00});             // ecx += edx != 0 (neg edx, adc ecx, 0)
++            e.bytes({0x89, 0x88});              // mov [rax + slot + status], ecx
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, status)));
++            e.bytes({0xC7, 0x80});              // mov dword [rax + slot + sticky], 0
++            e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, sticky)));
++            e.imm32(0u);
++        }
++        else if (p.upperFlags != 0u)
+         {
+             jitEmitFlagRow(e, p.issue + 4u);
+             const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
+@@ -1508,7 +1577,7 @@
+         const bool inlineSimple = alternative != 70; // patch 0080 (A/B mode 70: through upperEarly)
+         // Patch 0081: the late upper results and DIV inline too (A/B modes 74 and 73: through jitUpperLate,
+         // jitUpperDst and kLowerFast).
+-        const bool inlineLate = alternative != 74 && alternative != 73 && alternative != 76 && s_jitInlineFmac;
++        const bool inlineLate = alternative != 74 && alternative != 73 && alternative != 76 && alternative != 78 && s_jitInlineFmac;
+         const char *const hostBase = reinterpret_cast<const char *>(&host);
+         const JitHostLayout layout{
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.vuData) - hostBase),
+@@ -1527,6 +1596,59 @@
+         s.chainFlags = static_cast<uint8_t>((s.fallback ? 1u : 0u) | (s.hasD ? 2u : 0u) | (s.hasT ? 4u : 0u) |
+                                             (s.xgkickFirst ? 8u : 0u));
+         size_t nextCommit = 0u;
++        // Patch 0083 (A/B modes 77 and 78: not): the side 0 FMAC entries (MAC and status) that another one of the
++        // schedule overwrites before anything can read MAC or status (the next flag commit that touches them, skipping
++        // CLIP entries, is a known FMAC one): their pair only works out what they add to the sticky status bits and
++        // their commit only ORs that in (jitEmitFmac stickyOnly, jitEmitStickyCommit). Nothing in a schedule with
++        // execLower pairs (FMAND, FSAND... go through it) or FSSET/FCSET. The entries' pairs are found by due cycle.
++        std::vector<uint8_t> stickyOnlyCommit(s.commits.size(), 0u), stickyOnlyDue;
++        if (inlineFlags && s_jitSse41 && s_jitStickyFlags && alternative != 77 && alternative != 78)
++        {
++            std::vector<uint8_t> kinds;
++            bool allowed = true;
++            for (const BlockPair &p : s.pairs)
++            {
++                if (p.lowerExec == LowerExec || p.lowerFlag != 0u)
++                    allowed = false;
++                const uint8_t kind = p.upperFlags != 0u && (p.upperFn != nullptr || p.upperEarly != nullptr) ? p.upperFlags
++                                     : p.upperPath == UpperClip                                       ? kFlagClip
++                                                                                                      : 0u;
++                const size_t due = static_cast<size_t>(p.issue) + 4u;
++                if (kinds.size() <= due)
++                    kinds.resize(due + 1u, 0u);
++                kinds[due] = kind;
++            }
++            const auto kindOf = [&](const BlockCommit &c) -> uint8_t
++            {
++                return c.kind == CommitFlag && c.reg == 0u && c.due < kinds.size() ? kinds[c.due] : 0u;
++            };
++            for (size_t c = 0; allowed && c < s.commits.size(); ++c)
++            {
++                if (s.commits[c].kind != CommitFlag || kindOf(s.commits[c]) != (kFlagMac | kFlagStatus))
++                    continue;
++                for (size_t n = c + 1u; n < s.commits.size(); ++n)
++                {
++                    if (s.commits[n].kind != CommitFlag)
++                        continue;
++                    const uint8_t next = kindOf(s.commits[n]);
++                    if (next == kFlagClip)
++                        continue;
++                    if (next == (kFlagMac | kFlagStatus))
++                    {
++                        stickyOnlyCommit[c] = 1u;
++                        if (stickyOnlyDue.size() <= s.commits[c].due)
++                            stickyOnlyDue.resize(s.commits[c].due + 1u, 0u);
++                        stickyOnlyDue[s.commits[c].due] = 1u;
++                    }
++                    break;
++                }
++            }
++        }
++        const auto stickyOnlyPair = [&](const BlockPair &p)
++        {
++            const size_t due = static_cast<size_t>(p.issue) + 4u;
++            return due < stickyOnlyDue.size() && stickyOnlyDue[due] != 0u;
++        };
+         // Kind of the side 0 flag entry queued for each due cycle (relative to the entry) by a pair of this schedule.
+         std::vector<uint8_t> upperFlagKind;
+         const auto knownKind = [&](const BlockCommit &c) -> uint8_t
+@@ -1540,7 +1662,8 @@
+             if (s_jitSse41)
+             {
+                 for (; nextCommit < end; ++nextCommit)
+-                    jitEmitCommit<Host>(e, s.commits[nextCommit], inlineFlags ? knownKind(s.commits[nextCommit]) : 0u);
++                    jitEmitCommit<Host>(e, s.commits[nextCommit], inlineFlags ? knownKind(s.commits[nextCommit]) : 0u,
++                                        stickyOnlyCommit[nextCommit] != 0u);
+                 return;
+             }
+             s.jitRanges.push_back({&s.commits[nextCommit], static_cast<uint32_t>(end - nextCommit)});
+@@ -1575,7 +1698,8 @@
+             if (upperDone)
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+-                      jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40)) &&
++                      jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40,
++                                  nullptr, stickyOnlyPair(p))) &&
+                     !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+@@ -1583,7 +1707,8 @@
+             {
+                 const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
+                 if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
+-                                                reinterpret_cast<const void *>(&jitUpperLate<Host>))) &&
++                                                reinterpret_cast<const void *>(&jitUpperLate<Host>),
++                                                stickyOnlyPair(p))) &&
+                     !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
+                     e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             }
+@@ -1666,7 +1791,7 @@
+             e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
+         // A/B modes 71 and 73: every schedule returns to runBlocks, as before patch 0081.
+         jitEmitChain(e, layout, engine, s, alternative == 0 ? offsetof(Schedule, jit) : offsetof(Schedule, jitCalls),
+-                     s_jitChain && alternative != 71 && alternative != 73 && alternative != 76);
++                     s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78);
+         e.epilogue();
+ 
+         uint8_t *const code = engine.jit.alloc(e.code().size());
+@@ -1683,6 +1808,19 @@
+             for (size_t i = 0; i < s.pairs.size(); ++i)
+                 std::fprintf(mapFile, "P %u %u %08x %08x\n", pairOffsets[i], s.pairs[i].pc, s.pairs[i].lower,
+                              s.pairs[i].upper);
++            // PS2X_JIT_MAPA_BYTES=1 (patch 0083): also the code, "X <hex bytes>" (scripts/jit_desensamblar.py).
++            static const bool s_mapBytes = []()
++            {
++                const char *value = std::getenv("PS2X_JIT_MAPA_BYTES");
++                return value != nullptr && value[0] != '0';
++            }();
++            if (s_mapBytes)
++            {
++                std::fputs("X ", mapFile);
++                for (const uint8_t byte : e.code())
++                    std::fprintf(mapFile, "%02x", byte);
++                std::fputc('\n', mapFile);
++            }
+             std::fflush(mapFile);
+         }
+         return true;

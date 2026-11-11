@@ -1,0 +1,513 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 006abb0..7fec175 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -52,7 +52,9 @@ private:
+     void ResetUnlocked();
+     // The presentation copy of local memory as a band job (patch 0067): the job's tag, or 0 when copied already.
+     // SnapshotVramDone: whether that job is finished (out is then complete).
+-    uint64_t SnapshotVramJob(std::vector<uint8_t> &out, bool defer);
++    // rangeBytes != 0 (patch 0104): only [rangeBegin, rangeBegin + rangeBytes) of local memory is copied (the rest of
++    // out keeps what it had).
++    uint64_t SnapshotVramJob(std::vector<uint8_t> &out, bool defer, uint32_t rangeBegin = 0u, uint32_t rangeBytes = 0u);
+     bool SnapshotVramDone(uint64_t tag, const std::vector<uint8_t> &out);
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index e86c210..fed31e4 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -42,6 +42,10 @@ public:
+     void TextureFlush() override;
+     void Sync(GSSyncReason reason) override;
+     PresentationFrame Present(const GSPresentationRequest &request) override;
++    // Patch 0104: queue a snapshot for this request (from the queue's producer, in order with the draws), and convert
++    // the last published one without queueing another (the window, when the snapshots come from the display flips).
++    void QueueSnapshot(const GSPresentationRequest &request);
++    PresentationFrame PresentPublished();
+ 
+     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
+     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
+@@ -52,6 +56,9 @@ public:
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
+ private:
++    PresentationFrame PresentPublishedLocked(); // with m_presentMutex held
++    static void displaySnapshotRange(const GSPresentationRequest &request, uint32_t &begin, uint32_t &bytes);
++
+     struct ClutCommand
+     {
+         GSTex0Reg tex0{};
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 55f9b0f..21f8389 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -6088,7 +6088,16 @@ bool GSCpuBackend::BandUploadJob(const uint8_t *data, uint32_t sizeBytes)
+     return true;
+ }
+ 
+-uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
++// Patch 0104: with the snapshots taken at every display flip, the GS thread waiting for every band before each copy
++// cost ~8 % in a race; the copy goes as a band job then (the patch 0067 path, mode 42). A/B mode 103: as before.
++static std::atomic<bool> g_flipSnapshotsAsJobs{false};
++
++void ps2GsSnapshotsAsBandJobs(bool enabled)
++{
++    g_flipSnapshotsAsJobs.store(enabled, std::memory_order_relaxed);
++}
++
++uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer, uint32_t rangeBegin, uint32_t rangeBytes)
+ {
+     // Patch 0067: the copy of local memory for the presentation as a band job, so that this thread does not wait for
+     // every pending job (the "directo" waits of [gs:bandas], one per presented frame). Only in A/B mode 42 since patch
+@@ -6103,13 +6112,20 @@ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+         return 0u;
+     }
+     out.resize(m_vramSize);
++    if (rangeBytes == 0u || rangeBegin >= m_vramSize)
++    {
++        rangeBegin = 0u;
++        rangeBytes = m_vramSize;
++    }
++    rangeBytes = std::min(rangeBytes, m_vramSize - rangeBegin);
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+     BandState *bands = m_bands.get();
+-    if (!defer || bands == nullptr || mode != 42 || bands->verifyLeft != 0u ||
++    const bool asJob = mode == 42 || (mode != 103 && g_flipSnapshotsAsJobs.load(std::memory_order_relaxed));
++    if (!defer || bands == nullptr || !asJob || bands->verifyLeft != 0u ||
+         bands->RefreshMinDone() >= bands->prepared)
+     {
+         WaitBandsUnlocked();
+-        std::memcpy(out.data(), m_vram, m_vramSize);
++        std::memcpy(out.data() + rangeBegin, m_vram + rangeBegin, rangeBytes);
+         return 0u;
+     }
+     BandState &bs = *bands;
+@@ -6132,9 +6148,9 @@ uint64_t GSCpuBackend::SnapshotVramJob(std::vector<uint8_t> &out, bool defer)
+     job.minX = job.minY = 0;
+     job.maxX = job.maxY = -1;
+     BandState::Upload &copy = bs.uploads[slot];
+-    copy.vram = m_vram;
+-    copy.copyTo = out.data();
+-    copy.copyBytes = m_vramSize;
++    copy.vram = m_vram + rangeBegin;
++    copy.copyTo = out.data() + rangeBegin;
++    copy.copyBytes = rangeBytes;
+     const uint64_t tag = index + 1u;
+     bs.copyReadJob = tag;
+     bs.CheckRecord(tag, {}, nullptr);
+@@ -6426,6 +6442,16 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+     return true;
+ }
+ 
++// Patch 0104: when the display buffer at FBP 0 is all black, present another context frame instead (made for
++// another game). F1 06 always shows 0/128: at an unlucky moment it showed its mirror or environment-map target
++// (FBP 384/439), so its overrides turn this off (ps2GsSetBlackDisplayFallback).
++static std::atomic<bool> g_blackDisplayFallback{true};
++
++void ps2GsSetBlackDisplayFallback(bool enabled)
++{
++    g_blackDisplayFallback.store(enabled, std::memory_order_relaxed);
++}
++
+ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+ {
+     // Snapshot local memory under the backend lock, then perform the expensive
+@@ -6482,7 +6508,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
+             return false;
+ 
+-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
++        if (!usedPreferred && displayFrame.fbp == 0u && g_blackDisplayFallback.load(std::memory_order_relaxed) &&
++            countNonBlackPixels(pixels, width, height) == 0u)
+         {
+             for (const GSFrameReg &candidate : request.contextFrames)
+             {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index cb3c4d0..e2444e9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -18,6 +18,9 @@
+ #include <sstream>
+ #include <thread>
+ #include <immintrin.h>
++
++// gs_cpu_backend.cpp (patch 0104): presentation copies as band jobs.
++void ps2GsSnapshotsAsBandJobs(bool enabled);
+ #include "ThreadNaming.h"
+ 
+ void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bool bandWorker); // gs_threaded_backend.cpp
+@@ -194,12 +197,15 @@ namespace
+         s_report = now;
+     }
+ 
++    void queueDisplaySnapshot(const GSPresentationRequest &request); // patch 0104, below
++
+     class GifPacketThread
+     {
+     public:
+         static constexpr uint64_t kRingBytes = 8ull << 20;
+         static constexpr uint64_t kMaxRecord = kRingBytes / 4u; // larger packets go on the caller's thread
+         static constexpr uint32_t kSkip = 0xFFFFFFFFu;            // the rest of the ring is empty: go on at 0
++        static constexpr uint32_t kSnapshotMarker = 0xFFFFFFFEu;  // patch 0104: a GSPresentationRequest follows
+ 
+         // False: not queued (too big); the caller processes it.
+         bool submit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
+@@ -228,6 +234,30 @@ namespace
+             return true;
+         }
+ 
++        // Patch 0104: a presentation snapshot in order with the packets (see ps2GsBeforeDisplayChange).
++        bool submitSnapshotMarker(const GSPresentationRequest &request)
++        {
++            const uint64_t need = 16u + ((static_cast<uint64_t>(sizeof(request)) + 15u) & ~15ull);
++            if (!m_started)
++                return false;
++            uint64_t tail = m_tail.load(std::memory_order_relaxed);
++            uint64_t pos = tail % kRingBytes;
++            const uint64_t skip = pos + need > kRingBytes ? kRingBytes - pos : 0u;
++            waitForRoom(tail + skip + need);
++            if (skip != 0u)
++            {
++                writeHeader(pos, kSkip, nullptr);
++                tail += skip;
++                pos = 0u;
++            }
++            writeHeader(pos, kSnapshotMarker, nullptr);
++            std::memcpy(m_ring.get() + pos + 16u, &request, sizeof(request));
++            m_tail.store(tail + need, std::memory_order_seq_cst);
++            if (m_sleeping.load(std::memory_order_seq_cst))
++                wake();
++            return true;
++        }
++
+         // Until every packet queued so far has been processed. why: who asks (PS2X_GS_GIF_ESPERAS).
+         void sync(const char *why)
+         {
+@@ -334,6 +364,13 @@ namespace
+                     std::memcpy(&gs, header + 8u, sizeof(gs));
+                     if (size == kSkip)
+                         head += kRingBytes - pos;
++                    else if (size == kSnapshotMarker)
++                    {
++                        GSPresentationRequest request{};
++                        std::memcpy(&request, header + 16u, sizeof(request));
++                        queueDisplaySnapshot(request);
++                        head += 16u + ((static_cast<uint64_t>(sizeof(request)) + 15u) & ~15ull);
++                    }
+                     else
+                     {
+                         gs->processGIFPacket(header + 16u, size);
+@@ -354,6 +391,38 @@ namespace
+     };
+     GifPacketThread s_gifThread;
+ 
++    // Patch 0104: presentation snapshots taken at the display flips. The game points DISPFB at a buffer whose drawing
++    // is still going on (here the drawing lags the flip), so a snapshot taken whenever the window asks caught it half
++    // drawn (no HUD, the mirror or environment pass, black). When DISPFB changes, the buffer being left is complete:
++    // its snapshot is queued right there, in order with the GIF packets, and the window shows the last published one.
++    GSRegisters *g_displayPrivRegs = nullptr;
++    GSRasterBackend *g_displayBackend = nullptr;
++    std::mutex g_lastRequestMutex;
++    GSPresentationRequest g_lastRequest{}; // the last one built under the state lock (context frames, preferred)
++    bool g_hasLastRequest = false;
++    std::atomic<int64_t> g_lastFlipSnapshotNs{0};
++
++    int64_t steadyNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++
++    void queueDisplaySnapshot(const GSPresentationRequest &request)
++    {
++        if (auto *threaded = dynamic_cast<GSThreadedBackend *>(g_displayBackend))
++        {
++            static bool s_asJobs = false;
++            if (!s_asJobs)
++            {
++                s_asJobs = true;
++                ps2GsSnapshotsAsBandJobs(true);
++            }
++            threaded->QueueSnapshot(request);
++            g_lastFlipSnapshotNs.store(steadyNs(), std::memory_order_relaxed);
++        }
++    }
++
+     // Before a GS method takes the state mutex: on the EE thread, the queued packets first.
+     inline void gifSyncBeforeAccess(const char *why)
+     {
+@@ -362,6 +431,33 @@ namespace
+     }
+ }
+ 
++// Patch 0104: from PS2Memory, on the EE thread, just before DISPFB1/2 change buffer: snapshot the one being left, in
++// order with the GIF packets (see g_lastFlipSnapshotNs).
++void ps2GsBeforeDisplayChange()
++{
++    if (!g_displayPrivRegs || !g_displayBackend || t_gifWorker || g_ps2AbMode.load(std::memory_order_relaxed) == 103)
++        return; // A/B mode 103: no flip snapshots, as before patch 0104
++    GSPresentationRequest request{};
++    {
++        std::lock_guard<std::mutex> lastLock(g_lastRequestMutex);
++        if (!g_hasLastRequest)
++            return;
++        request = g_lastRequest;
++    }
++    request.pmode = g_displayPrivRegs->pmode;
++    request.smode2 = g_displayPrivRegs->smode2;
++    request.dispfb1 = g_displayPrivRegs->dispfb1;
++    request.display1 = g_displayPrivRegs->display1;
++    request.dispfb2 = g_displayPrivRegs->dispfb2;
++    request.display2 = g_displayPrivRegs->display2;
++    request.bgcolor = g_displayPrivRegs->bgcolor;
++    request.vsyncTick = g_displayPrivRegs->vsyncTick.load(std::memory_order_acquire);
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (s_gifThreadEnabled && mode != 75 && mode != 76 && mode != 78 && s_gifThread.submitSnapshotMarker(request))
++        return;
++    queueDisplaySnapshot(request); // no GIF thread (yet): the EE thread queues the draws itself
++}
++
+ void ps2GsGifSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
+ {
+     const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
+@@ -390,6 +486,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_privRegs = privRegs;
+     if (!m_backend)
+         m_backend = CreateDefaultGSRasterBackend();
++    g_displayPrivRegs = privRegs; // patch 0104
++    g_displayBackend = m_backend.get();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -811,18 +909,42 @@ void GS::latchHostPresentationFrame()
+         // The window thread does not wait for the GS state: the EE holds it while a GIF packet waits for room in the
+         // rasterizer queue, which can take seconds when the GS is the bottleneck. A window that stops processing its
+         // messages is shown by Windows as not responding (blank captures); keep the frame latched last instead.
++        // F1 06 (patch 0104): skipping the latch froze the window for seconds in heavy races (the EE or the GIF thread
++        // holds the state almost all the time there). Without the lock, use the display registers (privileged: the EE
++        // writes them directly) with the rest of the last request built under the lock.
+         std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::try_to_lock);
++        if (!lock.owns_lock() && g_ps2AbMode.load(std::memory_order_relaxed) == 103)
++            return; // A/B mode 103: as before patch 0104
+         if (!lock.owns_lock())
+-            return;
+-        if (!m_backend || !m_privRegs)
+         {
+-            std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+-            m_hostPresentationFrame.clear();
+-            m_hasHostPresentationFrame = false;
+-            m_hostPresentationWidth = m_hostPresentationHeight = 0u;
+-            return;
++            std::lock_guard<std::mutex> lastLock(g_lastRequestMutex);
++            if (!g_hasLastRequest || !m_privRegs)
++                return;
++            request = g_lastRequest;
++            request.pmode = m_privRegs->pmode;
++            request.smode2 = m_privRegs->smode2;
++            request.dispfb1 = m_privRegs->dispfb1;
++            request.display1 = m_privRegs->display1;
++            request.dispfb2 = m_privRegs->dispfb2;
++            request.display2 = m_privRegs->display2;
++            request.bgcolor = m_privRegs->bgcolor;
++            request.vsyncTick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
++        }
++        else
++        {
++            if (!m_backend || !m_privRegs)
++            {
++                std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++                m_hostPresentationFrame.clear();
++                m_hasHostPresentationFrame = false;
++                m_hostPresentationWidth = m_hostPresentationHeight = 0u;
++                return;
++            }
++            request = buildPresentationRequestUnlocked();
++            std::lock_guard<std::mutex> lastLock(g_lastRequestMutex);
++            g_lastRequest = request;
++            g_hasLastRequest = true;
+         }
+-        request = buildPresentationRequestUnlocked();
+     }
+ 
+     PresentationFrame frame{};
+@@ -830,13 +952,40 @@ void GS::latchHostPresentationFrame()
+         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+         if (m_backend)
+         {
+-            m_backend->Flush();
+-            m_backend->Sync(GSSyncReason::Presentation);
+-            frame = m_backend->Present(request);
++            // Patch 0104: while the game flips its display buffers, the snapshots are queued at the flips
++            // (ps2GsBeforeDisplayChange) and the window only converts the last one published. A screen that has not
++            // flipped for 100 ms is snapshotted from here, as before.
++            auto *threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get());
++            if (threaded && steadyNs() - g_lastFlipSnapshotNs.load(std::memory_order_relaxed) < 100000000)
++                frame = threaded->PresentPublished();
++            else
++            {
++                m_backend->Flush();
++                m_backend->Sync(GSSyncReason::Presentation);
++                frame = m_backend->Present(request);
++            }
+         }
+     }
+ 
+     const bool hasFrame = static_cast<bool>(frame);
++    {
++        // Patch 0104: the snapshot is taken wherever the GS queue is when the window asks, so now and then it catches
++        // the display buffer just cleared (all black). Keep the frame latched last for up to 3 black latches in a row
++        // (a fade to black still shows after ~60 ms).
++        static uint32_t s_blackInARow = 0u;
++        bool black = hasFrame;
++        for (size_t i = 0; black && i + 3u < frame.pixels.size(); i += 4u)
++            black = (frame.pixels[i] | frame.pixels[i + 1u] | frame.pixels[i + 2u]) == 0u;
++        if (black && s_blackInARow < 3u)
++        {
++            ++s_blackInARow;
++            std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++            if (m_hasHostPresentationFrame)
++                return;
++        }
++        if (!black)
++            s_blackInARow = 0u;
++    }
+     {
+         // Traza temporal (F1 06): por qué no hay fotograma que presentar.
+         static uint32_t s_sinFotograma = 0u;
+@@ -2035,6 +2184,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+     }
+ 
+     m_backend = std::move(backend);
++    g_displayBackend = m_backend.get(); // patch 0104
+     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+     s_drawBatchCache.owner = nullptr; // a new backend may reuse the old one's address
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 09415d7..621b253 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -670,7 +670,10 @@ void GSThreadedBackend::Execute(Command &command, uint64_t index)
+                            publish(m_snapshotRequest);
+                        }
+                        s_lastSnapshot = now;
+-                       m_snapshotJob = m_cpu->SnapshotVramJob(m_workerSnapshot, m_publishedSerial != 0u);
++                       uint32_t rangeBegin = 0u, rangeBytes = 0u;
++                       displaySnapshotRange(payload.request, rangeBegin, rangeBytes);
++                       m_snapshotJob = m_cpu->SnapshotVramJob(m_workerSnapshot, m_publishedSerial != 0u, rangeBegin,
++                                                              rangeBytes);
+                        if (m_snapshotJob == 0u)
+                            publish(payload.request);
+                        else
+@@ -679,6 +682,38 @@ void GSThreadedBackend::Execute(Command &command, uint64_t index)
+                command);
+ }
+ 
++// Patch 0104: the part of local memory a presentation reads (the display buffers of the enabled CRTs, as whole pages
++// of up to 512 rows), so that the snapshot at every display flip copies ~1.3 MB instead of 4 MB. With a preferred
++// source (another buffer), all of it, as before.
++void GSThreadedBackend::displaySnapshotRange(const GSPresentationRequest &request, uint32_t &begin, uint32_t &bytes)
++{
++    begin = 0u;
++    bytes = 0u;
++    if (request.hasPreferredSource)
++        return;
++    const bool crt1 = (request.pmode & 1u) != 0u;
++    const bool crt2 = (request.pmode & 2u) != 0u;
++    uint64_t lo = ~0ull, hi = 0u;
++    for (int i = 0; i < 2; ++i)
++    {
++        if (!(i == 0 ? crt1 : crt2))
++            continue;
++        const uint64_t dispfb = i == 0 ? request.dispfb1 : request.dispfb2;
++        const uint64_t fbp = dispfb & 0x1FFu;
++        const uint64_t fbw = std::max<uint64_t>(1u, (dispfb >> 9) & 0x3Fu);
++        const uint64_t psm = (dispfb >> 15) & 0x1Fu;
++        const uint64_t pageRows = (psm & 0x2u) != 0u ? 64u : 32u; // 16-bit formats: 64x64 pages
++        const uint64_t start = fbp * 8192u;
++        const uint64_t size = fbw * ((512u + pageRows - 1u) / pageRows) * 8192u;
++        lo = std::min(lo, start);
++        hi = std::max(hi, start + size);
++    }
++    if (hi <= lo)
++        return;
++    begin = static_cast<uint32_t>(lo);
++    bytes = static_cast<uint32_t>(hi - lo);
++}
++
+ void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+     Drain();
+@@ -796,7 +831,22 @@ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &reques
+         // its messages for seconds, and Windows then showed it as not responding (blank captures).
+         TryPush(SnapshotCommand{request}, 65536u);
+     }
++    return PresentPublishedLocked();
++}
+ 
++void GSThreadedBackend::QueueSnapshot(const GSPresentationRequest &request)
++{
++    TryPush(SnapshotCommand{request}, 65536u);
++}
++
++PresentationFrame GSThreadedBackend::PresentPublished()
++{
++    std::lock_guard<std::mutex> presentLock(m_presentMutex);
++    return PresentPublishedLocked();
++}
++
++PresentationFrame GSThreadedBackend::PresentPublishedLocked()
++{
+     {
+         std::lock_guard<std::mutex> lock(m_publishMutex);
+         if (m_publishedSerial == m_presentSerial)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 6ab60d5..e1ff3a3 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -18,8 +18,18 @@
+ #include <utility>
+ #include <vector>
+ 
++// gs_frontend.cpp (patch 0104): DISPFB1/2 are about to show another buffer.
++void ps2GsBeforeDisplayChange();
++
+ namespace
+ {
++    // Patch 0104: before a write to DISPFB1/2 that changes the buffer shown (FBP), the GS snapshots the one being left.
++    inline void noteDisplayWrite(uint32_t regOff, uint64_t oldValue, uint64_t newValue)
++    {
++        if ((regOff == 0x70u || regOff == 0x90u) && ((oldValue ^ newValue) & 0x1FFull) != 0u)
++            ps2GsBeforeDisplayChange();
++    }
++
+     // See advanceEeTimers (patch 0051).
+     uint32_t *s_gifStatWord = nullptr;
+     const void *s_gifStatMap = nullptr;
+@@ -1150,6 +1160,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+         {
+             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
+             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
++            noteDisplayWrite(regOff, *reg, newVal);
+             *reg = newVal;
+         }
+         return;
+@@ -1207,6 +1218,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
++            noteDisplayWrite(regOff, *reg, value);
+             *reg = value;
+         }
+         return;
+@@ -1515,7 +1527,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
+             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
+-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
++            const uint64_t newVal = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
++            noteDisplayWrite(regOff, *reg, newVal);
++            *reg = newVal;
+         }
+         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
+         return true;

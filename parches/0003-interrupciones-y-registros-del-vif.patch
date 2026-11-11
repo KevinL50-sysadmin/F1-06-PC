@@ -1,0 +1,198 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_intc_queue.h b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+new file mode 100644
+index 0000000..e3ff905
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_intc_queue.h
+@@ -0,0 +1,14 @@
++#ifndef PS2_INTC_QUEUE_H
++#define PS2_INTC_QUEUE_H
++
++#include <cstdint>
++
++// INTC causes raised by hardware emulation (for example the VIF 'i' bit) travel through
++// PS2Memory's completed-DMAC queue tagged with this bit, so they keep their order relative to
++// DMA completions and PS2Runtime::drainCompletedDmacHandlers dispatches them as INTC interrupts.
++constexpr uint32_t kPs2QueuedIntcCauseFlag = 0x80000000u;
++
++constexpr uint32_t kPs2IntcCauseVif0 = 4u;
++constexpr uint32_t kPs2IntcCauseVif1 = 5u;
++
++#endif // PS2_INTC_QUEUE_H
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..80408fb 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2278,8 +2278,55 @@ int PS2Memory::pollDmaRegisters()
+     return 0;
+ }
+ 
++namespace
++{
++    // VIFn registers as the CPU reads them: VIF0 at 0x10003800, VIF1 at 0x10003C00, one every 0x10.
++    bool readVifRegister(const VIFRegisters &regs, uint32_t offset, uint32_t &value)
++    {
++        switch (offset)
++        {
++        case 0x00: value = regs.stat; return true;
++        case 0x10: value = 0u; return true; // FBRST is write-only
++        case 0x20: value = regs.err; return true;
++        case 0x30: value = regs.mark; return true;
++        case 0x40: value = regs.cycle; return true;
++        case 0x50: value = regs.mode; return true;
++        case 0x60: value = regs.num; return true;
++        case 0x70: value = regs.mask; return true;
++        case 0x80: value = regs.code; return true;
++        case 0x90: value = regs.itops; return true;
++        case 0xA0: value = regs.base; return true;
++        case 0xB0: value = regs.ofst; return true;
++        case 0xC0: value = regs.tops; return true;
++        case 0xD0: value = regs.itop; return true;
++        case 0xE0: value = regs.top; return true;
++        default: break;
++        }
++        if (offset >= 0x100u && offset < 0x180u && (offset & 0xFu) == 0u)
++        {
++            const uint32_t index = (offset - 0x100u) / 0x10u; // R0-R3, then C0-C3
++            value = index < 4u ? regs.row[index] : regs.col[index - 4u];
++            return true;
++        }
++        return false;
++    }
++}
++
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (address >= 0x10003C00u && address < 0x10003E00u)
++    {
++        uint32_t value = 0u;
++        if (readVifRegister(vif1_regs, address - 0x10003C00u, value))
++            return value;
++    }
++    if (address >= 0x10003800u && address < 0x10003A00u)
++    {
++        uint32_t value = 0u;
++        if (readVifRegister(vif0_regs, address - 0x10003800u, value))
++            return value;
++    }
++
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..6bfa744 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_intc_queue.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+@@ -1487,6 +1488,11 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
++        if ((cause & kPs2QueuedIntcCauseFlag) != 0u)
++        {
++            eeScheduler().dispatchIrq(false, cause & ~kPs2QueuedIntcCauseFlag);
++            continue;
++        }
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..ff77753 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,8 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
++#include "runtime/ps2_intc_queue.h"
+ #include <cstring>
++#include <iostream>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -113,7 +115,12 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+         vif0_regs.code = cmd;
+         vif0_regs.num = num;
+         if (irq)
++        {
+             vif0_regs.stat |= (1u << 11);
++            // The 'i' bit raises INTC cause 4 (VIF0). Hardware also stalls the VIF until VIF0_FBRST.STC;
++            // this interpreter does not stall, so the handler runs after the transfer.
++            queueCompletedDmacCause(kPs2IntcCauseVif0 | kPs2QueuedIntcCauseFlag);
++        }
+ 
+         if (opcode == VIF_NOP)
+         {
+@@ -344,7 +351,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+         if (irq)
++        {
+             vif1_regs.stat |= (1u << 11); // INT
++            // The 'i' bit raises INTC cause 5 (VIF1). Hardware also stalls the VIF until VIF1_FBRST.STC;
++            // this interpreter does not stall, so the handler runs after the transfer.
++            queueCompletedDmacCause(kPs2IntcCauseVif1 | kPs2QueuedIntcCauseFlag);
++            static uint32_t s_irqLogCount = 0u;
++            if (s_irqLogCount < 32u)
++            {
++                ++s_irqLogCount;
++                std::cerr << "[vif1:irq] cmd=0x" << std::hex << cmd << " mark=0x" << vif1_regs.mark << std::dec
++                          << std::endl;
++            }
++        }
+ 
+         if (opcode == VIF_NOP)
+         {
+@@ -403,6 +422,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
+         {
+             uint32_t startPC = (uint32_t)imm * 8u;
++            {
++                static uint32_t s_mscalLogCount = 0u;
++                if (s_mscalLogCount < 40u)
++                {
++                    ++s_mscalLogCount;
++                    uint32_t firstLower = 0u, firstUpper = 0u;
++                    if (m_vu1Code && startPC + 8u <= PS2_VU1_CODE_SIZE)
++                    {
++                        std::memcpy(&firstLower, m_vu1Code + startPC, 4u);
++                        std::memcpy(&firstUpper, m_vu1Code + startPC + 4u, 4u);
++                    }
++                    std::cerr << "[vif1:mscal] start=0x" << std::hex << startPC << " code=0x" << firstUpper << ":0x"
++                              << firstLower << std::dec << std::endl;
++                }
++            }
+ 
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
+@@ -469,6 +503,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
++            bool copied = false;
+             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+             {
+                 uint32_t copyBytes = mpgBytes;
+@@ -478,6 +513,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 {
+                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                     markVU1CodeModified();
++                    copied = true;
++                }
++            }
++            {
++                static uint32_t s_mpgLogCount = 0u;
++                if (s_mpgLogCount < 40u)
++                {
++                    ++s_mpgLogCount;
++                    std::cerr << "[vif1:mpg] dest=0x" << std::hex << destAddr << " bytes=0x" << mpgBytes
++                              << " left=0x" << (sizeBytes - pos) << std::dec << (copied ? " copied" : " SKIPPED")
++                              << std::endl;
+                 }
+             }
+             pos += mpgBytes;

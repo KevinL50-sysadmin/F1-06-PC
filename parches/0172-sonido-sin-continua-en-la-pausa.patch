@@ -1,0 +1,234 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index d51c91e..f3345db 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -285,6 +285,8 @@ namespace ps2x::iop::detail
+         // Fase 5 (T5, T6): latencia_audio waiting for the device's next request (-1: none) and audio_mono.
+         std::atomic<int> g_latencyRequest{-1};
+         std::atomic<bool> g_outputMono{false};
++        // B2 (patch 0172): the analog output's high-pass (see Spu2DcBlocker); PS2X_SPU2_CONTINUA=1 turns it off.
++        std::atomic<bool> g_outputDcFilter{true};
+         // Fase 5 (T11, patch 0159): frames in a row the synthesis has just played at or below kQuietLevel (before the
+         // volume); before it has played anything, "quiet" (huge).
+         constexpr int32_t kQuietLevel = 16; // of 32767, about -66 dBFS
+@@ -344,6 +346,7 @@ namespace ps2x::iop::detail
+         // Statistics ("[spu2]" every 10 s).
+         uint64_t keyOns = 0, fetchIrqs = 0, audibleVoiceSamples = 0, chunks = 0;
+         Spu2OutputResampler resampler;
++        Spu2DcBlocker dcBlocker;
+         uint64_t reportInputFrames = 0, reportOutputFrames = 0;
+         std::chrono::steady_clock::time_point reportStart = std::chrono::steady_clock::now();
+         uint64_t reportSample = 0;
+@@ -820,6 +823,9 @@ namespace ps2x::iop::detail
+             peak = std::max<int32_t>(peak, level);
+             g_quietFrames.store(level <= kQuietLevel ? g_quietFrames.load(std::memory_order_relaxed) + 1u : 0u,
+                                 std::memory_order_relaxed);
++            // Before the ring, so an underrun that fades to zero starts from (nearly) zero too.
++            if (g_outputDcFilter.load(std::memory_order_relaxed))
++                dcBlocker.process(left, right);
+             const int32_t gain = g_outputGain.load(std::memory_order_relaxed);
+             left = clamp16((left * gain) >> 8);
+             right = clamp16((right * gain) >> 8);
+@@ -1043,6 +1049,8 @@ namespace ps2x::iop::detail
+         }
+         if (const char *value = std::getenv("PS2X_AUDIO_MONO"))
+             setSpu2OutputMono(value[0] == '1');
++        if (const char *value = std::getenv("PS2X_SPU2_CONTINUA"))
++            setSpu2OutputDcFilter(value[0] != '1');
+         reset();
+     }
+ 
+@@ -1587,6 +1595,11 @@ namespace ps2x::iop::detail
+         return raise;
+     }
+ 
++    void setSpu2OutputDcFilter(bool enabled) noexcept
++    {
++        g_outputDcFilter.store(enabled, std::memory_order_relaxed);
++    }
++
+     std::size_t readSpu2OutputRaw(int16_t *out, std::size_t frames) noexcept
+     {
+         const size_t r = g_output.read.load(std::memory_order_relaxed);
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2_output.h b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+index 254dbd1..897a3b7 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2_output.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2_output.h
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ 
+@@ -167,6 +168,44 @@ namespace ps2x::iop::detail
+         uint64_t m_played = 0; // frames taken from the ring since the last underrun or target change
+     };
+ 
++    // B2 (patch 0172): the PS2's analog audio output is AC-coupled, so a constant level in the mix never reaches the
++    // speakers. F1 06 pauses a race by setting every voice's pitch to 0 with some volumes still up: the mix holds a
++    // constant (-4481 in a test run, 20198 in the user's log) that is silence on the console and in PCSX2. The host
++    // played it, and every ring underrun in the pause dropped it to zero and back, a click each time. A one-pole
++    // high-pass per channel, y[n] = x[n] - x[n-1] + Pole * y[n-1]: a constant is gone in ~0.1 s; 20 Hz loses 0.3 dB.
++    class Spu2DcBlocker
++    {
++    public:
++        static constexpr double CutoffHz = 5.0;
++        static constexpr double Pole = 1.0 - 2.0 * 3.14159265358979323846 * CutoffHz / 48000.0;
++
++        void process(int16_t &left, int16_t &right) noexcept
++        {
++            left = m_left.step(left);
++            right = m_right.step(right);
++        }
++
++    private:
++        struct Channel
++        {
++            double previousIn = 0.0;
++            double previousOut = 0.0;
++
++            int16_t step(int16_t sample) noexcept
++            {
++                const double in = sample;
++                previousOut = in - previousIn + Pole * previousOut;
++                previousIn = in;
++                return static_cast<int16_t>(std::clamp(std::lround(previousOut), -32768L, 32767L));
++            }
++        };
++
++        Channel m_left, m_right;
++    };
++
++    // B2: PS2X_SPU2_CONTINUA=1 (or false here) plays the constant level as before. Any thread.
++    void setSpu2OutputDcFilter(bool enabled) noexcept;
++
+     // The host ring without the consumer above (no rebuffering or fades): the tests of the synthesis timing read it
+     // directly. Returns the frames written to `out`.
+     std::size_t readSpu2OutputRaw(int16_t *out, std::size_t frames) noexcept;
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index a169edd..5343699 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -64,8 +64,10 @@ namespace
+         ps2x::iop::detail::Spu2 spu;
+         std::vector<uint8_t> iopRam = std::vector<uint8_t>(0x1000u, 0u);
+ 
+-        Spu2InputRig()
++        // dcFilter: the analog output's high-pass (patch 0172). Off by default: these tests play constant levels.
++        explicit Spu2InputRig(bool dcFilter = false)
+         {
++            ps2x::iop::detail::setSpu2OutputDcFilter(dcFilter);
+             drain();
+             spu.setClock(&cycles);
+             spu.write16(kCore1 + 0x198u, 0x00C0u);  // MMIX: sound data input L/R into the dry mix
+@@ -87,9 +89,19 @@ namespace
+ 
+         // 256 samples of one value into the left input half at `address` (0x2400 or 0x2500), by DMA.
+         void fillHalf(uint32_t address, int16_t value)
++        {
++            fillHalfWith(address, [value](uint32_t) { return value; });
++        }
++
++        // 256 samples value(i) into the left input half at `address`, by DMA.
++        template <typename Value>
++        void fillHalfWith(uint32_t address, Value &&value)
+         {
+             for (uint32_t i = 0; i < 256u; ++i)
+-                std::memcpy(iopRam.data() + i * 2u, &value, 2u);
++            {
++                const int16_t sample = value(i);
++                std::memcpy(iopRam.data() + i * 2u, &sample, 2u);
++            }
+             spu.write16(kCore1 + 0x1A8u, static_cast<uint16_t>(address >> 16));
+             spu.write16(kCore1 + 0x1AAu, static_cast<uint16_t>(address));
+             spu.dmaTransfer(1, iopRam.data(), static_cast<uint32_t>(iopRam.size()), 0u, 512u, true);
+@@ -431,6 +443,87 @@ void register_ps2_iop_tests()
+             t.Equals(s_tapped.size(), before, "nothing tapped after the tap is removed");
+         });
+ 
++        // B2 (patch 0172): in a race's pause F1 06 sets every voice's pitch to 0 and leaves some volumes up, so the mix
++        // holds a constant level (-4481 in a test run, 20198 in the user's log). The PS2's analog output is AC-coupled:
++        // a constant never reaches the speakers (PCSX2 plays silence there). Ours kept it, and every ring underrun in
++        // the pause dropped it to zero and back: the rasp the user heard.
++        tc.Run("SPU2 output removes a constant level, as the PS2's AC-coupled analog output does", [](TestCase &t)
++        {
++            Spu2InputRig rig(true);
++            rig.setSample(0);
++            rig.fillHalf(0x2400u, 4481);
++            rig.fillHalf(0x2500u, 4481);
++            std::vector<int16_t> left;
++            for (uint64_t step = 1; step <= 12u; ++step) // 49152 samples, about 1 s, in pieces the ring holds
++            {
++                rig.setSample(step * 4096u);
++                const std::vector<int16_t> piece = rig.collect(4096u);
++                left.insert(left.end(), piece.begin(), piece.end());
++            }
++            t.IsTrue(left.size() >= 45000u, "the second plays (" + std::to_string(left.size()) + " frames)");
++            if (left.size() < 45000u)
++                return;
++            t.IsTrue(left[20] > 4000, "the step itself still plays (" + std::to_string(left[20]) + ")");
++            int16_t residue = 0;
++            for (size_t i = 24000u; i < left.size(); ++i)
++                residue = std::max<int16_t>(residue, static_cast<int16_t>(std::abs(left[i])));
++            t.IsTrue(residue <= 2, "after half a second nothing is left of it (max " + std::to_string(residue) + ")");
++        });
++
++        tc.Run("SPU2 output high-pass saturates instead of wrapping on a full-scale step", [](TestCase &t)
++        {
++            // A race mix clips at full scale (PCSX2 too); a jump across the whole range overshoots in the filter.
++            ps2x::iop::detail::Spu2DcBlocker blocker;
++            int16_t left = -32768, right = 32767;
++            for (int i = 0; i < 48000; ++i)
++            {
++                left = -32768;
++                right = 32767;
++                blocker.process(left, right);
++            }
++            t.IsTrue(std::abs(left) <= 1 && std::abs(right) <= 1, "a held full-scale level settles to zero");
++            left = 32767;
++            right = -32768;
++            blocker.process(left, right);
++            t.Equals(left, int16_t{32767}, "the step up saturates at the top");
++            t.Equals(right, int16_t{-32768}, "the step down saturates at the bottom");
++        });
++
++        tc.Run("SPU2 output keeps the level of a low tone while it removes the constant", [](TestCase &t)
++        {
++            // 93.75 Hz (one period per 512-sample input area), amplitude 8000: an engine's fundamental is about there.
++            Spu2InputRig rig(true);
++            const auto tone = [](uint32_t base)
++            {
++                return [base](uint32_t i)
++                {
++                    const double phase = 2.0 * 3.14159265358979323846 * static_cast<double>(base + i) / 512.0;
++                    return static_cast<int16_t>(std::lround(8000.0 * std::sin(phase)));
++                };
++            };
++            rig.setSample(0);
++            rig.fillHalfWith(0x2400u, tone(0u));
++            rig.fillHalfWith(0x2500u, tone(256u));
++            std::vector<int16_t> left;
++            for (uint64_t step = 1; step <= 12u; ++step)
++            {
++                rig.setSample(step * 4096u);
++                const std::vector<int16_t> piece = rig.collect(4096u);
++                left.insert(left.end(), piece.begin(), piece.end());
++            }
++            t.IsTrue(left.size() >= 45000u, "the second plays (" + std::to_string(left.size()) + " frames)");
++            if (left.size() < 45000u)
++                return;
++            int high = -32768, low = 32767;
++            for (size_t i = 24000u; i < left.size(); ++i)
++            {
++                high = std::max<int>(high, left[i]);
++                low = std::min<int>(low, left[i]);
++            }
++            t.IsTrue(high >= 7900 && high <= 8100 && low <= -7900 && low >= -8100,
++                     "the tone keeps its level (" + std::to_string(low) + ".." + std::to_string(high) + ")");
++        });
++
+         tc.Run("SPU2 output resampler absorbs a slower device clock without dropping frames or clicks", [](TestCase &t)
+         {
+             ResamplerRun run;

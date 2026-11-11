@@ -1,0 +1,219 @@
+diff --git a/ps2xRuntime/include/ps2_options_menu.h b/ps2xRuntime/include/ps2_options_menu.h
+index 1dfbb3d..b1ef453 100644
+--- a/ps2xRuntime/include/ps2_options_menu.h
++++ b/ps2xRuntime/include/ps2_options_menu.h
+@@ -92,8 +92,8 @@ namespace ps2x
+     }
+ 
+     // PS2X_MENU_GUION (tests): "<seconds>:<action>,..." from the first frame of the window. Actions: abrir, cerrar,
+-    // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido>, tecla=<arriba|abajo|izquierda|derecha|aceptar>
+-    // or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
++    // guardar, descartar, defecto, seccion=<pantalla|graficos|sonido|juego>, tecla=<arriba|abajo|izquierda|derecha|
++    // aceptar>, foto (a photo, as tecla_foto) or <option>=<value> (as the menu sets it). PS2X_MENU_PETICION=<file>: the actions written in that file
+     // ("<action>,...") run when it appears, and the file is deleted (scripts that wait for a screen of the game).
+     struct MenuScriptStep
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 5053c57..266200d 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -153,6 +153,26 @@ namespace ps2x
+              "sacada de las muestras del supersampling, que debe ser 4 o mas; 0 = resolucion nativa. Con gs = cpu no\n"
+              "se usa.",
+              "0"},
++            // Fase 5 (tanda A): also rows of the game's own OPTIONS > AJUSTES PC (src/f1_overrides.cpp).
++            {"saltar_intro", "PS2X_SALTAR_INTRO", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Videos del arranque (la presentacion y la demostracion de la pantalla de titulo): 1 = se cortan a los dos\n"
++             "segundos; 0 = se ven enteros. Los fondos animados de los menus no cambian."},
++            {"latencia_audio", "PS2X_LATENCIA_AUDIO", "auto", {{"auto", "auto"}, {"baja", "baja"}, {"alta", "alta"}}, 0, 0,
++             "Retraso del sonido: auto (de 43 a 128 ms, sube si hay cortes y baja poco a poco), baja (43 ms, como\n"
++             "mucho 64 ms si hay cortes) o alta (128 ms fijos, para un PC lento)."},
++            {"audio_mono", "PS2X_AUDIO_MONO", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
++             "Sonido: 0 = estereo; 1 = mono (los dos canales juntos, para un solo altavoz o un solo oido)."},
++            {"vibracion", "PS2X_VIBRACION", "100", {}, 0, 100,
++             "Fuerza de la vibracion del mando y del volante, de 0 (sin vibracion) a 100. La de cada mando se puede\n"
++             "quitar tambien en controles.ini."},
++            {"daltonismo", "PS2X_DALTONISMO", "no",
++             {{"no", "no"}, {"protanopia", "protanopia"}, {"deuteranopia", "deuteranopia"}, {"tritanopia", "tritanopia"}},
++             0, 0,
++             "Filtro para daltonismo sobre la imagen: no, protanopia (rojo), deuteranopia (verde) o tritanopia (azul).\n"
++             "Mueve los colores que se confunden a otros que se distinguen (daltonizar)."},
++            {"tecla_foto", "PS2X_TECLA_FOTO", "f12", {{"f12", "f12"}, {"f9", "f9"}, {"f8", "f8"}, {"no", "no"}}, 0, 0,
++             "Tecla de las fotos (f12, f9, f8 o no): guarda la imagen del juego a su resolucion interna, en PNG, en la\n"
++             "carpeta capturas."},
+         };
+         return specs;
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 9bc51e1..7ff68c9 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -1,7 +1,11 @@
+ #include "ps2_options_menu.h"
++#include "ps2_color_vision.h"
+ #include "ps2_display.h"
+ #include "ps2_options.h"
++#include "ps2_pad_players.h"
++#include "ps2_photo.h"
+ #include "ps2_runtime.h"
++#include "ps2x/iop/iop_spu2_audio.h"
+ #include "runtime/gs/gs_gpu_bridge.h"
+ 
+ #include "imgui.h"
+@@ -33,7 +37,7 @@ namespace
+     {
+         const char *key;
+         const char *label;
+-        std::vector<Choice> choices; // empty: volumen (0 to 100 in steps of 5)
++        std::vector<Choice> choices; // empty: a percentage (volumen, vibracion), 0 to 100 in steps of 5
+         const char *hint;
+     };
+ 
+@@ -81,8 +85,27 @@ namespace
+                "Bordes más suaves. Cuanto más alto, más trabajo para la tarjeta gráfica; con una gráfica modesta, "
+                "baja a x1 o x2."},
+               {"alta_resolucion", "Doble resolución", {{"0", "No"}, {"1", "Sí"}},
+-               "La imagen con el doble de ancho y de alto, más nítida. Necesita supersampling x4 o más."}}},
+-            {"Sonido", {{"volumen", "Volumen", {}, "El volumen de todo el sonido del juego."}}},
++               "La imagen con el doble de ancho y de alto, más nítida. Necesita supersampling x4 o más."},
++              // Fase 5 (T7, T8).
++              {"daltonismo", "Filtro para daltonismo",
++               {{"no", "No"}, {"protanopia", "Protanopia (rojo)"}, {"deuteranopia", "Deuteranopia (verde)"},
++                {"tritanopia", "Tritanopia (azul)"}},
++               "Mueve los colores que se confunden a otros que se distinguen, sobre la imagen ya ampliada."},
++              {"tecla_foto", "Tecla de foto", {{"f12", "F12"}, {"f9", "F9"}, {"f8", "F8"}, {"no", "Ninguna"}},
++               "Guarda la imagen del juego a su resolución interna, en PNG, en la carpeta capturas."}}},
++            {"Sonido",
++             {{"volumen", "Volumen", {}, "El volumen de todo el sonido del juego."},
++              // Fase 5 (T5, T6).
++              {"latencia_audio", "Latencia del sonido", {{"auto", "Automática"}, {"baja", "Baja"}, {"alta", "Alta"}},
++               "Automática: de 43 a 128 ms, según el PC. Baja: 43 ms (64 como mucho si hay cortes). Alta: 128 ms, "
++               "para un PC lento."},
++              {"audio_mono", "Salida de sonido", {{"0", "Estéreo"}, {"1", "Mono"}},
++               "Mono: los dos canales juntos, para un solo altavoz o un solo oído."}}},
++            // Fase 5 (T4, T6).
++            {"Juego",
++             {{"saltar_intro", "Saltar los vídeos de inicio", {{"0", "No"}, {"1", "Sí"}},
++               "La presentación y la demostración de la pantalla de título se cortan a los dos segundos."},
++              {"vibracion", "Vibración", {}, "La fuerza de la vibración del mando y del volante; 0 % la quita."}}},
+         };
+         return list;
+     }
+@@ -309,6 +332,25 @@ namespace
+             }
+         if (changed("volumen"))
+             runtime.setOutputVolume(std::atoi(valueOf(model.current, "volumen").c_str()));
++        // Fase 5 (tanda A). saltar_intro needs nothing here: the game asks for it when a video plays.
++        if (changed("latencia_audio"))
++        {
++            ps2x::iop::Spu2OutputLatency latency = ps2x::iop::Spu2OutputLatency::Auto;
++            if (ps2x::iop::parseSpu2OutputLatency(valueOf(model.current, "latencia_audio"), latency))
++                ps2x::iop::setSpu2OutputLatency(latency);
++        }
++        if (changed("audio_mono"))
++            ps2x::iop::setSpu2OutputMono(valueOf(model.current, "audio_mono") == "1");
++        if (changed("vibracion"))
++            ps2x::setRumbleIntensity(std::atoi(valueOf(model.current, "vibracion").c_str()));
++        if (changed("daltonismo"))
++        {
++            ps2x::ColorVision vision = ps2x::ColorVision::Normal;
++            ps2x::parseColorVision(valueOf(model.current, "daltonismo"), vision);
++            ps2x::setColorVision(vision);
++        }
++        if (changed("tecla_foto"))
++            ps2x::setPhotoKeyOption(valueOf(model.current, "tecla_foto"));
+         for (const auto &[key, value] : model.current)
+             if (key != "gs") // gs stays as the game started
+                 applied[key] = value;
+@@ -380,10 +422,12 @@ void PS2OptionsMenu::update(PS2Runtime &runtime)
+             ps2x::discardMenuChanges(s.model);
+         else if (action == "defecto")
+             ps2x::resetMenuToDefaults(s.model);
++        else if (action == "foto")
++            ps2x::requestPhoto();
+         else if (action.rfind("seccion=", 0) == 0)
+         {
+             const std::string name = action.substr(8);
+-            s.section = name == "graficos" ? 1 : name == "sonido" ? 2 : 0;
++            s.section = name == "graficos" ? 1 : name == "sonido" ? 2 : name == "juego" ? 3 : 0;
+         }
+         else if (action.rfind("tecla=", 0) == 0)
+         {
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 9ee3ce9..7ccf5e4 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -311,6 +311,73 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(ps2x::setMenuOptionNumber(forced, "alta_resolucion", 1.0f), "no double resolution with gs = cpu");
+         });
+ 
++        // Fase 5 (tanda A): the new PC options, in opciones.ini, their variables and the game's own rows (numbers).
++        tc.Run("the fase 5 PC options have their defaults, variables and numbers", [](TestCase &t)
++        {
++            const ps2x::OptionsFile defaults = ps2x::parseOptions("");
++            t.Equals(defaults.values.at("saltar_intro"), std::string("0"), "the intro plays by default");
++            t.Equals(defaults.values.at("latencia_audio"), std::string("auto"), "adaptive audio latency");
++            t.Equals(defaults.values.at("audio_mono"), std::string("0"), "stereo");
++            t.Equals(defaults.values.at("vibracion"), std::string("100"), "full vibration");
++            t.Equals(defaults.values.at("daltonismo"), std::string("no"), "no colour filter");
++            t.Equals(defaults.values.at("tecla_foto"), std::string("f12"), "photos with F12");
++            const std::string text = ps2x::defaultOptionsText(false);
++            for (const char *line : {"saltar_intro = 0\n", "latencia_audio = auto\n", "audio_mono = 0\n",
++                                     "vibracion = 100\n", "daltonismo = no\n", "tecla_foto = f12\n"})
++                t.IsTrue(contains(text, line), std::string("the template has ") + line);
++
++            const ps2x::OptionsFile file = ps2x::parseOptions(
++                "saltar_intro = 1\nlatencia_audio = BAJA\naudio_mono = 1\nvibracion = 40\ndaltonismo = tritanopia\n"
++                "tecla_foto = f9\n");
++            t.IsTrue(file.warnings.empty(), "valid values give no warning");
++            const std::vector<ps2x::EnvironmentSetting> settings = ps2x::optionsEnvironment(file, environmentOf({}));
++            const auto variable = [&settings](const char *name)
++            {
++                for (const ps2x::EnvironmentSetting &setting : settings)
++                    if (setting.variable == name)
++                        return setting.value;
++                return std::string("<none>");
++            };
++            t.Equals(variable("PS2X_SALTAR_INTRO"), std::string("1"), "saltar_intro -> PS2X_SALTAR_INTRO");
++            t.Equals(variable("PS2X_LATENCIA_AUDIO"), std::string("baja"), "latencia_audio -> PS2X_LATENCIA_AUDIO");
++            t.Equals(variable("PS2X_AUDIO_MONO"), std::string("1"), "audio_mono -> PS2X_AUDIO_MONO");
++            t.Equals(variable("PS2X_VIBRACION"), std::string("40"), "vibracion -> PS2X_VIBRACION");
++            t.Equals(variable("PS2X_DALTONISMO"), std::string("tritanopia"), "daltonismo -> PS2X_DALTONISMO");
++            t.Equals(variable("PS2X_TECLA_FOTO"), std::string("f9"), "tecla_foto -> PS2X_TECLA_FOTO");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions(
++                "latencia_audio = media\nvibracion = 101\ndaltonismo = rojo\ntecla_foto = f1\n");
++            t.Equals(bad.warnings.size(), size_t{4u}, "one warning per bad value");
++            t.Equals(bad.values.at("vibracion"), std::string("100"), "a bad vibration takes the default");
++            t.Equals(bad.values.at("tecla_foto"), std::string("f12"), "a bad key takes the default");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            const auto number = [&model](const char *key)
++            {
++                float value = -99.0f;
++                return ps2x::menuOptionNumber(model, key, value) ? value : -99.0f;
++            };
++            t.Equals(number("latencia_audio"), 0.0f, "auto: the first choice");
++            t.Equals(number("daltonismo"), 0.0f, "no: the first choice");
++            t.Equals(number("vibracion"), 100.0f, "vibracion is its percentage");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "daltonismo", 2.0f), "daltonismo 2");
++            t.Equals(model.current.at("daltonismo"), std::string("deuteranopia"), "is deuteranopia");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "daltonismo", 4.0f), "past tritanopia");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "latencia_audio", 2.0f), "latencia_audio 2");
++            t.Equals(model.current.at("latencia_audio"), std::string("alta"), "is alta");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "tecla_foto", 3.0f), "tecla_foto 3");
++            t.Equals(model.current.at("tecla_foto"), std::string("no"), "no photo key");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "vibracion", 0.0f), "vibration off");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "vibracion", 101.0f), "over 100 %");
++            t.Equals(model.current.at("vibracion"), std::string("0"), "stays off");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "saltar_intro", 1.0f), "skip the intro");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "audio_mono", 1.0f), "mono");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "daltonismo"), std::string("deuteranopia"), "CONFIRM writes daltonismo");
++            t.Equals(fileValue(saved, "saltar_intro"), std::string("1"), "and saltar_intro");
++            t.Equals(fileValue(saved, "filtro"), std::string("fsr"), "the older options keep their values");
++        });
++
+         tc.Run("the pad combo fires once after being held for its time", [](TestCase &t)
+         {
+             ps2x::HoldComboDetector combo(0.5);

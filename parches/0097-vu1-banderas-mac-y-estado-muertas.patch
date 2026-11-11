@@ -1,0 +1,301 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index 0c1efe0..04a887d 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -66,7 +66,8 @@
+ // 75 together (patches 0081 and 0082 off at once; kept by runBlocks), 77 (VU1 and VU0) every FMAC flag entry of the
+ // compiled schedules worked out and committed whole (before patch 0083; kept by runBlocks), 78 everything of patches
+ // 0081-0084 off at once (73, 75, 77 and 79; kept by runBlocks), 79 the PATH1 GIF packets queued and copied by the
+-// arbiter (before patch 0084).
++// arbiter (before patch 0084), 99 the VU1 schedules with the MAC and status flags worked out even when nothing
++// reads them (before patch 0097).
+ // Since patch 0069 the modes of
+ // other parts than the VU1 (36 and up, except 40, 43 and 44) run the VU1 schedules compiled, as mode 0. A
+ // game hook can alternate it while running so both versions are measured on the same scene within one run (the host
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index e2be57b..1c30c0d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -636,6 +636,9 @@ namespace
+         bool jitTried = false;
+         void *jitCalls = nullptr; // A/B modes 30 and 31: compiled without the inline FMAC or lower steps
+         bool jitCallsTried = false;
++        // Patch 0097: compiled for code whose MAC and status flags nothing reads (BlockEngine::macStatusDead).
++        void *jitNoFlags = nullptr;
++        bool jitNoFlagsTried = false;
+         std::vector<JitCommitRange> jitRanges;
+         // Patch 0081: what a chain into this schedule checks (set when compiled): 1 fallback, 2 hasD, 4 hasT,
+         // 8 xgkickFirst.
+@@ -1325,6 +1328,10 @@ namespace
+         Schedule *emptyEntry[0x4000u / 8u] = {}; // schedule of the block at each pc entered with nothing in flight
+         BlockStats stats;
+         JitArena jit;
++        // Patch 0097: the VU1 micro memory has no instruction that reads the MAC or status flags (FMAND, FMEQ, FMOR,
++        // FSAND, FSEQ, FSOR; set by VU1Interpreter::run for each run): the compiled schedules leave out the FMAC flag
++        // entries whose commit is in the same schedule, and those commits (Schedule::jitNoFlags).
++        bool macStatusDead = false;
+ 
+         void clear()
+         {
+@@ -1998,7 +2005,15 @@ namespace
+             }
+             if (st.cycle + s->lastIssue >= budgetEnd)
+                 return BlockRunEnd::Budget;
+-            if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s, host))))
++            if (abMode == 0 && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
++                (s->jitNoFlags != nullptr || (!s->jitNoFlagsTried && jitCompile<Host>(engine, *s, host, kJitNoFlags))))
++            {
++                // Patch 0097: compiled without the dead flag work (it chains to its own kind).
++                reinterpret_cast<JitCode>(s->jitNoFlags)(&vu, &st, &host);
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
++                ++engine.stats.jitBlocks;
++            }
++            else if (abMode == 0 && s_jitEnabled && (s->jit != nullptr || (!s->jitTried && jitCompile<Host>(engine, *s, host))))
+             {
+                 // Compiled (patch 0057). The code may have jumped on to the schedules after it (patch 0081): what
+                 // follows is for the last one, the earlier ones counted themselves.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c15a622..891c5eb 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1050,9 +1050,56 @@ namespace
+         const void *owner = nullptr;
+         uint8_t code[0x4000u] = {};
+         uint64_t changed[0x4000u / 8u / 64u] = {};
++        // Patch 0097: pairs of code whose lower instruction reads the MAC or status flags (pairReadsMacStatus), and
++        // how many there are.
++        uint64_t flagReaders[0x4000u / 8u / 64u] = {};
++        uint32_t flagReaderCount = 0u;
+     };
+     DecodeSnapshot s_decodeSnapshots[2];
+ 
++    // Patch 0097: the lower instruction of the pair at code reads MAC or status: FSEQ, FSAND, FSOR (0x14, 0x16, 0x17)
++    // or FMEQ, FMAND, FMOR (0x18, 0x1A, 0x1B) in bits 31-25, unless the upper has the I bit (then the lower word is
++    // the value for I). FSSET only writes the sticky bits.
++    inline bool pairReadsMacStatus(const uint8_t *code)
++    {
++        uint32_t words[2];
++        std::memcpy(words, code, 8u);
++        if ((words[1] >> 31) != 0u)
++            return false;
++        const uint32_t op = words[0] >> 25;
++        return op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu;
++    }
++
++    inline void notePairFlagReader(DecodeSnapshot &snapshot, uint32_t i, const uint8_t *code)
++    {
++        const uint64_t bit = 1ull << (i & 63u);
++        const bool was = (snapshot.flagReaders[i >> 6] & bit) != 0u;
++        const bool is = pairReadsMacStatus(code);
++        if (was == is)
++            return;
++        snapshot.flagReaders[i >> 6] ^= bit;
++        if (is)
++            ++snapshot.flagReaderCount;
++        else
++            --snapshot.flagReaderCount;
++    }
++
++    // Patch 0097: PS2X_VU1_BANDERAS_MUERTAS=0 (and A/B mode 99): the VU1 schedules always work out the MAC and status
++    // flags, as before.
++    const bool s_deadFlagsEnabled = []()
++    {
++        const char *value = std::getenv("PS2X_VU1_BANDERAS_MUERTAS");
++        return value == nullptr || value[0] != '0';
++    }();
++
++    // The VU1 code that owner last decoded has no MAC or status reader (only meaningful right after its decode).
++    inline bool vu1MacStatusDead(const void *owner)
++    {
++        const DecodeSnapshot &snapshot = s_decodeSnapshots[1];
++        return s_deadFlagsEnabled && g_ps2AbMode.load(std::memory_order_relaxed) != 99 && snapshot.owner == owner &&
++               snapshot.flagReaderCount == 0u;
++    }
++
+     // Pairs of the VU1 already decoded and planned, by content (patch 0039): the game loads six microprograms in turn
+     // at the same addresses, so after each upload the same pairs came back and were decoded and planned again (~2 %
+     // of the EE thread in race). Each pair index keeps its last kPairVariants versions (a pair decodes from its own 8
+@@ -2852,6 +2899,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+             if (std::memcmp(snapshot.code + i * 8u, vuCode + i * 8u, 8u) == 0)
+                 continue;
+             snapshot.changed[i >> 6] |= 1ull << (i & 63u);
++            notePairFlagReader(snapshot, i, vuCode + i * 8u);
+             if (variants)
+             {
+                 uint32_t words[2];
+@@ -2869,6 +2917,10 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     {
+         for (uint32_t i = 0; i < pairCount; ++i)
+             m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
++        std::memset(snapshot.flagReaders, 0, sizeof(snapshot.flagReaders));
++        snapshot.flagReaderCount = 0u;
++        for (uint32_t i = 0; i < pairCount; ++i)
++            notePairFlagReader(snapshot, i, vuCode + i * 8u);
+         // The pair plans follow the cache: run() rebuilds them all before using them.
+         s_planTables[m_unit == Unit::VU1 ? 1 : 0].owner = nullptr;
+     }
+@@ -3003,6 +3055,16 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+         s_blocksOff = false;
+         s_verifyPackets = nullptr;
++        if (m_unit == Unit::VU1 && vu1MacStatusDead(this))
++        {
++            // Patch 0097: nothing in this code reads MAC or status, and the blocks leave most of them out: compare
++            // only the D and I bits of status (DIV, SQRT and RSQRT; current and sticky), which they keep.
++            VU1State blocksState{};
++            std::memcpy(&blocksState, stateBlocks.data(), sizeof(VU1State));
++            blocksState.mac = m_state.mac;
++            blocksState.status = (blocksState.status & 0xC30u) | (m_state.status & ~0xC30u);
++            std::memcpy(stateBlocks.data(), &blocksState, sizeof(VU1State));
++        }
+ 
+         const bool same = stoppedBlocks == m_stopRequested &&
+                           std::memcmp(stateBlocks.data(), &m_state, sizeof(VU1State)) == 0 &&
+@@ -3305,6 +3367,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             blocks->clear();
+             blocks->owner = this;
+         }
++        blocks->macStatusDead = m_unit == Unit::VU1 && vu1MacStatusDead(this); // patch 0097
+     }
+     // What runBlocks needs of this interpreter (a local class has the member function's access).
+     struct BlockHost
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index 45906d1..27fad75 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -24,6 +24,9 @@
+ 
+     using JitCode = void (*)(VU1State *, BlockState *, void *);
+ 
++    // Patch 0097: jitCompile's alternative for Schedule::jitNoFlags (BlockEngine::macStatusDead).
++    constexpr int kJitNoFlags = 1000;
++
+     // Patch 0083: PS2X_VU1_JIT_PEGAJOSAS=0: every FMAC flag entry worked out and committed whole (as before).
+     const bool s_jitStickyFlags = []()
+     {
+@@ -496,8 +499,10 @@
+     // (jitCompile): the entry only gets its status (Z if a written lane of the value or, for MADD/MSUB, of the product
+     // is zero, S if one is negative; the same bits as current | sticky) and a zero sticky, for jitEmitStickyCommit.
+     // shadow (patch 0087; nullptr: off): the operands through JitNormShadow and st.jitNorm.
++    // noEntry (patch 0097): no flag entry at all (nothing reads MAC or status, and its commit is left out too).
+     inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
+-                            const void *lateSlow = nullptr, bool stickyOnly = false, JitNormShadow *shadow = nullptr)
++                            const void *lateSlow = nullptr, bool stickyOnly = false, JitNormShadow *shadow = nullptr,
++                            bool noEntry = false)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -660,7 +665,7 @@
+         e.imm32(op.components);
+         const size_t toSlow = e.jne32();
+ 
+-        if (p.upperFlags != 0u && stickyOnly)
++        if (p.upperFlags != 0u && !noEntry && stickyOnly)
+         {
+             jitEmitFlagRow(e, p.issue + 4u);
+             const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
+@@ -696,7 +701,7 @@
+             e.imm32(slot + static_cast<uint32_t>(offsetof(FlagSlot, sticky)));
+             e.imm32(0u);
+         }
+-        else if (p.upperFlags != 0u)
++        else if (p.upperFlags != 0u && !noEntry)
+         {
+             jitEmitFlagRow(e, p.issue + 4u);
+             const uint32_t slot = static_cast<uint32_t>(offsetof(BlockState, flags));
+@@ -1637,9 +1642,15 @@
+             host.workingClipOffset(),
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.codeGeneration) - hostBase),
+             host.xgkickActiveOffset()};
+-        (alternative == 0 ? s.jitTried : s.jitCallsTried) = true;
+-        s.jitRanges.clear();
+-        s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
++        const bool noFlags = alternative == kJitNoFlags;
++        (alternative == 0 ? s.jitTried : noFlags ? s.jitNoFlagsTried : s.jitCallsTried) = true;
++        if (noFlags && !s_jitSse41)
++            return false; // its commits would go through s.jitRanges, which the other compiles point into
++        if (!noFlags)
++        {
++            s.jitRanges.clear();
++            s.jitRanges.reserve(s.pairs.size() + 1u); // stable addresses: the code points into it
++        }
+         JitEmitter e;
+         e.prologue();
+         if (e.code().size() != kJitPrologueBytes)
+@@ -1700,6 +1711,24 @@
+             const size_t due = static_cast<size_t>(p.issue) + 4u;
+             return due < stickyOnlyDue.size() && stickyOnlyDue[due] != 0u;
+         };
++        // Patch 0097 (noFlags): the due cycles of the side 0 flag commits of the schedule. A FMAC entry (MAC and
++        // status) committed at one of them is left out, and so is that commit (knownKind says it is that entry);
++        // entries committed after the schedule are written as always, for the commit that does not know them.
++        std::vector<uint8_t> flagCommitDue;
++        if (noFlags)
++            for (const BlockCommit &c : s.commits)
++                if (c.kind == CommitFlag && c.reg == 0u)
++                {
++                    if (flagCommitDue.size() <= c.due)
++                        flagCommitDue.resize(c.due + 1u, 0u);
++                    flagCommitDue[c.due] = 1u;
++                }
++        const auto noEntryPair = [&](const BlockPair &p)
++        {
++            const size_t due = static_cast<size_t>(p.issue) + 4u;
++            return noFlags && p.lowerFlag == 0u && p.upperFlags == (kFlagMac | kFlagStatus) && due < flagCommitDue.size() &&
++                   flagCommitDue[due] != 0u;
++        };
+         // Kind of the side 0 flag entry queued for each due cycle (relative to the entry) by a pair of this schedule.
+         std::vector<uint8_t> upperFlagKind;
+         const auto knownKind = [&](const BlockCommit &c) -> uint8_t
+@@ -1713,8 +1742,12 @@
+             if (s_jitSse41)
+             {
+                 for (; nextCommit < end; ++nextCommit)
++                {
++                    if (noFlags && knownKind(s.commits[nextCommit]) == (kFlagMac | kFlagStatus))
++                        continue; // patch 0097: its entry was left out (noEntryPair)
+                     jitEmitCommit<Host>(e, s.commits[nextCommit], inlineFlags ? knownKind(s.commits[nextCommit]) : 0u,
+                                         stickyOnlyCommit[nextCommit] != 0u);
++                }
+                 return;
+             }
+             s.jitRanges.push_back({&s.commits[nextCommit], static_cast<uint32_t>(end - nextCommit)});
+@@ -1753,7 +1786,7 @@
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+                       jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40,
+-                                  nullptr, stickyOnlyPair(p), shadow)) &&
++                                  nullptr, stickyOnlyPair(p), shadow, noEntryPair(p))) &&
+                     !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+@@ -1762,7 +1795,7 @@
+                 const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
+                 if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
+                                                 reinterpret_cast<const void *>(&jitUpperLate<Host>),
+-                                                stickyOnlyPair(p), shadow)) &&
++                                                stickyOnlyPair(p), shadow, noEntryPair(p))) &&
+                     !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
+                     e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             }
+@@ -1850,7 +1883,10 @@
+         else
+             e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
+         // A/B modes 71 and 73: every schedule returns to runBlocks, as before patch 0081.
+-        jitEmitChain(e, layout, engine, s, alternative == 0 ? offsetof(Schedule, jit) : offsetof(Schedule, jitCalls),
++        jitEmitChain(e, layout, engine, s,
++                     alternative == 0 ? offsetof(Schedule, jit)
++                     : noFlags        ? offsetof(Schedule, jitNoFlags)
++                                      : offsetof(Schedule, jitCalls),
+                      s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78);
+         e.epilogue();
+ 
+@@ -1858,7 +1894,7 @@
+         if (code == nullptr)
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+-        (alternative == 0 ? s.jit : s.jitCalls) = code;
++        (alternative == 0 ? s.jit : noFlags ? s.jitNoFlags : s.jitCalls) = code;
+         if (mapFile != nullptr)
+         {
+             static std::mutex s_mapMutex; // the VU0 and VU1 engines may compile on different threads

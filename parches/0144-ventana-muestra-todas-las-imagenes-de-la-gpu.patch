@@ -1,0 +1,410 @@
+diff --git a/ps2xRuntime/include/ps2_display.h b/ps2xRuntime/include/ps2_display.h
+index e9dcad4..98e2a3c 100644
+--- a/ps2xRuntime/include/ps2_display.h
++++ b/ps2xRuntime/include/ps2_display.h
+@@ -159,6 +159,43 @@ namespace ps2x
+         double m_frames = 0.0;
+     };
+ 
++    // T9: whether the window latches the game's picture in this window frame. serial: the GS's published pictures
++    // (ps2GsPresentationSerial; 0 when the latch builds the picture itself), tick: the EE's VSync count. A published
++    // serial is latched as soon as it changes; without one, once per tick (as before T9).
++    bool latchNeeded(bool latchedBefore, uint64_t serial, uint64_t lastSerial, uint64_t tick, uint64_t lastTick);
++
++    // Frame pacing (T9, PS2X_TRAZA_FOTOGRAMAS): fed once per window frame with its time and whether it showed a new game
++    // picture. The first frame only starts the count. A window of the count (take) gives the window frame times, the
++    // new pictures, how many window frames each picture stayed on screen (holds: refreshes -> pictures; a 50 fps game
++    // on a 165 Hz window holds them 3 or 4) and the longest time without a new picture.
++    class FramePacingStats
++    {
++    public:
++        struct Window
++        {
++            double seconds = 0.0;
++            int windowFrames = 0;
++            double meanMs = 0.0, stddevMs = 0.0, maxMs = 0.0;
++            int pictures = 0;
++            std::map<int, int> holds;
++            double longestStallMs = 0.0;
++        };
++        void frame(double seconds, bool newPicture);
++        // When at least period seconds have passed since the window started: fills it in and starts the next one.
++        bool take(double period, Window &out);
++        // Seconds without a new picture before the one the last frame showed (0 if the last frame showed none).
++        double endedStall() const { return m_endedStall; }
++
++    private:
++        bool m_started = false;
++        double m_windowStart = 0.0, m_lastFrame = 0.0, m_lastPicture = 0.0, m_endedStall = 0.0;
++        int m_framesSincePicture = 0;
++        bool m_hasPicture = false;
++        int m_frames = 0, m_pictures = 0;
++        double m_sumMs = 0.0, m_sumSquaresMs = 0.0, m_maxMs = 0.0, m_longestStall = 0.0;
++        std::map<int, int> m_holds;
++    };
++
+     // The window side of the settings (raylib; main thread only, between InitWindow and CloseWindow).
+     class DisplayPresenter
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 7600ffd..5525d5f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -439,6 +439,23 @@ namespace
+     }
+ }
+ 
++extern std::atomic<uint64_t> g_ps2GsGpuPublishedFrames; // gs_gpu_bridge.cpp
++
++// T9 (F1 06): which picture a latch would get now, for the window to latch each new one as soon as it is published.
++// The window latched once per EE VSync tick, but the GPU GS reads a flip's picture back a few ms after it: with the
++// window and the ticks at different rates (60 or 165 Hz against 50), the latch fell now before and now after the
++// readback, and one picture in five was shown twice and the next one never (40 of 50 a second, in menus and races).
++// 0 when the latch builds the picture itself (the CPU GS, or no flip for 100 ms): then once per tick, as before.
++// A/B mode 112: always once per tick, as before T9.
++uint64_t ps2GsPresentationSerial()
++{
++    const int mode = g_ps2AbMode.load(std::memory_order_relaxed);
++    if (!dynamic_cast<GSGpuBackend *>(g_displayBackend) || mode == 103 || mode == 112 ||
++        steadyNs() - g_lastFlipSnapshotNs.load(std::memory_order_relaxed) >= 100000000)
++        return 0u;
++    return g_ps2GsGpuPublishedFrames.load(std::memory_order_acquire) + 1u;
++}
++
+ // Patch 0104: from PS2Memory, on the EE thread, just before DISPFB1/2 change buffer: snapshot the one being left, in
+ // order with the GIF packets (see g_lastFlipSnapshotNs).
+ void ps2GsBeforeDisplayChange()
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 13bbe36..2b29c88 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -24,6 +24,9 @@
+ #include <dlfcn.h>
+ #endif
+ 
++// T9 (F1 06): frames published for the window so far (GS::presentationSerial, gs_frontend.cpp).
++std::atomic<uint64_t> g_ps2GsGpuPublishedFrames{0u};
++
+ namespace
+ {
+     // The C ABI of pgs_puente.dll (gpu/pgs_puente/pgs_puente.h, API version 4), declared here so that the runtime
+@@ -535,6 +538,7 @@ struct GSGpuBackend::Impl
+     {
+         std::lock_guard<std::mutex> lock(publishMutex);
+         published = std::move(frame);
++        g_ps2GsGpuPublishedFrames.fetch_add(1u, std::memory_order_release);
+     }
+ 
+     // The newest frame read back by the DLL (never waits for the GPU).
+diff --git a/ps2xRuntime/src/lib/ps2_display.cpp b/ps2xRuntime/src/lib/ps2_display.cpp
+index 8eec7e6..f3574e1 100644
+--- a/ps2xRuntime/src/lib/ps2_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_display.cpp
+@@ -282,6 +282,64 @@ namespace ps2x
+         return m_meter.sample(m_frames, seconds);
+     }
+ 
++    bool latchNeeded(bool latchedBefore, uint64_t serial, uint64_t lastSerial, uint64_t tick, uint64_t lastTick)
++    {
++        if (!latchedBefore)
++            return true;
++        return serial != 0u ? serial != lastSerial : tick != lastTick;
++    }
++
++    void FramePacingStats::frame(double seconds, bool newPicture)
++    {
++        m_endedStall = 0.0;
++        if (!m_started)
++        {
++            m_started = true;
++            m_windowStart = m_lastFrame = seconds;
++            m_hasPicture = newPicture;
++            m_lastPicture = seconds;
++            m_framesSincePicture = 0;
++            return;
++        }
++        const double ms = 1000.0 * (seconds - m_lastFrame);
++        m_lastFrame = seconds;
++        ++m_frames;
++        m_sumMs += ms;
++        m_sumSquaresMs += ms * ms;
++        m_maxMs = std::max(m_maxMs, ms);
++        ++m_framesSincePicture;
++        if (!newPicture)
++            return;
++        ++m_pictures;
++        if (m_hasPicture)
++            ++m_holds[m_framesSincePicture];
++        m_endedStall = seconds - m_lastPicture;
++        m_longestStall = std::max(m_longestStall, m_endedStall);
++        m_hasPicture = true;
++        m_lastPicture = seconds;
++        m_framesSincePicture = 0;
++    }
++
++    bool FramePacingStats::take(double period, Window &out)
++    {
++        if (!m_started || m_lastFrame - m_windowStart < period || m_frames == 0)
++            return false;
++        out.seconds = m_lastFrame - m_windowStart;
++        out.windowFrames = m_frames;
++        out.meanMs = m_sumMs / m_frames;
++        out.stddevMs = std::sqrt(std::max(0.0, m_sumSquaresMs / m_frames - out.meanMs * out.meanMs));
++        out.maxMs = m_maxMs;
++        out.pictures = m_pictures;
++        out.holds = m_holds;
++        // A stall still going on counts up to now.
++        out.longestStallMs = 1000.0 * std::max(m_longestStall, m_lastFrame - m_lastPicture);
++        m_windowStart = m_lastFrame;
++        m_frames = m_pictures = 0;
++        m_sumMs = m_sumSquaresMs = m_maxMs = m_longestStall = 0.0;
++        m_holds.clear();
++        return true;
++    }
++
+     bool RateMeter::sample(double count, double seconds)
+     {
+         if (!m_started)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0148ffc..7221e01 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -706,6 +706,38 @@ static bool EnsureFrameTexture(Texture2D &tex, uint32_t width, uint32_t height)
+     return true;
+ }
+ 
++// PS2X_TRAZA_FOTOGRAMAS=1 (T9, diagnostics): [ps2x:fotogramas] once a second with the window frame times, the
++// latched frames that brought a new picture (by a hash of its pixels) and how many window frames each stayed on screen;
++// [ps2x:congelada] for every 100 ms or more without a new picture. t= counts from the process start, like the game's
++// own traces ([f1-06:lua] t=).
++static const bool s_traceFrames = []()
++{
++    const char *value = std::getenv("PS2X_TRAZA_FOTOGRAMAS");
++    return value != nullptr && value[0] != '\0' && value[0] != '0';
++}();
++static const auto s_processStart = std::chrono::steady_clock::now();
++static bool s_traceNewPicture = false; // the frame uploaded in this window frame differs from the previous one
++
++static double SecondsSinceProcessStart()
++{
++    return std::chrono::duration<double>(std::chrono::steady_clock::now() - s_processStart).count();
++}
++
++static uint64_t PictureHash(const std::vector<uint8_t> &pixels)
++{
++    uint64_t hash = 0x9E3779B97F4A7C15ull;
++    const size_t words = pixels.size() / 8u;
++    for (size_t i = 0; i < words; ++i)
++    {
++        uint64_t word = 0;
++        std::memcpy(&word, pixels.data() + i * 8u, sizeof(word));
++        hash = (hash ^ word) * 0x100000001B3ull;
++    }
++    return hash ^ pixels.size();
++}
++
++uint64_t ps2GsPresentationSerial(); // gs_frontend.cpp
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -723,12 +755,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         SaveRequestedCapture(s_uploadBuffer, static_cast<uint32_t>(tex.width), s_lastWidth, s_lastHeight,
+                              rt->memory().getRDRAM());
+ 
++    // T9: with the GPU GS, each picture as soon as it is published (ps2GsPresentationSerial); else once per tick.
++    static uint64_t s_lastSerial = 0u;
+     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
++    const uint64_t serial = ps2GsPresentationSerial();
++    const bool needsLatch =
++        ps2x::latchNeeded(s_hasLatchedInitialFrame, serial, s_lastSerial, currentTick, s_lastPresentationTick);
+     if (needsLatch)
+     {
+         rt->gs().latchHostPresentationFrame();
+         s_lastPresentationTick = currentTick;
++        s_lastSerial = serial;
+         s_hasLatchedInitialFrame = true;
+     }
+     else if (s_hasUploadedFrame)
+@@ -781,6 +818,42 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+         ++s_uploadDebugCount;
+     });
++    if (s_traceFrames)
++    {
++        static uint64_t s_lastHash = 0u;
++        const uint64_t hash = PictureHash(s_scratch);
++        s_traceNewPicture = hash != s_lastHash;
++        s_lastHash = hash;
++        // PS2X_TRAZA_FOTOGRAMAS_CSV=<file>: each new picture with its time and how much it changed (mean difference
++        // of a 32x24 grid of luma samples, 0-255), to time screen changes the same way in a video of PCSX2.
++        static FILE *const s_csv = []() -> FILE *
++        {
++            const char *path = std::getenv("PS2X_TRAZA_FOTOGRAMAS_CSV");
++            FILE *file = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
++            if (file != nullptr)
++                std::fprintf(file, "t,diferencia\n");
++            return file;
++        }();
++        if (s_csv != nullptr && s_traceNewPicture && width != 0u && height != 0u &&
++            s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
++        {
++            static std::array<uint8_t, 32u * 24u> s_lastGrid{};
++            std::array<uint8_t, 32u * 24u> grid{};
++            uint32_t total = 0u;
++            for (uint32_t gy = 0; gy < 24u; ++gy)
++                for (uint32_t gx = 0; gx < 32u; ++gx)
++                {
++                    const uint8_t *p = s_scratch.data() +
++                                       (static_cast<size_t>((2u * gy + 1u) * height / 48u) * width + (2u * gx + 1u) * width / 64u) * 4u;
++                    const uint8_t luma = static_cast<uint8_t>((p[0] * 77u + p[1] * 150u + p[2] * 29u) >> 8);
++                    grid[gy * 32u + gx] = luma;
++                    total += static_cast<uint32_t>(std::abs(static_cast<int>(luma) - static_cast<int>(s_lastGrid[gy * 32u + gx])));
++                }
++            s_lastGrid = grid;
++            std::fprintf(s_csv, "%.4f,%.2f\n", SecondsSinceProcessStart(), total / 768.0);
++            std::fflush(s_csv);
++        }
++    }
+     s_lastDisplayFbp = displayFbp;
+     s_lastSourceFbp = sourceFbp;
+     s_lastPreferred = usedPreferredDisplaySource;
+@@ -3101,6 +3174,37 @@ void PS2Runtime::run()
+         if (!s_windowCapturePath.empty())
+             SaveWindowCapture();
+         EndDrawing();
++        if (s_traceFrames)
++        {
++            static ps2x::FramePacingStats s_pacing;
++            static uint64_t s_flips = g_ps2DisplayFlips.load(std::memory_order_relaxed);
++            static uint64_t s_ticks = m_eeScheduler->currentVSyncTick();
++            const double now = SecondsSinceProcessStart();
++            s_pacing.frame(now, s_traceNewPicture);
++            s_traceNewPicture = false;
++            if (s_pacing.endedStall() >= 0.1)
++                std::cout << "[ps2x:congelada] t=" << now << " ms=" << static_cast<int>(1000.0 * s_pacing.endedStall())
++                          << std::endl;
++            ps2x::FramePacingStats::Window window;
++            if (s_pacing.take(1.0, window))
++            {
++                const uint64_t flips = g_ps2DisplayFlips.load(std::memory_order_relaxed);
++                const uint64_t ticks = m_eeScheduler->currentVSyncTick();
++                char text[256];
++                std::snprintf(text, sizeof(text),
++                              "[ps2x:fotogramas] t=%.3f ventana/s=%.1f dtMedio=%.2f dtDesv=%.2f dtMax=%.1f imagenes/s=%.1f "
++                              "vsync/s=%.1f cambiosDispfb/s=%.1f congeladaMax=%.0f refrescos=",
++                              now, window.windowFrames / window.seconds, window.meanMs, window.stddevMs, window.maxMs,
++                              window.pictures / window.seconds, (ticks - s_ticks) / window.seconds,
++                              (flips - s_flips) / window.seconds, window.longestStallMs);
++                std::cout << text;
++                for (const auto &[refreshes, pictures] : window.holds)
++                    std::cout << refreshes << ":" << pictures << " ";
++                std::cout << std::endl;
++                s_flips = flips;
++                s_ticks = ticks;
++            }
++        }
+ 
+         if (WindowShouldClose())
+         {
+diff --git a/ps2xTest/src/ps2_display_tests.cpp b/ps2xTest/src/ps2_display_tests.cpp
+index 1f97912..82440d4 100644
+--- a/ps2xTest/src/ps2_display_tests.cpp
++++ b/ps2xTest/src/ps2_display_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_options.h"
+ #include "ps2_runtime.h"
+ 
++#include <cmath>
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -424,6 +425,87 @@ void register_ps2_display_tests()
+             t.Equals(still.rate(), 0.0, "no flips: 0");
+         });
+ 
++        tc.Run("the window latches every picture the GPU GS publishes, at any window rate", [](TestCase &t)
++        {
++            // 2 s of a game at 50 pictures a second; each one is published 4.5 ms after its tick (the GPU readback).
++            // The window latches with latchNeeded and shows the newest published picture.
++            auto shown = [](double windowHz, bool withSerial)
++            {
++                constexpr double kTick = 0.020, kReadback = 0.0045;
++                bool latchedBefore = false;
++                uint64_t lastSerial = 0u, lastTick = 0u;
++                int64_t lastPicture = -1;
++                int pictures = 0;
++                for (int k = 0; k * (1.0 / windowHz) < 2.0; ++k)
++                {
++                    const double now = 0.0013 + k / windowHz;
++                    const uint64_t tick = static_cast<uint64_t>(now / kTick);
++                    const int64_t published = now < kReadback ? 0 : static_cast<int64_t>((now - kReadback) / kTick) + 1;
++                    const uint64_t serial = withSerial ? static_cast<uint64_t>(published) + 1u : 0u;
++                    if (!ps2x::latchNeeded(latchedBefore, serial, lastSerial, tick, lastTick))
++                        continue;
++                    latchedBefore = true;
++                    lastSerial = serial;
++                    lastTick = tick;
++                    if (published - 1 != lastPicture && published > 0)
++                        ++pictures;
++                    lastPicture = published - 1;
++                }
++                return pictures;
++            };
++            t.Equals(shown(60.0, true), 100, "60 Hz window: all 100 pictures");
++            t.Equals(shown(165.0, true), 100, "165 Hz window: all 100 pictures");
++            t.Equals(shown(144.0, true), 100, "144 Hz window: all 100 pictures");
++            t.IsTrue(shown(60.0, false) < 90, "once per tick (CPU GS) loses some at 60 Hz: " + std::to_string(shown(60.0, false)));
++
++            t.IsTrue(ps2x::latchNeeded(false, 0u, 0u, 5u, 5u), "the first frame latches");
++            t.IsTrue(!ps2x::latchNeeded(true, 0u, 0u, 5u, 5u), "no serial, same tick: no latch");
++            t.IsTrue(ps2x::latchNeeded(true, 0u, 7u, 6u, 5u), "no serial, new tick: latch");
++            t.IsTrue(!ps2x::latchNeeded(true, 7u, 7u, 6u, 5u), "same serial, new tick: no latch");
++            t.IsTrue(ps2x::latchNeeded(true, 8u, 7u, 5u, 5u), "new serial, same tick: latch");
++        });
++
++        tc.Run("the frame pacing stats count pictures, how long each stays on screen and the stalls", [](TestCase &t)
++        {
++            // A 165 Hz window showing a game at 50 pictures a second: each picture stays 3 or 4 refreshes.
++            ps2x::FramePacingStats pacing;
++            ps2x::FramePacingStats::Window window;
++            int shown = -1;
++            for (int k = 0; k <= 165; ++k)
++            {
++                const double seconds = k / 165.0;
++                const int picture = static_cast<int>(seconds * 50.0 + 1e-9);
++                pacing.frame(seconds, picture != shown);
++                shown = picture;
++            }
++            t.IsTrue(pacing.take(1.0, window), "a second has passed");
++            t.Equals(window.windowFrames, 165, "window frames");
++            t.Equals(window.pictures, 50, "new pictures");
++            t.IsTrue(std::fabs(window.meanMs - 1000.0 / 165.0) < 0.01, "mean frame time: " + std::to_string(window.meanMs));
++            t.IsTrue(window.stddevMs < 0.01, "even window frames: " + std::to_string(window.stddevMs));
++            t.Equals(window.holds.size(), static_cast<size_t>(2), "two hold lengths");
++            t.Equals(window.holds[3], 35, "35 pictures held 3 refreshes");
++            t.Equals(window.holds[4], 15, "15 held 4 (3.3 on average)");
++            t.IsTrue(std::fabs(window.longestStallMs - 4000.0 / 165.0) < 0.01, "longest wait for a picture: 4 refreshes");
++            t.IsTrue(!pacing.take(1.0, window), "the window was reset");
++
++            // A load: 0.4 s without a new picture, then pictures again. The stall is reported with the picture that ends it.
++            ps2x::FramePacingStats load;
++            load.frame(10.0, true);
++            t.Equals(load.endedStall(), 0.0, "the first picture ends no stall");
++            for (int k = 1; k < 24; ++k)
++                load.frame(10.0 + k / 60.0, false);
++            t.Equals(load.endedStall(), 0.0, "no picture yet");
++            load.frame(10.4, true);
++            t.IsTrue(std::fabs(load.endedStall() - 0.4) < 1e-9, "0.4 s stall: " + std::to_string(load.endedStall()));
++            load.frame(10.42, true);
++            t.IsTrue(std::fabs(load.endedStall() - 0.02) < 1e-9, "then one frame");
++            t.IsTrue(load.take(0.4, window), "0.42 s window");
++            t.Equals(window.pictures, 2, "two pictures after the one that started the window");
++            t.IsTrue(std::fabs(window.longestStallMs - 400.0) < 1e-6, "longest stall 400 ms");
++            t.IsTrue(std::fabs(window.maxMs - 20.0) < 1e-6, "longest window frame: the last, 20 ms");
++        });
++
+         tc.Run("the frame rate meter counts per second", [](TestCase &t)
+         {
+             ps2x::RateMeter meter;
