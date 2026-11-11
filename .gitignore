@@ -16,3 +16,6 @@
 /analisis/analyzer-log.txt
 __pycache__/
 *.pyc
+
+# Previas de los diseños (se regeneran con Chrome headless)
+/design/*/.previas/

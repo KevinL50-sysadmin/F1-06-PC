@@ -1,4 +1,4 @@
-# F1 06 PC — a native Windows port of Formula One 06 (PS2) by static recompilation
+# F1 06 PC: a native Windows port of Formula One 06 (PS2) by static recompilation
 
 > **Fan project. Not affiliated with, endorsed by or connected to Sony Interactive Entertainment, SCE Studio Liverpool,
 > Formula One Group, the FIA or any other rights holder.** No game data is distributed: you need your own copy of the
@@ -8,8 +8,8 @@
 program. This is not an emulator running the disc: the game's MIPS code (about 14,000 functions) is translated ahead
 of time into C++ with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and compiled into a normal `.exe`, together with
 a runtime that stands in for the PS2 hardware (EE, IOP, VU1, SPU2) and draws the GS graphics on your graphics card
-through [paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) (Vulkan). On top of a faithful 1.0 base — the
-full PS2 game, all 18 circuits, championship, split screen — it adds PC options that live inside the game's own menus,
+through [paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) (Vulkan). On top of a faithful 1.0 base (the
+full PS2 game, all 18 circuits, championship, split screen), it adds PC options that live inside the game's own menus,
 with its own fonts, colours and controller navigation: no overlays, no external launchers.
 
 ## Highlights
@@ -19,8 +19,8 @@ with its own fonts, colours and controller navigation: no overlays, no external 
   (nearest, bilinear, sharp, AMD FSR 1, CRT); software (CPU) mode as a fallback.
 - **Display**: window, borderless or fullscreen, the game's own **widescreen 16:9** option, aspect auto / 4:3 / 16:9 /
   square pixels, VSync, FPS counter, **wider field of view** (+5 % to +30 %) for the race cameras.
-- **Beyond-PS2 detail**: CAR DETAIL option — REDUCED, AS ON PS2 (default), HIGH or MAXIMUM (every car drawn with
-  the player car's full detail) — and a SCENERY DISTANCE option (AS ON PS2, FAR, VERY FAR) that pushes the scenery fade
+- **Beyond-PS2 detail**: a CAR DETAIL option with REDUCED, AS ON PS2 (default), HIGH or MAXIMUM, where every car is
+  drawn with the player car's full detail, and a SCENERY DISTANCE option (AS ON PS2, FAR, VERY FAR) that pushes the scenery fade
   distances further out.
 - **Photo mode**: freezes the race, free camera, switch to any car and any race camera; **replays** with rewind and
   fast-forward.
@@ -144,7 +144,7 @@ Only the European PAL release, SCES-53950. Other regions use a different executa
 
 ## Support the project
 
-If you'd like to support the work, there is a Ko-fi: **KOFI_URL**. Donations fund the time spent on the port, the
+If you'd like to support the work, there is a Ko-fi: **https://ko-fi.com/kevinl50**. Donations fund the time spent on the port, the
 tools behind it and, hopefully one day, community servers. They never buy builds, features or game content:
 everything stays free for everyone.
 
@@ -162,9 +162,9 @@ assets, ISO images or BIOS files are distributed; no official logo is used as pr
 
 ## Credits and third-party software
 
-- **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** — the PlayStation 2 static recompiler and runtime this port is
+- **[PS2Recomp](https://github.com/ran-j/PS2Recomp)**: the PlayStation 2 static recompiler and runtime this port is
   built on (GPL-3.0). This project's changes to it are kept as patches in `parches/`.
-- **[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs)** — GS rendering on the GPU with Vulkan (LGPL-3.0
+- **[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs)**: GS rendering on the GPU with Vulkan (LGPL-3.0
   or later), with **[Granite](https://github.com/Themaister/Granite)** (MIT), **volk** (MIT) and **Vulkan-Headers**
   (Apache-2.0 or MIT). Full source and licenses ship in the package's `licencias\` folder.
 - **[raylib](https://github.com/raysan5/raylib)** (zlib) and **[Dear ImGui](https://github.com/ocornut/imgui)** (MIT),
@@ -241,7 +241,7 @@ con cortafuegos real); el `.exe` no está firmado.
 **Online:** hoy hay juego en red experimental para 2 PC. Un online con cuentas y servidores comunitarios es algo que
 nos gustaría explorar en el futuro: un objetivo, no una promesa.
 
-**Apoyo:** Ko-fi en **KOFI_URL**. Las donaciones apoyan el trabajo del port, las herramientas y, ojalá, futuros
+**Apoyo:** Ko-fi en **https://ko-fi.com/kevinl50**. Las donaciones apoyan el trabajo del port, las herramientas y, ojalá, futuros
 servidores comunitarios; nunca compran versiones, funciones ni contenido del juego: todo sigue gratis para todos.
 
 **Aviso legal:** proyecto de fans independiente y sin ánimo de lucro. *Formula One 06* y las marcas "Formula One",
