@@ -4,9 +4,10 @@
 # .gitignore deja fuera): archivo a archivo los .cmd de la raiz, .gitignore, README.md, LICENSE, .github/FUNDING.yml,
 # config/recomp.toml, gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/
 # y los .patch de parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los
-# borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario), .git-blame-ignore-revs (nombra
+# borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario),
+# scripts/exportar-personales.txt (patrones privados de datos personales), .git-blame-ignore-revs (nombra
 # commits privados) y, por supuesto, cualquier dato del juego. Un archivo nuevo en src/, parches/, gpu/, config/,
-# scripts/ o docs/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
+# scripts/, docs/ o .github/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
 # revisarlo y anadirlo a una de las dos listas de abajo.
 #
 # La exportacion se monta en una carpeta temporal y se comprueba; falla (codigo 1, sin tocar dist/F1-06-PC) si
@@ -73,8 +74,8 @@ clasificar() {
     case "$1" in
         src/*.cpp | src/*.h | parches/*.patch) clase=publico ;;
         # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
-        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
-        src/* | parches/* | gpu/* | config/* | scripts/* | docs/*) clase=sin-revisar ;;
+        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
+        src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/*) clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;
         *.md | ESTADO* | ROADMAP* | .git-blame-ignore-revs) clase=fuera ;;
@@ -144,7 +145,7 @@ done
 cd "$arbol"
 
 excluidas=(odd ESTADO.md ROADMAP.md analisis .git-blame-ignore-revs config/recomp.toml.antes-entradas logs
-           scripts/pcsx2-ref.ps1 juego mc0 mc1 datos build tools third_party)
+           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt juego mc0 mc1 datos build tools third_party)
 for ruta in "${excluidas[@]}"; do
     [ ! -e "$ruta" ] || fallo "ruta excluida presente: $ruta"
 done
@@ -155,15 +156,48 @@ done
 # Datos personales, sin distinguir mayusculas: rutas de la unidad J: y de la carpeta del usuario de Windows, su nombre,
 # su correo y las carpetas del proyecto y de la ISO. Se permiten el enlace al repositorio publico
 # (github.com/<cuenta>/F1-06-PC), los perfiles publicos de Ko-fi y X del autor (tambien el ko_fi de .github/FUNDING.yml)
-# y las carpetas de usuario genericas (Users/Public y Users/p de los tests).
+# y las carpetas de usuario genericas (Users/Public y Users/p de los tests). Se anaden los patrones del archivo privado
+# scripts/exportar-personales.txt si existe (una ERE por linea, sin los espacios del final; # y lineas en blanco no
+# cuentan): asi los datos que no deben salir ni como patron no estan en este script, que se publica. Un patron no
+# valido para grep -E hace fallar la exportacion. Con -i no siempre se igualan mayusculas fuera del ASCII: una letra
+# acentuada se escribe alli en las dos formas (en los binarios se busca byte a byte: el texto debe ir en UTF-8).
 # Los corchetes evitan que este mismo script coincida con sus patrones.
 personales='J:[\\/]|[a-z]:[\\/]+users[\\/]+[a-z0-9._-]{2,}|K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula'
 permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#ko_fi: k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
 # En los binarios solo los patrones largos (los cortos darian falsos positivos en datos comprimidos).
 personales_binario='K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula|[a-z]:[\\/]+users[\\/]+k[e]vin'
+# grep sale con 2 si el patron no vale: no se puede tomar por "sin coincidencias".
+patron_valido() { local r=0; printf '' | grep -E -e "$1" || r=$?; [ "$r" -le 1 ]; }
+if [ -f "$raiz/scripts/exportar-personales.txt" ]; then
+    linea=0
+    while IFS= read -r patron || [ -n "$patron" ]; do
+        linea=$((linea + 1))
+        patron="${patron%$'\r'}"
+        patron="${patron%"${patron##*[![:space:]]}"}"
+        case "$patron" in "" | "#"*) continue ;; esac
+        if ! patron_valido "($patron)" 2>/dev/null; then
+            echo "FALLO: patron no valido para grep -E en scripts/exportar-personales.txt, linea $linea." >&2
+            echo "Exportacion NO valida. dist/F1-06-PC no se ha tocado." >&2
+            exit 1
+        fi
+        personales+="|($patron)"
+        personales_binario+="|($patron)"
+    done < "$raiz/scripts/exportar-personales.txt"
+fi
+for p in "$personales" "$personales_binario"; do
+    patron_valido "$p" || { echo "FALLO: patron de datos personales no valido" >&2; exit 1; }
+done
 buscar_personales() { sed -E "$permitidos" | grep -i -E "$personales"; }
+# grep_personales <salida> <grep...>: deja las lineas en <salida>; un 2 de grep (no pudo leer) es un fallo, no "limpio".
+grep_personales() {
+    local salida=$1 r=0
+    shift
+    "$@" > "$salida" || r=$?
+    [ "$r" -le 1 ] || fallo "grep no pudo buscar datos personales (codigo $r): ${*: -1}"
+}
 
-coincidencias="$(grep -r -I -n -i -E "$personales" . | buscar_personales || true)"
+grep_personales "$temporal/coinciden" grep -r -I -n -i -E "$personales" .
+coincidencias="$(buscar_personales < "$temporal/coinciden" || true)"
 if [ -n "$coincidencias" ]; then
     fallo "datos personales en archivos de texto:"
     echo "$coincidencias" >&2
@@ -177,14 +211,19 @@ while IFS= read -r -d '' archivo; do
         *) codificacion=UTF-16LE ;;
     esac
     if iconv -f "$codificacion" -t UTF-8 "$archivo" > "$temporal/texto" 2>/dev/null && grep -I -q . "$temporal/texto"; then
-        coincidencias="$(grep -n -i -E "$personales" "$temporal/texto" | buscar_personales || true)"
+        grep_personales "$temporal/coinciden" grep -n -i -E "$personales" "$temporal/texto"
+        coincidencias="$(buscar_personales < "$temporal/coinciden" || true)"
         if [ -n "$coincidencias" ]; then
             fallo "datos personales en texto UTF-16: $archivo"
             echo "$coincidencias" >&2
         fi
-    elif grep -a -q -i -E "$personales_binario" "$archivo" \
-         || tr -d '\000' < "$archivo" | grep -a -q -i -E "$personales_binario"; then
-        fallo "datos personales en binario: $archivo"
+    else
+        grep_personales "$temporal/coinciden" grep -a -c -i -E "$personales_binario" "$archivo"
+        tr -d '\000' < "$archivo" > "$temporal/sin-nul"
+        grep_personales "$temporal/coinciden-sin-nul" grep -a -c -i -E "$personales_binario" "$temporal/sin-nul"
+        if [ "$(cat "$temporal/coinciden")" != 0 ] || [ "$(cat "$temporal/coinciden-sin-nul")" != 0 ]; then
+            fallo "datos personales en binario: $archivo"
+        fi
     fi
 done < <(grep -r -I -L -Z . . || true)
 
