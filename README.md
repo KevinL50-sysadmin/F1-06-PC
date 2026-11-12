@@ -60,12 +60,14 @@ owners.
 - A graphics card with Vulkan for the normal (GPU) mode; without it the game draws in software mode (slower).
 - **Your own copy of Formula One 06 for PS2, European PAL version (SCES-53950)**, dumped from your own disc to an
   `.iso` file.
-- CPU: no minimum has been measured yet. The race start with 22 cars is the most demanding moment and depends on the
-  processor's clock speed (see *Known limitations*). [VERIFICAR: minimum or recommended CPU]
+- CPU: no minimum has been established (the port has been measured on a single PC). The game's main thread is
+  CPU-bound, so single-core speed matters most: the race start with 22 cars is the most demanding moment, and when
+  the cores stay below about 4 GHz (for example with Windows' *Balanced* power plan) it drops under 50 fps for a few
+  seconds (see *Known limitations*). As a guideline, a recent desktop processor with high boost clocks.
 
 ## Installation
 
-1. Download either the **installer** (`.exe`) or the **portable** `.zip` from the release page (RELEASE_URL).
+1. Download either the **installer** (`.exe`) or the **portable** `.zip` from [the latest release](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest).
    - Installer: creates "F1 06 PC" shortcuts in the Start menu and on the desktop; uninstall from Settings > Apps (it
      asks whether to also delete your saves and options). Your saves and settings go to
      `Documents\My Games\F1-06`. One installer page lets you pick your ISO (already filled in if one is found in your
@@ -116,7 +118,7 @@ Dump your own disc: the project will never tell you where to download a game ima
   over 127.0.0.1 so far; a test across two PCs with a real firewall is pending. Traffic is signed but **not
   encrypted**: outside your home, use Tailscale or ZeroTier rather than opening a port.
 - The original game had no online mode; this port does not add one (yet).
-- DualShock 4 vibration does not work. [VERIFICAR: still true]
+- DualShock 4 vibration is untested.
 - The executable is not code-signed, so SmartScreen warns on first run.
 
 ## FAQ
@@ -130,7 +132,6 @@ legal way to get it is from a disc you own.
 The project ships no game data, no ISO and no BIOS, and is not a commercial product. Making a personal backup of a
 game you own is treated differently from country to country, so check your local law. If you are a rights holder and
 have a concern, please open an issue at https://github.com/KevinL50-sysadmin/F1-06-PC/issues.
-[VERIFICAR: contact method for rights holders]
 
 **Is there online play?**
 Not over the internet with accounts. Today there is experimental 2-player netplay between two PCs. Online play with
@@ -154,6 +155,8 @@ Bug reports are just as valuable
 ([issues](https://github.com/KevinL50-sysadmin/F1-06-PC/issues)): please attach `F1-06.log` (portable: `registros\` inside the game folder; installed:
 `%LOCALAPPDATA%\F1-06\registros`).
 
+Follow progress and news on X: **https://x.com/KevinLA50**.
+
 ## Legal notice
 
 *Formula One 06* is © its respective owners. "Formula One", "Formula 1", "F1", "PlayStation", "PS2" and related marks
@@ -175,7 +178,7 @@ assets, ISO images or BIOS files are distributed; no official logo is used as pr
 - **AMD FidelityFX Super Resolution 1** (EASU and RCAS, MIT), adapted to GLSL for the FSR image filter.
 - **FFmpeg** DLLs for the game's videos (LGPL).
 - **Michroma** font (SIL Open Font License 1.1), used for the port's on-screen notices.
-- Modelled on the god-of-war-recomp project [VERIFICAR: link], with ideas (never code) taken from the F1
+- Modelled on the [god-of-war-recomp](https://github.com/KIexster/god-of-war-recomp) project, with ideas (never code) taken from the F1
   Championship Edition PS3 recompilation.
 - Thanks to SCE Studio Liverpool for the original game, and to the PS2 preservation and recompilation communities.
 
@@ -189,10 +192,11 @@ Source: https://github.com/KevinL50-sysadmin/F1-06-PC. The repository holds only
 DLL), `config/recomp.toml`, `scripts/` (build, packaging and analysis tools; comments in Spanish) and the root `.cmd`
 build scripts. It never contains game data.
 
-Outline (Windows, from the project root) [VERIFICAR: full clean-checkout procedure, including the PS2Recomp base
-commit the patches apply to]:
+Outline (Windows, from the project root):
 
-1. Clone PS2Recomp into `third_party\PS2Recomp` and apply `parches\*.patch` in order.
+1. Clone [PS2Recomp](https://github.com/ran-j/PS2Recomp) into `third_party\PS2Recomp`, check out the base commit
+   `2c5fbb9389e11dd95693385969490c9e8e6f57b4` and apply `parches\*.patch` on top of it in numeric order (for
+   example `git apply --whitespace=nowarn` for each one, from `0001` up).
 2. Put portable MSVC, Windows SDK, CMake and Ninja in `tools\` (`entorno.cmd` sets up a console with them).
 3. `compilar-ps2recomp.cmd` builds PS2Recomp in `build\ps2recomp`.
 4. Extract your own disc into `juego\` (`scripts\iso_ps2.py`), then `recompilar.cmd` translates `juego\SCES_539.50` to
@@ -224,9 +228,11 @@ respuesta; pantalla partida y juego en red por IP (experimental); carpeta `mods\
 regresiones completas guionizadas).
 
 **Requisitos:** Windows 10/11 de 64 bits, tarjeta gráfica con Vulkan (sin ella, modo Software, más lento) y **tu
-propia copia de Formula One 06 PAL (SCES-53950)**, volcada de tu disco a una `.iso`.
+propia copia de Formula One 06 PAL (SCES-53950)**, volcada de tu disco a una `.iso`. CPU: sin mínimo establecido;
+lo que más cuenta es la velocidad de un núcleo (por debajo de unos 4 GHz la salida baja de 50 fps unos segundos).
 
-**Instalación:** descarga el instalador o el `.zip` portable (RELEASE_URL). El instalador crea los accesos "F1 06 PC"
+**Instalación:** descarga el instalador o el `.zip` portable de
+[la última versión](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). El instalador crea los accesos "F1 06 PC"
 y puede copiar los datos de tu ISO durante la instalación. Si no, la primera vez el juego te pide la ISO una sola vez
 (te ofrece la que encuentre en Descargas o en el Escritorio, o la buscas tú), comprueba que es la PAL (SCES-53950),
 copia los datos con una barra de progreso y arranca; después, a jugar. La ISO solo se lee. Si Windows avisa con SmartScreen ("Windows protegió su PC"), pulsa "Más información" y "Ejecutar de todas
@@ -238,13 +244,14 @@ completa, F10 aspecto, F12 foto, H HUD, F8 o R3 modo foto. Todo explicado en `LE
 **Limitaciones conocidas:** con el plan de energía Equilibrado y programas abiertos, la salida con 22 coches puede bajar
 a 42-45 fps unos segundos (con Alto rendimiento, 50); DETALLE ALTO cuesta un 16 % y MÁXIMO va a unos 25 fps en la
 salida; sin 60 fps; el juego en red es experimental (2 jugadores, firmado pero sin cifrar; falta la prueba en dos PC
-con cortafuegos real); el `.exe` no está firmado.
+con cortafuegos real); la vibración del DualShock 4 no está probada; el `.exe` no está firmado.
 
 **Online:** hoy hay juego en red experimental para 2 PC. Un online con cuentas y servidores comunitarios es algo que
 nos gustaría explorar en el futuro: un objetivo, no una promesa.
 
 **Apoyo:** Ko-fi en **https://ko-fi.com/kevinl50**. Las donaciones apoyan el trabajo del port, las herramientas y, ojalá, futuros
 servidores comunitarios; nunca compran versiones, funciones ni contenido del juego: todo sigue gratis para todos.
+Novedades en X: **https://x.com/KevinLA50**.
 
 **Aviso legal:** proyecto de fans independiente y sin ánimo de lucro. *Formula One 06* y las marcas "Formula One",
 "F1", "PlayStation" y relacionadas pertenecen a sus dueños y solo se nombran para describir la compatibilidad. No se

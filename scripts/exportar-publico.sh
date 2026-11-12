@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Exporta la parte publica del proyecto a dist/F1-06-PC, la copia de trabajo del repositorio publico F1-06-PC
 # (este repositorio sigue privado). Solo sale una lista blanca revisada de archivos del repositorio (nunca lo que
-# .gitignore deja fuera): archivo a archivo los .cmd de la raiz, .gitignore, README.md, LICENSE, config/recomp.toml,
-# gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/ y los .patch de
-# parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los borradores del anuncio
-# (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario), .git-blame-ignore-revs (nombra
+# .gitignore deja fuera): archivo a archivo los .cmd de la raiz, .gitignore, README.md, LICENSE, .github/FUNDING.yml,
+# config/recomp.toml, gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/
+# y los .patch de parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los
+# borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario), .git-blame-ignore-revs (nombra
 # commits privados) y, por supuesto, cualquier dato del juego. Un archivo nuevo en src/, parches/, gpu/, config/,
 # scripts/ o docs/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
 # revisarlo y anadirlo a una de las dos listas de abajo.
@@ -40,7 +40,7 @@ esac
 
 # Lista blanca revisada, archivo a archivo. Un archivo de la lista que no exista no es un fallo.
 revisados=(
-    .gitignore README.md LICENSE
+    .gitignore README.md LICENSE .github/FUNDING.yml
     compilar-ps2recomp.cmd compilar-runner.cmd ejecutar.cmd entorno.cmd recompilar.cmd
     config/recomp.toml
     gpu/pgs_puente/CMakeLists.txt gpu/pgs_puente/LICENSE.txt gpu/pgs_puente/compilar.cmd
@@ -154,10 +154,11 @@ done
 
 # Datos personales, sin distinguir mayusculas: rutas de la unidad J: y de la carpeta del usuario de Windows, su nombre,
 # su correo y las carpetas del proyecto y de la ISO. Se permiten el enlace al repositorio publico
-# (github.com/<cuenta>/F1-06-PC), los perfiles publicos de Ko-fi y X del autor y las carpetas de usuario genericas (Users/Public y Users/p de los tests).
+# (github.com/<cuenta>/F1-06-PC), los perfiles publicos de Ko-fi y X del autor (tambien el ko_fi de .github/FUNDING.yml)
+# y las carpetas de usuario genericas (Users/Public y Users/p de los tests).
 # Los corchetes evitan que este mismo script coincida con sus patrones.
 personales='J:[\\/]|[a-z]:[\\/]+users[\\/]+[a-z0-9._-]{2,}|K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula'
-permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
+permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#ko_fi: k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
 # En los binarios solo los patrones largos (los cortos darian falsos positivos en datos comprimidos).
 personales_binario='K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula|[a-z]:[\\/]+users[\\/]+k[e]vin'
 buscar_personales() { sed -E "$permitidos" | grep -i -E "$personales"; }
