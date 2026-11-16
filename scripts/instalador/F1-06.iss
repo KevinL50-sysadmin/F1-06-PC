@@ -1,12 +1,16 @@
 ; Instalador de F1 06 recompilado (Inno Setup 6). No se compila a mano: lo hace scripts\empaquetar.ps1 -Instalador,
 ; que pasa la carpeta portable ya hecha (Origen), el nombre del .exe, la version, la fecha, el icono (Icono:
 ; build\icono\F1-06.ico, el logo del juego, de scripts\hacer-icono.ps1) y la carpeta de salida.
-; Instala el .exe, las DLL, datos\ y LEEME.txt; sin portable.txt, asi que el juego guarda lo del usuario en
-; Documentos\My Games\F1-06 (config, partidas, mods) y los registros en AppData\Local\F1-06\registros.
+; Instala el .exe, las DLL, data\, README.txt (ingles), LEEME.txt (espanol) y licenses\; sin portable.txt, asi que el
+; juego guarda lo del usuario en Documentos\My Games\F1-06 (config, saves, mods, screenshots) y los registros en
+; AppData\Local\F1-06\logs.
+; v1.1.1 (odd/tasks/player-folders.md): la carpeta del jugador va en ingles. Al actualizar desde la 1.1.0 se quitan
+; "Jugar en red - Invitado.cmd" y licencias\ ([InstallDelete]) y {app}\datos se renombra a {app}\data (el juego no
+; puede en Archivos de programa); al desinstalar se borran las copias del disco con los dos nombres.
 ; Los datos pasan de 4 GB: Setup.exe + archivos .bin (DiskSpanning) del tamano maximo.
 ; Compresion lzma2/fast en varios hilos: la mayor parte de los datos es audio y video ya comprimido (lzma o zip
 ; solo lo dejan en ~81 %), y lzma2/fast reduce mas los .WAD de graficos sin pasar de unos minutos.
-; Lanzamiento T1: con /DSinDatos (empaquetar.ps1 -SinDatos, la version publica) no lleva datos\: un solo Setup.exe
+; Lanzamiento T1: con /DSinDatos (empaquetar.ps1 -SinDatos, la version publica) no lleva data\: un solo Setup.exe
 ; con la pagina "Elige tu copia del juego (ISO)", que al instalar ejecuta {#NombreExe} --extraer-iso <iso> --ventana
 ; (su barra de progreso, cancelable). En blanco, el juego pide la ISO la primera vez que se abre.
 
@@ -53,7 +57,7 @@ OutputBaseFilename=F1-06-Setup
 #ifdef SinDatos
 Compression=lzma2/ultra64
 SolidCompression=yes
-; Lo que ocupara datos\ al copiar la ISO (Inno avisa si no cabe).
+; Lo que ocupara data\ al copiar la ISO (Inno avisa si no cabe).
 ExtraDiskSpaceRequired=4500000000
 #else
 Compression=lzma2/fast
@@ -95,8 +99,8 @@ es.IsoTitulo=Elige tu copia del juego (ISO)
 en.IsoTitulo=Choose your copy of the game (ISO)
 es.IsoDescripcion=El juego no trae nada del disco: hace falta tu Formula One 06 de PS2 (europeo PAL, SCES-53950).
 en.IsoDescripcion=The game includes nothing from the disc: your Formula One 06 for PS2 (European PAL, SCES-53950) is needed.
-es.IsoTexto=Elige la imagen .iso de tu disco. Al instalar se comprueba y sus archivos se copian en la carpeta datos del juego (unos 4,2 GB, unos minutos, con una barra de progreso); la ISO solo se lee.%n%nSi lo dejas en blanco, el juego te la pedirá la primera vez que lo abras.
-en.IsoTexto=Choose the .iso image of your disc. During the installation it is checked and its files are copied to the game's datos folder (about 4.2 GB, a few minutes, with a progress bar); the ISO is only read.%n%nIf you leave it blank, the game asks for it the first time you open it.
+es.IsoTexto=Elige la imagen .iso de tu disco. Al instalar se comprueba y sus archivos se copian en la carpeta data del juego (unos 4,2 GB, unos minutos, con una barra de progreso); la ISO solo se lee.%n%nSi lo dejas en blanco, el juego te la pedirá la primera vez que lo abras.
+en.IsoTexto=Choose the .iso image of your disc. During the installation it is checked and its files are copied to the game's data folder (about 4.2 GB, a few minutes, with a progress bar); the ISO is only read.%n%nIf you leave it blank, the game asks for it the first time you open it.
 es.IsoCampo=Imagen del disco (.iso):
 en.IsoCampo=Disc image (.iso):
 es.IsoFiltro=Imagen de disco de PS2 (*.iso)|*.iso|Todos los archivos|*.*
@@ -114,12 +118,18 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#Origen}\{#NombreExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Origen}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Origen}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Origen}\LEEME.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; Licencias de paraLLEl-GS (LGPL) y sus dependencias, con su codigo fuente (lo genera empaquetar.ps1)
-Source: "{#Origen}\licencias\*"; DestDir: "{app}\licencias"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#Origen}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 #ifndef SinDatos
-Source: "{#Origen}\datos\*"; DestDir: "{app}\datos"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#Origen}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
 #endif
+
+[InstallDelete]
+; player-folders T3: nombres de la 1.1.0 que pone el paquete (no son del jugador); se rehacen con los nuevos.
+Type: files; Name: "{app}\Jugar en red - Invitado.cmd"
+Type: filesandordirs; Name: "{app}\licencias"
 
 [Icons]
 Name: "{autoprograms}\{#NombreApp}"; Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"
@@ -135,6 +145,24 @@ Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchPro
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+// player-folders T3: {app}\datos de la 1.1.0 (la privada lo instalaba; la publica lo copiaba de la ISO) pasa a
+// {app}\data antes de copiar los archivos, para no dejar dos copias del disco (unos 4 GB). Solo si no hay data: si
+// estan los dos, se dejan como estan (el juego usa data). Si no se puede renombrar, sigue datos y el juego lo lee.
+procedure RenombrarDatosViejos;
+var
+  Viejo, Nuevo: String;
+begin
+  Viejo := ExpandConstant('{app}\datos');
+  Nuevo := ExpandConstant('{app}\data');
+  if DirExists(Viejo) and not DirExists(Nuevo) and not FileExists(Nuevo) then
+  begin
+    if RenameFile(Viejo, Nuevo) then
+      Log('Renombrada ' + Viejo + ' a ' + Nuevo)
+    else
+      Log('No se pudo renombrar ' + Viejo + ' a ' + Nuevo + ': se deja');
+  end;
+end;
+
 #ifdef SinDatos
 var
   PaginaIso: TInputFileWizardPage;
@@ -200,15 +228,13 @@ begin
   end;
 end;
 
-// Tras copiar los archivos: el .exe comprueba la ISO y la copia en {app}\datos con su ventana de progreso (y sus
+// Tras copiar los archivos: el .exe comprueba la ISO y la copia en {app}\data con su ventana de progreso (y sus
 // mensajes de error). Si no se copia, el juego la pide al abrirse.
-procedure CurStepChanged(CurStep: TSetupStep);
+procedure CopiarIso;
 var
   Iso: String;
   Codigo: Integer;
 begin
-  if CurStep <> ssPostInstall then
-    Exit;
   Iso := Trim(PaginaIso.Values[0]);
   if Iso = '' then
     Exit;
@@ -219,28 +245,47 @@ begin
 end;
 #endif
 
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // ssInstall: antes de [InstallDelete] y de copiar los archivos.
+  if CurStep = ssInstall then
+    RenombrarDatosViejos;
 #ifdef SinDatos
-// Lanzamiento T1: la copia del disco que el juego hizo en LocalAppData (instalado en Archivos de programa sin
-// elegir la ISO al instalar) se borra siempre, como la de {app}\datos: se rehace con la ISO. Tambien su copia a
-// medias (datos.extrayendo) y las datos incompletas que aparto (datos.anterior, datos.anterior-2...). Solo en la
-// publica: la privada lleva datos\ en {app} y nunca escribe ahi.
-procedure BorrarCopiasDelDisco(const Carpeta: String);
+  if CurStep = ssPostInstall then
+    CopiarIso;
+#endif
+end;
+
+#ifdef SinDatos
+// Una copia del disco con el nombre Nombre: la carpeta, su copia a medias (Nombre.extrayendo) y las incompletas que
+// aparto el juego (Nombre.anterior, Nombre.anterior-2...).
+procedure BorrarCopiaDelDisco(const Carpeta, Nombre: String);
 var
   Busqueda: TFindRec;
 begin
-  DelTree(Carpeta + '\datos', True, True, True);
-  DelTree(Carpeta + '\datos.extrayendo', True, True, True);
-  if FindFirst(Carpeta + '\datos.anterior*', Busqueda) then
+  DelTree(Carpeta + '\' + Nombre, True, True, True);
+  DelTree(Carpeta + '\' + Nombre + '.extrayendo', True, True, True);
+  if FindFirst(Carpeta + '\' + Nombre + '.anterior*', Busqueda) then
   try
     repeat
       if ((Busqueda.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
-          ((CompareText(Busqueda.Name, 'datos.anterior') = 0) or
-           (CompareText(Copy(Busqueda.Name, 1, 15), 'datos.anterior-') = 0)) then
-        DelTree(Carpeta + '' + Busqueda.Name, True, True, True);
+          ((CompareText(Busqueda.Name, Nombre + '.anterior') = 0) or
+           (CompareText(Copy(Busqueda.Name, 1, Length(Nombre) + 10), Nombre + '.anterior-') = 0)) then
+        DelTree(Carpeta + '\' + Busqueda.Name, True, True, True);
     until not FindNext(Busqueda);
   finally
     FindClose(Busqueda);
   end;
+end;
+
+// Lanzamiento T1: la copia del disco que el juego hizo en LocalAppData (instalado en Archivos de programa sin
+// elegir la ISO al instalar) se borra siempre, como la de {app}\data: se rehace con la ISO. Con el nombre de la 1.1.1
+// (data) y el de la 1.1.0 (datos) si el juego no llego a renombrarla (player-folders T3). Solo en la publica: la
+// privada lleva data\ en {app} y nunca escribe ahi.
+procedure BorrarCopiasDelDisco(const Carpeta: String);
+begin
+  BorrarCopiaDelDisco(Carpeta, 'data');
+  BorrarCopiaDelDisco(Carpeta, 'datos');
 end;
 #endif
 

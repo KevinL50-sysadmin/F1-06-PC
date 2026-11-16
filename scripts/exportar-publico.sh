@@ -5,6 +5,7 @@
 # config/recomp.toml, gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/
 # y los .patch de parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los
 # borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario),
+# scripts/comentarios.ps1 (herramienta del autor para leer y contestar comentarios de la gente),
 # scripts/exportar-personales.txt (patrones privados de datos personales), .git-blame-ignore-revs (nombra
 # commits privados) y, por supuesto, cualquier dato del juego. Un archivo nuevo en src/, parches/, gpu/, config/,
 # scripts/, docs/ o .github/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
@@ -41,7 +42,7 @@ esac
 
 # Lista blanca revisada, archivo a archivo. Un archivo de la lista que no exista no es un fallo.
 revisados=(
-    .gitignore README.md LICENSE .github/FUNDING.yml
+    .gitignore README.md CHANGELOG.md LICENSE .github/FUNDING.yml
     compilar-ps2recomp.cmd compilar-runner.cmd ejecutar.cmd entorno.cmd recompilar.cmd
     config/recomp.toml
     gpu/pgs_puente/CMakeLists.txt gpu/pgs_puente/LICENSE.txt gpu/pgs_puente/compilar.cmd
@@ -60,7 +61,7 @@ revisados=(
     scripts/obtener-parallel-gs.ps1 scripts/pct_decodificar.py scripts/perfil.cpp scripts/pgs-reproducir.ps1
     scripts/pila.cpp scripts/probar-circuitos.ps1 scripts/probar-modo.ps1
     scripts/probar-red.ps1 scripts/prueba_ipu.cpp scripts/prueba_tablas_gs.cpp scripts/prueba_vu1.cmd
-    scripts/prueba_vu1.cpp scripts/recortar.ps1 scripts/tanda-tarjeta.ps1 scripts/teclas.ps1 scripts/vu_dis.py
+    scripts/prueba_vu1.cpp scripts/recortar.ps1 scripts/simbolizar.ps1 scripts/tanda-tarjeta.ps1 scripts/teclas.ps1 scripts/vu_dis.py
     scripts/wav_chasquidos.py scripts/wav_comparar.py scripts/wav_niveles.py scripts/wav_recortar.py
     scripts/wav_vs_pss.py
 )
@@ -74,7 +75,8 @@ clasificar() {
     case "$1" in
         src/*.cpp | src/*.h | parches/*.patch) clase=publico ;;
         # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
-        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
+        # comentarios.ps1 es una herramienta del autor para atender a la gente, no de los jugadores: privado.
+        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | scripts/comentarios.ps1 | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
         src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/*) clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;
@@ -145,7 +147,8 @@ done
 cd "$arbol"
 
 excluidas=(odd ESTADO.md ROADMAP.md analisis .git-blame-ignore-revs config/recomp.toml.antes-entradas logs
-           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt juego mc0 mc1 datos build tools third_party)
+           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt scripts/comentarios.ps1 juego mc0 mc1 datos data build tools
+           third_party)
 for ruta in "${excluidas[@]}"; do
     [ ! -e "$ruta" ] || fallo "ruta excluida presente: $ruta"
 done
@@ -231,7 +234,7 @@ grandes="$(find . -type f -size +5242880c -print)"
 [ -z "$grandes" ] || fallo "archivos de mas de 5 MB:"$'\n'"$grandes"
 
 juego="$(find . \( -iname '*.iso' -o -iname '*.wad' -o -iname '*.elf' -o -iname '*.irx' -o -iname '*.pss' \
-    -o -iname '*.bin' -o -iname 'SCES_*' -o -iname 'prod.keys' -o -iname 'mc0' -o -iname 'mc1' -o -iname 'datos' \) \
+    -o -iname '*.bin' -o -iname 'SCES_*' -o -iname 'prod.keys' -o -iname 'mc0' -o -iname 'mc1' -o -iname 'datos' -o -iname 'data' \) \
     -print)"
 [ -z "$juego" ] || fallo "datos del juego:"$'\n'"$juego"
 

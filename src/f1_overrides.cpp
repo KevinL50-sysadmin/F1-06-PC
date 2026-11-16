@@ -58,6 +58,8 @@ void ps2DebugDumpVif1Irqs();
 // f1_fallos.cpp: nucleos del procesador (aparte porque necesita Win32).
 bool f1EnNucleoEficiente();
 void f1NucleosDeRendimiento(bool rendimiento);
+// Vigilante T3 (al final): el paron de prueba del EE, fuera del espacio anonimo para que tenga nombre en la pila.
+void f1ParonDePruebaEe(double segundos);
 uint64_t f1CpuHilo();
 uint64_t f1Tsc();
 // kernel32 (1.4 T2): ciclos del hilo actual, sin <windows.h> (choca con raylib.h).
@@ -931,8 +933,33 @@ namespace
         g_trazadaOriginal(rdram, ctx, runtime);
     }
 
+    // Vigilante T3 (pruebas): PS2X_PRUEBA_PARON=ee:<a_los_s>:<dura_s> para el hilo del EE una vez, a los a_los_s
+    // segundos del arranque, durante dura_s segundos (al cerrar un fotograma), para ver el informe del vigilante y la
+    // vuelta. ventana:<a_los_s>:<dura_s> para el bucle de la ventana (ps2_runtime.cpp). Sin la variable no hace nada.
+    struct ParonPrueba
+    {
+        bool activo = false;
+        double aLos = 0.0, dura = 0.0;
+    };
+
+    ParonPrueba leerParonPrueba(const char *latido)
+    {
+        ParonPrueba p;
+        char nombre[16] = {};
+        if (const char *valor = std::getenv("PS2X_PRUEBA_PARON"); valor != nullptr &&
+            std::sscanf(valor, "%15[^:]:%lf:%lf", nombre, &p.aLos, &p.dura) == 3)
+            p.activo = std::strcmp(nombre, latido) == 0 && p.dura > 0.0;
+        return p;
+    }
+
     void trazarFinFotograma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static ParonPrueba s_paron = leerParonPrueba("ee");
+        if (s_paron.activo && segundosDesdeArranque() >= s_paron.aLos)
+        {
+            s_paron.activo = false;
+            f1ParonDePruebaEe(s_paron.dura);
+        }
         ps2x::setReplayScrubSeeking(false); // fase 5 (T14): el salto atras de la repeticion ya se ha hecho
         if (g_vigiaRdram == nullptr && g_vigiaRuntime != nullptr)
         {
@@ -1969,7 +1996,7 @@ namespace
     // 1,0 + 6,1 s; las de arranque (Sony, aviso legal, Dolby) 1,0 + 4,0 s, con el porcentaje por tiempo. En el estado 3
     // el hilo del EE va ocioso un 50-70 % del tiempo: duerme hasta el siguiente VBLANK o va por delante del reloj real
     // (el ritmo del EE), y el IOP, que sigue al reloj del EE, espera en sus DelayThread y en el sceCdSync del 0114.
-    // opciones.ini cargas_rapidas = 1: durante el estado 3 el reloj del juego no espera al real (ps2SetFastForward):
+    // settings.ini cargas_rapidas = 1: durante el estado 3 el reloj del juego no espera al real (ps2SetFastForward):
     // el EE, sus temporizadores y el IOP van tan rapido como da el PC. Los fundidos y la animacion (estados 1, 2 y 4)
     // van a su ritmo. Solo mientras el SPU2 lleva kMuestrasSilencio sin sonar: con el IOP adelantado, la salida de
     // sonido (al ritmo real) se desborda y descarta lo que sobra; asi solo se descarta silencio (la musica del menu
@@ -2587,6 +2614,8 @@ namespace
         double ultimaBusqueda = 0.0;
         double ultimoInforme = 0.0;
         bool salida = false;
+        double salidaEn = 0.0;
+        bool lanzado = false; // el guia ya ha pasado de kGuiaLanzado tras la salida
         bool cerrada = false; // la estela es una vuelta entera y se recorre en bucle
         std::vector<PuntoEstela> estela;
         size_t cercano = 0u;
@@ -2598,6 +2627,7 @@ namespace
     EstadoPiloto g_piloto;
     constexpr uint32_t kCochePaso = 0x4F0u;
     constexpr uint32_t kCoches = 22u;
+    constexpr float kGuiaLanzado = 30.0f; // m/s (108 km/h)
 
     bool pareceCoche(const uint8_t *rdram, uint32_t a)
     {
@@ -2711,8 +2741,15 @@ namespace
         const float gv = std::hypot(leerFloat(rdram, guia + 0x20u), leerFloat(rdram, guia + 0x28u));
         if (!e.cerrada)
         {
-            if (e.estela.empty() || std::hypot(gx - e.estela.back().x, gz - e.estela.back().z) >= 2.0f)
-                e.estela.push_back({gx, gz, gv});
+            // La estela empieza con el guia en marcha, y en su arranque (hasta kGuiaLanzado) su velocidad no es un
+            // limite: es la de un coche que sale parado, y el jugador, que sale 8-16 m por detras, pasa por esos puntos
+            // mas deprisa. Con ella la meta quedaba en 8 m/s y el piloto frenaba a 11 m/s con la cruz del guion
+            // pulsada (el paron a 25 mph en 1.a de la salida, lanzamiento L71).
+            if (gv >= kGuiaLanzado)
+                e.lanzado = true;
+            if (gv >= 2.0f &&
+                (e.estela.empty() || std::hypot(gx - e.estela.back().x, gz - e.estela.back().z) >= 2.0f))
+                e.estela.push_back({gx, gz, e.lanzado ? gv : std::max(gv, kGuiaLanzado)});
             if (e.estela.size() > 500u && std::hypot(gx - e.estela.front().x, gz - e.estela.front().z) < 12.0f)
             {
                 e.cerrada = true;
@@ -2732,6 +2769,7 @@ namespace
             if (gv < 2.0f)
                 return; // aun no se ha dado la salida: acelerar ahora es salida en falso
             e.salida = true;
+            e.salidaEn = ahora;
             std::cout << "[f1-06:piloto] t=" << ahora << " salida" << std::endl;
         }
         if (!e.cerrada)
@@ -2803,7 +2841,11 @@ namespace
         }
         if (minima > 1e29f)
             minima = 0.0f;
-        const float meta = std::max(8.0f, s_ritmo * minima);
+        float meta = std::max(8.0f, s_ritmo * minima);
+        // Con la estela abierta su final es el guia: a menos de `delante` m de el, no mas deprisa que el (sin el paron
+        // de la salida se le echaba encima y chocaban, lanzamiento L71).
+        if (!e.cerrada && std::hypot(gx - px, gz - pz) < delante)
+            meta = std::min(meta, std::max(8.0f, gv));
         // Direccion (persecucion pura): angulo con signo hacia el objetivo; negativo = a la derecha.
         float dx = e.estela[objetivo].x - px, dz = e.estela[objetivo].z - pz;
         const float dn = std::hypot(dx, dz);
@@ -2860,7 +2902,7 @@ namespace
             }
         }
         rdram[(datos + 6u) & PS2_RAM_MASK] = static_cast<uint8_t>(std::lround(127.5f + giro * 127.5f));
-        if (ahora - e.ultimoInforme >= 2.0)
+        if (ahora - e.ultimoInforme >= (ahora - e.salidaEn < 10.0 ? 0.5 : 2.0)) // cada 0,5 s en la salida
         {
             e.ultimoInforme = ahora;
             std::cout << "[f1-06:piloto] t=" << ahora << " pos=(" << px << ", " << pz << ") v=" << v << " meta=" << meta
@@ -2920,7 +2962,7 @@ namespace
     // demultiplexe, y pone sys->isEnd para su sceMpegIsEnd, 0x2EAF18). Hasta el 0101 se saltaban: sceMpegIsEnd decia
     // "terminado" (salvo a la pregunta de Lua de los 2 primeros segundos, porque el grafo descarta un resultado que
     // llega durante una transicion y la pantalla se quedaba en blanco).
-    // Fase 5 (T4): opciones.ini saltar_intro = 1 los corta. Son los unicos sceMpeg del juego (el disco solo tiene
+    // Fase 5 (T4): settings.ini saltar_intro = 1 los corta. Son los unicos sceMpeg del juego (el disco solo tiene
     // Movies\PAL\INTRO.PSS: la intro y la demostracion de la pantalla de titulo, Attract); los fondos .ipf de los menus
     // y de los circuitos los decodifica el juego con el IPU y no pasan por aqui. Pasados kSegundosVideoSaltado desde su
     // sceMpegCreate, sceMpegIsEnd (0x2EAF18, codigo del juego) responde "terminado" al reproductor (func_29A778) y a la
@@ -2993,7 +3035,7 @@ namespace
     // +0x3C dice que se ve, el +0x34 lo dibuja (los paquetes GIF del EE del parche 0148). Los sprites de varios elementos
     // (posiciones, salpicadero, mapa) se quedan en una lista comun que dibuja el +0x34 de cualquier otro: quitar
     // elementos solo del dibujo no los quita de la pantalla; hay que rehacer los activos.
-    // opciones.ini hud = completo, minimo u oculto (se mira en cada fotograma). Oculto: no se llama a func_1F6BB0 (los
+    // settings.ini hud = completo, minimo u oculto (se mira en cada fotograma). Oculto: no se llama a func_1F6BB0 (los
     // elementos se siguen actualizando y al volver el HUD esta al dia). Minimo: los activos se rehacen con
     // func_1F6C60 como si en SCREEN LAYOUT solo estuvieran puestos las posiciones, las banderas, el velocimetro y el
     // salpicadero (velocidad, marcha y ayudas); las opciones del jugador se dejan como estaban justo despues. Al entrar o
@@ -3117,7 +3159,7 @@ namespace
     // cada fotograma por func_2C5948(camara, datos, panoramica, a3, f12 = angulo de sus datos + 0x90), llamada solo por
     // el metodo 0x1169E0 (vtable 0x412B54); angulos vistos en Silverstone: 0,26 (salida), 0,38, 0,48, 0,52 y 0,57.
     // Otras: func_325E38 (una vista fija de pi/4 por fotograma, camara 0x1C623B0), func_325460 (pi/4 al crearla) y las de
-    // func_323580/func_323C28 y func_248628/func_248B50 (angulo de sus datos) no se tocan. opciones.ini fov (0 a 30 %):
+    // func_323580/func_323C28 y func_248628/func_248B50 (angulo de sus datos) no se tocan. settings.ini fov (0 a 30 %):
     // el angulo se abre en func_2C5948 antes de llamarla (ps2x::widenedCameraFov), en cada fotograma; el juego vuelve a
     // pasar su angulo cada vez, asi que no se acumula y un cambio se ve en el siguiente fotograma. El HUD es 2D aparte.
     // F1_FOV_DIAG=1: [f1-06:fov] cada 5 s, quien llama a func_2C5730 y func_2C5600, la camara y sus angulos.
@@ -3621,7 +3663,7 @@ namespace
     // T2 del volante nativo (parche 0174, odd/tasks/volante-nativo.md): la biblioteca Logitech del juego (liblgdev 1.11,
     // 0x2F6950-0x2F77F8 y lgDevASync 0x2F7880) se sustituye por el anfitrion: el juego ve un Driving Force Pro
     // (ps2x::lgdev::HostLibrary) alimentado desde el volante del PC (DirectInput, ps2x::readNativeWheel con la seccion
-    // [volante] de controles.ini). Contrato en analisis/volante-liblgdev.md. Mientras tanto el volante no mueve el
+    // [volante] de controls.ini). Contrato en analisis/volante-liblgdev.md. Mientras tanto el volante no mueve el
     // DualShock 2 del jugador 1. F1_VOLANTE_STICK=1: como antes (la biblioteca del juego y el volante como stick).
     // F1_VOLANTE_FALSO=<direccion>,<acelerador>,<freno> (pruebas, sin hardware, tambien con PS2X_SIN_MANDOS=1): un
     // volante fijo con esos ejes (direccion -1..1, pedales 0..1); sus botones y su cruceta son los del mando del puerto 0
@@ -3632,7 +3674,7 @@ namespace
     // el hilo que lee el volante la aplica por DirectInput (ps2_pad_win.cpp). F1_VOLANTE_DIAG=1: cada orden de fuerza
     // en el log, con el efecto descifrado (tambien sin volante). F1_VOLANTE_INVERTIR_FUERZA=1: las fuerzas al reves.
     // T6 (parche 0176): el giro como el Driving Force Pro del original, giro = 200 grados de tope a tope sobre los
-    // grados_volante (900) del volante en G HUB, en [volante] de controles.ini (ps2x::lgdev::wheelInputFrom); el muelle
+    // grados_volante (900) del volante en G HUB, en [volante] de controls.ini (ps2x::lgdev::wheelInputFrom); el muelle
     // y el amortiguador del juego en la misma escala (g_escala). F1_VOLANTE_FALSO no pasa por esa escala: sus valores ya
     // son fracciones del giro del juego.
     namespace volante
@@ -5535,7 +5577,7 @@ namespace
     // OPTIONS (menu principal y pausa) gana la entrada "GRAFICOS PC" ("PC GRAPHICS" si el juego no esta en espanol), que
     // abre la misma pantalla que DISPLAY SETTINGS (nodo DisplaySettings del grafo; los .bgf no se tocan) con nuestras
     // filas: los mismos ClassConfigMenuToggleItem y ClassSlider del juego (fuentes, sonidos, flechas, ayuda abajo), Atras
-    // deshace (revert de cada fila) y CONFIRM guarda opciones.ini.
+    // deshace (revert de cada fila) y CONFIRM guarda settings.ini.
     // El bytecode del juego no se cambia: al cargar uno de los trozos de kExtensionesLua, el gancho de lua_load guarda
     // sus bytes y sirve en su lugar un texto nuestro que primero ejecuta el original, pedido con
     // loadstring("", "=ps2x:<trozo>") (el mismo gancho reconoce ese nombre y sirve los bytes guardados por getS; f_parser
@@ -5546,7 +5588,7 @@ namespace
     // "ps2x:<opcion>" el valor de la opcion (ps2x::menuOptionNumber) y "ps2x:<opcion>", v la cambia en caliente (sobre el
     // modelo de PS2OptionsMenu: PS2OptionsMenu::setGameOptionNumber, aplicado en el siguiente fotograma); "ps2x:pagina"[, v]
     // dice si DisplaySettings abre nuestras filas (1 GRAFICOS PC, 2 AJUSTES PC, 3 PANTALLA PC, 4 JUEGO EN RED PC, 5 la
-    // lista OPCIONES PC que lleva a las otras cuatro) o las del juego (0); "ps2x:abrir" toma los valores que F11/F10 hayan cambiado y "ps2x:guardar" escribe opciones.ini (las
+    // lista OPCIONES PC que lleva a las otras cuatro) o las del juego (0); "ps2x:abrir" toma los valores que F11/F10 hayan cambiado y "ps2x:guardar" escribe settings.ini (las
     // claves de PANTALLA PC y JUEGO EN RED PC, en puentePantallaPc y puenteJuegoEnRed). Las demas claves van a la funcion
     // original.
     // F1_OPCIONES_JUEGO=0 lo desactiva (los trozos se cargan tal cual).
@@ -5688,7 +5730,7 @@ end
     // DISPLAY SETTINGS: con "ps2x:pagina" = 1, customActivate (menu principal) y pauseCustomActivate (pausa) ponen
     // nuestras filas en lugar de las del juego, con nuestro titulo. Las filas se crean al abrir la pagina y se sueltan
     // al salir (en la carrera el monton de Lua va casi lleno). hasChanged = false: no cuentan en getNumChanged, asi que
-    // CONFIRM no pide guardar el perfil en la tarjeta por ellas (se guardan en opciones.ini). En la pausa van menos filas
+    // CONFIRM no pide guardar el perfil en la tarjeta por ellas (se guardan en settings.ini). En la pausa van menos filas
     // (cabe un dialogo mas pequeno y la memoria es justa).
     // PANTALLA PC (pagina 3, Nativizacion T5): su fila VALORES POR DEFECTO los pone en el anfitrion y la pagina se
     // rehace tras la pulsacion (onItemIncrease/onItemDecrease) para mostrarlos; como las filas nuevas toman los
@@ -6098,7 +6140,7 @@ return function(fila, T, onoff, lista, G, rehacer, pausa)
 end
 )lua";
 
-    // PANTALLA PC (Nativizacion T5): las opciones de la pantalla que antes solo estaban en el F2 y en opciones.ini, en
+    // PANTALLA PC (Nativizacion T5): las opciones de la pantalla que antes solo estaban en el F2 y en settings.ini, en
     // un trozo que la pagina pide al abrirse (=ps2x:pantalla-pc), como AJUSTES PC. Solo en el menu principal. Los
     // tamanos de la ventana los da el anfitrion ("ps2x:ventanas", "ps2x:ventana_ancho"/"_alto", i; la fila es la
     // posicion en esa lista) y gs dice "(AL REINICIAR)" en el valor que no es el que esta en uso ("ps2x:gs_en_uso").
@@ -6143,7 +6185,7 @@ end
 )lua";
 
     // JUEGO EN RED PC (Nativizacion T6): el anfitrion desde el juego (red_anfitrion, que antes estaba en AJUSTES PC) y
-    // las opciones de red que antes solo estaban en el F2 y en opciones.ini, en un trozo que la pagina pide al abrirse
+    // las opciones de red que antes solo estaban en el F2 y en settings.ini, en un trozo que la pagina pide al abrirse
     // (=ps2x:juego-en-red). Solo en el menu principal. CONTRASENA (Nativizacion T16): X abre el teclado del juego
     // (Keyboard.fxg, en estrellas, de 8 a 32 caracteres); al confirmar, el texto va al anfitrion caracter a caracter
     // ("ps2x:red_clave_empezar", "ps2x:red_clave_letra", codigo, "ps2x:red_clave_poner"; asi no queda ningun trozo
@@ -6222,8 +6264,8 @@ return function(fila, T, onoff, lista, G, rehacer)
     {T("APAGADO", "OFF"), T("Enciende ANFITRI\195\147N para que otro PC se una.", "Turn HOST on so another PC can join.")},
     {T("EMPEZANDO", "STARTING"), T("El anfitri\195\179n est\195\161 empezando.", "The host is starting.")},
     {T("ESPERANDO AL INVITADO", "WAITING FOR THE GUEST"),
-      T("El invitado abre Jugar en red - Invitado y escribe la direcci\195\179n, el puerto y la contrase\195\177a.",
-        "The guest opens Netplay - Guest and types the address, the port and the password.")},
+      T("El invitado abre Play online - Guest (instalado: Jugar en red (invitado), en Inicio) y escribe la direcci\195\179n, el puerto y la contrase\195\177a.",
+        "The guest opens Play online - Guest (installed: Jugar en red (invitado), in Start) and types the address, the port and the password.")},
     {T("INVITADO CONECTADO", "GUEST CONNECTED"), T("El invitado es el jugador 2.", "The guest is player 2.")},
     {T("NO SE PUDO EMPEZAR", "COULD NOT START"), T("El motivo sale arriba del juego.", "The reason is shown at the top of the game.")},
   }
@@ -6490,7 +6532,7 @@ end
         return true;
     }
 
-    // ---- Fase 5 (T16): dificultad de los rivales mas fina (ps2_ai_difficulty.h; opciones.ini dificultad_ia) ----
+    // ---- Fase 5 (T16): dificultad de los rivales mas fina (ps2_ai_difficulty.h; settings.ini dificultad_ia) ----
     // El juego tiene tres niveles (DIFFICULTY > OPPONENT AI, MEN_DIF_OA: game.aidifficulty(modo[, nivel]) = 0x15CD18,
     // tabla game.* 0x3FC820, que guarda el numero tal cual en el byte *0x49ED94 + 0x7C + modo * 8 + 6 del perfil;
     // game.rookie, game.semipro, game.professional = 0, 1, 2). func_1E6AC8 lo copia a la preparacion de la carrera
@@ -6713,7 +6755,7 @@ end
 
     // DIFFICULTY (fase 5, T16): la fila OPPONENT AI del juego (ClassConfigMenuToggleItem, EASY / MEDIUM / HARD) va de
     // EASY a HARD en pasos de 10 (EASY, 10, 20, 30, 40, MEDIUM, 60... HARD). Guarda lo mismo que el juego, el nivel mas
-    // cercano (game.aidifficulty), y el valor fino en opciones.ini (por el puente: "ps2x:ia_elegir", valor de la fila ->
+    // cercano (game.aidifficulty), y el valor fino en settings.ini (por el puente: "ps2x:ia_elegir", valor de la fila ->
     // nivel del juego; "ps2x:ia_fila", nivel del juego -> valor de la fila).
     // CRASH DAMAGE (danos-siempre T1): con distancia 0,05 ("3 LAPS") el juego deja la fila solo en OFF, en gris y sin
     // escribir; tras su customActivate vuelve a OFF / ON con game.crashdamage del modo, como con cualquier otra
@@ -7963,6 +8005,16 @@ end
         instalarChivato(runtime, kSceSifSendCmd, trazarSceSifSendCmd, g_sceSifSendCmdOriginal);
         arrancarVigilanteCola(runtime);
     }
+}
+
+// El codigo propio se compila sin PDB propio (solo los simbolos publicos del enlazador): una funcion del espacio
+// anonimo saldria en el informe con el nombre de la publica anterior.
+void f1ParonDePruebaEe(double segundos)
+{
+    std::cout << "[vigilante] prueba: EE parado " << segundos << " s a proposito (PS2X_PRUEBA_PARON) t="
+              << segundosDesdeArranque() << std::endl;
+    std::this_thread::sleep_for(std::chrono::duration<double>(segundos));
+    std::cout << "[vigilante] prueba: EE en marcha otra vez t=" << segundosDesdeArranque() << std::endl;
 }
 
 PS2_REGISTER_GAME_OVERRIDE("Formula One 06 (SCES-53950)", "SCES_539.50", 0x00101BE8u, 0u, applyFormulaOne06)

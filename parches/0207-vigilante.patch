@@ -1,0 +1,1352 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e10c852..1eb61c3 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -422,6 +422,8 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_user_paths.cpp
+     src/lib/ps2_disc_setup.cpp
+     src/lib/ps2_disc_setup_win.cpp
++    src/lib/ps2_vigilante.cpp
++    src/lib/ps2_vigilante_win.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+diff --git a/ps2xRuntime/include/ps2_vigilante.h b/ps2xRuntime/include/ps2_vigilante.h
+new file mode 100644
+index 0000000..0f45150
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_vigilante.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <string_view>
++#include <vector>
++
++// Vigilante (odd/tasks/vigilante.md): si un latido del juego (los VBlank del EE, las vueltas del bucle de la ventana)
++// deja de avanzar durante umbral segundos, el registro recoge la pila de cada hilo; si despues sigue, cuanto duro el
++// paron. Mientras todo va bien no escribe nada: un hilo que lee los contadores una vez por segundo.
++namespace ps2x::vigilante
++{
++    constexpr int kUmbralPorDefecto = 10;
++    constexpr int kUmbralMinimo = 3;
++    constexpr int kUmbralMaximo = 600;
++
++    // Un valor aceptado de la opcion vigilante (opciones.ini y PS2X_VIGILANTE): segundos enteros, 0 o de 3 a 600.
++    bool umbralValido(std::string_view valor);
++
++    // Valor de PS2X_VIGILANTE, sin espacios alrededor: un valor aceptado (0 apaga el vigilante); sin valor o no
++    // aceptado (1, 2, mas de 600, letras), 10, como hace opciones.ini.
++    int leerUmbral(const char *valor);
++
++    enum class Suceso
++    {
++        Parado, // el latido lleva umbral segundos o mas sin avanzar (uno por paron)
++        Sigue,  // vuelve a avanzar tras un paron avisado
++    };
++
++    struct Aviso
++    {
++        size_t latido = 0u;
++        Suceso suceso = Suceso::Parado;
++        double segundos = 0.0; // Parado: desde el ultimo avance; Sigue: lo que duro el paron
++    };
++
++    // La logica del vigilante, sin hilos ni Win32. Un latido que aun no ha avanzado nunca (el arranque, antes del
++    // primer fotograma) no avisa; umbral 0 no avisa nunca.
++    class Detector
++    {
++    public:
++        Detector(size_t latidos, int umbralSegundos);
++
++        // Una muestra: ahora en segundos de un reloj monotono y contadores[i], el valor del latido i. excusados[i]
++        // (opcional): el latido i esta parado por algo normal (T3: la ventana minimizada o arrastrada); no avisa y el
++        // paron se cuenta desde que acaba la excusa. Un paron ya avisado sigue hasta que el latido avance.
++        std::vector<Aviso> muestra(double ahora, const uint64_t *contadores, const bool *excusados = nullptr);
++
++    private:
++        struct Estado
++        {
++            bool visto = false;     // ya hay un valor anterior
++            bool arrancado = false; // ha avanzado alguna vez
++            bool avisado = false;   // paron actual ya avisado
++            uint64_t valor = 0u;
++            double ultimoAvance = 0.0;
++        };
++        std::vector<Estado> m_estados;
++        int m_umbral;
++    };
++
++    // Latido del bucle de la ventana (ps2_runtime.cpp): una suma relajada por vuelta.
++    std::atomic<uint64_t> &latidoVentana();
++
++    // T3: la ventana del juego (HWND en Windows). Minimizada, el bucle de raylib espera sin dar vueltas, y mientras se
++    // arrastra o hay un menu del sistema abierto, Windows no vuelve al bucle: el latido de la ventana queda excusado.
++    void ventanaDelJuego(void *ventana);
++
++    struct Latido
++    {
++        const char *nombre;
++        const std::atomic<uint64_t> *contador;
++    };
++
++    // Arranca el hilo "Vigilante" (Windows; en otros sistemas no hace nada). umbralSegundos 0: no arranca. Los
++    // contadores deben vivir mientras viva el proceso.
++    bool arrancar(int umbralSegundos, const std::vector<Latido> &latidos);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 2701624..bffad21 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_display.h"
+ #include "ps2_options_menu.h"
+ #include "ps2_user_paths.h"
++#include "ps2_vigilante.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -139,6 +140,12 @@ namespace ps2x
+             {"volumen", "PS2X_VOLUMEN", "100", {}, 0, 100, "Volumen del sonido, de 0 (sin sonido) a 100."},
+             {"registro", "PS2X_LOG", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Registro del juego (F1-06.log en la carpeta registros) al abrirlo con doble clic: 1 = si, 0 = no."},
++            // Vigilante T2 (ps2_vigilante.h): the stack of every thread in the log when the game stops moving.
++            // The same accepted values as PS2X_VIGILANTE read by the runtime (leerUmbral).
++            {"vigilante", "PS2X_VIGILANTE", "10", {}, 0, 0,
++             "Vigilante de cuelgues: si la imagen deja de avanzar durante estos segundos, el registro anota donde\n"
++             "estaba parado cada hilo del juego (y, si sigue, cuanto duro el paron). 0 lo apaga; de 3 a 600.",
++             nullptr, [](std::string_view value) { return vigilante::umbralValido(value); }, "0 o de 3 a 600"},
+             {"gs", "PS2X_GS", "gpu", {{"cpu", nullptr}, {"gpu", "gpu"}}, 0, 0,
+              "Dibujo de los graficos: gpu = en la tarjeta grafica (Vulkan), lo normal; cpu = modo Software, mas lento\n"
+              "(el dibujo de referencia). Si falta pgs_puente.dll junto al juego o Vulkan, se usa cpu.",
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d739881..4b11bf1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -25,6 +25,7 @@
+ #include "ps2_photo_mode.h"
+ #include "ps2_replay_scrub.h"
+ #include "ps2_netplay.h"
++#include "ps2_vigilante.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -1974,6 +1975,8 @@ bool PS2Runtime::initialize(const char *title)
+             [](const char *name) { return static_cast<const char *>(std::getenv(name)); });
+         InitWindow(startDisplay.windowWidth, startDisplay.windowHeight, title);
+ #if defined(_WIN32)
++        // Vigilante T3: minimized or being dragged, the window's loop stops on purpose (ps2_vigilante.h).
++        ps2x::vigilante::ventanaDelJuego(GetWindowHandle());
+         if (backgroundWindow)
+         {
+             ps2xSetWindowPos(GetWindowHandle(), reinterpret_cast<void *>(1) /* HWND_BOTTOM */, -4000, 0, 0, 0,
+@@ -3764,6 +3767,36 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
+ }
+ 
++// Vigilante T3 (tests): PS2X_PRUEBA_PARON=ventana:<a_los_s>:<dura_s> stops the window loop once, a_los_s seconds
++// after run() starts, for dura_s seconds, to see the vigilante's report and the recovery (ee:... is in
++// src/f1_overrides.cpp). Returns a negative start when unset.
++static void ReadTestWindowStall(double &startSeconds, double &seconds)
++{
++    startSeconds = -1.0;
++    seconds = 0.0;
++    char name[16] = {};
++    double start = 0.0, duration = 0.0;
++    if (const char *value = std::getenv("PS2X_PRUEBA_PARON"); value != nullptr &&
++        std::sscanf(value, "%15[^:]:%lf:%lf", name, &start, &duration) == 3 &&
++        std::strcmp(name, "ventana") == 0 && duration > 0.0)
++    {
++        startSeconds = start;
++        seconds = duration;
++    }
++}
++
++// Apart (not inlined) so that it shows with its name in the report's stack.
++#if defined(_MSC_VER)
++__declspec(noinline)
++#endif
++static void TestWindowStall(double seconds)
++{
++    std::cout << "[vigilante] prueba: ventana parada " << seconds << " s a proposito (PS2X_PRUEBA_PARON)"
++              << std::endl;
++    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
++    std::cout << "[vigilante] prueba: ventana en marcha otra vez" << std::endl;
++}
++
+ void PS2Runtime::run()
+ {
+     m_stopRequested.store(false, std::memory_order_relaxed);
+@@ -3815,9 +3848,21 @@ void PS2Runtime::run()
+         }
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
++    double testStallStart = -1.0, testStallSeconds = 0.0;
++    ReadTestWindowStall(testStallStart, testStallSeconds);
++    const auto loopStart = std::chrono::steady_clock::now();
++
+     uint64_t tick = 0;
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        // Vigilante T2: the window's heartbeat (one relaxed add per loop; ps2_vigilante.h).
++        ps2x::vigilante::latidoVentana().fetch_add(1u, std::memory_order_relaxed);
++        if (testStallStart >= 0.0 &&
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - loopStart).count() >= testStallStart)
++        {
++            testStallStart = -1.0;
++            TestWindowStall(testStallSeconds);
++        }
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante.cpp b/ps2xRuntime/src/lib/ps2_vigilante.cpp
+new file mode 100644
+index 0000000..ce689da
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vigilante.cpp
+@@ -0,0 +1,95 @@
++#include "ps2_vigilante.h"
++
++#include <cctype>
++#include <cstring>
++
++namespace ps2x::vigilante
++{
++    namespace
++    {
++        // Los segundos de un valor de solo cifras; -1 si no lo es o pasa de kUmbralMaximo.
++        int segundosDe(std::string_view valor)
++        {
++            if (valor.empty())
++                return -1;
++            int segundos = 0;
++            for (const char c : valor)
++            {
++                if (!std::isdigit(static_cast<unsigned char>(c)))
++                    return -1;
++                segundos = segundos * 10 + (c - '0');
++                if (segundos > kUmbralMaximo)
++                    return -1;
++            }
++            return segundos;
++        }
++    }
++
++    bool umbralValido(std::string_view valor)
++    {
++        const int segundos = segundosDe(valor);
++        return segundos == 0 || (segundos >= kUmbralMinimo && segundos <= kUmbralMaximo);
++    }
++
++    int leerUmbral(const char *valor)
++    {
++        if (valor == nullptr)
++            return kUmbralPorDefecto;
++        const char *inicio = valor;
++        const char *fin = valor + std::strlen(valor);
++        while (inicio < fin && std::isspace(static_cast<unsigned char>(*inicio)))
++            ++inicio;
++        while (fin > inicio && std::isspace(static_cast<unsigned char>(fin[-1])))
++            --fin;
++        const std::string_view recortado(inicio, static_cast<size_t>(fin - inicio));
++        return umbralValido(recortado) ? segundosDe(recortado) : kUmbralPorDefecto;
++    }
++
++    Detector::Detector(size_t latidos, int umbralSegundos) : m_estados(latidos), m_umbral(umbralSegundos)
++    {
++    }
++
++    std::vector<Aviso> Detector::muestra(double ahora, const uint64_t *contadores, const bool *excusados)
++    {
++        std::vector<Aviso> avisos;
++        for (size_t i = 0; i < m_estados.size(); ++i)
++        {
++            Estado &e = m_estados[i];
++            const uint64_t valor = contadores[i];
++            if (!e.visto || valor != e.valor)
++            {
++                if (e.visto)
++                {
++                    if (e.avisado)
++                        avisos.push_back({i, Suceso::Sigue, ahora - e.ultimoAvance});
++                    e.arrancado = true;
++                }
++                e.visto = true;
++                e.avisado = false;
++                e.valor = valor;
++                e.ultimoAvance = ahora;
++                continue;
++            }
++            if (m_umbral <= 0 || !e.arrancado || e.avisado)
++                continue;
++            if (excusados != nullptr && excusados[i])
++            {
++                e.ultimoAvance = ahora; // el paron cuenta desde que acaba la excusa
++                continue;
++            }
++            const double parado = ahora - e.ultimoAvance;
++            if (parado >= static_cast<double>(m_umbral))
++            {
++                e.avisado = true;
++                avisos.push_back({i, Suceso::Parado, parado});
++            }
++        }
++        return avisos;
++    }
++
++    std::atomic<uint64_t> &latidoVentana()
++    {
++        static std::atomic<uint64_t> latido{0u};
++        return latido;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+new file mode 100644
+index 0000000..d8679b8
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+@@ -0,0 +1,598 @@
++// Vigilante T2 (odd/tasks/vigilante.md): el hilo "Vigilante" y su informe. Una vez por segundo lee los latidos; si
++// uno se para, escribe en el registro la pila de cada hilo del proceso:
++//   [vigilante] parado EE desde hace 10 s
++//   [vigilante] compilacion: F1-06.exe fecha_pe=6736A0F1 tam_imagen=04B2D000 pdb=ps2EntryRunner.pdb
++//               guid=0123456789ABCDEF0123456789ABCDEF edad=1 base=0x00007FF6A1230000
++//   [vigilante] hilo 1234 GameThread
++//   [vigilante]   #0 ntdll.dll+0x9F0C4
++//   [vigilante]   #1 F1-06.exe+0x1A2B3C
++//   [vigilante] fin del informe (23 hilos)
++//   [vigilante] EE sigue tras 26 s
++// El paquete no lleva el PDB: modulo+desplazamiento y la identidad de la compilacion bastan para traducirlo en casa,
++// y dbghelp ni se carga (no es seguro entre hilos y el informe de fallos, f1_fallos.cpp, tambien lo usa). Solo si el
++// PDB que nombra el propio .exe esta a su lado (desarrollo), tras el fin del informe se repiten las pilas con nombres:
++//   [vigilante] nombres (con el PDB junto al .exe):
++//   [vigilante] hilo 1234 GameThread
++//   [vigilante]   #0 ntdll.dll+0x9F0C4 NtWaitForSingleObject+0x14
++//   [vigilante] fin de los nombres
++// Asi un dbghelp colgado no se lleva las lineas de modulo+desplazamiento, que ya estan escritas.
++//
++// El juego puede tener cerrojos tomados (el del monton, el del CRT): con un hilo suspendido solo se lee su contexto y
++// se desenrolla su pila a un arreglo; nada de malloc, new, printf ni iostream. Se suspende un hilo cada vez y se
++// reanuda enseguida, con el vigilante en prioridad maxima mientras tanto (que no se quede sin CPU con un hilo del juego
++// suspendido). La salida va con WriteFile al manejador de stderr (el registro, o la consola sin registro), sin el
++// cerrojo de los FILE del CRT.
++
++#include "ps2_vigilante.h"
++
++#include <algorithm>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <tlhelp32.h>
++#include <psapi.h>
++#include <dbghelp.h> // solo los tipos: dbghelp.dll se carga a mano, en desarrollo
++#include <io.h>
++#include <cstring>
++#endif
++
++namespace ps2x::vigilante
++{
++#if defined(_WIN32)
++    namespace
++    {
++        constexpr int kMaxMarcos = 32;
++        constexpr size_t kMaxHilos = 256u;
++        constexpr size_t kMaxModulos = 512u;
++        constexpr int kMaxInformes = 20; // tras estos, solo la linea del paron
++
++        HANDLE g_salida = INVALID_HANDLE_VALUE;
++        std::atomic<bool> g_arrancado{false};
++        std::atomic<HWND> g_ventana{nullptr};
++
++        // T3: la ventana minimizada (raylib no da vueltas al bucle sin FLAG_WINDOW_ALWAYS_RUN), arrastrada o con un
++        // menu del sistema abierto (el bucle modal de Windows no vuelve al del juego).
++        bool ventanaEnPausa()
++        {
++            const HWND ventana = g_ventana.load(std::memory_order_relaxed);
++            if (ventana == nullptr)
++                return false;
++            if (IsIconic(ventana))
++                return true;
++            GUITHREADINFO info{};
++            info.cbSize = sizeof(info);
++            const DWORD hilo = GetWindowThreadProcessId(ventana, nullptr);
++            return hilo != 0u && GetGUIThreadInfo(hilo, &info) &&
++                   (info.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE)) != 0u;
++        }
++
++        // Una linea en un bufer fijo, sin reservar memoria.
++        class Linea
++        {
++        public:
++            Linea &texto(const char *s)
++            {
++                while (s != nullptr && *s != '\0' && m_n < sizeof(m_bufer) - 2u)
++                    m_bufer[m_n++] = *s++;
++                return *this;
++            }
++            Linea &decimal(uint64_t v)
++            {
++                char cifras[24];
++                int n = 0;
++                do
++                {
++                    cifras[n++] = static_cast<char>('0' + v % 10u);
++                    v /= 10u;
++                } while (v != 0u);
++                while (n > 0 && m_n < sizeof(m_bufer) - 2u)
++                    m_bufer[m_n++] = cifras[--n];
++                return *this;
++            }
++            // Hexadecimal en mayusculas, con al menos 'ancho' cifras.
++            Linea &hex(uint64_t v, int ancho = 1)
++            {
++                char cifras[16];
++                int n = 0;
++                do
++                {
++                    cifras[n++] = "0123456789ABCDEF"[v & 0xFu];
++                    v >>= 4;
++                } while (v != 0u || n < ancho);
++                while (n > 0 && m_n < sizeof(m_bufer) - 2u)
++                    m_bufer[m_n++] = cifras[--n];
++                return *this;
++            }
++            void escribir()
++            {
++                m_bufer[m_n++] = '\r';
++                m_bufer[m_n++] = '\n';
++                DWORD escritos = 0;
++                if (g_salida != INVALID_HANDLE_VALUE && g_salida != nullptr)
++                    WriteFile(g_salida, m_bufer, static_cast<DWORD>(m_n), &escritos, nullptr);
++                m_n = 0u;
++            }
++
++        private:
++            char m_bufer[640];
++            size_t m_n = 0u;
++        };
++
++        Linea &inicio(Linea &l)
++        {
++            return l.texto("[vigilante] ");
++        }
++
++        struct Modulo
++        {
++            uint64_t base;
++            uint64_t tam;
++            char nombre[64];
++        };
++
++        struct Hilo
++        {
++            DWORD id;
++            char nombre[96];
++            uint64_t marcos[kMaxMarcos];
++            int n; // -1: no se pudo leer
++        };
++
++        // Estado del informe: estatico (un solo hilo vigilante), para no reservar memoria.
++        Modulo g_modulos[kMaxModulos];
++        size_t g_numModulos = 0u;
++        Hilo g_hilos[kMaxHilos];
++        bool g_identidadEscrita = false;
++        int g_informes = 0;
++
++        void aUtf8(const wchar_t *w, char *destino, int tam)
++        {
++            destino[0] = '\0';
++            if (w == nullptr)
++                return;
++            const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, destino, tam, nullptr, nullptr);
++            if (n <= 0)
++                destino[0] = '\0';
++            destino[tam - 1] = '\0';
++        }
++
++        // Los modulos cargados, leidos del PEB sin el cerrojo del cargador (K32EnumProcessModules).
++        void leerModulos()
++        {
++            HMODULE modulos[kMaxModulos];
++            DWORD bytes = 0;
++            g_numModulos = 0u;
++            if (!EnumProcessModules(GetCurrentProcess(), modulos, sizeof(modulos), &bytes))
++                return;
++            const size_t n = std::min<size_t>(bytes / sizeof(HMODULE), kMaxModulos);
++            for (size_t i = 0; i < n; ++i)
++            {
++                MODULEINFO info{};
++                if (!GetModuleInformation(GetCurrentProcess(), modulos[i], &info, sizeof(info)))
++                    continue;
++                Modulo &m = g_modulos[g_numModulos++];
++                m.base = reinterpret_cast<uint64_t>(info.lpBaseOfDll);
++                m.tam = info.SizeOfImage;
++                if (GetModuleBaseNameA(GetCurrentProcess(), modulos[i], m.nombre, sizeof(m.nombre)) == 0)
++                    std::strcpy(m.nombre, "?");
++            }
++        }
++
++        const Modulo *moduloDe(uint64_t direccion)
++        {
++            for (size_t i = 0; i < g_numModulos; ++i)
++                if (direccion >= g_modulos[i].base && direccion - g_modulos[i].base < g_modulos[i].tam)
++                    return &g_modulos[i];
++            return nullptr;
++        }
++
++        // Desenrolla la pila de un contexto (del hilo suspendido): solo lee memoria. Un marco roto acaba la pila.
++        int desenrollar(CONTEXT *c, uint64_t *marcos)
++        {
++            int n = 0;
++            __try
++            {
++                while (n < kMaxMarcos && c->Rip != 0u)
++                {
++                    marcos[n++] = c->Rip;
++                    const DWORD64 rspAntes = c->Rsp;
++                    DWORD64 base = 0;
++                    PRUNTIME_FUNCTION funcion = RtlLookupFunctionEntry(c->Rip, &base, nullptr);
++                    if (funcion != nullptr)
++                    {
++                        void *datos = nullptr;
++                        DWORD64 marco = 0;
++                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, funcion, c, &datos, &marco, nullptr);
++                    }
++                    else
++                    {
++                        // Funcion hoja (sin datos de desenrollado): la vuelta esta en la cima de la pila.
++                        c->Rip = *reinterpret_cast<const DWORD64 *>(c->Rsp);
++                        c->Rsp += 8u;
++                    }
++                    if (c->Rsp <= rspAntes && funcion != nullptr)
++                        break; // la pila no avanza: algo no cuadra
++                }
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++            }
++            return n;
++        }
++
++        // Suspende el hilo, copia su contexto y su pila, y lo reanuda.
++        int capturar(HANDLE hilo, uint64_t *marcos)
++        {
++            if (SuspendThread(hilo) == static_cast<DWORD>(-1))
++                return -1;
++            CONTEXT c{};
++            c.ContextFlags = CONTEXT_FULL;
++            int n = -1;
++            if (GetThreadContext(hilo, &c)) // espera a que la suspension sea efectiva
++                n = desenrollar(&c, marcos);
++            ResumeThread(hilo);
++            return n;
++        }
++
++        void nombreDelHilo(HANDLE hilo, char *destino, int tam)
++        {
++            using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
++            static const auto leer = reinterpret_cast<GetThreadDescriptionFn>(
++                GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
++            destino[0] = '\0';
++            PWSTR descripcion = nullptr;
++            if (leer != nullptr && SUCCEEDED(leer(hilo, &descripcion)) && descripcion != nullptr)
++            {
++                aUtf8(descripcion, destino, tam);
++                LocalFree(descripcion);
++            }
++        }
++
++        // El registro CodeView RSDS del .exe: GUID, edad y ruta del PDB con que se enlazo.
++        struct CodeView
++        {
++            GUID guid;
++            DWORD edad;
++            const char *pdb; // la ruta tal como la guardo el enlazador
++        };
++
++        const IMAGE_NT_HEADERS64 *cabeceras(const uint8_t *base)
++        {
++            const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
++            if (base == nullptr || dos->e_magic != IMAGE_DOS_SIGNATURE)
++                return nullptr;
++            return reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
++        }
++
++        bool leerCodeView(CodeView &cv)
++        {
++            const auto *base = reinterpret_cast<const uint8_t *>(GetModuleHandleW(nullptr));
++            const IMAGE_NT_HEADERS64 *nt = cabeceras(base);
++            if (nt == nullptr)
++                return false;
++            const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
++            const auto *depuracion = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY *>(base + dir.VirtualAddress);
++            for (size_t i = 0; dir.VirtualAddress != 0u && i < dir.Size / sizeof(IMAGE_DEBUG_DIRECTORY); ++i)
++            {
++                const IMAGE_DEBUG_DIRECTORY &d = depuracion[i];
++                if (d.Type != IMAGE_DEBUG_TYPE_CODEVIEW || d.AddressOfRawData == 0u || d.SizeOfData < 24u)
++                    continue;
++                const uint8_t *datos = base + d.AddressOfRawData;
++                if (std::memcmp(datos, "RSDS", 4) != 0)
++                    continue;
++                std::memcpy(&cv.guid, datos + 4, sizeof(cv.guid));
++                std::memcpy(&cv.edad, datos + 20, sizeof(cv.edad));
++                cv.pdb = reinterpret_cast<const char *>(datos + 24);
++                return true;
++            }
++            return false;
++        }
++
++        const char *nombreDeArchivo(const char *ruta)
++        {
++            const char *nombre = ruta;
++            for (const char *c = ruta; *c != '\0'; ++c)
++                if (*c == '\\' || *c == '/')
++                    nombre = c + 1;
++            return nombre;
++        }
++
++        // Exe, fecha del PE, tamano de la imagen, PDB (GUID y edad del registro CodeView RSDS) y base: con esto se
++        // encuentra el PDB guardado de esta compilacion.
++        void escribirIdentidad()
++        {
++            Linea l;
++            const auto *base = reinterpret_cast<const uint8_t *>(GetModuleHandleW(nullptr));
++            wchar_t rutaW[MAX_PATH] = {};
++            char exe[MAX_PATH] = {};
++            GetModuleFileNameW(nullptr, rutaW, MAX_PATH);
++            const wchar_t *barra = wcsrchr(rutaW, L'\\');
++            aUtf8(barra != nullptr ? barra + 1 : rutaW, exe, sizeof(exe));
++            inicio(l).texto("compilacion: ").texto(exe);
++            if (const IMAGE_NT_HEADERS64 *nt = cabeceras(base))
++            {
++                l.texto(" fecha_pe=").hex(nt->FileHeader.TimeDateStamp, 8);
++                l.texto(" tam_imagen=").hex(nt->OptionalHeader.SizeOfImage, 8);
++                CodeView cv{};
++                if (leerCodeView(cv))
++                {
++                    // El GUID como lo escribe symstore (sin guiones) y la edad.
++                    l.texto(" pdb=").texto(nombreDeArchivo(cv.pdb)).texto(" guid=").hex(cv.guid.Data1, 8)
++                        .hex(cv.guid.Data2, 4).hex(cv.guid.Data3, 4);
++                    for (const unsigned char b : cv.guid.Data4)
++                        l.hex(b, 2);
++                    l.texto(" edad=").decimal(cv.edad);
++                }
++            }
++            l.texto(" base=0x").hex(reinterpret_cast<uint64_t>(base), 16);
++            l.escribir();
++        }
++
++        // Desarrollo: el PDB que nombra el registro CodeView del .exe esta en su carpeta. El paquete no lo lleva.
++        bool pdbJuntoAlExe()
++        {
++            CodeView cv{};
++            if (!leerCodeView(cv))
++                return false;
++            wchar_t ruta[MAX_PATH] = {};
++            const DWORD n = GetModuleFileNameW(nullptr, ruta, MAX_PATH);
++            wchar_t *barra = n > 0u && n < MAX_PATH ? wcsrchr(ruta, L'\\') : nullptr;
++            if (barra == nullptr)
++                return false;
++            const int libre = static_cast<int>(MAX_PATH - (barra + 1 - ruta));
++            if (MultiByteToWideChar(CP_UTF8, 0, nombreDeArchivo(cv.pdb), -1, barra + 1, libre) <= 0)
++                return false;
++            const DWORD atributos = GetFileAttributesW(ruta);
++            return atributos != INVALID_FILE_ATTRIBUTES && (atributos & FILE_ATTRIBUTE_DIRECTORY) == 0u;
++        }
++
++        // dbghelp.dll, cargada a mano y solo con el PDB junto al .exe: el paquete del jugador no la toca nunca.
++        struct Dbghelp
++        {
++            decltype(&SymSetOptions) opciones = nullptr;
++            decltype(&SymInitializeW) iniciar = nullptr;
++            decltype(&SymCleanup) soltar = nullptr;
++            decltype(&SymFromAddr) simbolo = nullptr;
++        };
++
++        const Dbghelp *dbghelp()
++        {
++            static Dbghelp d;
++            static bool intentado = false;
++            if (!intentado)
++            {
++                intentado = true;
++                if (pdbJuntoAlExe())
++                    if (HMODULE m = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
++                    {
++                        d.opciones = reinterpret_cast<decltype(d.opciones)>(GetProcAddress(m, "SymSetOptions"));
++                        d.iniciar = reinterpret_cast<decltype(d.iniciar)>(GetProcAddress(m, "SymInitializeW"));
++                        d.soltar = reinterpret_cast<decltype(d.soltar)>(GetProcAddress(m, "SymCleanup"));
++                        d.simbolo = reinterpret_cast<decltype(d.simbolo)>(GetProcAddress(m, "SymFromAddr"));
++                    }
++            }
++            return d.opciones && d.iniciar && d.soltar && d.simbolo ? &d : nullptr;
++        }
++
++        // Un marco: modulo+desplazamiento y, con dbghelp ya iniciado, el nombre de la funcion.
++        void escribirMarco(int i, uint64_t direccion, const Dbghelp *simbolos)
++        {
++            Linea l;
++            inicio(l).texto("  #").decimal(static_cast<uint64_t>(i)).texto(" ");
++            if (const Modulo *m = moduloDe(direccion))
++                l.texto(m->nombre).texto("+0x").hex(direccion - m->base);
++            else
++                l.texto("0x").hex(direccion, 16);
++            if (simbolos != nullptr)
++            {
++                alignas(SYMBOL_INFO) char bufer[sizeof(SYMBOL_INFO) + 256] = {};
++                auto *simbolo = reinterpret_cast<SYMBOL_INFO *>(bufer);
++                simbolo->SizeOfStruct = sizeof(SYMBOL_INFO);
++                simbolo->MaxNameLen = 255;
++                DWORD64 desplazamiento = 0;
++                if (simbolos->simbolo(GetCurrentProcess(), direccion, &desplazamiento, simbolo))
++                    l.texto(" ").texto(simbolo->Name).texto("+0x").hex(desplazamiento);
++            }
++            l.escribir();
++        }
++
++        void escribirHilos(size_t numHilos, const Dbghelp *simbolos)
++        {
++            for (size_t i = 0; i < numHilos; ++i)
++            {
++                const Hilo &h = g_hilos[i];
++                if (h.id == 0u)
++                    continue;
++                Linea l;
++                inicio(l).texto("hilo ").decimal(h.id);
++                if (h.nombre[0] != '\0')
++                    l.texto(" ").texto(h.nombre);
++                if (h.n < 0)
++                    l.texto(" (no se pudo leer su pila)");
++                l.escribir();
++                for (int m = 0; m < h.n; ++m)
++                    escribirMarco(m, h.marcos[m], simbolos);
++            }
++        }
++
++        // Desarrollo: las mismas pilas con nombres, despues del informe. dbghelp se inicia y se suelta cada vez, para
++        // no dejarla tomada (el informe de fallos hace su propio SymInitialize).
++        void escribirNombres(size_t numHilos)
++        {
++            const Dbghelp *d = dbghelp();
++            if (d == nullptr)
++                return;
++            // Solo la carpeta del .exe: nunca un servidor de simbolos de la red (_NT_SYMBOL_PATH no cuenta).
++            wchar_t carpeta[MAX_PATH] = {};
++            GetModuleFileNameW(nullptr, carpeta, MAX_PATH);
++            if (wchar_t *barra = wcsrchr(carpeta, L'\\'))
++                *barra = L'\0';
++            d->opciones(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
++            if (!d->iniciar(GetCurrentProcess(), carpeta, TRUE))
++                return;
++            Linea l;
++            inicio(l).texto("nombres (con el PDB junto al .exe):").escribir();
++            escribirHilos(numHilos, d);
++            inicio(l).texto("fin de los nombres").escribir();
++            d->soltar(GetCurrentProcess());
++        }
++
++        void informe()
++        {
++            if (!g_identidadEscrita)
++            {
++                g_identidadEscrita = true;
++                escribirIdentidad();
++            }
++            leerModulos();
++
++            // Los hilos del proceso, salvo este.
++            const DWORD propio = GetCurrentThreadId();
++            const DWORD proceso = GetCurrentProcessId();
++            size_t numHilos = 0u;
++            HANDLE foto = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++            if (foto != INVALID_HANDLE_VALUE)
++            {
++                THREADENTRY32 entrada{};
++                entrada.dwSize = sizeof(entrada);
++                for (BOOL hay = Thread32First(foto, &entrada); hay && numHilos < kMaxHilos;
++                     hay = Thread32Next(foto, &entrada))
++                    if (entrada.th32OwnerProcessID == proceso && entrada.th32ThreadID != propio)
++                        g_hilos[numHilos++].id = entrada.th32ThreadID;
++                CloseHandle(foto);
++            }
++
++            // Primero todas las pilas (lo mas juntas posible en el tiempo); despues se escriben. Mientras, el vigilante
++            // va en prioridad maxima: con un hilo del juego suspendido no debe esperar a que le toque la CPU.
++            const HANDLE propioHilo = GetCurrentThread();
++            const int prioridad = GetThreadPriority(propioHilo);
++            SetThreadPriority(propioHilo, THREAD_PRIORITY_TIME_CRITICAL);
++            for (size_t i = 0; i < numHilos; ++i)
++            {
++                Hilo &h = g_hilos[i];
++                h.n = -1;
++                h.nombre[0] = '\0';
++                HANDLE hilo = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
++                                         FALSE, h.id);
++                if (hilo == nullptr)
++                    continue;
++                // El id de la foto puede ser ya de un hilo de otro proceso (el hilo acabo y su id se reutilizo).
++                if (GetProcessIdOfThread(hilo) == proceso)
++                {
++                    nombreDelHilo(hilo, h.nombre, sizeof(h.nombre));
++                    h.n = capturar(hilo, h.marcos);
++                }
++                else
++                    h.id = 0u; // no se escribe
++                CloseHandle(hilo);
++            }
++            SetThreadPriority(propioHilo,
++                              prioridad != THREAD_PRIORITY_ERROR_RETURN ? prioridad : THREAD_PRIORITY_BELOW_NORMAL);
++
++            // Modulo+desplazamiento antes de tocar dbghelp: si se cuelga, el informe ya esta escrito.
++            escribirHilos(numHilos, nullptr);
++            const size_t escritos = static_cast<size_t>(
++                std::count_if(g_hilos, g_hilos + numHilos, [](const Hilo &h) { return h.id != 0u; }));
++            Linea l;
++            inicio(l).texto("fin del informe (").decimal(escritos).texto(" hilos)").escribir();
++            escribirNombres(numHilos);
++        }
++
++        double segundosAhora()
++        {
++            ULONGLONG cienNs = 0; // sin el tiempo de suspension del PC
++            QueryUnbiasedInterruptTime(&cienNs);
++            return static_cast<double>(cienNs) / 1.0e7;
++        }
++
++        void bucle(int umbral, std::vector<Latido> latidos)
++        {
++            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++            using SetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PCWSTR);
++            if (const auto nombrar = reinterpret_cast<SetThreadDescriptionFn>(
++                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")))
++                nombrar(GetCurrentThread(), L"Vigilante");
++
++            Detector detector(latidos.size(), umbral);
++            std::vector<uint64_t> valores(latidos.size(), 0u);
++            std::unique_ptr<bool[]> excusados(new bool[latidos.size()]());
++            for (;;)
++            {
++                Sleep(1000);
++                const bool pausa = ventanaEnPausa();
++                for (size_t i = 0; i < latidos.size(); ++i)
++                {
++                    valores[i] = latidos[i].contador->load(std::memory_order_relaxed);
++                    excusados[i] = pausa && latidos[i].contador == &latidoVentana();
++                }
++                bool parado = false;
++                for (const Aviso &aviso : detector.muestra(segundosAhora(), valores.data(), excusados.get()))
++                {
++                    Linea l;
++                    inicio(l);
++                    const uint64_t segundos = static_cast<uint64_t>(aviso.segundos + 0.5);
++                    if (aviso.suceso == Suceso::Parado)
++                    {
++                        l.texto("parado ").texto(latidos[aviso.latido].nombre).texto(" desde hace ").decimal(segundos)
++                            .texto(" s");
++                        parado = true;
++                    }
++                    else
++                        l.texto(latidos[aviso.latido].nombre).texto(" sigue tras ").decimal(segundos).texto(" s");
++                    l.escribir();
++                }
++                if (parado)
++                {
++                    if (g_informes < kMaxInformes)
++                        informe();
++                    else if (g_informes == kMaxInformes)
++                    {
++                        Linea l;
++                        inicio(l).texto("ya hay ").decimal(kMaxInformes).texto(" informes: no se escriben mas pilas")
++                            .escribir();
++                    }
++                    ++g_informes;
++                }
++            }
++        }
++    }
++
++    bool arrancar(int umbralSegundos, const std::vector<Latido> &latidos)
++    {
++        if (umbralSegundos <= 0 || latidos.empty() || g_arrancado.exchange(true))
++            return false;
++        // El manejador de stderr (el registro, unido a stdout, o la consola); se escribe sin pasar por el CRT.
++        g_salida = reinterpret_cast<HANDLE>(_get_osfhandle(2));
++        if (g_salida == INVALID_HANDLE_VALUE || g_salida == nullptr)
++            g_salida = GetStdHandle(STD_ERROR_HANDLE);
++        std::thread(bucle, umbralSegundos, latidos).detach();
++        return true;
++    }
++
++    void ventanaDelJuego(void *ventana)
++    {
++        g_ventana.store(static_cast<HWND>(ventana), std::memory_order_relaxed);
++    }
++#else
++    void ventanaDelJuego(void *ventana)
++    {
++        (void)ventana;
++    }
++
++    bool arrancar(int umbralSegundos, const std::vector<Latido> &latidos)
++    {
++        (void)umbralSegundos;
++        (void)latidos;
++        return false;
++    }
++#endif
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index f842faa..bbcafcd 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -6,6 +6,7 @@
+ #include "lib/ps2_game_font.h"
+ #include "ps2_user_paths.h"
+ #include "ps2_disc_setup.h"
++#include "ps2_vigilante.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -666,6 +667,15 @@ int main(int argc, char *argv[])
+                           << " (el juego sigue sin red)" << std::endl;
+         }
+ 
++        // Vigilante T2 (ps2_vigilante.h): when the EE's VBlanks or the window's loop stop for vigilante seconds, the
++        // log gets the stack of every thread. The guest (above) runs no game and has none.
++        const int vigilante = ps2x::vigilante::leerUmbral(std::getenv("PS2X_VIGILANTE"));
++        if (ps2x::vigilante::arrancar(vigilante, {{"EE", &runtime.memory().gs().vsyncTick},
++                                                  {"ventana", &ps2x::vigilante::latidoVentana()}}))
++            std::cout << "[vigilante] umbral " << vigilante << " s (latidos EE y ventana)" << std::endl;
++        else
++            std::cout << "[vigilante] apagado" << std::endl;
++
+         runtime.run();
+ 
+ #ifdef _DEBUG
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index be86118..c0e02df 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -48,6 +48,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_high_ram_tests.cpp
+     src/ps2_game_font_tests.cpp
+     src/ps2_game_graphics_tests.cpp
++    src/ps2_vigilante_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 01d15fe..f6b04c3 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -29,6 +29,7 @@ void register_ps2_netplay_audio_tests();
+ void register_ps2_high_ram_tests();
+ void register_ps2_game_font_tests();
+ void register_ps2_game_graphics_tests();
++void register_ps2_vigilante_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -62,6 +63,7 @@ int main()
+     register_ps2_high_ram_tests();
+     register_ps2_game_font_tests();
+     register_ps2_game_graphics_tests();
++    register_ps2_vigilante_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 183b44e..e97e217 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -385,7 +385,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{28}, "twenty-eight options (fase 5: fifteen more; lejania: two)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{29}, "twenty-nine options (fase 5: fifteen more; lejania: two; vigilante: one)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);
+diff --git a/ps2xTest/src/ps2_vigilante_tests.cpp b/ps2xTest/src/ps2_vigilante_tests.cpp
+new file mode 100644
+index 0000000..791d21e
+--- /dev/null
++++ b/ps2xTest/src/ps2_vigilante_tests.cpp
+@@ -0,0 +1,365 @@
++#include "MiniTest.h"
++#include "ps2_options.h"
++#include "ps2_vigilante.h"
++
++#include <cstdint>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace
++{
++    using ps2x::vigilante::Aviso;
++    using ps2x::vigilante::Detector;
++    using ps2x::vigilante::Suceso;
++
++    // One heartbeat: samples (time, counter) in order; returns every event of the last one.
++    std::vector<Aviso> sample(Detector &detector, double now, uint64_t counter)
++    {
++        return detector.muestra(now, &counter);
++    }
++
++    // A heartbeat that advances once per second from t = 0 to t = last (so its last change is at t = last).
++    void advanceUntil(Detector &detector, int last, std::vector<Aviso> &all)
++    {
++        for (int t = 0; t <= last; ++t)
++            for (const Aviso &aviso : sample(detector, t, static_cast<uint64_t>(t)))
++                all.push_back(aviso);
++    }
++}
++
++void register_ps2_vigilante_tests()
++{
++    MiniTest::Case("Vigilante", [](TestCase &tc)
++    {
++        tc.Run("no event while the heartbeat advances", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 120, all);
++            t.Equals(all.size(), size_t{0u}, "two minutes advancing: nothing");
++        });
++
++        tc.Run("one parado event exactly at the threshold, none just below", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all); // last change at t = 5
++            t.Equals(sample(detector, 14.0, 5u).size(), size_t{0u}, "9 s stalled: nothing");
++            t.Equals(sample(detector, 14.999, 5u).size(), size_t{0u}, "just below 10 s: nothing");
++            const std::vector<Aviso> at = sample(detector, 15.0, 5u);
++            t.Equals(at.size(), size_t{1u}, "10 s stalled: one event");
++            if (at.size() == 1u)
++            {
++                t.Equals(at[0].latido, size_t{0u}, "of the heartbeat 0");
++                t.IsTrue(at[0].suceso == Suceso::Parado, "parado");
++                t.Equals(at[0].segundos, 10.0, "stalled for 10 s");
++            }
++        });
++
++        tc.Run("a sample after the threshold fires once with the stall so far", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            t.Equals(sample(detector, 13.0, 5u).size(), size_t{0u}, "8 s: nothing");
++            const std::vector<Aviso> late = sample(detector, 17.5, 5u);
++            t.Equals(late.size(), size_t{1u}, "12.5 s (samples late): one event");
++            if (late.size() == 1u)
++                t.Equals(late[0].segundos, 12.5, "with the 12.5 s");
++        });
++
++        tc.Run("no repeat while still stalled", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            size_t events = 0u;
++            for (int s = 6; s <= 600; ++s)
++                events += sample(detector, s, 5u).size();
++            t.Equals(events, size_t{1u}, "almost ten minutes stalled: one event");
++        });
++
++        tc.Run("a recovery after a reported stall gives one sigue event with its duration", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            for (int s = 6; s <= 30; ++s)
++                sample(detector, s, 5u);
++            const std::vector<Aviso> back = sample(detector, 31.0, 6u);
++            t.Equals(back.size(), size_t{1u}, "it advances: one event");
++            if (back.size() == 1u)
++            {
++                t.IsTrue(back[0].suceso == Suceso::Sigue, "sigue");
++                t.Equals(back[0].latido, size_t{0u}, "of the heartbeat 0");
++                t.Equals(back[0].segundos, 26.0, "after 26 s (from t = 5 to t = 31)");
++            }
++            t.Equals(sample(detector, 32.0, 7u).size(), size_t{0u}, "and then nothing while it advances");
++        });
++
++        tc.Run("a short stall below the threshold gives no sigue event", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            for (int s = 6; s <= 14; ++s)
++                sample(detector, s, 5u);
++            t.Equals(sample(detector, 14.5, 6u).size(), size_t{0u}, "9.5 s stalled, then advances: nothing");
++        });
++
++        tc.Run("a second stall after a recovery fires again", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            t.Equals(sample(detector, 15.0, 5u).size(), size_t{1u}, "first stall");
++            t.Equals(sample(detector, 16.0, 6u).size(), size_t{1u}, "recovery");
++            t.Equals(sample(detector, 25.0, 6u).size(), size_t{0u}, "9 s into the second stall: nothing");
++            const std::vector<Aviso> again = sample(detector, 26.0, 6u);
++            t.Equals(again.size(), size_t{1u}, "10 s into the second stall: one event");
++            if (again.size() == 1u)
++            {
++                t.IsTrue(again[0].suceso == Suceso::Parado, "parado again");
++                t.Equals(again[0].segundos, 10.0, "counted from the recovery");
++            }
++        });
++
++        tc.Run("a heartbeat that never advanced is silent", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            size_t events = 0u;
++            for (int s = 0; s <= 300; ++s)
++                events += sample(detector, s, 0u).size();
++            t.Equals(events, size_t{0u}, "never advanced from 0: nothing");
++
++            Detector started(1u, 10);
++            events = 0u;
++            for (int s = 0; s <= 300; ++s)
++                events += sample(started, s, 1234u).size();
++            t.Equals(events, size_t{0u}, "stuck at its first value (not 0): nothing either");
++        });
++
++        tc.Run("threshold 0 is off", [](TestCase &t)
++        {
++            Detector detector(1u, 0);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            size_t events = 0u;
++            for (int s = 6; s <= 600; ++s)
++                events += sample(detector, s, 5u).size();
++            events += sample(detector, 601.0, 6u).size();
++            t.Equals(all.size() + events, size_t{0u}, "no stall and no recovery");
++        });
++
++        tc.Run("two heartbeats are independent", [](TestCase &t)
++        {
++            Detector detector(2u, 10);
++            uint64_t counters[2] = {0u, 0u};
++            std::vector<Aviso> all;
++            for (int s = 0; s <= 5; ++s)
++            {
++                counters[0] = counters[1] = static_cast<uint64_t>(s);
++                for (const Aviso &aviso : detector.muestra(s, counters))
++                    all.push_back(aviso);
++            }
++            // The second one (the window) stalls at t = 5; the first (EE) keeps going.
++            for (int s = 6; s <= 20; ++s)
++            {
++                counters[0] = static_cast<uint64_t>(s);
++                for (const Aviso &aviso : detector.muestra(s, counters))
++                    all.push_back(aviso);
++            }
++            t.Equals(all.size(), size_t{1u}, "one event");
++            if (all.size() == 1u)
++            {
++                t.Equals(all[0].latido, size_t{1u}, "of the stalled heartbeat only");
++                t.IsTrue(all[0].suceso == Suceso::Parado, "parado");
++            }
++            counters[1] = 99u;
++            const std::vector<Aviso> back = detector.muestra(21.0, counters);
++            t.Equals(back.size(), size_t{1u}, "its recovery");
++            if (back.size() == 1u)
++            {
++                t.Equals(back[0].latido, size_t{1u}, "of the same heartbeat");
++                t.IsTrue(back[0].suceso == Suceso::Sigue, "sigue");
++                t.Equals(back[0].segundos, 16.0, "after 16 s");
++            }
++        });
++
++        tc.Run("an excused stall (minimized window) is silent and counts from the end of the excuse", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            const bool excused = true;
++            size_t events = 0u;
++            for (int s = 6; s <= 100; ++s)
++            {
++                uint64_t counter = 5u;
++                events += detector.muestra(s, &counter, &excused).size();
++            }
++            t.Equals(events, size_t{0u}, "95 s stalled while excused: nothing");
++            t.Equals(sample(detector, 109.0, 5u).size(), size_t{0u}, "9 s after the excuse: nothing");
++            const std::vector<Aviso> at = sample(detector, 110.0, 5u);
++            t.Equals(at.size(), size_t{1u}, "10 s after the excuse: one event");
++            if (at.size() == 1u)
++            {
++                t.IsTrue(at[0].suceso == Suceso::Parado, "parado");
++                t.Equals(at[0].segundos, 10.0, "counted from the last excused sample");
++            }
++
++            Detector restored(1u, 10);
++            advanceUntil(restored, 5, all);
++            for (int s = 6; s <= 60; ++s)
++            {
++                uint64_t counter = 5u;
++                restored.muestra(s, &counter, &excused);
++            }
++            t.Equals(sample(restored, 61.0, 6u).size(), size_t{0u}, "it advances after the excuse: no sigue");
++        });
++
++        tc.Run("an excused heartbeat that advances while excused gives no sigue", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            const bool excused = true;
++            for (int s = 6; s <= 20; ++s)
++            {
++                uint64_t counter = static_cast<uint64_t>(s);
++                for (const Aviso &aviso : detector.muestra(s, &counter, &excused))
++                    all.push_back(aviso);
++            }
++            for (int s = 21; s <= 29; ++s)
++                for (const Aviso &aviso : sample(detector, s, 20u))
++                    all.push_back(aviso);
++            t.Equals(all.size(), size_t{0u}, "advancing while excused, then 9 s stalled: nothing");
++            const std::vector<Aviso> at = sample(detector, 30.0, 20u);
++            t.Equals(at.size(), size_t{1u}, "10 s stalled without excuse: one event");
++            if (at.size() == 1u)
++            {
++                t.IsTrue(at[0].suceso == Suceso::Parado, "parado");
++                t.Equals(at[0].segundos, 10.0, "stalled for 10 s");
++            }
++        });
++
++        tc.Run("threshold 3 fires at exactly 3.0 s", [](TestCase &t)
++        {
++            Detector detector(1u, 3);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            t.Equals(sample(detector, 7.999, 5u).size(), size_t{0u}, "just below 3 s: nothing");
++            const std::vector<Aviso> at = sample(detector, 8.0, 5u);
++            t.Equals(all.size() + at.size(), size_t{1u}, "3 s stalled: one event");
++            if (at.size() == 1u)
++                t.Equals(at[0].segundos, 3.0, "stalled for 3 s");
++        });
++
++        tc.Run("an excuse does not hide a stall already reported", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            std::vector<Aviso> all;
++            advanceUntil(detector, 5, all);
++            t.Equals(sample(detector, 15.0, 5u).size(), size_t{1u}, "stall reported");
++            const bool excused = true;
++            size_t events = 0u;
++            for (int s = 16; s <= 30; ++s)
++            {
++                uint64_t counter = 5u;
++                events += detector.muestra(s, &counter, &excused).size();
++            }
++            t.Equals(events, size_t{0u}, "minimized while stalled: nothing more");
++            const std::vector<Aviso> back = sample(detector, 31.0, 6u);
++            t.Equals(back.size(), size_t{1u}, "it advances: one event");
++            if (back.size() == 1u)
++            {
++                t.IsTrue(back[0].suceso == Suceso::Sigue, "sigue");
++                t.Equals(back[0].segundos, 26.0, "with the whole stall (from t = 5 to t = 31)");
++            }
++        });
++
++        tc.Run("only the excused heartbeat is excused", [](TestCase &t)
++        {
++            Detector detector(2u, 10);
++            uint64_t counters[2] = {0u, 0u};
++            const bool excused[2] = {false, true};
++            std::vector<Aviso> all;
++            for (int s = 0; s <= 5; ++s)
++            {
++                counters[0] = counters[1] = static_cast<uint64_t>(s);
++                detector.muestra(s, counters, excused);
++            }
++            for (int s = 6; s <= 30; ++s)
++                for (const Aviso &aviso : detector.muestra(s, counters, excused))
++                    all.push_back(aviso);
++            t.Equals(all.size(), size_t{1u}, "both stalled: one event");
++            if (all.size() == 1u)
++            {
++                t.Equals(all[0].latido, size_t{0u}, "of the heartbeat that is not excused");
++                t.IsTrue(all[0].suceso == Suceso::Parado, "parado");
++            }
++        });
++
++        tc.Run("the option value is read as whole seconds", [](TestCase &t)
++        {
++            using ps2x::vigilante::leerUmbral;
++            t.Equals(leerUmbral(nullptr), 10, "unset: 10");
++            t.Equals(leerUmbral(""), 10, "empty: 10");
++            t.Equals(leerUmbral("abc"), 10, "not a number: 10");
++            t.Equals(leerUmbral("12s"), 10, "trailing letters: 10");
++            t.Equals(leerUmbral("-5"), 10, "negative: 10");
++            t.Equals(leerUmbral("0"), 0, "0: off");
++            // The same values as opciones.ini: 0 or 3 to 600; anything else is the default, like an invalid value.
++            t.Equals(leerUmbral("1"), 10, "1: not accepted, 10");
++            t.Equals(leerUmbral("2"), 10, "2: not accepted, 10");
++            t.Equals(leerUmbral("3"), 3, "3");
++            t.Equals(leerUmbral("10"), 10, "10");
++            t.Equals(leerUmbral(" 30 "), 30, "spaces around: 30");
++            t.Equals(leerUmbral("600"), 600, "600");
++            t.Equals(leerUmbral("601"), 10, "601: not accepted, 10");
++            t.Equals(leerUmbral("700"), 10, "700: not accepted, 10");
++            t.Equals(leerUmbral("99999999999999999999"), 10, "huge: 10");
++        });
++
++        tc.Run("the vigilante option is 10 by default and sets PS2X_VIGILANTE", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("vigilante"), std::string("10"), "10 by default");
++            t.IsTrue(ps2x::defaultOptionsText(false).find("vigilante = 10\n") != std::string::npos,
++                     "the template has it");
++            t.IsTrue(ps2x::defaultOptionsText(true).find("vigilante = 10\n") != std::string::npos,
++                     "development too");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("vigilante = 0\n");
++            t.IsTrue(file.warnings.empty(), "0 gives no warning");
++            std::map<std::string, std::string> variables;
++            for (const ps2x::EnvironmentSetting &setting :
++                 ps2x::optionsEnvironment(file, [](const char *) -> const char * { return nullptr; }))
++                variables[setting.variable] = setting.value;
++            t.Equals(variables["PS2X_VIGILANTE"], std::string("0"), "vigilante -> PS2X_VIGILANTE");
++
++            const ps2x::OptionsFile bad = ps2x::parseOptions("vigilante = mucho\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "a value that is not a number warns");
++            t.Equals(bad.values.at("vigilante"), std::string("10"), "and gives the default");
++
++            // The same values as PS2X_VIGILANTE (leerUmbral): 0 or 3 to 600.
++            for (const char *accepted : {"3", "600"})
++            {
++                const ps2x::OptionsFile ok = ps2x::parseOptions(std::string("vigilante = ") + accepted + "\n");
++                t.IsTrue(ok.warnings.empty(), std::string(accepted) + " gives no warning");
++                t.Equals(ok.values.at("vigilante"), std::string(accepted), std::string(accepted) + " is kept");
++            }
++            for (const char *rejected : {"1", "2", "601", "700"})
++            {
++                const ps2x::OptionsFile no = ps2x::parseOptions(std::string("vigilante = ") + rejected + "\n");
++                t.Equals(no.warnings.size(), size_t{1u}, std::string(rejected) + " warns");
++                if (no.warnings.size() == 1u)
++                    t.IsTrue(no.warnings[0].find("(valores: 0 o de 3 a 600)") != std::string::npos,
++                             std::string(rejected) + ": the warning says the accepted values");
++                t.Equals(no.values.at("vigilante"), std::string("10"), std::string(rejected) + " gives the default");
++            }
++            t.IsTrue(ps2x::defaultOptionsText(false).find("0 lo apaga; de 3 a 600") != std::string::npos,
++                     "the help text says the accepted values");
++        });
++    });
++}

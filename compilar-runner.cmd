@@ -3,6 +3,8 @@ rem Compila el .exe del juego (ps2EntryRunner.exe) a partir del codigo ya traduc
 rem Usalo tras cambiar algo en src\; recompilar.cmd lo llama despues de traducir el ELF.
 rem Compilacion de desarrollo: optimiza cada bloque (/O2) pero sin LTCG, para que el enlazado
 rem sea rapido y solo se recompile lo que cambie. Salida: build\runner-dev\ps2xRuntime\
+rem Informacion de depuracion completa tambien en el runner (/Z7, parche 0208; el codigo generado es el mismo): el PDB
+rem ocupa unos 470 MB y scripts\simbolizar.ps1 lo usa para traducir los informes del vigilante.
 rem Procesos en paralelo: variable F1_JOBS (por defecto 4; cada uno puede ocupar 1-2 GB de RAM).
 rem Traza de llamadas (ps2_log.txt, cada funcion escribe al entrar y salir): F1_TRAZA=ON. Por defecto OFF, porque
 rem frena mucho el hilo del EE. Cambiarla obliga a recompilar las 14.000 funciones (unos 40 minutos).

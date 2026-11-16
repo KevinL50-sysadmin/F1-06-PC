@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1eb61c3..2a2c9b4 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -584,6 +584,10 @@ endif()
+ 
+ if(MSVC)
+     target_compile_options(ps2EntryRunner PRIVATE /FS)
++    # Patch 0208: full debug info (/Z7, in the objects) for the runner too, like ps2_runtime. Without it the PDB only
++    # has the public symbols of the runner, so a frame in a static function (src/f1_*.cpp, main.cpp) took the name of
++    # the previous public one. /Z7 does not change the generated code and the link options stay the same.
++    target_compile_options(ps2EntryRunner PRIVATE /Z7)
+     # Patch 0088: MSVC compiles the translated functions above its size limit without optimizing them (warning C4883;
+     # 141 of them in F1 06, among them the hottest one of the game); /d2OptimizeHugeFunctions optimizes them too.
+     if(PS2X_OPTIMIZE_HUGE_FUNCTIONS)

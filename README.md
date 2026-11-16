@@ -31,7 +31,7 @@ with its own fonts, colours and controller navigation: no overlays, no external 
 - **Finer AI difficulty** (11 steps from EASY to HARD), **crash damage also in short races** (1-3 laps), colour-blind
   filters, mono audio, audio latency and vibration strength settings.
 - **Controllers**: DualSense (with vibration), DualShock 4, XInput pads and a fully configurable keyboard
-  (`config\controles.ini`). Two players in **split screen**.
+  (`config\controls.ini`). Two players in **split screen**.
 - **Steering wheel**: a Logitech G29 is presented to the game as its own *Driving Force Pro*, with the game's native
   steering, pedals, menu buttons and **force feedback**.
 - **Netplay over IP (experimental)**: one PC hosts and runs the game; a second PC joins as player 2 of split screen,
@@ -67,7 +67,8 @@ owners.
 
 ## Installation
 
-1. Download either the **installer** (`.exe`) or the **portable** `.zip` from [the latest release](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest).
+1. Download either the **installer** (`.exe`) or the **portable** `.zip` from [the latest release](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). What changed in each
+   version is in [CHANGELOG.md](CHANGELOG.md).
    - Installer: creates "F1 06 PC" shortcuts in the Start menu and on the desktop; uninstall from Settings > Apps (it
      asks whether to also delete your saves and options). Your saves and settings go to
      `Documents\My Games\F1-06`. One installer page lets you pick your ISO (already filled in if one is found in your
@@ -78,7 +79,7 @@ owners.
 2. **First run**: if the game data is not there yet, the game asks once for your Formula One 06 ISO. It offers an ISO
    found in your Downloads folder, on your Desktop or next to the `.exe` (or lets you browse for one), checks that it
    is the PAL version (SCES-53950), copies the game data with a cancellable progress bar (about 4 GB: portable, into
-   `datos\` next to the `.exe`; installed, into `%LOCALAPPDATA%\F1-06\datos`) and starts. The ISO is only read.
+   `data\` next to the `.exe`; installed, into `%LOCALAPPDATA%\F1-06\data`) and starts. The ISO is only read.
    After that you just play.
 3. Windows may show "Windows protected your PC" (SmartScreen) because the `.exe` is not signed: click **More info**
    and then **Run anyway**.
@@ -89,7 +90,7 @@ Dump your own disc: the project will never tell you where to download a game ima
 
 - All PC options are in **OPTIONS > PC OPTIONS** in the main menu, with four pages: **PC GRAPHICS**, **PC DISPLAY**,
   **PC SETTINGS** and **PC NETPLAY**. Each page has a DEFAULT VALUES row. Changes are visible at once; ACCEPT saves them to
-  `config\opciones.ini`. The race pause menu also has PC GRAPHICS and PHOTO MODE.
+  `config\settings.ini`. The race pause menu also has PC GRAPHICS and PHOTO MODE.
 - Keys: **F11** fullscreen / window, **F10** aspect, **F12** screenshot, **H** HUD mode, **F8** photo mode. With a
   controller, **R3** enters and leaves photo mode and **L3** shows or hides the help bar. Close the window (X or
   Alt+F4) to quit; Esc never closes the game.
@@ -97,13 +98,13 @@ Dump your own disc: the project will never tell you where to download a game ima
   d-pad left/right changes car, △ cycles the race cameras, ○ takes the photo, START returns to the race (keyboard:
   W S A D, R F, arrows, Q E, Z X, TAB, V).
 - Replays: SELECT pauses, R2 fast-forward (x2, then x4), L2 rewinds (keyboard: K, L, J).
-- Controls are configured in `config\controles.ini` (pad, keyboard, wheel; a `[jugador2]` section for the second
+- Controls are configured in `config\controls.ini` (pad, keyboard, wheel; a `[jugador2]` section for the second
   player). Wheel settings in its `[volante]` section: set `grados_volante` to the rotation configured in G HUB (900
   by default); `giro` is the lock-to-lock range the game uses (200 by default, like the original Driving Force Pro).
 - Netplay: the host turns HOST on in PC NETPLAY and tells the guest the address, port (TCP 50650 by default) and
-  password; the guest opens `Jugar en red - Invitado.cmd` (installed: "F1 06 PC - Jugar en red (invitado)" in the Start
+  password; the guest opens `Play online - Guest.cmd` (installed: "F1 06 PC - Jugar en red (invitado)" in the Start
   menu; or `F1-06.exe --invitado`) and does not need the game data. Image
-  quality low / medium / high uses about 4 / 8 / 15 Mbit/s. Full details in `LEEME.txt` inside the package (Spanish).
+  quality low / medium / high uses about 4 / 8 / 15 Mbit/s. Full details in `README.txt` inside the package (Spanish: `LEEME.txt`).
 
 ## Known limitations
 
@@ -152,8 +153,8 @@ tools behind it and, hopefully one day, community servers. They never buy builds
 everything stays free for everyone.
 
 Bug reports are just as valuable
-([issues](https://github.com/KevinL50-sysadmin/F1-06-PC/issues)): please attach `F1-06.log` (portable: `registros\` inside the game folder; installed:
-`%LOCALAPPDATA%\F1-06\registros`).
+([issues](https://github.com/KevinL50-sysadmin/F1-06-PC/issues)): please attach `F1-06.log` (portable: `logs\` inside the game folder; installed:
+`%LOCALAPPDATA%\F1-06\logs`).
 
 Follow progress and news on X: **https://x.com/KevinLA50**.
 
@@ -171,7 +172,7 @@ assets, ISO images or BIOS files are distributed; no official logo is used as pr
   built on (GPL-3.0). This project's changes to it are kept as patches in `parches/`.
 - **[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs)**: GS rendering on the GPU with Vulkan (LGPL-3.0
   or later), with **[Granite](https://github.com/Themaister/Granite)** (MIT), **volk** (MIT) and **Vulkan-Headers**
-  (Apache-2.0 or MIT). Full source and licenses ship in the package's `licencias\` folder.
+  (Apache-2.0 or MIT). Full source and licenses ship in the package's `licenses\` folder.
 - **[raylib](https://github.com/raysan5/raylib)** (zlib) and **[Dear ImGui](https://github.com/ocornut/imgui)** (MIT),
   pulled in by PS2Recomp's runtime; other PS2Recomp build dependencies: fmt, ELFIO, toml11, libdwarf, rabbitizer,
   nlohmann/json (each under its own license).
@@ -258,4 +259,4 @@ Novedades en X: **https://x.com/KevinLA50**.
 distribuyen recursos del juego, ISO ni BIOS, ni se usa ningún logotipo oficial como imagen del proyecto.
 
 **Créditos:** PS2Recomp (GPL-3.0), paraLLEl-GS (LGPL-3.0+), Granite, volk y Vulkan-Headers, raylib, Dear ImGui, AMD FSR 1,
-FFmpeg y la letra Michroma (OFL 1.1); detalles y licencias en la sección en inglés y en `licencias\` del paquete.
+FFmpeg y la letra Michroma (OFL 1.1); detalles y licencias en la sección en inglés y en `licenses\` del paquete.
