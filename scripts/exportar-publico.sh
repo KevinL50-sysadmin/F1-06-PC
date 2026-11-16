@@ -166,7 +166,7 @@ done
 # acentuada se escribe alli en las dos formas (en los binarios se busca byte a byte: el texto debe ir en UTF-8).
 # Los corchetes evitan que este mismo script coincida con sus patrones.
 personales='J:[\\/]|[a-z]:[\\/]+users[\\/]+[a-z0-9._-]{2,}|K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula'
-permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#ko_fi: k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
+permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#(recompstore|recomplauncher)\.com/dev/k[e]vinl50-sysadmin\b##gI; s#ko_fi: k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
 # En los binarios solo los patrones largos (los cortos darian falsos positivos en datos comprimidos).
 personales_binario='K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula|[a-z]:[\\/]+users[\\/]+k[e]vin'
 # grep sale con 2 si el patron no vale: no se puede tomar por "sin coincidencias".

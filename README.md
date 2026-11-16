@@ -1,5 +1,11 @@
 <p align="center"><img src="docs/lanzamiento/img/cabecera-readme.png" alt="F1 06 PC: the PS2 game, statically recompiled into a native Windows port" width="100%"></p>
 
+<p align="center">
+  <a href="https://recomplauncher.com/game/f1-06-pc"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher" height="48"></a>
+  &nbsp;&nbsp;
+  <a href="https://recompstore.com/dev/kevinl50-sysadmin"><img src="https://recompstore.com/assets/press/verified-dark.svg" alt="Verified developer on RecompStore" height="48"></a>
+</p>
+
 # F1 06 PC: a native Windows port of Formula One 06 (PS2) by static recompilation
 
 > **Fan project. Not affiliated with, endorsed by or connected to Sony Interactive Entertainment, SCE Studio Liverpool,
