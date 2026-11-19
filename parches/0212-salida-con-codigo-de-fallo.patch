@@ -1,0 +1,488 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 2a2c9b4..80c2234 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -424,6 +424,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_disc_setup_win.cpp
+     src/lib/ps2_vigilante.cpp
+     src/lib/ps2_vigilante_win.cpp
++    src/lib/ps2_salida.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+diff --git a/ps2xRuntime/include/ps2_salida.h b/ps2xRuntime/include/ps2_salida.h
+new file mode 100644
+index 0000000..9149986
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_salida.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// Salida del proceso (odd/tasks/fallos-con-log.md T2). RecompLauncher solo adjunta el .log mas reciente a un informe
++// de fallo cuando el juego termina con un codigo distinto de 0, asi que un fallo anota aqui su codigo y su motivo, y la
++// salida (main.cpp, o el plazo de cierre de ps2_runtime.cpp) termina con el y escribe una ultima linea en el registro:
++//   [salida] motivo=<motivo> codigo=<codigo>
++// El cierre normal sale con 0 (motivo=normal). Ningun codigo de aqui va en exit_codes de recomplauncher.json: eso
++// cambiaria el informe por un mensaje.
++namespace ps2x::salida
++{
++    // Distintos de los de --extraer-iso (0-4), del error fatal (1), del invitado de red (2) y de abort() (3).
++    constexpr int kExcepcionJuego = 10;  // excepcion C++ en el hilo del juego
++    constexpr int kExitDelJuego = 11;    // el juego llamo a exit() (p. ej. un error de Lua sin pcall)
++    constexpr int kCuelgueAlCerrar = 12; // el EE seguia colgado al cerrar, o el juego no se paro al cerrar
++
++    // Anota un fallo; gana el primero (los siguientes solo quedan en el registro de quien los detecta). Un codigo 0 no
++    // es un fallo y no hace nada. Seguro entre hilos; motivo se copia (sin espacios, para buscarlo en el registro).
++    void anotarFallo(int codigo, const char *motivo);
++
++    int codigo();         // 0 si no se ha anotado ningun fallo
++    const char *motivo(); // "normal" si no se ha anotado ningun fallo
++
++    // Escribe "[salida] motivo=<motivo> codigo=<codigo>" en std::cout y vacia std::cout y std::cerr (std::_Exit no
++    // vacia nada).
++    void escribir(int codigo, const char *motivo);
++
++    // Solo para las pruebas: vuelve al estado sin fallo.
++    void reiniciarParaPruebas();
++}
+diff --git a/ps2xRuntime/include/ps2_vigilante.h b/ps2xRuntime/include/ps2_vigilante.h
+index 0f45150..5ddadcb 100644
+--- a/ps2xRuntime/include/ps2_vigilante.h
++++ b/ps2xRuntime/include/ps2_vigilante.h
+@@ -47,6 +47,10 @@ namespace ps2x::vigilante
+         // paron se cuenta desde que acaba la excusa. Un paron ya avisado sigue hasta que el latido avance.
+         std::vector<Aviso> muestra(double ahora, const uint64_t *contadores, const bool *excusados = nullptr);
+ 
++        // odd/tasks/fallos-con-log.md T2: el latido i esta en un paron ya avisado y aun no ha vuelto a avanzar (un
++        // paron del que se recupero ya no cuenta). Fuera de rango: false.
++        bool parado(size_t latido) const;
++
+     private:
+         struct Estado
+         {
+@@ -76,4 +80,9 @@ namespace ps2x::vigilante
+     // Arranca el hilo "Vigilante" (Windows; en otros sistemas no hace nada). umbralSegundos 0: no arranca. Los
+     // contadores deben vivir mientras viva el proceso.
+     bool arrancar(int umbralSegundos, const std::vector<Latido> &latidos);
++
++    // odd/tasks/fallos-con-log.md T2: el latido de ese nombre (p. ej. "EE") esta parado ahora mismo segun el hilo
++    // "Vigilante" (Detector::parado tras su ultima muestra). false si el vigilante no corre o no hay latido con ese
++    // nombre. Seguro entre hilos.
++    bool latidoParado(std::string_view nombre);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ed0bc83..b0ed7e7 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,7 @@
+ #include "ps2_replay_scrub.h"
+ #include "ps2_netplay.h"
+ #include "ps2_vigilante.h"
++#include "ps2_salida.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -3841,10 +3842,13 @@ void PS2Runtime::run()
+         catch (const std::exception &e)
+         {
+             std::cerr << "Error during program execution: " << e.what() << std::endl;
++            // odd/tasks/fallos-con-log.md T2: el proceso sale distinto de 0 (RecompLauncher adjunta el registro).
++            ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+         }
+         catch (...)
+         {
+             std::cerr << "Error during program execution: unknown exception" << std::endl;
++            ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+         }
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
+@@ -4038,12 +4042,30 @@ void PS2Runtime::run()
+         if (WindowShouldClose())
+         {
+             RUNTIME_LOG("[run] window close requested, breaking out of loop");
++            // odd/tasks/fallos-con-log.md T2 (S2): solo cuenta el cuelgue que sigue al cerrar. Solo el EE: la ventana
++            // da vueltas mientras se cierra, y un paron del que el juego se recupero ya no esta parado.
++            if (ps2x::vigilante::latidoParado("EE"))
++            {
++                std::cout << "[salida] el EE sigue colgado al cerrar la ventana" << std::endl;
++                ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "cuelgue-al-cerrar");
++            }
+             requestStop();
+             break;
+         }
+     }
+ 
+     requestStop();
++    // odd/tasks/fallos-con-log.md T2: parar es cooperativo; con el EE colgado de verdad el hilo del juego no acaba
++    // nunca y el proceso se quedaria para siempre en join(). Se le dan 10 s; si no, se sale con el codigo del fallo.
++    const auto plazoCierre = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (!gameThreadFinished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < plazoCierre)
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    if (!gameThreadFinished.load(std::memory_order_acquire))
++    {
++        ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "no-se-para-al-cerrar");
++        ps2x::salida::escribir(ps2x::salida::codigo(), ps2x::salida::motivo());
++        std::_Exit(ps2x::salida::codigo());
++    }
+     if (gameThread.joinable())
+     {
+         gameThread.join();
+diff --git a/ps2xRuntime/src/lib/ps2_salida.cpp b/ps2xRuntime/src/lib/ps2_salida.cpp
+new file mode 100644
+index 0000000..80b914a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_salida.cpp
+@@ -0,0 +1,53 @@
++#include "ps2_salida.h"
++
++#include <cstring>
++#include <iostream>
++#include <mutex>
++
++namespace ps2x::salida
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        int g_codigo = 0;
++        char g_motivo[64] = "normal";
++    }
++
++    void anotarFallo(int codigo, const char *motivo)
++    {
++        if (codigo == 0)
++            return;
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (g_codigo != 0)
++            return;
++        g_codigo = codigo;
++        std::strncpy(g_motivo, motivo != nullptr && motivo[0] != '\0' ? motivo : "fallo", sizeof(g_motivo) - 1u);
++        g_motivo[sizeof(g_motivo) - 1u] = '\0';
++    }
++
++    int codigo()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        return g_codigo;
++    }
++
++    const char *motivo()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        return g_motivo; // solo cambia una vez, de "normal" al primer fallo
++    }
++
++    void escribir(int codigo, const char *motivo)
++    {
++        std::cout << "[salida] motivo=" << (motivo != nullptr ? motivo : "normal") << " codigo=" << codigo << "\n";
++        std::cout.flush();
++        std::cerr.flush();
++    }
++
++    void reiniciarParaPruebas()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_codigo = 0;
++        std::strcpy(g_motivo, "normal");
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante.cpp b/ps2xRuntime/src/lib/ps2_vigilante.cpp
+index ce689da..bf401cf 100644
+--- a/ps2xRuntime/src/lib/ps2_vigilante.cpp
++++ b/ps2xRuntime/src/lib/ps2_vigilante.cpp
+@@ -87,6 +87,11 @@ namespace ps2x::vigilante
+         return avisos;
+     }
+ 
++    bool Detector::parado(size_t latido) const
++    {
++        return latido < m_estados.size() && m_estados[latido].avisado;
++    }
++
+     std::atomic<uint64_t> &latidoVentana()
+     {
+         static std::atomic<uint64_t> latido{0u};
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+index d8679b8..2062552 100644
+--- a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+@@ -59,6 +59,13 @@ namespace ps2x::vigilante
+         std::atomic<bool> g_arrancado{false};
+         std::atomic<HWND> g_ventana{nullptr};
+ 
++        // odd/tasks/fallos-con-log.md T2: los nombres de los latidos (copiados en arrancar) y si cada uno esta parado
++        // tras la ultima muestra del bucle; latidoParado los lee desde otro hilo. Solo los kMaxLatidos primeros.
++        constexpr size_t kMaxLatidos = 8u;
++        char g_nombres[kMaxLatidos][32] = {};
++        std::atomic<size_t> g_numLatidos{0u};
++        std::atomic<bool> g_parados[kMaxLatidos] = {};
++
+         // T3: la ventana minimizada (raylib no da vueltas al bucle sin FLAG_WINDOW_ALWAYS_RUN), arrastrada o con un
+         // menu del sistema abierto (el bucle modal de Windows no vuelve al del juego).
+         bool ventanaEnPausa()
+@@ -535,7 +542,10 @@ namespace ps2x::vigilante
+                     excusados[i] = pausa && latidos[i].contador == &latidoVentana();
+                 }
+                 bool parado = false;
+-                for (const Aviso &aviso : detector.muestra(segundosAhora(), valores.data(), excusados.get()))
++                const std::vector<Aviso> avisos = detector.muestra(segundosAhora(), valores.data(), excusados.get());
++                for (size_t i = 0; i < latidos.size() && i < kMaxLatidos; ++i)
++                    g_parados[i].store(detector.parado(i), std::memory_order_relaxed);
++                for (const Aviso &aviso : avisos)
+                 {
+                     Linea l;
+                     inicio(l);
+@@ -574,15 +584,40 @@ namespace ps2x::vigilante
+         g_salida = reinterpret_cast<HANDLE>(_get_osfhandle(2));
+         if (g_salida == INVALID_HANDLE_VALUE || g_salida == nullptr)
+             g_salida = GetStdHandle(STD_ERROR_HANDLE);
++        const size_t numLatidos = std::min(latidos.size(), kMaxLatidos);
++        for (size_t i = 0; i < numLatidos; ++i)
++        {
++            const char *nombre = latidos[i].nombre != nullptr ? latidos[i].nombre : "";
++            std::strncpy(g_nombres[i], nombre, sizeof(g_nombres[i]) - 1u);
++            g_nombres[i][sizeof(g_nombres[i]) - 1u] = '\0';
++        }
++        g_numLatidos.store(numLatidos, std::memory_order_release);
+         std::thread(bucle, umbralSegundos, latidos).detach();
+         return true;
+     }
+ 
++    bool latidoParado(std::string_view nombre)
++    {
++        if (!g_arrancado.load(std::memory_order_relaxed))
++            return false;
++        const size_t numLatidos = g_numLatidos.load(std::memory_order_acquire);
++        for (size_t i = 0; i < numLatidos; ++i)
++            if (nombre == g_nombres[i])
++                return g_parados[i].load(std::memory_order_relaxed);
++        return false;
++    }
++
+     void ventanaDelJuego(void *ventana)
+     {
+         g_ventana.store(static_cast<HWND>(ventana), std::memory_order_relaxed);
+     }
+ #else
++    bool latidoParado(std::string_view nombre)
++    {
++        (void)nombre;
++        return false;
++    }
++
+     void ventanaDelJuego(void *ventana)
+     {
+         (void)ventana;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index c244f0e..c021407 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -7,6 +7,7 @@
+ #include "ps2_user_paths.h"
+ #include "ps2_disc_setup.h"
+ #include "ps2_vigilante.h"
++#include "ps2_salida.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -692,9 +693,13 @@ int main(int argc, char *argv[])
+ #ifdef _DEBUG
+         ps2_log::print_saved_location();
+ #endif
++        // odd/tasks/fallos-con-log.md T2: 0 en el cierre normal; un fallo anotado (ps2_salida.h) sale con su codigo
++        // para que RecompLauncher adjunte el registro. La ultima linea del registro dice el motivo.
++        const int codigoSalida = ps2x::salida::codigo();
++        ps2x::salida::escribir(codigoSalida, ps2x::salida::motivo());
+         std::cout.flush();
+         std::cerr.flush();
+-        std::_Exit(0);
++        std::_Exit(codigoSalida);
+     }
+     catch (const std::exception &e)
+     {
+@@ -705,6 +710,7 @@ int main(int argc, char *argv[])
+         std::cerr << "[main] fatal exception: unknown" << std::endl;
+     }
+ 
++    ps2x::salida::escribir(1, "error-fatal");
+     std::cout.flush();
+     std::cerr.flush();
+     std::_Exit(1);
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index c0e02df..48769db 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_game_font_tests.cpp
+     src/ps2_game_graphics_tests.cpp
+     src/ps2_vigilante_tests.cpp
++    src/ps2_salida_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index f6b04c3..e1f9a38 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -30,6 +30,7 @@ void register_ps2_high_ram_tests();
+ void register_ps2_game_font_tests();
+ void register_ps2_game_graphics_tests();
+ void register_ps2_vigilante_tests();
++void register_ps2_salida_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -64,6 +65,7 @@ int main()
+     register_ps2_game_font_tests();
+     register_ps2_game_graphics_tests();
+     register_ps2_vigilante_tests();
++    register_ps2_salida_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_salida_tests.cpp b/ps2xTest/src/ps2_salida_tests.cpp
+new file mode 100644
+index 0000000..eae5629
+--- /dev/null
++++ b/ps2xTest/src/ps2_salida_tests.cpp
+@@ -0,0 +1,140 @@
++#include "MiniTest.h"
++#include "ps2_salida.h"
++#include "ps2_vigilante.h"
++
++#include <cstdint>
++#include <iostream>
++#include <sstream>
++#include <string>
++
++// odd/tasks/fallos-con-log.md T2 (S1, S2): a failure exits non-zero so RecompLauncher attaches F1-06.log; a hang
++// counts only while it is still going on when the player closes the game.
++namespace
++{
++    using ps2x::vigilante::Detector;
++
++    // Captures what ps2x::salida::escribir sends to std::cout.
++    std::string written(int codigo, const char *motivo)
++    {
++        std::ostringstream out;
++        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
++        ps2x::salida::escribir(codigo, motivo);
++        std::cout.rdbuf(old);
++        return out.str();
++    }
++
++    void sample(Detector &detector, double now, uint64_t counter)
++    {
++        (void)detector.muestra(now, &counter);
++    }
++}
++
++void register_ps2_salida_tests()
++{
++    MiniTest::Case("Salida", [](TestCase &tc)
++    {
++        tc.BeforeEach([]() { ps2x::salida::reiniciarParaPruebas(); });
++
++        tc.Run("no failure: exit code 0 and reason normal", [](TestCase &t)
++        {
++            t.Equals(ps2x::salida::codigo(), 0, "code 0");
++            t.Equals(std::string(ps2x::salida::motivo()), std::string("normal"), "reason normal");
++        });
++
++        tc.Run("a noted failure gives its code and reason", [](TestCase &t)
++        {
++            ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
++            t.Equals(ps2x::salida::codigo(), 10, "game thread exception: 10");
++            t.Equals(std::string(ps2x::salida::motivo()), std::string("excepcion-hilo-juego"), "its reason");
++        });
++
++        tc.Run("the first failure wins", [](TestCase &t)
++        {
++            ps2x::salida::anotarFallo(ps2x::salida::kExitDelJuego, "exit-del-juego");
++            ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "cuelgue-al-cerrar");
++            t.Equals(ps2x::salida::codigo(), 11, "still the game's exit: 11");
++            t.Equals(std::string(ps2x::salida::motivo()), std::string("exit-del-juego"), "still its reason");
++        });
++
++        tc.Run("codes are distinct, non-zero and outside the disc and guest codes", [](TestCase &t)
++        {
++            t.Equals(ps2x::salida::kExcepcionJuego, 10, "game thread exception");
++            t.Equals(ps2x::salida::kExitDelJuego, 11, "game's exit()");
++            t.Equals(ps2x::salida::kCuelgueAlCerrar, 12, "hang when closing");
++        });
++
++        tc.Run("code 0 is not a failure and changes nothing", [](TestCase &t)
++        {
++            ps2x::salida::anotarFallo(0, "nada");
++            t.Equals(ps2x::salida::codigo(), 0, "still 0");
++            t.Equals(std::string(ps2x::salida::motivo()), std::string("normal"), "still normal");
++            ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "cuelgue-al-cerrar");
++            t.Equals(ps2x::salida::codigo(), 12, "a later real failure still counts");
++        });
++
++        tc.Run("the final log line names reason and code", [](TestCase &t)
++        {
++            t.Equals(written(0, "normal"), std::string("[salida] motivo=normal codigo=0\n"), "normal close");
++            t.Equals(written(12, "cuelgue-al-cerrar"), std::string("[salida] motivo=cuelgue-al-cerrar codigo=12\n"),
++                     "hang when closing");
++        });
++    });
++
++    MiniTest::Case("VigilanteParado", [](TestCase &tc)
++    {
++        tc.Run("not stalled while advancing or before the threshold", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            for (int s = 0; s <= 5; ++s)
++                sample(detector, s, static_cast<uint64_t>(s));
++            t.IsFalse(detector.parado(0u), "advancing: not stalled");
++            sample(detector, 14.0, 5u);
++            t.IsFalse(detector.parado(0u), "9 s without advancing: not yet");
++        });
++
++        tc.Run("stalled from the threshold while the stall goes on", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            for (int s = 0; s <= 5; ++s)
++                sample(detector, s, static_cast<uint64_t>(s));
++            sample(detector, 15.0, 5u);
++            t.IsTrue(detector.parado(0u), "10 s: stalled");
++            sample(detector, 300.0, 5u);
++            t.IsTrue(detector.parado(0u), "still stalled at 300 s");
++        });
++
++        tc.Run("a stall the game recovered from no longer counts (S2)", [](TestCase &t)
++        {
++            Detector detector(1u, 10);
++            for (int s = 0; s <= 5; ++s)
++                sample(detector, s, static_cast<uint64_t>(s));
++            sample(detector, 20.0, 5u);
++            t.IsTrue(detector.parado(0u), "stalled");
++            sample(detector, 21.0, 6u);
++            t.IsFalse(detector.parado(0u), "advanced again: not stalled");
++        });
++
++        tc.Run("each heartbeat on its own; out of range is not stalled", [](TestCase &t)
++        {
++            Detector detector(2u, 10);
++            uint64_t values[2] = {0u, 0u};
++            for (int s = 0; s <= 5; ++s)
++            {
++                values[0] = static_cast<uint64_t>(s);
++                values[1] = static_cast<uint64_t>(s);
++                (void)detector.muestra(s, values);
++            }
++            values[1] = 100u; // only the second one keeps advancing
++            (void)detector.muestra(16.0, values);
++            t.IsTrue(detector.parado(0u), "first stalled");
++            t.IsFalse(detector.parado(1u), "second advancing");
++            t.IsFalse(detector.parado(2u), "no third heartbeat");
++        });
++
++        tc.Run("not stalled by name when the watchdog is not running", [](TestCase &t)
++        {
++            t.IsFalse(ps2x::vigilante::latidoParado("EE"), "EE");
++            t.IsFalse(ps2x::vigilante::latidoParado("no-existe"), "unknown name");
++        });
++    });
++}

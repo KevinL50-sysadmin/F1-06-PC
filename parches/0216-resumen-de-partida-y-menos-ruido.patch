@@ -1,0 +1,226 @@
+diff --git a/ps2xRuntime/include/ps2_salida.h b/ps2xRuntime/include/ps2_salida.h
+index 9149986..28ededc 100644
+--- a/ps2xRuntime/include/ps2_salida.h
++++ b/ps2xRuntime/include/ps2_salida.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include <cstdint>
++#include <string>
++
+ // Salida del proceso (odd/tasks/fallos-con-log.md T2). RecompLauncher solo adjunta el .log mas reciente a un informe
+ // de fallo cuando el juego termina con un codigo distinto de 0, asi que un fallo anota aqui su codigo y su motivo, y la
+ // salida (main.cpp, o el plazo de cierre de ps2_runtime.cpp) termina con el y escribe una ultima linea en el registro:
+@@ -20,10 +23,29 @@ namespace ps2x::salida
+     int codigo();         // 0 si no se ha anotado ningun fallo
+     const char *motivo(); // "normal" si no se ha anotado ningun fallo
+ 
+-    // Escribe "[salida] motivo=<motivo> codigo=<codigo>" en std::cout y vacia std::cout y std::cerr (std::_Exit no
+-    // vacia nada).
++    // Donde estaba el jugador y como fue la partida (T3d): lo da el juego (f1_overrides.cpp) al salir.
++    struct Partida
++    {
++        bool enCarrera = false;   // si no, menu (front-end)
++        int circuito = -1;        // indice del ultimo circuito elegido; -1 = desconocido (no se escribe)
++        double segundos = 0.0;    // desde el arranque
++        uint64_t fotogramas = 0u; // fotogramas que el juego termino
++        double fpsMinimo = -1.0;  // peor ventana de 10 s con la carrera en pantalla; < 0 = ninguna (no se escribe)
++    };
++
++    // "estado=<carrera|menu> [circuito=<n> ]duracion=<s>s fotogramas=<n> fps_media=<x.x>[ fps_min_10s=<x.x>]"
++    std::string resumen(const Partida &partida);
++
++    // Fuente de la partida para escribir(). Se llama al salir, tambien con el hilo del juego colgado: no debe tomar
++    // cerrojos ni tocar nada que ese hilo pueda tener a medias (solo atomicos). nullptr la quita.
++    using FuentePartida = Partida (*)();
++    void registrarPartida(FuentePartida fuente);
++
++    // Con una fuente registrada, escribe primero "[salida] partida: <resumen>"; despues, siempre,
++    // "[salida] motivo=<motivo> codigo=<codigo>" en std::cout, y vacia std::cout y std::cerr (std::_Exit no vacia
++    // nada).
+     void escribir(int codigo, const char *motivo);
+ 
+-    // Solo para las pruebas: vuelve al estado sin fallo.
++    // Solo para las pruebas: vuelve al estado sin fallo y sin fuente de la partida.
+     void reiniciarParaPruebas();
+ }
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index cf0d009..8996144 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -915,9 +915,20 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+-                                         << " free=" << freeBlocks << " format=" << format
+-                                         << " result=" << result);
++        // Solo cuando cambia (fallos-con-log T3d): el juego la sondea ~100 veces/s y llenaba el registro.
++        {
++            static std::mutex s_mutex;
++            static std::string s_ultima;
++            std::ostringstream linea;
++            linea << "[MC] GetInfo port=" << port << " type=" << cardType << " free=" << freeBlocks
++                  << " format=" << format << " result=" << result;
++            std::lock_guard<std::mutex> lock(s_mutex);
++            if (linea.str() != s_ultima)
++            {
++                s_ultima = linea.str();
++                RUNTIME_LOG(s_ultima << "\n");
++            }
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+@@ -1223,7 +1234,20 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
++        // Solo cuando cambia la pareja (orden, resultado) (fallos-con-log T3d).
++        {
++            static std::mutex s_mutex;
++            static bool s_hay = false;
++            static int32_t s_cmd = 0, s_result = 0;
++            std::lock_guard<std::mutex> lock(s_mutex);
++            if (!s_hay || cmd != s_cmd || result != s_result)
++            {
++                s_hay = true;
++                s_cmd = cmd;
++                s_result = result;
++                RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result << "\n");
++            }
++        }
+ 
+         if (cmdPtr != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_salida.cpp b/ps2xRuntime/src/lib/ps2_salida.cpp
+index 80b914a..c0b3c90 100644
+--- a/ps2xRuntime/src/lib/ps2_salida.cpp
++++ b/ps2xRuntime/src/lib/ps2_salida.cpp
+@@ -1,5 +1,8 @@
+ #include "ps2_salida.h"
+ 
++#include <atomic>
++#include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <iostream>
+ #include <mutex>
+@@ -11,6 +14,7 @@ namespace ps2x::salida
+         std::mutex g_mutex;
+         int g_codigo = 0;
+         char g_motivo[64] = "normal";
++        std::atomic<FuentePartida> g_fuente{nullptr};
+     }
+ 
+     void anotarFallo(int codigo, const char *motivo)
+@@ -37,8 +41,31 @@ namespace ps2x::salida
+         return g_motivo; // solo cambia una vez, de "normal" al primer fallo
+     }
+ 
++    std::string resumen(const Partida &partida)
++    {
++        const double media =
++            partida.segundos > 0.0 ? static_cast<double>(partida.fotogramas) / partida.segundos : 0.0;
++        char texto[192];
++        int n = std::snprintf(texto, sizeof(texto), "estado=%s", partida.enCarrera ? "carrera" : "menu");
++        if (partida.circuito >= 0)
++            n += std::snprintf(texto + n, sizeof(texto) - n, " circuito=%d", partida.circuito);
++        n += std::snprintf(texto + n, sizeof(texto) - n, " duracion=%.0fs fotogramas=%llu fps_media=%.1f",
++                           std::floor(partida.segundos + 0.5), static_cast<unsigned long long>(partida.fotogramas),
++                           media);
++        if (partida.fpsMinimo >= 0.0)
++            std::snprintf(texto + n, sizeof(texto) - n, " fps_min_10s=%.1f", partida.fpsMinimo);
++        return texto;
++    }
++
++    void registrarPartida(FuentePartida fuente)
++    {
++        g_fuente.store(fuente);
++    }
++
+     void escribir(int codigo, const char *motivo)
+     {
++        if (const FuentePartida fuente = g_fuente.load())
++            std::cout << "[salida] partida: " << resumen(fuente()) << "\n";
+         std::cout << "[salida] motivo=" << (motivo != nullptr ? motivo : "normal") << " codigo=" << codigo << "\n";
+         std::cout.flush();
+         std::cerr.flush();
+@@ -49,5 +76,6 @@ namespace ps2x::salida
+         std::lock_guard<std::mutex> lock(g_mutex);
+         g_codigo = 0;
+         std::strcpy(g_motivo, "normal");
++        g_fuente.store(nullptr);
+     }
+ }
+diff --git a/ps2xTest/src/ps2_salida_tests.cpp b/ps2xTest/src/ps2_salida_tests.cpp
+index eae5629..fdc4497 100644
+--- a/ps2xTest/src/ps2_salida_tests.cpp
++++ b/ps2xTest/src/ps2_salida_tests.cpp
+@@ -80,6 +80,65 @@ void register_ps2_salida_tests()
+         });
+     });
+ 
++    // T3d (S3): the last lines also say where the player was and how the session ran.
++    MiniTest::Case("SalidaPartida", [](TestCase &tc)
++    {
++        tc.BeforeEach([]() { ps2x::salida::reiniciarParaPruebas(); });
++
++        tc.Run("race summary names state, track, duration, frames, mean and worst fps", [](TestCase &t)
++        {
++            ps2x::salida::Partida p;
++            p.enCarrera = true;
++            p.circuito = 5;
++            p.segundos = 812.4;
++            p.fotogramas = 48000u;
++            p.fpsMinimo = 42.04;
++            t.Equals(ps2x::salida::resumen(p),
++                     std::string("estado=carrera circuito=5 duracion=812s fotogramas=48000 fps_media=59.1 fps_min_10s=42.0"),
++                     "race");
++        });
++
++        tc.Run("menu summary leaves out an unknown track and worst fps", [](TestCase &t)
++        {
++            ps2x::salida::Partida p;
++            p.segundos = 20.0;
++            p.fotogramas = 600u;
++            t.Equals(ps2x::salida::resumen(p), std::string("estado=menu duracion=20s fotogramas=600 fps_media=30.0"),
++                     "menu");
++        });
++
++        tc.Run("zero duration gives mean fps 0 instead of dividing by zero", [](TestCase &t)
++        {
++            ps2x::salida::Partida p;
++            t.Equals(ps2x::salida::resumen(p), std::string("estado=menu duracion=0s fotogramas=0 fps_media=0.0"),
++                     "empty");
++        });
++
++        tc.Run("with a registered source the summary line comes before the final line", [](TestCase &t)
++        {
++            ps2x::salida::registrarPartida([]
++            {
++                ps2x::salida::Partida p;
++                p.enCarrera = true;
++                p.circuito = 0;
++                p.segundos = 10.0;
++                p.fotogramas = 600u;
++                return p;
++            });
++            t.Equals(written(10, "excepcion-hilo-juego"),
++                     std::string("[salida] partida: estado=carrera circuito=0 duracion=10s fotogramas=600 fps_media=60.0\n"
++                                 "[salida] motivo=excepcion-hilo-juego codigo=10\n"),
++                     "summary then reason and code");
++        });
++
++        tc.Run("resetting for tests drops the registered source", [](TestCase &t)
++        {
++            ps2x::salida::registrarPartida([] { return ps2x::salida::Partida{}; });
++            ps2x::salida::reiniciarParaPruebas();
++            t.Equals(written(0, "normal"), std::string("[salida] motivo=normal codigo=0\n"), "only the final line");
++        });
++    });
++
+     MiniTest::Case("VigilanteParado", [](TestCase &tc)
+     {
+         tc.Run("not stalled while advancing or before the threshold", [](TestCase &t)

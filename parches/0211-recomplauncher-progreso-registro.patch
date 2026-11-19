@@ -1,0 +1,331 @@
+diff --git a/ps2xRuntime/include/ps2_disc_setup.h b/ps2xRuntime/include/ps2_disc_setup.h
+index 0b8cf5e..ef5aa34 100644
+--- a/ps2xRuntime/include/ps2_disc_setup.h
++++ b/ps2xRuntime/include/ps2_disc_setup.h
+@@ -131,9 +131,18 @@ namespace ps2x::disc
+         std::function<void(const std::string &message)> error;
+     };
+ 
++    // RecompLauncher's prepare step (odd/tasks/recomplauncher-json.md S4, docs/recomplauncher/developer-docs.md):
++    // launcherProgressFraction is done/total in hundredths, rounded down so 1 only shows when everything is there,
++    // with a dot whatever the locale and no trailing zeros ("0", "0.05", "0.4", "0.42", "1"; total 0 is "1").
++    // launcherProgressLine: "progress 0.42 Copying the game data (1854 of 4214 MB)".
++    std::string launcherProgressFraction(uint64_t done, uint64_t total);
++    std::string launcherProgressLine(uint64_t done, uint64_t total);
++
+     // F1-06.exe --extraer-iso <iso or folder> [--ventana] and --comprobar-iso <iso or folder>. Returns the exit code:
+     // 0 done (or already extracted / valid), 1 bad arguments, 2 not Formula One 06 PAL, 3 read, write or space
+-    // failure, 4 cancelled. Returns -1 when args is not one of these commands.
++    // failure, 4 cancelled. Returns -1 when args is not one of these commands. --extraer-iso without --ventana also
++    // writes launcherProgressLine lines (a first one at 0, one per hundredth, "progress 1 Game data ready" when it
++    // ends with 0) next to the "[disco] NN %" ones.
+     int runDiscCommand(const std::vector<std::string> &args, const std::filesystem::path &exeDirectory,
+                        const std::filesystem::path &localAppDataDirectory, std::ostream &out,
+                        const DiscCommandUi *ui, bool spanish);
+diff --git a/ps2xRuntime/include/ps2_user_paths.h b/ps2xRuntime/include/ps2_user_paths.h
+index 33949a5..63e50c9 100644
+--- a/ps2xRuntime/include/ps2_user_paths.h
++++ b/ps2xRuntime/include/ps2_user_paths.h
+@@ -117,6 +117,11 @@ namespace ps2x
+     // "[rutas] modo portable|instalado|desarrollo: config=... saves=... logs=... mods=..."
+     std::string describeUserPaths(const UserPaths &paths);
+ 
++    // Whether the console output goes to <logs>\<exe>.log: when stdout is a console (a player started the .exe), or
++    // when RecompLauncher started it (RECOMPLAUNCHER_VERSION set and not empty) even with stdout captured, so its crash
++    // reports carry the log; never with PS2X_LOG=0. Otherwise (our scripts redirect stdout to a file) no.
++    bool shouldWriteLogFile(bool stdoutIsConsole, const char *recompLauncherVersion, const char *ps2xLog);
++
+     // A path for the log that never throws on characters outside the console code page.
+     std::string pathForLog(const std::filesystem::path &path);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_disc_setup.cpp b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+index e87f09d..782f8b5 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_setup.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+@@ -689,6 +689,25 @@ namespace ps2x::disc
+         return {};
+     }
+ 
++    std::string launcherProgressFraction(uint64_t done, uint64_t total)
++    {
++        if (total == 0u || done >= total)
++            return "1";
++        const uint64_t hundredths = done * 100u / total; // below 100: done < total, far from overflowing
++        if (hundredths == 0u)
++            return "0";
++        std::string digits = std::to_string(hundredths / 10u) + std::to_string(hundredths % 10u);
++        if (digits.back() == '0')
++            digits.pop_back();
++        return "0." + digits; // integers only: no locale decimal separator
++    }
++
++    std::string launcherProgressLine(uint64_t done, uint64_t total)
++    {
++        return "progress " + launcherProgressFraction(done, total) + " Copying the game data (" +
++               std::to_string(done / (1024u * 1024u)) + " of " + std::to_string(total / (1024u * 1024u)) + " MB)";
++    }
++
+     int runDiscCommand(const std::vector<std::string> &args, const fs::path &exeDirectory,
+                        const fs::path &localAppDataDirectory, std::ostream &out, const DiscCommandUi *ui, bool spanish)
+     {
+@@ -706,6 +725,13 @@ namespace ps2x::disc
+             return 1;
+         }
+         const DiscCommandUi *dialogs = window ? ui : nullptr;
++        // RecompLauncher's prepare step runs it without --ventana and reads these lines from stdout.
++        const bool launcherProgress = extract && !window;
++        const auto ready = [&]()
++        {
++            if (launcherProgress)
++                out << "progress 1 Game data ready" << std::endl;
++        };
+         const auto error = [&](const std::string &message)
+         {
+             out << "[disco] " << message << std::endl;
+@@ -737,6 +763,7 @@ namespace ps2x::disc
+             if (checkDataFolder(data) == DataState::Complete && dataFolderFingerprint(data) == report.fingerprint)
+             {
+                 out << "[disco] " << pathForLog(data) << " ya tiene este disco: no se copia otra vez" << std::endl;
++                ready();
+                 return 0;
+             }
+         }
+@@ -750,6 +777,7 @@ namespace ps2x::disc
+             return 3;
+         }
+         int lastTenth = -1;
++        std::string lastFraction = "0"; // the first line, before the copy, is at 0
+         const ExtractProgress console = [&](uint64_t done, uint64_t total, const std::string &file)
+         {
+             const int tenth = total == 0u ? 10 : static_cast<int>(done * 10u / total);
+@@ -759,10 +787,19 @@ namespace ps2x::disc
+                 out << "[disco] " << tenth * 10 << " % (" << done / (1024u * 1024u) << " de " << total / (1024u * 1024u)
+                     << " MB) " << file << std::endl;
+             }
++            // One line per hundredth (at most 101); the 1 is written once, when the folder is complete (ready()).
++            const std::string fraction = launcherProgressFraction(done, total);
++            if (launcherProgress && fraction != lastFraction && fraction != "1")
++            {
++                lastFraction = fraction;
++                out << launcherProgressLine(done, total) << std::endl;
++            }
+             return !(dialogs && dialogs->progress) || dialogs->progress(done, total, file);
+         };
+         out << "[disco] copiando en " << pathForLog(parent / kDataFolderName) << " (pasa por "
+             << kTempFolderName << ")" << std::endl;
++        if (launcherProgress)
++            out << launcherProgressLine(0u, report.totalBytes) << std::endl;
+         const ExtractResult result = extractDisc(report, parent, console);
+         if (!result.previousData.empty())
+             out << "[disco] la carpeta data anterior (incompleta) queda en " << pathForLog(result.previousData)
+@@ -772,9 +809,11 @@ namespace ps2x::disc
+         case ExtractStatus::Done:
+             out << "[disco] listo: " << report.files.size() << " archivos en " << pathForLog(result.dataDirectory)
+                 << std::endl;
++            ready();
+             return 0;
+         case ExtractStatus::AlreadyThere:
+             out << "[disco] " << pathForLog(result.dataDirectory) << " ya tiene este disco" << std::endl;
++            ready();
+             return 0;
+         case ExtractStatus::Cancelled:
+             error(describeExtractProblem(result, spanish));
+diff --git a/ps2xRuntime/src/lib/ps2_user_paths.cpp b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+index 08c1b52..56eadb7 100644
+--- a/ps2xRuntime/src/lib/ps2_user_paths.cpp
++++ b/ps2xRuntime/src/lib/ps2_user_paths.cpp
+@@ -279,6 +279,13 @@ namespace ps2x
+                " saves=" + saves + " logs=" + pathForLog(paths.logsDirectory) + " mods=" + mods;
+     }
+ 
++    bool shouldWriteLogFile(bool stdoutIsConsole, const char *recompLauncherVersion, const char *ps2xLog)
++    {
++        if (ps2xLog != nullptr && ps2xLog[0] == '0')
++            return false;
++        return stdoutIsConsole || (recompLauncherVersion != nullptr && recompLauncherVersion[0] != '\0');
++    }
++
+     std::string pathForLog(const fs::path &path)
+     {
+         try
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 167642f..c244f0e 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -165,17 +165,16 @@ namespace
+ 
+     // A player starts the .exe by hand, so its output goes to a console window nobody keeps: write it to
+     // <directory>\<exe name>.log instead (the previous run is kept as <exe name>.anterior.log). Runs whose output is
+-    // already redirected (the test scripts) are left alone; PS2X_LOG=0 (registro = 0 in settings.ini) keeps the
+-    // console. Fase 5 (T15): the netplay guest writes <exe name>-invitado.log (logName), so a host on the same PC
++    // already redirected (the test scripts) are left alone, unless RecompLauncher started the game
++    // (RECOMPLAUNCHER_VERSION; its crash reports carry the log); PS2X_LOG=0 (registro = 0 in settings.ini) keeps the
++    // console (ps2x::shouldWriteLogFile). Fase 5 (T15): the netplay guest writes <exe name>-invitado.log (logName), so a host on the same PC
+     // keeps its own.
+     void redirectConsoleToLogFile(const std::filesystem::path &executable, const std::filesystem::path &directory,
+                                   const std::string &logName)
+     {
+ #if defined(_WIN32)
+-        if (_isatty(_fileno(stdout)) == 0)
+-            return;
+-        const char *setting = std::getenv("PS2X_LOG");
+-        if (setting != nullptr && setting[0] == '0')
++        if (!ps2x::shouldWriteLogFile(_isatty(_fileno(stdout)) != 0, std::getenv("RECOMPLAUNCHER_VERSION"),
++                                      std::getenv("PS2X_LOG")))
+             return;
+         std::error_code error;
+         std::filesystem::create_directories(directory, error);
+diff --git a/ps2xTest/src/ps2_disc_setup_tests.cpp b/ps2xTest/src/ps2_disc_setup_tests.cpp
+index 9c4ae23..9f33ce0 100644
+--- a/ps2xTest/src/ps2_disc_setup_tests.cpp
++++ b/ps2xTest/src/ps2_disc_setup_tests.cpp
+@@ -5,7 +5,9 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <clocale>
+ #include <cstring>
++#include <locale>
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
+@@ -521,6 +523,111 @@ void register_ps2_disc_setup_tests()
+             t.IsFalse(fs::exists(exe2 / "data"), "nothing left after cancel");
+         });
+ 
++        // odd/tasks/recomplauncher-json.md S4: RecompLauncher's prepare step reads "progress <0-1> <text>" lines.
++        tc.Run("launcher progress: the fraction in hundredths, rounded down, with a dot in any locale", [](TestCase &t)
++        {
++            using ps2x::disc::launcherProgressFraction;
++            t.Equals(launcherProgressFraction(0u, 100u), std::string("0"), "nothing yet");
++            t.Equals(launcherProgressFraction(100u, 100u), std::string("1"), "all");
++            t.Equals(launcherProgressFraction(0u, 0u), std::string("1"), "an empty disc is done");
++            t.Equals(launcherProgressFraction(150u, 100u), std::string("1"), "never above 1");
++            t.Equals(launcherProgressFraction(42u, 100u), std::string("0.42"), "two decimals");
++            t.Equals(launcherProgressFraction(40u, 100u), std::string("0.4"), "no trailing zero");
++            t.Equals(launcherProgressFraction(5u, 100u), std::string("0.05"), "leading zero kept");
++            t.Equals(launcherProgressFraction(999u, 1000u), std::string("0.99"), "rounded down: 1 only at the end");
++            t.Equals(launcherProgressFraction(1u, 1000u), std::string("0"), "below a hundredth is 0");
++            t.Equals(launcherProgressFraction(4418568191ull, 4418568192ull), std::string("0.99"),
++                     "a full disc minus a byte");
++            const std::locale previous = std::locale::global(std::locale::classic());
++            const std::string previousC = std::setlocale(LC_ALL, nullptr);
++            bool german = false;
++            try
++            {
++                std::locale::global(std::locale("de-DE"));
++                german = std::setlocale(LC_ALL, "de-DE") != nullptr;
++            }
++            catch (const std::exception &)
++            {
++            }
++            const std::string fraction = launcherProgressFraction(42u, 100u);
++            const std::string line = ps2x::disc::launcherProgressLine(42u, 100u);
++            std::setlocale(LC_ALL, previousC.c_str());
++            std::locale::global(previous);
++            t.IsTrue(german, "the de-DE locale (comma decimals) was set for the check");
++            t.Equals(fraction, std::string("0.42"), "a dot with a comma locale");
++            t.Equals(line, std::string("progress 0.42 Copying the game data (0 of 0 MB)"), "the line too");
++        });
++
++        tc.Run("launcher progress: the exact line, sizes in MB", [](TestCase &t)
++        {
++            constexpr uint64_t mb = 1024u * 1024u;
++            t.Equals(ps2x::disc::launcherProgressLine(1854u * mb, 4214u * mb),
++                     std::string("progress 0.43 Copying the game data (1854 of 4214 MB)"), "the docs' example sizes");
++            t.Equals(ps2x::disc::launcherProgressLine(0u, 4214u * mb),
++                     std::string("progress 0 Copying the game data (0 of 4214 MB)"), "the first line");
++            t.Equals(ps2x::disc::launcherProgressLine(4214u * mb, 4214u * mb),
++                     std::string("progress 1 Copying the game data (4214 of 4214 MB)"), "all copied");
++        });
++
++        tc.Run("--extraer-iso writes progress lines for RecompLauncher, not with --ventana", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const fs::path exe = dir.path / "F1-06";
++            fs::create_directories(exe);
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "extracted");
++            std::vector<std::string> progress;
++            std::vector<std::string> percent;
++            {
++                std::istringstream lines(out.str());
++                std::string line;
++                while (std::getline(lines, line))
++                {
++                    if (line.rfind("progress ", 0u) == 0u)
++                        progress.push_back(line);
++                    if (line.rfind("[disco] ", 0u) == 0u && contains(line, " % ("))
++                        percent.push_back(line);
++                }
++            }
++            t.IsTrue(progress.size() >= 2u, "progress lines: " + out.str());
++            if (progress.size() >= 2u)
++            {
++                t.Equals(progress.front(), std::string("progress 0 Copying the game data (0 of 0 MB)"), "first at 0");
++                t.Equals(progress.back(), std::string("progress 1 Game data ready"), "last at 1");
++                t.Equals(static_cast<size_t>(std::count_if(progress.begin(), progress.end(),
++                                                           [](const std::string &line)
++                                                           { return line.rfind("progress 1 ", 0u) == 0u; })),
++                         size_t{1u}, "a single progress 1");
++            }
++            t.IsTrue(!percent.empty() && percent.back().rfind("[disco] 100 % (0 de 0 MB) ", 0u) == 0u,
++                     "the [disco] NN % lines are still there: " + out.str());
++
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "already there");
++            t.IsTrue(contains(out.str(), "progress 1 Game data ready\n"), "already there is ready too: " + out.str());
++
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--comprobar-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "checked");
++            t.IsFalse(contains(out.str(), "progress "), "checking writes no progress: " + out.str());
++
++            const ps2x::disc::DiscCommandUi dialogs{[](uint64_t, uint64_t, const std::string &) { return true; },
++                                                    [](const std::string &) {}};
++            const fs::path exe2 = dir.path / "F1-06b";
++            fs::create_directories(exe2);
++            writeText(exe2 / "portable.txt", "x");
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string(), "--ventana"}, exe2, {}, out, &dialogs,
++                                                true),
++                     0, "extracted with the window");
++            t.IsFalse(contains(out.str(), "progress "), "no progress lines with --ventana: " + out.str());
++            t.IsTrue(contains(out.str(), "[disco] 100 % ("), "the [disco] lines stay: " + out.str());
++        });
++
+         // v1.1.1 (odd/tasks/player-folders.md S2, S3): the game data folder is data; v1.1.0's datos is renamed.
+         tc.Run("a v1.1.0 datos is renamed to data next to the .exe and in LocalAppData, byte for byte", [](TestCase &t)
+         {
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index c3c65b2..fe4d7d0 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -166,6 +166,23 @@ void register_ps2_user_paths_tests()
+ {
+     MiniTest::Case("UserPaths", [](TestCase &tc)
+     {
++        // odd/tasks/recomplauncher-json.md S3: the log also when RecompLauncher captures stdout.
++        tc.Run("the log file: a console, or RecompLauncher; never with PS2X_LOG=0", [](TestCase &t)
++        {
++            using ps2x::shouldWriteLogFile;
++            t.IsTrue(shouldWriteLogFile(true, nullptr, nullptr), "a console: yes");
++            t.IsFalse(shouldWriteLogFile(false, nullptr, nullptr), "redirected, no launcher: no (as before)");
++            t.IsTrue(shouldWriteLogFile(false, "0.9.3", nullptr), "redirected by RecompLauncher 0.9.3: yes");
++            t.IsFalse(shouldWriteLogFile(false, "", nullptr), "an empty RECOMPLAUNCHER_VERSION: no");
++            t.IsTrue(shouldWriteLogFile(true, "", nullptr), "an empty variable changes nothing on a console");
++            t.IsTrue(shouldWriteLogFile(true, nullptr, "1"), "PS2X_LOG=1: yes");
++            t.IsTrue(shouldWriteLogFile(false, "0.9.3", ""), "an empty PS2X_LOG does not disable it");
++            t.IsFalse(shouldWriteLogFile(true, nullptr, "0"), "PS2X_LOG=0 on a console: no");
++            t.IsFalse(shouldWriteLogFile(false, "0.9.3", "0"), "PS2X_LOG=0 with RecompLauncher: no");
++            t.IsFalse(shouldWriteLogFile(true, "0.9.3", "0"), "PS2X_LOG=0 with both: no");
++            t.IsFalse(shouldWriteLogFile(false, nullptr, "0"), "PS2X_LOG=0 redirected: no");
++        });
++
+         tc.Run("portable mode keeps config, saves, logs and mods next to the .exe", [](TestCase &t)
+         {
+             const fs::path exe = "C:/Games/F1-06";

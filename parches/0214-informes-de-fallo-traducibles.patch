@@ -1,0 +1,952 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 40682f4..c7d021e 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -427,6 +427,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_salida.cpp
+     src/lib/ps2_cabecera.cpp
+     src/lib/ps2_cabecera_win.cpp
++    src/lib/ps2_fallo.cpp
+     src/lib/ps2_version.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+diff --git a/ps2xRuntime/include/ps2_fallo.h b/ps2xRuntime/include/ps2_fallo.h
+new file mode 100644
+index 0000000..85cc291
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_fallo.h
+@@ -0,0 +1,95 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// Informes de fallo traducibles (odd/tasks/fallos-con-log.md T3b, S3): lo que escriben el filtro de excepciones sin
++// manejar ("[fallo]", src/f1_fallos.cpp del proyecto), el catch del hilo del juego ("[excepcion]", ps2_runtime.cpp) y
++// el manejador de std::terminate ("[terminate]", main.cpp), con el mismo formato que el vigilante (ps2_vigilante.h):
++//   [fallo] compilacion: F1-06.exe fecha_pe=6736A0F1 tam_imagen=04B2D000 pdb=ps2EntryRunner.pdb guid=... edad=1 base=0x...
++//   [fallo] hilo 1234 GameThread
++//   [fallo] ee pc=0x00123456 ra=0x00123400 hilo_ee=1
++//   [fallo] pila (12 marcos):
++//   [fallo]   #0 ntdll.dll+0x9F0C4
++//   [fallo]   #1 F1-06.exe+0x1A2B3C
++//   [fallo] fin del informe
++// modulo+desplazamiento y la linea "compilacion:" bastan para traducirlo en casa con scripts/simbolizar.ps1 y el PDB
++// guardado de esa version (el paquete no lo lleva). Solo con el PDB junto al .exe (desarrollo) siguen los nombres.
++// Este archivo no incluye windows.h: lo usa src/f1_fallos.cpp, que se compila por lotes con raylib.
++namespace ps2x::fallo
++{
++    // PS2X_PRUEBA_FALLO=<tipo>:<segundos> (solo para probar los informes, T4): a los <segundos> del arranque, en el
++    // hilo del juego al dibujar un fotograma (src/f1_overrides.cpp), acceso = escritura en la direccion 0 (informe
++    // "[fallo]", sale con 0xC0000005), excepcion = std::runtime_error (informe "[excepcion]", sale con 10) y
++    // terminate = std::runtime_error en un hilo auxiliar "PruebaFallo" (informe "[terminate]", abort).
++    enum class Prueba
++    {
++        Ninguna,
++        Acceso,
++        Excepcion,
++        Terminate,
++    };
++
++    struct PruebaFallo
++    {
++        Prueba tipo = Prueba::Ninguna;
++        double segundos = 0.0;
++    };
++
++    // El valor de PS2X_PRUEBA_FALLO: "<tipo>:<segundos>" con tipo acceso, excepcion o terminate y segundos un numero
++    // >= 0 (decimales con punto). nullptr, vacio o cualquier otra cosa: Ninguna (no se provoca nada).
++    PruebaFallo leerPrueba(const char *valor);
++
++    // Lo que se sabe del EE al caer: el pc y el ra que publico el planificador por ultima vez (EeScheduler,
++    // m_debugPc / m_debugRa) y el hilo del EE que corria (0: ninguno).
++    struct EstadoEe
++    {
++        bool hay = false; // el juego ya corre (registrarEe se llamo)
++        uint32_t pc = 0u;
++        uint32_t ra = 0u;
++        int hilo = 0;
++    };
++
++    // Las lineas del informe, en destino (acaban en '\0', sin salto de linea; se cortan si no caben). Devuelven la
++    // longitud escrita. No reservan memoria ni usan el CRT: valen dentro de un filtro de excepciones.
++    //   "<prefijo>  #<i> <modulo>+0x<DESPL>" (hexadecimal en mayusculas, como el vigilante); sin modulo:
++    //   "<prefijo>  #<i> 0x<DIRECCION de 16 cifras>"
++    size_t lineaMarco(char *destino, size_t tam, const char *prefijo, int indice, const char *modulo,
++                      uint64_t desplazamiento, uint64_t direccion);
++    //   "<prefijo>hilo <id> <nombre>"; nombre vacio o nullptr: "<prefijo>hilo <id> (sin nombre)"
++    size_t lineaHilo(char *destino, size_t tam, const char *prefijo, uint32_t id, const char *nombre);
++    //   "<prefijo>ee pc=0x<8 cifras> ra=0x<8 cifras> hilo_ee=<n>"; sin datos: "<prefijo>ee sin datos (el juego aun no
++    //   corre)"
++    size_t lineaEe(char *destino, size_t tam, const char *prefijo, const EstadoEe &ee);
++
++    // El runtime dice como leer el estado del EE (PS2Runtime::run). La funcion se llama desde el informe, en el hilo
++    // que cae: solo debe leer atomicos.
++    using LectorEe = EstadoEe (*)(const void *dato);
++    void registrarEe(LectorEe lector, const void *dato);
++
++    // Windows: el manejador de excepciones vectorizado que guarda, en cada hilo, la pila del ultimo throw de C++ (no
++    // los relanzamientos "throw;" ni las EeDispatcherTransfer del planificador, que no son errores). Sin el, en el
++    // catch la pila del throw ya no existe. Una vez, al arrancar (main.cpp).
++    void instalarCapturaDeLanzamientos();
++
++    // La pila del ultimo throw de C++ de este hilo (instalarCapturaDeLanzamientos). Devuelve cuantos marcos copio en
++    // marcos (0: ninguno). olvidar: la borra despues (un informe no repite una pila vieja).
++    int pilaDelLanzamiento(void **marcos, int max, bool olvidar);
++
++    // El tipo de ese throw, decorado como lo guarda el compilador (".?AVruntime_error@std@@"; datos del modulo, no
++    // caducan); nullptr sin pila guardada o si no se pudo leer. Antes de pilaDelLanzamiento(..., true), que lo olvida.
++    const char *tipoDelLanzamiento();
++
++    // La pila de quien llama (saltar: marcos de arriba que no se escriben).
++    int pilaActual(void **marcos, int max, int saltar);
++
++    // El informe en stderr (el registro), sin el CRT ni reservar memoria: vacia antes stdout y stderr del CRT para que
++    // lo ya escrito salga antes, y luego escribe compilacion, hilo, ee, la pila (titulo "pila" si es nullptr) y "fin del
++    // informe"; con el PDB junto al .exe, tambien los nombres. marcos2 (opcional): una segunda pila, con su titulo,
++    // despues de la primera. Un informe cada vez en todo el proceso. Fuera de Windows no hace nada.
++    void escribirInforme(const char *prefijo, const char *titulo, void *const *marcos, int n,
++                         const char *titulo2 = nullptr, void *const *marcos2 = nullptr, int n2 = 0);
++
++    // Una linea suelta "<prefijo><texto>" en stderr, por el mismo camino que el informe.
++    void escribirLinea(const char *prefijo, const char *texto);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_fallo.cpp b/ps2xRuntime/src/lib/ps2_fallo.cpp
+new file mode 100644
+index 0000000..5a2e8cb
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_fallo.cpp
+@@ -0,0 +1,135 @@
++// Informes de fallo (ps2_fallo.h): lo que no depende de Windows. La parte de Windows (pila, modulos, escritura) esta
++// en ps2_vigilante_win.cpp, junto a la del vigilante, de la que reutiliza la lectura de modulos y la identidad.
++#include "ps2_fallo.h"
++
++#include <cstdlib>
++#include <cstring>
++
++namespace ps2x::fallo
++{
++    namespace
++    {
++        // Escribe en un bufer fijo, sin reservar memoria ni usar el CRT (sirve dentro de un filtro de excepciones).
++        class Texto
++        {
++        public:
++            Texto(char *destino, size_t tam) : m_destino(destino), m_tam(tam)
++            {
++                if (m_tam > 0u)
++                    m_destino[0] = '\0';
++            }
++            Texto &texto(const char *s)
++            {
++                while (s != nullptr && *s != '\0')
++                    poner(*s++);
++                return *this;
++            }
++            Texto &decimal(uint64_t v)
++            {
++                char cifras[24];
++                int n = 0;
++                do
++                {
++                    cifras[n++] = static_cast<char>('0' + v % 10u);
++                    v /= 10u;
++                } while (v != 0u);
++                while (n > 0)
++                    poner(cifras[--n]);
++                return *this;
++            }
++            // Mayusculas, con al menos 'ancho' cifras (como Linea::hex del vigilante).
++            Texto &hex(uint64_t v, int ancho = 1)
++            {
++                char cifras[16];
++                int n = 0;
++                do
++                {
++                    cifras[n++] = "0123456789ABCDEF"[v & 0xFu];
++                    v >>= 4;
++                } while (v != 0u || n < ancho);
++                while (n > 0)
++                    poner(cifras[--n]);
++                return *this;
++            }
++            size_t largo() const
++            {
++                return m_n;
++            }
++
++        private:
++            void poner(char c)
++            {
++                if (m_n + 1u < m_tam)
++                {
++                    m_destino[m_n++] = c;
++                    m_destino[m_n] = '\0';
++                }
++            }
++            char *m_destino;
++            size_t m_tam;
++            size_t m_n = 0u;
++        };
++    }
++
++    PruebaFallo leerPrueba(const char *valor)
++    {
++        PruebaFallo prueba;
++        if (valor == nullptr)
++            return prueba;
++        const char *dos = std::strchr(valor, ':');
++        if (dos == nullptr)
++            return prueba;
++        const size_t largo = static_cast<size_t>(dos - valor);
++        Prueba tipo = Prueba::Ninguna;
++        if (largo == 6u && std::strncmp(valor, "acceso", largo) == 0)
++            tipo = Prueba::Acceso;
++        else if (largo == 9u && std::strncmp(valor, "excepcion", largo) == 0)
++            tipo = Prueba::Excepcion;
++        else if (largo == 9u && std::strncmp(valor, "terminate", largo) == 0)
++            tipo = Prueba::Terminate;
++        const char *numero = dos + 1;
++        // Solo cifras y un punto: sin signo, espacios ni exponentes.
++        if (tipo == Prueba::Ninguna || *numero == '\0' || std::strspn(numero, "0123456789.") != std::strlen(numero))
++            return prueba;
++        char *fin = nullptr;
++        const double segundos = std::strtod(numero, &fin);
++        if (fin == numero || *fin != '\0' || !(segundos >= 0.0))
++            return prueba;
++        prueba.tipo = tipo;
++        prueba.segundos = segundos;
++        return prueba;
++    }
++
++    size_t lineaMarco(char *destino, size_t tam, const char *prefijo, int indice, const char *modulo,
++                      uint64_t desplazamiento, uint64_t direccion)
++    {
++        Texto t(destino, tam);
++        t.texto(prefijo).texto("  #").decimal(static_cast<uint64_t>(indice < 0 ? 0 : indice)).texto(" ");
++        if (modulo != nullptr)
++            t.texto(modulo).texto("+0x").hex(desplazamiento);
++        else
++            t.texto("0x").hex(direccion, 16);
++        return t.largo();
++    }
++
++    size_t lineaHilo(char *destino, size_t tam, const char *prefijo, uint32_t id, const char *nombre)
++    {
++        Texto t(destino, tam);
++        t.texto(prefijo).texto("hilo ").decimal(id).texto(" ");
++        t.texto(nombre != nullptr && nombre[0] != '\0' ? nombre : "(sin nombre)");
++        return t.largo();
++    }
++
++    size_t lineaEe(char *destino, size_t tam, const char *prefijo, const EstadoEe &ee)
++    {
++        Texto t(destino, tam);
++        t.texto(prefijo);
++        if (!ee.hay)
++            return t.texto("ee sin datos (el juego aun no corre)").largo();
++        t.texto("ee pc=0x").hex(ee.pc, 8).texto(" ra=0x").hex(ee.ra, 8).texto(" hilo_ee=");
++        if (ee.hilo < 0)
++            t.texto("-");
++        t.decimal(static_cast<uint64_t>(ee.hilo < 0 ? -static_cast<int64_t>(ee.hilo) : ee.hilo));
++        return t.largo();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b0ed7e7..214a3b5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -27,6 +27,7 @@
+ #include "ps2_netplay.h"
+ #include "ps2_vigilante.h"
+ #include "ps2_salida.h"
++#include "ps2_fallo.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -3798,6 +3799,22 @@ static void TestWindowStall(double seconds)
+     std::cout << "[vigilante] prueba: ventana en marcha otra vez" << std::endl;
+ }
+ 
++// odd/tasks/fallos-con-log.md T3b: the report of an exception that reached GameThread's catch, with the stack of its
++// throw (kept by ps2x::fallo's vectored handler: in the catch it is gone). An exception rethrown with "throw;" keeps
++// the stack of its first throw; one from code that saw no throw of C++ (none kept) gets the catch's own stack.
++static void ReportGameThreadException()
++{
++    void *frames[48];
++    int count = ps2x::fallo::pilaDelLanzamiento(frames, 48, true);
++    if (count > 0)
++    {
++        ps2x::fallo::escribirInforme("[excepcion] ", "pila del throw", frames, count);
++        return;
++    }
++    count = ps2x::fallo::pilaActual(frames, 48, 0);
++    ps2x::fallo::escribirInforme("[excepcion] ", "pila del catch (no se guardo la del throw)", frames, count);
++}
++
+ void PS2Runtime::run()
+ {
+     m_stopRequested.store(false, std::memory_order_relaxed);
+@@ -3828,6 +3845,20 @@ void PS2Runtime::run()
+     std::atomic<bool> gameThreadFinished{false};
+     ps2x::GameFrameCounter gameFrameRate; // the FPS counter
+ 
++    // fallos-con-log T3b: the crash reports say where the EE was (the pc and ra the scheduler published last).
++    ps2x::fallo::registrarEe(
++        [](const void *data) -> ps2x::fallo::EstadoEe
++        {
++            const auto *runtime = static_cast<const PS2Runtime *>(data);
++            ps2x::fallo::EstadoEe ee;
++            ee.hay = true;
++            ee.pc = runtime->m_debugPc.load(std::memory_order_relaxed);
++            ee.ra = runtime->m_debugRa.load(std::memory_order_relaxed);
++            ee.hilo = runtime->m_eeScheduler ? runtime->m_eeScheduler->currentThreadId() : 0;
++            return ee;
++        },
++        this);
++
+     std::thread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
+@@ -3842,12 +3873,14 @@ void PS2Runtime::run()
+         catch (const std::exception &e)
+         {
+             std::cerr << "Error during program execution: " << e.what() << std::endl;
++            ReportGameThreadException(); // T3b
+             // odd/tasks/fallos-con-log.md T2: el proceso sale distinto de 0 (RecompLauncher adjunta el registro).
+             ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+         }
+         catch (...)
+         {
+             std::cerr << "Error during program execution: unknown exception" << std::endl;
++            ReportGameThreadException(); // T3b
+             ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+         }
+         gameThreadFinished.store(true, std::memory_order_release); });
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+index c996890..5a19e09 100644
+--- a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+@@ -24,8 +24,10 @@
+ // cerrojo de los FILE del CRT.
+ 
+ #include "ps2_vigilante.h"
++#include "ps2_fallo.h" // fallos-con-log T3b: los informes de fallo usan lo mismo (al final del archivo)
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <memory>
+ #include <thread>
+ #include <vector>
+@@ -82,10 +84,14 @@ namespace ps2x::vigilante
+                    (info.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE)) != 0u;
+         }
+ 
+-        // Una linea en un bufer fijo, sin reservar memoria.
++        // Una linea en un bufer fijo, sin reservar memoria. Sale por destino o, sin el, por la salida del vigilante.
+         class Linea
+         {
+         public:
++            Linea() = default;
++            explicit Linea(HANDLE destino) : m_destino(destino)
++            {
++            }
+             Linea &texto(const char *s)
+             {
+                 while (s != nullptr && *s != '\0' && m_n < sizeof(m_bufer) - 2u)
+@@ -124,8 +130,10 @@ namespace ps2x::vigilante
+                 m_bufer[m_n++] = '\r';
+                 m_bufer[m_n++] = '\n';
+                 DWORD escritos = 0;
+-                if (g_salida != INVALID_HANDLE_VALUE && g_salida != nullptr)
+-                    WriteFile(g_salida, m_bufer, static_cast<DWORD>(m_n), &escritos, nullptr);
++                const HANDLE salida =
++                    m_destino != INVALID_HANDLE_VALUE && m_destino != nullptr ? m_destino : g_salida;
++                if (salida != INVALID_HANDLE_VALUE && salida != nullptr)
++                    WriteFile(salida, m_bufer, static_cast<DWORD>(m_n), &escritos, nullptr);
+                 m_n = 0u;
+             }
+             // T3a (fallos-con-log): lo escrito hasta ahora, sin escribirlo.
+@@ -137,6 +145,7 @@ namespace ps2x::vigilante
+         private:
+             char m_bufer[640];
+             size_t m_n = 0u;
++            HANDLE m_destino = INVALID_HANDLE_VALUE;
+         };
+ 
+         Linea &inicio(Linea &l)
+@@ -159,9 +168,15 @@ namespace ps2x::vigilante
+             int n; // -1: no se pudo leer
+         };
+ 
++        // Los modulos cargados: una tabla para el vigilante y otra para los informes de fallo (otro hilo).
++        struct TablaModulos
++        {
++            Modulo modulos[kMaxModulos];
++            size_t n = 0u;
++        };
++
+         // Estado del informe: estatico (un solo hilo vigilante), para no reservar memoria.
+-        Modulo g_modulos[kMaxModulos];
+-        size_t g_numModulos = 0u;
++        TablaModulos g_modulos;
+         Hilo g_hilos[kMaxHilos];
+         bool g_identidadEscrita = false;
+         int g_informes = 0;
+@@ -178,11 +193,11 @@ namespace ps2x::vigilante
+         }
+ 
+         // Los modulos cargados, leidos del PEB sin el cerrojo del cargador (K32EnumProcessModules).
+-        void leerModulos()
++        void leerModulos(TablaModulos &tabla)
+         {
+             HMODULE modulos[kMaxModulos];
+             DWORD bytes = 0;
+-            g_numModulos = 0u;
++            tabla.n = 0u;
+             if (!EnumProcessModules(GetCurrentProcess(), modulos, sizeof(modulos), &bytes))
+                 return;
+             const size_t n = std::min<size_t>(bytes / sizeof(HMODULE), kMaxModulos);
+@@ -191,7 +206,7 @@ namespace ps2x::vigilante
+                 MODULEINFO info{};
+                 if (!GetModuleInformation(GetCurrentProcess(), modulos[i], &info, sizeof(info)))
+                     continue;
+-                Modulo &m = g_modulos[g_numModulos++];
++                Modulo &m = tabla.modulos[tabla.n++];
+                 m.base = reinterpret_cast<uint64_t>(info.lpBaseOfDll);
+                 m.tam = info.SizeOfImage;
+                 if (GetModuleBaseNameA(GetCurrentProcess(), modulos[i], m.nombre, sizeof(m.nombre)) == 0)
+@@ -199,11 +214,11 @@ namespace ps2x::vigilante
+             }
+         }
+ 
+-        const Modulo *moduloDe(uint64_t direccion)
++        const Modulo *moduloDe(const TablaModulos &tabla, uint64_t direccion)
+         {
+-            for (size_t i = 0; i < g_numModulos; ++i)
+-                if (direccion >= g_modulos[i].base && direccion - g_modulos[i].base < g_modulos[i].tam)
+-                    return &g_modulos[i];
++            for (size_t i = 0; i < tabla.n; ++i)
++                if (direccion >= tabla.modulos[i].base && direccion - tabla.modulos[i].base < tabla.modulos[i].tam)
++                    return &tabla.modulos[i];
+             return nullptr;
+         }
+ 
+@@ -407,7 +422,7 @@ namespace ps2x::vigilante
+         {
+             Linea l;
+             inicio(l).texto("  #").decimal(static_cast<uint64_t>(i)).texto(" ");
+-            if (const Modulo *m = moduloDe(direccion))
++            if (const Modulo *m = moduloDe(g_modulos, direccion))
+                 l.texto(m->nombre).texto("+0x").hex(direccion - m->base);
+             else
+                 l.texto("0x").hex(direccion, 16);
+@@ -472,7 +487,7 @@ namespace ps2x::vigilante
+                 g_identidadEscrita = true;
+                 escribirIdentidad();
+             }
+-            leerModulos();
++            leerModulos(g_modulos);
+ 
+             // Los hilos del proceso, salvo este.
+             const DWORD propio = GetCurrentThreadId();
+@@ -666,3 +681,277 @@ namespace ps2x::vigilante
+     }
+ #endif
+ }
++
++// fallos-con-log T3b (ps2_fallo.h): los informes "[fallo]", "[excepcion]" y "[terminate]" con lo del vigilante
++// (Linea, la tabla de modulos, la identidad, el nombre del hilo y dbghelp solo con el PDB junto al .exe). Se escriben
++// en el hilo que cae, que puede tener cerrojos tomados: sin reservar memoria ni el CRT (salvo vaciar stdout y stderr
++// antes, como ya hacia el informe de f1_fallos.cpp).
++namespace ps2x::fallo
++{
++    namespace
++    {
++        std::atomic<LectorEe> g_lectorEe{nullptr};
++        std::atomic<const void *> g_datoEe{nullptr};
++    }
++
++    void registrarEe(LectorEe lector, const void *dato)
++    {
++        g_datoEe.store(dato, std::memory_order_relaxed);
++        g_lectorEe.store(lector, std::memory_order_release);
++    }
++
++#if defined(_WIN32)
++    namespace
++    {
++        using ps2x::vigilante::Linea;
++        using ps2x::vigilante::Modulo;
++        using ps2x::vigilante::TablaModulos;
++
++        constexpr int kMaxLanzamiento = 48;
++        thread_local void *t_lanzamiento[kMaxLanzamiento];
++        thread_local int t_numLanzamiento = 0;
++        thread_local ULONG_PTR t_objeto = 0u;      // el objeto lanzado de la pila guardada
++        thread_local bool t_relanzando = false;    // se vio un "throw;" y aun no su excepcion sustituida
++        thread_local const char *t_tipo = nullptr; // su nombre decorado (datos RTTI del modulo: no caducan)
++        TablaModulos g_tablaFallo; // la del vigilante es de su hilo
++        volatile LONG g_informando = 0;
++
++        // El tipo lanzado es EeDispatcherTransfer (el "longjmp" del planificador, ee_scheduler.h: no es un error y
++        // se lanza muchas veces por segundo). ThrowInfo de x64: RVAs desde la base de la imagen; el primer tipo de su
++        // CatchableTypeArray es el exacto, con el nombre decorado tras dos punteros (".?AUEeDispatcherTransfer@@").
++        // Tambien da ese nombre (nullptr si no se pudo leer).
++        bool esTransferencia(ULONG_PTR throwInfo, ULONG_PTR imagen, const char *&nombre)
++        {
++            nombre = nullptr;
++            if (throwInfo == 0u || imagen == 0u)
++                return false;
++            __try
++            {
++                const auto *info = reinterpret_cast<const int32_t *>(throwInfo);
++                const auto *tipos = reinterpret_cast<const int32_t *>(imagen + static_cast<uint32_t>(info[3]));
++                if (tipos[0] < 1)
++                    return false;
++                const auto *tipo = reinterpret_cast<const int32_t *>(imagen + static_cast<uint32_t>(tipos[1]));
++                nombre = reinterpret_cast<const char *>(imagen + static_cast<uint32_t>(tipo[1])) + 16;
++                return std::strstr(nombre, "EeDispatcherTransfer") != nullptr;
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++                nombre = nullptr;
++                return false;
++            }
++        }
++
++        // Primera oportunidad de cada excepcion del proceso: solo los throw de C++ (0xE06D7363) guardan la pila en el
++        // hilo. Un "throw;" (p. ej. el catch (...) de EeScheduler::run) sale primero sin ThrowInfo y el runtime de
++        // C++ (VCRUNTIME140_1) lo vuelve a lanzar con el mismo objeto: esa no cuenta, se queda la pila del throw
++        // original. Nunca maneja nada.
++        LONG CALLBACK capturarLanzamiento(EXCEPTION_POINTERS *info)
++        {
++            const EXCEPTION_RECORD *r = info->ExceptionRecord;
++            if (r->ExceptionCode != 0xE06D7363u || r->NumberParameters < 4u)
++                return EXCEPTION_CONTINUE_SEARCH;
++            const ULONG_PTR magia = r->ExceptionInformation[0];
++            if (magia != 0x19930520u && magia != 0x19930521u && magia != 0x19930522u)
++                return EXCEPTION_CONTINUE_SEARCH;
++            if (r->ExceptionInformation[2] == 0u)
++            {
++                t_relanzando = true;
++                return EXCEPTION_CONTINUE_SEARCH;
++            }
++            const bool relanzada = t_relanzando && r->ExceptionInformation[1] == t_objeto;
++            t_relanzando = false;
++            const char *tipo = nullptr;
++            if (relanzada || esTransferencia(r->ExceptionInformation[2], r->ExceptionInformation[3], tipo))
++                return EXCEPTION_CONTINUE_SEARCH;
++            t_numLanzamiento = RtlCaptureStackBackTrace(1, kMaxLanzamiento, t_lanzamiento, nullptr);
++            t_objeto = r->ExceptionInformation[1];
++            t_tipo = tipo;
++            return EXCEPTION_CONTINUE_SEARCH;
++        }
++
++        EstadoEe leerEe()
++        {
++            const LectorEe lector = g_lectorEe.load(std::memory_order_acquire);
++            EstadoEe ee{};
++            if (lector == nullptr)
++                return ee;
++            __try
++            {
++                ee = lector(g_datoEe.load(std::memory_order_relaxed));
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++                ee = EstadoEe{};
++            }
++            return ee;
++        }
++
++        HANDLE salidaDeErrores()
++        {
++            HANDLE salida = reinterpret_cast<HANDLE>(_get_osfhandle(2));
++            if (salida == INVALID_HANDLE_VALUE || salida == nullptr)
++                salida = GetStdHandle(STD_ERROR_HANDLE);
++            return salida;
++        }
++
++        void escribirPila(HANDLE salida, const char *prefijo, const char *titulo, void *const *marcos, int n)
++        {
++            Linea l(salida);
++            l.texto(prefijo).texto(titulo != nullptr ? titulo : "pila").texto(" (").decimal(n > 0 ? n : 0)
++                .texto(" marcos):").escribir();
++            char bufer[600];
++            for (int i = 0; i < n; ++i)
++            {
++                const uint64_t direccion = reinterpret_cast<uint64_t>(marcos[i]);
++                const Modulo *m = ps2x::vigilante::moduloDe(g_tablaFallo, direccion);
++                lineaMarco(bufer, sizeof(bufer), prefijo, i, m != nullptr ? m->nombre : nullptr,
++                           m != nullptr ? direccion - m->base : 0u, direccion);
++                l.texto(bufer).escribir();
++            }
++        }
++
++        // Desarrollo (PDB junto al .exe): las mismas pilas con nombres, despues de "fin del informe".
++        void escribirNombres(HANDLE salida, const char *prefijo, void *const *marcos, int n, void *const *marcos2,
++                             int n2)
++        {
++            const ps2x::vigilante::Dbghelp *d = ps2x::vigilante::dbghelp();
++            if (d == nullptr)
++                return;
++            wchar_t carpeta[MAX_PATH] = {};
++            GetModuleFileNameW(nullptr, carpeta, MAX_PATH);
++            if (wchar_t *barra = wcsrchr(carpeta, L'\\'))
++                *barra = L'\0';
++            d->opciones(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
++            if (!d->iniciar(GetCurrentProcess(), carpeta, TRUE))
++                return;
++            Linea l(salida);
++            l.texto(prefijo).texto("nombres (con el PDB junto al .exe):").escribir();
++            for (int pila = 0; pila < 2; ++pila)
++            {
++                void *const *m = pila == 0 ? marcos : marcos2;
++                const int cuantos = pila == 0 ? n : n2;
++                for (int i = 0; m != nullptr && i < cuantos; ++i)
++                {
++                    const uint64_t direccion = reinterpret_cast<uint64_t>(m[i]);
++                    l.texto(prefijo).texto(pila == 0 ? "  #" : "  pila 2 #").decimal(static_cast<uint64_t>(i))
++                        .texto(" ");
++                    alignas(SYMBOL_INFO) char bufer[sizeof(SYMBOL_INFO) + 256] = {};
++                    auto *simbolo = reinterpret_cast<SYMBOL_INFO *>(bufer);
++                    simbolo->SizeOfStruct = sizeof(SYMBOL_INFO);
++                    simbolo->MaxNameLen = 255;
++                    DWORD64 desplazamiento = 0;
++                    if (d->simbolo(GetCurrentProcess(), direccion, &desplazamiento, simbolo))
++                        l.texto(simbolo->Name).texto("+0x").hex(desplazamiento);
++                    else
++                        l.texto("?");
++                    l.escribir();
++                }
++            }
++            l.texto(prefijo).texto("fin de los nombres").escribir();
++            d->soltar(GetCurrentProcess());
++        }
++    }
++
++    void instalarCapturaDeLanzamientos()
++    {
++        static const bool s_instalado = AddVectoredExceptionHandler(1, capturarLanzamiento) != nullptr;
++        (void)s_instalado;
++    }
++
++    int pilaDelLanzamiento(void **marcos, int max, bool olvidar)
++    {
++        const int n = std::min(t_numLanzamiento, max);
++        for (int i = 0; i < n; ++i)
++            marcos[i] = t_lanzamiento[i];
++        if (olvidar)
++        {
++            t_numLanzamiento = 0;
++            t_objeto = 0u;
++            t_tipo = nullptr;
++        }
++        return n > 0 ? n : 0;
++    }
++
++    const char *tipoDelLanzamiento()
++    {
++        return t_numLanzamiento > 0 ? t_tipo : nullptr;
++    }
++
++    int pilaActual(void **marcos, int max, int saltar)
++    {
++        if (max <= 0)
++            return 0;
++        return RtlCaptureStackBackTrace(static_cast<DWORD>(saltar + 1), static_cast<DWORD>(max), marcos, nullptr);
++    }
++
++    void escribirLinea(const char *prefijo, const char *texto)
++    {
++        std::fflush(stdout);
++        std::fflush(stderr);
++        Linea l(salidaDeErrores());
++        l.texto(prefijo).texto(texto).escribir();
++    }
++
++    void escribirInforme(const char *prefijo, const char *titulo, void *const *marcos, int n, const char *titulo2,
++                         void *const *marcos2, int n2)
++    {
++        // Un informe cada vez (dos hilos que caen a la vez no mezclan sus lineas ni la tabla de modulos).
++        while (InterlockedCompareExchange(&g_informando, 1, 0) != 0)
++            Sleep(1);
++        std::fflush(stdout); // lo que el CRT aun tenia, antes que el informe
++        std::fflush(stderr);
++        const HANDLE salida = salidaDeErrores();
++        Linea l(salida);
++        l.texto(prefijo).texto("compilacion: ");
++        ps2x::vigilante::identidad(l);
++        l.escribir();
++        char nombre[96] = {};
++        ps2x::vigilante::nombreDelHilo(GetCurrentThread(), nombre, sizeof(nombre));
++        char bufer[600];
++        lineaHilo(bufer, sizeof(bufer), prefijo, GetCurrentThreadId(), nombre);
++        l.texto(bufer).escribir();
++        lineaEe(bufer, sizeof(bufer), prefijo, leerEe());
++        l.texto(bufer).escribir();
++        ps2x::vigilante::leerModulos(g_tablaFallo);
++        escribirPila(salida, prefijo, titulo, marcos, n);
++        if (marcos2 != nullptr && n2 > 0)
++            escribirPila(salida, prefijo, titulo2, marcos2, n2);
++        l.texto(prefijo).texto("fin del informe").escribir();
++        escribirNombres(salida, prefijo, marcos, n, marcos2, n2);
++        InterlockedExchange(&g_informando, 0);
++    }
++#else
++    void instalarCapturaDeLanzamientos()
++    {
++    }
++
++    int pilaDelLanzamiento(void **marcos, int max, bool olvidar)
++    {
++        (void)marcos, (void)max, (void)olvidar;
++        return 0;
++    }
++
++    const char *tipoDelLanzamiento()
++    {
++        return nullptr;
++    }
++
++    int pilaActual(void **marcos, int max, int saltar)
++    {
++        (void)marcos, (void)max, (void)saltar;
++        return 0;
++    }
++
++    void escribirLinea(const char *prefijo, const char *texto)
++    {
++        std::fprintf(stderr, "%s%s\n", prefijo, texto);
++    }
++
++    void escribirInforme(const char *prefijo, const char *titulo, void *const *marcos, int n, const char *titulo2,
++                         void *const *marcos2, int n2)
++    {
++        (void)prefijo, (void)titulo, (void)marcos, (void)n, (void)titulo2, (void)marcos2, (void)n2;
++    }
++#endif
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index ab819d7..c3185c9 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -9,6 +9,7 @@
+ #include "ps2_vigilante.h"
+ #include "ps2_salida.h"
+ #include "ps2_cabecera.h"
++#include "ps2_fallo.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -33,6 +34,9 @@
+ #include <sstream>
+ #include <vector>
+ #include <ctime>
++#include <atomic>
++#include <csignal>
++#include <cstdio>
+ #if defined(_WIN32)
+ #include <io.h>
+ #include <cstdio>
+@@ -115,10 +119,45 @@ namespace
+     }
+ #endif
+ 
++    // odd/tasks/fallos-con-log.md T3b: the report of ps2_fallo.h for abort(), written once (g_terminateReported).
++    // MSVC keeps the std::terminate handler per thread, so the one below only covers the main thread; std::terminate in
++    // any other thread (an exception that leaves a std::thread) goes straight to abort(), whose SIGABRT handler is the
++    // same for the whole process: this one writes the report there, with the stack of abort (on MSVC the throw's frames
++    // are still under it) and that of the thread's last C++ throw. Returning lets abort() end the process.
++    std::atomic<bool> g_terminateReported{false};
++
++    void reportAbortSignal(int)
++    {
++        if (g_terminateReported.exchange(true))
++            return;
++        void *here[48];
++        const int hereCount = ps2x::fallo::pilaActual(here, 48, 0);
++        const char *thrownType = ps2x::fallo::tipoDelLanzamiento();
++        void *thrown[48];
++        const int thrownCount = ps2x::fallo::pilaDelLanzamiento(thrown, 48, true);
++        ps2x::fallo::escribirLinea("[terminate] ", "abort() (std::terminate en un hilo sin manejador propio, o abort)");
++        if (thrownType != nullptr)
++        {
++            ps2x::fallo::escribirLinea("[terminate] ultimo throw de este hilo: ", thrownType);
++        }
++        ps2x::fallo::escribirInforme("[terminate] ", "pila de abort", here, hereCount, "pila del ultimo throw de este hilo",
++                                     thrown, thrownCount);
++        std::fflush(nullptr);
++    }
++
++    // odd/tasks/fallos-con-log.md T3b: besides what was thrown, the report of ps2_fallo.h (build identity, thread, EE pc
++    // and ra, the stack of std::terminate and that of the thread's last C++ throw, as module+offset), and stdout and
++    // stderr flushed before abort(). The vectored handler that keeps the stack of each throw is installed here too.
+     void setupTerminateLogger() // to help on release build crashs
+     {
++        ps2x::fallo::instalarCapturaDeLanzamientos();
++        std::signal(SIGABRT, reportAbortSignal);
+         std::set_terminate([]()
+                            {
++                               void *here[48];
++                               const int hereCount = ps2x::fallo::pilaActual(here, 48, 0);
++                               void *thrown[48];
++                               const int thrownCount = ps2x::fallo::pilaDelLanzamiento(thrown, 48, true);
+                                std::cerr << "[terminate] unhandled exception" << std::endl;
+                                const std::exception_ptr ep = std::current_exception();
+                                if (ep)
+@@ -142,6 +181,13 @@ namespace
+                                        std::cerr << "[terminate] non-std exception" << std::endl;
+                                    }
+                                }
++                               ps2x::fallo::escribirInforme("[terminate] ", "pila de std::terminate", here, hereCount,
++                                                            "pila del ultimo throw de este hilo", thrown,
++                                                            thrownCount);
++                               g_terminateReported.store(true);
++                               std::cout.flush();
++                               std::cerr.flush();
++                               std::fflush(nullptr);
+                                std::abort(); });
+     }
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index c537e53..37e9b80 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -51,6 +51,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vigilante_tests.cpp
+     src/ps2_salida_tests.cpp
+     src/ps2_cabecera_tests.cpp
++    src/ps2_fallo_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 1265940..ff4db10 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -32,6 +32,7 @@ void register_ps2_game_graphics_tests();
+ void register_ps2_vigilante_tests();
+ void register_ps2_salida_tests();
+ void register_ps2_cabecera_tests();
++void register_ps2_fallo_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -68,6 +69,7 @@ int main()
+     register_ps2_vigilante_tests();
+     register_ps2_salida_tests();
+     register_ps2_cabecera_tests();
++    register_ps2_fallo_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_fallo_tests.cpp b/ps2xTest/src/ps2_fallo_tests.cpp
+new file mode 100644
+index 0000000..0dd29bd
+--- /dev/null
++++ b/ps2xTest/src/ps2_fallo_tests.cpp
+@@ -0,0 +1,102 @@
++#include "MiniTest.h"
++#include "ps2_fallo.h"
++
++#include <cstring>
++#include <string>
++
++// odd/tasks/fallos-con-log.md T3b (S3): the crash reports use the vigilante's module+offset format, and
++// PS2X_PRUEBA_FALLO=<tipo>:<segundos> triggers each kind of crash for the T4 tests.
++namespace
++{
++    using ps2x::fallo::Prueba;
++
++    std::string marco(const char *prefijo, int i, const char *modulo, uint64_t desp, uint64_t dir, size_t tam = 256)
++    {
++        char bufer[256];
++        const size_t n = ps2x::fallo::lineaMarco(bufer, tam, prefijo, i, modulo, desp, dir);
++        if (std::strlen(bufer) != n)
++            return "length mismatch";
++        return bufer;
++    }
++
++    std::string hilo(const char *prefijo, uint32_t id, const char *nombre)
++    {
++        char bufer[256];
++        ps2x::fallo::lineaHilo(bufer, sizeof(bufer), prefijo, id, nombre);
++        return bufer;
++    }
++
++    std::string ee(const char *prefijo, const ps2x::fallo::EstadoEe &estado)
++    {
++        char bufer[256];
++        ps2x::fallo::lineaEe(bufer, sizeof(bufer), prefijo, estado);
++        return bufer;
++    }
++}
++
++void register_ps2_fallo_tests()
++{
++    MiniTest::Case("Fallo", [](TestCase &tc)
++    {
++        tc.Run("PS2X_PRUEBA_FALLO: the three kinds with their seconds", [](TestCase &t)
++        {
++            const auto a = ps2x::fallo::leerPrueba("acceso:15");
++            t.IsTrue(a.tipo == Prueba::Acceso, "acceso");
++            t.Equals(a.segundos, 15.0, "15 s");
++            const auto e = ps2x::fallo::leerPrueba("excepcion:2.5");
++            t.IsTrue(e.tipo == Prueba::Excepcion, "excepcion");
++            t.Equals(e.segundos, 2.5, "2.5 s");
++            const auto m = ps2x::fallo::leerPrueba("terminate:0");
++            t.IsTrue(m.tipo == Prueba::Terminate, "terminate");
++            t.Equals(m.segundos, 0.0, "0 s");
++        });
++
++        tc.Run("PS2X_PRUEBA_FALLO: anything else triggers nothing", [](TestCase &t)
++        {
++            for (const char *valor : {"", "acceso", "acceso:", "acceso:-1", "acceso:15x", "acceso:15:3", "Acceso:15",
++                                      "otro:15", ":15", "acceso: ", "acceso:abc"})
++                t.IsTrue(ps2x::fallo::leerPrueba(valor).tipo == Prueba::Ninguna, std::string("rejected: ") + valor);
++            t.IsTrue(ps2x::fallo::leerPrueba(nullptr).tipo == Prueba::Ninguna, "unset");
++        });
++
++        tc.Run("frame line: module+offset like the vigilante", [](TestCase &t)
++        {
++            t.Equals(marco("[fallo] ", 0, "F1-06.exe", 0x1A2B3Cu, 0x7FF6A134B3Cull),
++                     std::string("[fallo]   #0 F1-06.exe+0x1A2B3C"), "game module");
++            t.Equals(marco("[terminate] ", 12, "ntdll.dll", 0x0u, 0x7FFA00000000ull),
++                     std::string("[terminate]   #12 ntdll.dll+0x0"), "offset 0, two-digit index");
++        });
++
++        tc.Run("frame line: an address outside every module", [](TestCase &t)
++        {
++            t.Equals(marco("[fallo] ", 3, nullptr, 0u, 0x1234ull), std::string("[fallo]   #3 0x0000000000001234"),
++                     "16 hex digits");
++        });
++
++        tc.Run("frame line: cut to the buffer, always terminated", [](TestCase &t)
++        {
++            t.Equals(marco("[fallo] ", 0, "F1-06.exe", 0x1A2B3Cu, 0u, 12), std::string("[fallo]   #"),
++                     "11 characters and the terminator");
++        });
++
++        tc.Run("thread line with and without a name", [](TestCase &t)
++        {
++            t.Equals(hilo("[fallo] ", 1234u, "GameThread"), std::string("[fallo] hilo 1234 GameThread"), "named");
++            t.Equals(hilo("[fallo] ", 77u, ""), std::string("[fallo] hilo 77 (sin nombre)"), "empty name");
++            t.Equals(hilo("[fallo] ", 77u, nullptr), std::string("[fallo] hilo 77 (sin nombre)"), "no name");
++        });
++
++        tc.Run("EE line: pc, ra and guest thread, or no data yet", [](TestCase &t)
++        {
++            ps2x::fallo::EstadoEe estado;
++            estado.hay = true;
++            estado.pc = 0x00123456u;
++            estado.ra = 0x1A00u;
++            estado.hilo = 3;
++            t.Equals(ee("[excepcion] ", estado), std::string("[excepcion] ee pc=0x00123456 ra=0x00001A00 hilo_ee=3"),
++                     "8 hex digits each");
++            t.Equals(ee("[fallo] ", ps2x::fallo::EstadoEe{}),
++                     std::string("[fallo] ee sin datos (el juego aun no corre)"), "before the game runs");
++        });
++    });
++}

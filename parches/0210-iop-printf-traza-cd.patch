@@ -1,0 +1,862 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index cb06155..bd659e1 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -21,6 +21,7 @@ add_library(ps2_iop STATIC
+     src/emulator/imports/iop_intrman.cpp
+     src/emulator/imports/iop_ioman.cpp
+     src/emulator/imports/iop_loadcore.cpp
++    src/emulator/imports/iop_printf_format.cpp
+     src/emulator/imports/iop_stdio.cpp
+     src/emulator/imports/iop_sysclib.cpp
+     src/emulator/imports/iop_sysmem.cpp
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index b2802b1..5bdd8c2 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -75,6 +75,8 @@ namespace ps2x::iop::detail
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
++        // Patch 0210: id of the thread running now (0 between timeslices), for the CD trace.
++        [[nodiscard]] int currentThreadId() const noexcept { return m_currentThread != nullptr ? m_currentThread->id : 0; }
+ 
+         // Depuracion (F1 06): escribe en stderr el estado de los hilos, semaforos y eventos del IOP.
+         void debugDump(uint64_t currentCycle) const;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 9ea6f57..baeea77 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_cdvd.h"
++#include "iop_printf_format.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -234,7 +235,53 @@ namespace ps2x::iop::detail
+             return clock != nullptr && *clock < busyUntil;
+         }
+ 
++        // Patch 0210: PS2X_IOP_TRAZA_CD=1, one "[IOP cd]" line per sceCdInit/Read/Seek/Sync/Callback, with the IOP
++        // cycle (c=) and the caller's ra.
++        [[nodiscard]] unsigned long long traceCycle() const noexcept
++        {
++            return static_cast<unsigned long long>(clock != nullptr ? *clock : 0u);
++        }
++
++        void traceCall(uint16_t ordinal, const IopCpuState &cpu, uint32_t a0, uint32_t a1, uint32_t a2) const
++        {
++            const uint32_t ra = cpu.gpr[31];
++            const uint32_t v0 = cpu.gpr[2];
++            switch (ordinal)
++            {
++            case 4:
++                std::fprintf(stderr, "[IOP cd] init mode=%u -> %u c=%llu ra=%08x\n", a0, v0, traceCycle(), ra);
++                break;
++            case 6:
++                std::fprintf(stderr, "[IOP cd] read lsn=%u n=%u buf=%08x -> %u cb=%08x busyUntil=%llu c=%llu ra=%08x\n",
++                             a0, a1, a2, v0, callback.address, static_cast<unsigned long long>(busyUntil), traceCycle(), ra);
++                break;
++            case 7:
++                std::fprintf(stderr, "[IOP cd] seek lsn=%u -> %u cb=%08x c=%llu ra=%08x\n", a0, v0, callback.address,
++                             traceCycle(), ra);
++                break;
++            case 11:
++                std::fprintf(stderr, "[IOP cd] sync mode=%u -> %u c=%llu ra=%08x\n", a0, v0, traceCycle(), ra);
++                break;
++            case 37:
++                std::fprintf(stderr, "[IOP cd] callback new=%08x old=%08x c=%llu ra=%08x\n", a0, v0, traceCycle(), ra);
++                break;
++            default:
++                break;
++            }
++        }
++
+         bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
++        {
++            const uint32_t a0 = cpu.gpr[4];
++            const uint32_t a1 = cpu.gpr[5];
++            const uint32_t a2 = cpu.gpr[6];
++            const bool handled = dispatchImportImpl(ordinal, cpu);
++            if (handled && iopTrazaCdEnabled())
++                traceCall(ordinal, cpu, a0, a1, a2);
++            return handled;
++        }
++
++        bool dispatchImportImpl(uint16_t ordinal, IopCpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+             const uint32_t a1 = cpu.gpr[5];
+diff --git a/ps2xIOP/src/emulator/imports/iop_printf_format.cpp b/ps2xIOP/src/emulator/imports/iop_printf_format.cpp
+new file mode 100644
+index 0000000..62b6ce5
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_printf_format.cpp
+@@ -0,0 +1,244 @@
++#include "iop_printf_format.h"
++
++#include <algorithm>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        struct Spec
++        {
++            bool left = false;
++            bool zero = false;
++            bool plus = false;
++            bool space = false;
++            bool alternate = false;
++            size_t width = 0u;
++            std::optional<size_t> precision;
++        };
++
++        class Output
++        {
++        public:
++            void append(std::string_view text)
++            {
++                const size_t room = kIopPrintfMaxOutput - std::min(kIopPrintfMaxOutput, m_text.size());
++                m_text.append(text.substr(0u, std::min(room, text.size())));
++            }
++
++            void repeat(char ch, size_t count)
++            {
++                const size_t room = kIopPrintfMaxOutput - std::min(kIopPrintfMaxOutput, m_text.size());
++                m_text.append(std::min(room, count), ch);
++            }
++
++            // body padded to the width: spaces on the left (or right with -); zeros between the prefix and the
++            // digits with 0.
++            void padded(const Spec &spec, std::string_view prefix, std::string_view body, bool zeroPad)
++            {
++                const size_t length = prefix.size() + body.size();
++                const size_t pad = spec.width > length ? spec.width - length : 0u;
++                if (!spec.left && !zeroPad)
++                    repeat(' ', pad);
++                append(prefix);
++                if (!spec.left && zeroPad)
++                    repeat('0', pad);
++                append(body);
++                if (spec.left)
++                    repeat(' ', pad);
++            }
++
++            [[nodiscard]] bool full() const noexcept { return m_text.size() >= kIopPrintfMaxOutput; }
++            [[nodiscard]] std::string take() { return std::move(m_text); }
++
++        private:
++            std::string m_text;
++        };
++
++        std::string digits(uint32_t value, uint32_t base, bool upper)
++        {
++            const char *table = upper ? "0123456789ABCDEF" : "0123456789abcdef";
++            std::string text;
++            do
++            {
++                text.push_back(table[value % base]);
++                value /= base;
++            } while (value != 0u);
++            std::reverse(text.begin(), text.end());
++            return text;
++        }
++
++        size_t clampSize(uint32_t value) noexcept
++        {
++            return std::min<size_t>(value, kIopPrintfMaxOutput);
++        }
++    }
++
++    std::string formatIopPrintf(std::string_view format,
++                                const IopPrintfArgument &nextArgument,
++                                const IopPrintfString &readString)
++    {
++        Output out;
++        uint32_t argumentIndex = 0u;
++        const auto next = [&]() -> uint32_t
++        {
++            return nextArgument ? nextArgument(argumentIndex++) : 0u;
++        };
++
++        size_t i = 0u;
++        while (i < format.size() && !out.full())
++        {
++            const size_t percent = format.find('%', i);
++            if (percent == std::string_view::npos)
++            {
++                out.append(format.substr(i));
++                break;
++            }
++            out.append(format.substr(i, percent - i));
++            size_t p = percent + 1u;
++
++            Spec spec;
++            for (; p < format.size(); ++p)
++            {
++                const char flag = format[p];
++                if (flag == '-')
++                    spec.left = true;
++                else if (flag == '0')
++                    spec.zero = true;
++                else if (flag == '+')
++                    spec.plus = true;
++                else if (flag == ' ')
++                    spec.space = true;
++                else if (flag == '#')
++                    spec.alternate = true;
++                else
++                    break;
++            }
++
++            if (p < format.size() && format[p] == '*')
++            {
++                const int32_t width = static_cast<int32_t>(next());
++                if (width < 0)
++                {
++                    spec.left = true;
++                    spec.width = clampSize(static_cast<uint32_t>(-static_cast<int64_t>(width)));
++                }
++                else
++                    spec.width = clampSize(static_cast<uint32_t>(width));
++                ++p;
++            }
++            else
++            {
++                uint64_t width = 0u;
++                for (; p < format.size() && format[p] >= '0' && format[p] <= '9'; ++p)
++                    width = std::min<uint64_t>(width * 10u + static_cast<uint64_t>(format[p] - '0'), kIopPrintfMaxOutput);
++                spec.width = static_cast<size_t>(width);
++            }
++
++            if (p < format.size() && format[p] == '.')
++            {
++                ++p;
++                if (p < format.size() && format[p] == '*')
++                {
++                    const int32_t precision = static_cast<int32_t>(next());
++                    if (precision >= 0) // a negative precision counts as none
++                        spec.precision = clampSize(static_cast<uint32_t>(precision));
++                    ++p;
++                }
++                else
++                {
++                    uint64_t precision = 0u;
++                    for (; p < format.size() && format[p] >= '0' && format[p] <= '9'; ++p)
++                        precision = std::min<uint64_t>(precision * 10u + static_cast<uint64_t>(format[p] - '0'),
++                                                       kIopPrintfMaxOutput);
++                    spec.precision = static_cast<size_t>(precision);
++                }
++            }
++
++            // Length modifiers: the IOP is a 32-bit machine and the guest passes one word per argument here.
++            while (p < format.size() &&
++                   (format[p] == 'h' || format[p] == 'l' || format[p] == 'z' || format[p] == 't' || format[p] == 'j'))
++                ++p;
++
++            if (p >= format.size())
++            {
++                out.append(format.substr(percent)); // a cut conversion is copied as it is
++                break;
++            }
++
++            const char conversion = format[p];
++            switch (conversion)
++            {
++            case 'd':
++            case 'i':
++            case 'u':
++            case 'x':
++            case 'X':
++            case 'o':
++            {
++                const uint32_t raw = next();
++                const bool isSigned = conversion == 'd' || conversion == 'i';
++                const bool negative = isSigned && static_cast<int32_t>(raw) < 0;
++                const uint32_t magnitude = negative ? 0u - raw : raw;
++                const uint32_t base = conversion == 'o' ? 8u : ((conversion == 'x' || conversion == 'X') ? 16u : 10u);
++                std::string body = (spec.precision && *spec.precision == 0u && magnitude == 0u)
++                                       ? std::string()
++                                       : digits(magnitude, base, conversion == 'X');
++                if (spec.precision && body.size() < *spec.precision)
++                    body.insert(0u, *spec.precision - body.size(), '0');
++                std::string prefix;
++                if (negative)
++                    prefix = "-";
++                else if (isSigned && spec.plus)
++                    prefix = "+";
++                else if (isSigned && spec.space)
++                    prefix = " ";
++                if (spec.alternate && base == 8u && (body.empty() || body.front() != '0'))
++                    body.insert(0u, 1u, '0');
++                if (spec.alternate && base == 16u && magnitude != 0u)
++                    prefix += conversion == 'X' ? "0X" : "0x";
++                out.padded(spec, prefix, body, spec.zero && !spec.precision);
++                break;
++            }
++            case 'p':
++            {
++                std::string body = digits(next(), 16u, false);
++                body.insert(0u, body.size() < 8u ? 8u - body.size() : 0u, '0');
++                out.padded(spec, "0x", body, spec.zero);
++                break;
++            }
++            case 'c':
++            {
++                const char ch = static_cast<char>(next() & 0xFFu);
++                out.padded(spec, {}, std::string_view(&ch, 1u), false);
++                break;
++            }
++            case 's':
++            {
++                const uint32_t address = next();
++                std::string text;
++                if (address == 0u)
++                    text = "(null)";
++                else if (const std::optional<std::string> guest = readString ? readString(address) : std::nullopt)
++                    text = *guest;
++                else
++                    text = "<bad>";
++                if (text.size() > kIopPrintfMaxString)
++                    text.resize(kIopPrintfMaxString);
++                if (spec.precision && text.size() > *spec.precision)
++                    text.resize(*spec.precision);
++                out.padded(spec, {}, text, false);
++                break;
++            }
++            case '%':
++                out.append("%");
++                break;
++            default:
++                out.append(format.substr(percent, p + 1u - percent)); // unknown: copied, no argument taken
++                break;
++            }
++            i = p + 1u;
++        }
++        return out.take();
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_printf_format.h b/ps2xIOP/src/emulator/imports/iop_printf_format.h
+new file mode 100644
+index 0000000..88274cd
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_printf_format.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <functional>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace ps2x::iop::detail
++{
++    // Patch 0210: the IOP's printf/fdprintf/vfdprintf format their text with the guest's arguments (until then the
++    // raw format string was logged, so F1 06's IRX warnings came out as "%p ... %d").
++    //
++    // nextArgument(index) returns the index-th 32-bit argument after the format (MIPS o32: the caller maps it to
++    // registers, the guest stack or a va_list). readString(address) returns the guest string at address, or nothing
++    // when the pointer is not readable guest memory. Supported: %d %i %u %o %x %X %p %s %c %% with the flags - 0 + space
++    // #, a width and a precision (digits or *), and the length modifiers h hh l ll z t j (all read one 32-bit word).
++    // %p prints 0x and 8 hex digits; %s of 0 prints (null) and of an unreadable pointer <bad>. Anything else is copied
++    // as it is.
++    using IopPrintfArgument = std::function<uint32_t(uint32_t index)>;
++    using IopPrintfString = std::function<std::optional<std::string>(uint32_t address)>;
++
++    [[nodiscard]] std::string formatIopPrintf(std::string_view format,
++                                              const IopPrintfArgument &nextArgument,
++                                              const IopPrintfString &readString);
++
++    // Longest output and longest %s string the formatter produces (a corrupt format or argument cannot run away).
++    inline constexpr size_t kIopPrintfMaxOutput = 4096u;
++    inline constexpr size_t kIopPrintfMaxString = 1024u;
++
++    // Patch 0210: the two messages F1 06 prints when AUDIO.IRX closes a file while CORE.IRX still has a read in
++    // flight for it (a race in the original game: the read finishes ~100 us later, nothing is lost and the game goes
++    // on; see odd/tasks/iop-salida.md L6). They are tagged in the log so players and report readers are not alarmed.
++    [[nodiscard]] inline bool isKnownHarmlessGameWarning(std::string_view text) noexcept
++    {
++        constexpr std::string_view closing = "WARNING: Closing file ";
++        constexpr std::string_view closingEnd = " will probably be fatal";
++        constexpr std::string_view callback = "IOP FATAL ERROR: callback received when status is ";
++        if (text.substr(0, callback.size()) == callback)
++            return true;
++        return text.substr(0, closing.size()) == closing && text.find(closingEnd) != std::string_view::npos;
++    }
++
++    inline constexpr std::string_view kKnownHarmlessGameWarningTag = "[harmless warning from the original game] ";
++
++    // Patch 0210: PS2X_IOP_TRAZA_CD=1 turns on the IOP CD diagnostic trace ("[IOP cd]" lines on stderr: sceCdRead,
++    // sceCdSync, sceCdSeek, sceCdCallback, sceCdInit and every CD callback delivery) and the caller's ra in the IOP
++    // printf lines. Off by default; read once.
++    [[nodiscard]] inline bool iopTrazaCdValue(const char *value) noexcept
++    {
++        return value != nullptr && std::atoi(value) != 0;
++    }
++
++    [[nodiscard]] inline bool iopTrazaCdEnabled() noexcept
++    {
++        static const bool s_enabled = iopTrazaCdValue(std::getenv("PS2X_IOP_TRAZA_CD"));
++        return s_enabled;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..1474287 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -1,13 +1,47 @@
+ #include "iop_stdio.h"
+ 
++#include "iop_printf_format.h"
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <algorithm>
++#include <cstdio>
+ #include <string>
+ 
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        // Patch 0210: guest words and strings for the printf formatter, read only from IOP RAM (an argument that is
++        // not a RAM pointer never touches a hardware register).
++        uint32_t guestWord(const IopMemory &memory, uint32_t address)
++        {
++            const uint32_t phys = IopMemory::physicalAddress(address);
++            if ((phys & 3u) != 0u || phys > IopMemory::RamSize - 4u)
++                return 0u;
++            return memory.read32(address);
++        }
++
++        std::optional<std::string> guestString(const IopMemory &memory, uint32_t address)
++        {
++            const uint32_t phys = IopMemory::physicalAddress(address);
++            if (address == 0u || phys >= IopMemory::RamSize)
++                return std::nullopt;
++            return memory.readString(address, std::min<size_t>(kIopPrintfMaxString, IopMemory::RamSize - phys));
++        }
++
++        // MIPS o32: argument slots 0-3 are a0-a3 and slot n >= 4 is the word at sp + 4n. The varargs start at
++        // firstSlot (1 for printf, 2 for fdprintf).
++        uint32_t varargSlot(const IopMemory &memory, const IopCpuState &cpu, uint32_t firstSlot, uint32_t index)
++        {
++            const uint32_t slot = firstSlot + index;
++            if (slot < 4u)
++                return cpu.gpr[4u + slot];
++            return guestWord(memory, cpu.gpr[29] + 4u * slot);
++        }
++    }
++
+     IopStdio::IopStdio(IopHost &host, IopMemory &memory) noexcept
+         : m_host(host), m_memory(memory)
+     {
+@@ -27,11 +61,38 @@ namespace ps2x::iop::detail
+             m_host.log(LogLevel::Info, std::string(prefix) + text);
+             setV0(static_cast<uint32_t>(text.size()) + resultBias);
+         };
++        // Patch 0210: printf/fdprintf/vfdprintf format their text with the guest's arguments; v0 is its length.
++        // With PS2X_IOP_TRAZA_CD=1 the line also carries the caller's ra, to find the IRX function that wrote it.
++        const auto logFormatted = [&](std::string_view name, uint32_t formatAddress, const IopPrintfArgument &argument)
++        {
++            const std::optional<std::string> format = guestString(m_memory, formatAddress);
++            const std::string text = formatIopPrintf(format ? std::string_view(*format) : std::string_view("(null)"),
++                                                     argument,
++                                                     [&](uint32_t address) { return guestString(m_memory, address); });
++            std::string line = "[IOP ";
++            line += name;
++            if (iopTrazaCdEnabled())
++            {
++                char ra[24];
++                std::snprintf(ra, sizeof(ra), " ra=%08x", cpu.gpr[31]);
++                line += ra;
++            }
++            line += "] ";
++            if (isKnownHarmlessGameWarning(text))
++                line += kKnownHarmlessGameWarningTag;
++            line += text;
++            m_host.log(LogLevel::Info, line);
++            setV0(static_cast<uint32_t>(text.size()));
++        };
++        const auto registerArguments = [&](uint32_t firstSlot) -> IopPrintfArgument
++        {
++            return [&, firstSlot](uint32_t index) { return varargSlot(m_memory, cpu, firstSlot, index); };
++        };
+ 
+         switch (ordinal)
+         {
+         case 4: // printf
+-            logString("[IOP printf] ", a0);
++            logFormatted("printf", a0, registerArguments(1u));
+             return true;
+         case 5: // getchar
+         case 10:
+@@ -49,7 +110,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 9: // fdprintf
+-            logString("[IOP fdprintf] ", a1);
++            logFormatted("fdprintf", a1, registerArguments(2u));
+             return true;
+         case 11:
+             setV0(a0 & 0xFFu);
+@@ -58,8 +119,11 @@ namespace ps2x::iop::detail
+             logString("[IOP fdputs] ", a0);
+             return true;
+         case 14: // vfdprintf
+-            logString("[IOP vfdprintf] ", a1);
++        {
++            const uint32_t list = cpu.gpr[6]; // va_list: the arguments as consecutive words in guest memory
++            logFormatted("vfdprintf", a1, [&, list](uint32_t index) { return guestWord(m_memory, list + 4u * index); });
+             return true;
++        }
+         default:
+             return false;
+         }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index d0e4960..750e396 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -10,6 +10,7 @@
+ #include "imports/iop_ioman.h"
+ #include "core/iop_kernel.h"
+ #include "imports/iop_loadcore.h"
++#include "imports/iop_printf_format.h"
+ #include "core/iop_memory.h"
+ #include "services/iop_module_loader.h"
+ #include "services/iop_rpc.h"
+@@ -775,12 +776,12 @@ namespace ps2x::iop::detail
+             if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
+                 return;
+ 
+-            std::vector<ScheduledGuestCallback> callbacks;
++            std::vector<std::pair<uint64_t, ScheduledGuestCallback>> callbacks;
+             for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end();)
+             {
+                 if (it->first > totalCycles)
+                     break;
+-                callbacks.push_back(it->second);
++                callbacks.emplace_back(it->first, it->second);
+                 it = pendingGuestCallbacks.erase(it);
+             }
+             if (callbacks.empty())
+@@ -789,8 +790,20 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = true;
+             try
+             {
+-                for (const ScheduledGuestCallback &callback : callbacks)
++                for (const auto &[dueCycle, callback] : callbacks)
+                 {
++                    // Patch 0210: PS2X_IOP_TRAZA_CD=1, one line per delivery: function, reason (its argument), the
++                    // cycle it was due and now, the interrupt enable (CpuSuspendIntr clears it), the running thread
++                    // and the ra/pc of the guest code it interrupts.
++                    if (iopTrazaCdEnabled())
++                    {
++                        std::fprintf(stderr,
++                                     "[IOP cd] deliver fn=%08x arg=%u due=%llu c=%llu intr=%u thread=%d ra=%08x pc=%08x\n",
++                                     callback.function, callback.argument, static_cast<unsigned long long>(dueCycle),
++                                     static_cast<unsigned long long>(totalCycles), memory.interruptControl(),
++                                     kernel.currentThreadId(), activeCpu != nullptr ? activeCpu->gpr[31] : 0u,
++                                     activeCpu != nullptr ? activeCpu->pc : 0u);
++                    }
+                     if (callback.function != 0u)
+                     {
+                         (void)callFunction(callback.function,
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index 5343699..9540df6 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -7,6 +7,10 @@
+ #include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+ #include "../../ps2xIOP/src/emulator/services/iop_rpc.h"
++#include "../../ps2xIOP/src/emulator/core/iop_cpu.h"
++#include "../../ps2xIOP/src/emulator/imports/iop_cdvd.h"
++#include "../../ps2xIOP/src/emulator/imports/iop_printf_format.h"
++#include "../../ps2xIOP/src/emulator/imports/iop_stdio.h"
+ #include "ps2x/iop/iop_spu2_audio.h"
+ 
+ #include <algorithm>
+@@ -14,7 +18,9 @@
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
+ #include <mutex>
++#include <optional>
+ #include <thread>
+ #include <vector>
+ 
+@@ -227,6 +233,56 @@ namespace
+             return delta;
+         }
+     };
++
++    // Patch 0210 (T1): the IOP printf formatter with plain arguments and a small table of guest strings.
++    struct PrintfArgs
++    {
++        std::vector<uint32_t> words;
++        std::map<uint32_t, std::string> strings;
++        std::vector<uint32_t> fetched;
++
++        std::string format(std::string_view text)
++        {
++            return ps2x::iop::detail::formatIopPrintf(
++                text,
++                [this](uint32_t index) -> uint32_t
++                {
++                    fetched.push_back(index);
++                    return index < words.size() ? words[index] : 0xDEADBEEFu;
++                },
++                [this](uint32_t address) -> std::optional<std::string>
++                {
++                    const auto it = strings.find(address);
++                    if (it == strings.end())
++                        return std::nullopt;
++                    return it->second;
++                });
++        }
++    };
++
++    // Patch 0210 (T1): calls one stdio import (printf 4, fdprintf 9, vfdprintf 14) on a real IopMemory; the last log
++    // line and v0 are the result.
++    struct StdioRig
++    {
++        iop_test::Host host;
++        ps2x::iop::detail::IopMemory memory;
++        ps2x::iop::detail::IopStdio stdio{host, memory};
++        ps2x::iop::detail::IopCpuState cpu{};
++
++        void putString(uint32_t address, const std::string &text)
++        {
++            (void)memory.writeRam(address, text.c_str(), text.size() + 1u);
++        }
++
++        bool call(uint16_t ordinal)
++        {
++            host.logs.clear();
++            cpu.gpr[2] = 0xFFFFFFFFu;
++            return stdio.dispatchImport(ordinal, cpu);
++        }
++
++        [[nodiscard]] std::string lastLog() const { return host.logs.empty() ? std::string() : host.logs.back(); }
++    };
+ }
+ 
+ void register_ps2_iop_tests()
+@@ -789,4 +845,210 @@ void register_ps2_iop_tests()
+         });
+ 
+     });
++
++    MiniTest::Case("PS2IopPrintf", [](TestCase &tc)
++    {
++        tc.Run("IOP printf fills the two F1 06 IRX warnings", [](TestCase &t)
++        {
++            PrintfArgs closing;
++            closing.words = {0x0012AB40u, 0xFFFFFFFEu};
++            t.Equals(closing.format("WARNING: Closing file %p with status %d will probably be fatal\n"),
++                     std::string("WARNING: Closing file 0x0012ab40 with status -2 will probably be fatal\n"),
++                     "%p prints 0x and 8 hex digits, %d a signed 32-bit value");
++            PrintfArgs fatal;
++            fatal.words = {3u};
++            t.Equals(fatal.format("IOP FATAL ERROR: callback received when status is %d\n"),
++                     std::string("IOP FATAL ERROR: callback received when status is 3\n"),
++                     "the callback status is filled in");
++            t.Equals(fatal.fetched, std::vector<uint32_t>{0u}, "one conversion reads one argument");
++        });
++
++        tc.Run("IOP printf integer conversions and length modifiers", [](TestCase &t)
++        {
++            PrintfArgs args;
++            args.words = {0xFFFFFFFBu, 42u, 0xFFFFFFFFu, 0xBEEFu, 0xBEEFu, 8u, 0x80000000u, 0xFFFFFFFFu, 0x1234u, 7u, 9u, 5u};
++            t.Equals(args.format("%d %i %u %x %X %o %d %ld %lx %hd %llu %zu"),
++                     std::string("-5 42 4294967295 beef BEEF 10 -2147483648 -1 1234 7 9 5"),
++                     "d i u x X o, and h/l/ll/z read one 32-bit word each");
++            t.Equals(args.fetched.size(), size_t(12u), "each conversion takes the next argument in order");
++        });
++
++        tc.Run("IOP printf flags, width and precision", [](TestCase &t)
++        {
++            PrintfArgs args;
++            args.words = {42u, 42u, 0xFFFFFFD6u, 7u, 0xAu, 0xABu, 5u, 5u, 255u, 8u, 4u, 1u, 0xFFFFFFFCu, 1u, 2u, 3u, 5u, 0u, 0u};
++            t.Equals(args.format("[%5d][%-5d][%05d][%.3d][%8.3x][%-8x][%+d][% d][%#x][%#o][%*d][%*d][%.*d][%08.3d][%.0d][%#x]"),
++                     std::string("[   42][42   ][-0042][007][     00a][ab      ][+5][ 5][0xff][010][   1][1   ][03][     005][][0]"),
++                     "flags - 0 + space #, width and precision as digits or *");
++            t.Equals(args.fetched.size(), size_t(19u), "* widths and precisions take their own argument");
++        });
++
++        tc.Run("IOP printf %p, %c, %% and unknown conversions", [](TestCase &t)
++        {
++            PrintfArgs args;
++            args.words = {0u, 0x1000u, 0x1000u, 0x41u, 0x142u};
++            t.Equals(args.format("%p|%12p|%-12p|%c|%3c|100%%|%q|%"),
++                     std::string("0x00000000|  0x00001000|0x00001000  |A|  B|100%|%q|%"),
++                     "%c prints the low byte; unknown and trailing % are copied without taking an argument");
++            t.Equals(args.fetched.size(), size_t(5u), "only the five real conversions read arguments");
++        });
++
++        tc.Run("IOP printf %s reads guest strings safely", [](TestCase &t)
++        {
++            PrintfArgs args;
++            args.strings[0x2000u] = "abc";
++            args.strings[0x3000u] = std::string(5000u, 'x');
++            args.words = {0x2000u, 0x2000u, 0x2000u, 0x2000u, 0u, 0x1F801070u, 0x3000u};
++            const std::string text = args.format("%s|%.2s|%5s|%-5s|%s|%s|%s");
++            t.Equals(text.substr(0, 26u), std::string("abc|ab|  abc|abc  |(null)|"),
++                     "precision cuts, width pads, a null pointer prints (null)");
++            t.Equals(text.substr(26u, 6u), std::string("<bad>|"), "an unreadable pointer prints <bad>");
++            t.Equals(text.size(), size_t(32u + ps2x::iop::detail::kIopPrintfMaxString),
++                     "a long guest string is cut at the maximum string length");
++        });
++
++        tc.Run("IOP printf output is bounded", [](TestCase &t)
++        {
++            PrintfArgs single;
++            single.words = {1u};
++            const std::string one = single.format("%999999999d");
++            t.IsTrue(one.size() <= ps2x::iop::detail::kIopPrintfMaxOutput, "a huge width is clamped to the output cap");
++            t.IsTrue(!one.empty() && one.back() == '1', "the value is still printed after the padding");
++
++            PrintfArgs many;
++            many.words = std::vector<uint32_t>(64u, 1u);
++            std::string format;
++            for (int i = 0; i < 20; ++i)
++                format += "%999999999d";
++            t.IsTrue(many.format(format).size() <= ps2x::iop::detail::kIopPrintfMaxOutput,
++                     "many huge widths cannot exceed the output cap");
++        });
++
++        tc.Run("IOP printf import formats a0 with a1-a3 and the guest stack", [](TestCase &t)
++        {
++            StdioRig rig;
++            rig.putString(0x10000u, "%d %d %d %d %d");
++            rig.cpu.gpr[4] = 0x10000u;
++            rig.cpu.gpr[5] = 1u;
++            rig.cpu.gpr[6] = 2u;
++            rig.cpu.gpr[7] = 3u;
++            rig.cpu.gpr[29] = 0x20000u;
++            rig.memory.write32(0x20010u, 4u);
++            rig.memory.write32(0x20014u, 5u);
++            t.IsTrue(rig.call(4u), "printf is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP printf] 1 2 3 4 5"), "varargs: a1, a2, a3, then sp+16, sp+20");
++            t.Equals(rig.cpu.gpr[2], 9u, "v0 is the length of the produced text");
++
++            rig.putString(0x10100u, "WARNING: Closing file %p with status %d will probably be fatal\n");
++            rig.cpu.gpr[4] = 0x10100u;
++            rig.cpu.gpr[5] = 0x0012AB40u;
++            rig.cpu.gpr[6] = 0xFFFFFFFEu;
++            t.IsTrue(rig.call(4u), "printf is handled");
++            const std::string warning = "WARNING: Closing file 0x0012ab40 with status -2 will probably be fatal\n";
++            t.Equals(rig.lastLog(), "[IOP printf] [harmless warning from the original game] " + warning,
++                     "the game's warning comes out filled and tagged as known");
++            t.Equals(rig.cpu.gpr[2], static_cast<uint32_t>(warning.size()), "v0 counts the formatted text, not the tag");
++        });
++
++        tc.Run("IOP known game warnings are recognized only for the two AUDIO/CORE race messages", [](TestCase &t)
++        {
++            using ps2x::iop::detail::isKnownHarmlessGameWarning;
++            t.IsTrue(isKnownHarmlessGameWarning(
++                         "WARNING: Closing file 0x000e1700 with status 2 will probably be fatal\n"),
++                     "AUDIO.IRX closing a file with a read in flight");
++            t.IsTrue(isKnownHarmlessGameWarning("IOP FATAL ERROR: callback received when status is 0\n"),
++                     "CORE.IRX finishing that read after the close");
++            t.IsFalse(isKnownHarmlessGameWarning("WARNING: Closing file 0x000e1700\n"),
++                      "another closing message is not tagged");
++            t.IsFalse(isKnownHarmlessGameWarning("IOP FATAL ERROR: out of memory\n"), "other fatal errors are not tagged");
++            t.IsFalse(isKnownHarmlessGameWarning(""), "empty text is not tagged");
++        });
++
++        tc.Run("IOP fdprintf and vfdprintf imports format their arguments", [](TestCase &t)
++        {
++            StdioRig rig;
++            rig.putString(0x10000u, "IOP FATAL ERROR: callback received when status is %d\n");
++            rig.cpu.gpr[4] = 1u;
++            rig.cpu.gpr[5] = 0x10000u;
++            rig.cpu.gpr[6] = 3u;
++            t.IsTrue(rig.call(9u), "fdprintf is handled");
++            const std::string fatal = "IOP FATAL ERROR: callback received when status is 3\n";
++            t.Equals(rig.lastLog(), "[IOP fdprintf] [harmless warning from the original game] " + fatal,
++                     "fdprintf: fd in a0, format in a1, first value in a2; known warning tagged");
++            t.Equals(rig.cpu.gpr[2], static_cast<uint32_t>(fatal.size()), "v0 counts the formatted text");
++
++            rig.putString(0x10100u, "%d %d %d");
++            rig.cpu.gpr[5] = 0x10100u;
++            rig.cpu.gpr[6] = 1u;
++            rig.cpu.gpr[7] = 2u;
++            rig.cpu.gpr[29] = 0x20000u;
++            rig.memory.write32(0x20010u, 3u);
++            t.IsTrue(rig.call(9u), "fdprintf is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP fdprintf] 1 2 3"), "fdprintf varargs: a2, a3, then sp+16");
++
++            rig.putString(0x10200u, "%s=%x");
++            rig.putString(0x10300u, "name");
++            rig.memory.write32(0x30000u, 0x10300u);
++            rig.memory.write32(0x30004u, 0x1Fu);
++            rig.cpu.gpr[5] = 0x10200u;
++            rig.cpu.gpr[6] = 0x30000u;
++            t.IsTrue(rig.call(14u), "vfdprintf is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP vfdprintf] name=1f"), "vfdprintf: the va_list in a2");
++            t.Equals(rig.cpu.gpr[2], 7u, "v0 counts the formatted text");
++        });
++
++        tc.Run("IOP printf import survives bad pointers", [](TestCase &t)
++        {
++            StdioRig rig;
++            rig.putString(0x10000u, "[%s][%s]");
++            rig.cpu.gpr[4] = 0x10000u;
++            rig.cpu.gpr[5] = 0x1F801070u; // I_STAT: a hardware register, never read as a string
++            rig.cpu.gpr[6] = 0u;
++            t.IsTrue(rig.call(4u), "printf is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP printf] [<bad>][(null)]"), "bad and null %s pointers");
++
++            rig.putString(0x10100u, "%x %x");
++            rig.cpu.gpr[5] = 0x10100u;
++            rig.cpu.gpr[6] = 0xFFFFFFF0u; // a va_list outside RAM reads zeros
++            t.IsTrue(rig.call(14u), "vfdprintf is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP vfdprintf] 0 0"), "a bad va_list reads zeros");
++        });
++
++        tc.Run("IOP puts/fdputs and the traced CD imports keep their results", [](TestCase &t)
++        {
++            StdioRig rig;
++            rig.putString(0x10000u, "hi %d");
++            rig.cpu.gpr[4] = 0x10000u;
++            t.IsTrue(rig.call(7u), "puts is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP puts] hi %d"), "puts logs its text unformatted");
++            t.Equals(rig.cpu.gpr[2], 6u, "puts returns the length plus the newline");
++            t.IsTrue(rig.call(12u), "fdputs is handled");
++            t.Equals(rig.lastLog(), std::string("[IOP fdputs] hi %d"), "fdputs logs its text unformatted");
++            t.Equals(rig.cpu.gpr[2], 5u, "fdputs returns the length");
++
++            ps2x::iop::detail::IopKernel kernel(rig.memory);
++            ps2x::iop::detail::IopCdvd cdvd(rig.host, rig.memory, kernel);
++            ps2x::iop::detail::IopCpuState cpu{};
++            cpu.gpr[4] = 0u; // sceCdInit(SCECdINIT)
++            t.IsTrue(cdvd.dispatchImport(4u, cpu) && cpu.gpr[2] == 1u, "sceCdInit returns 1");
++            cpu.gpr[4] = 0x1234u;
++            cpu.gpr[28] = 0x5678u;
++            t.IsTrue(cdvd.dispatchImport(37u, cpu) && cpu.gpr[2] == 0u, "sceCdCallback returns the previous (none)");
++            cpu.gpr[4] = 0x2000u;
++            t.IsTrue(cdvd.dispatchImport(37u, cpu) && cpu.gpr[2] == 0x1234u, "and then the one set before");
++            cpu.gpr[4] = 1u;
++            t.IsTrue(cdvd.dispatchImport(11u, cpu) && cpu.gpr[2] == 0u, "sceCdSync(1) without a clock is not busy");
++            cpu.gpr[4] = 100u;
++            t.IsTrue(cdvd.dispatchImport(7u, cpu) && cpu.gpr[2] == 1u, "sceCdSeek returns 1");
++            t.IsTrue(static_cast<bool>(cdvd.takeCompletionCallback()), "the seek queues the callback set last");
++        });
++
++        tc.Run("PS2X_IOP_TRAZA_CD value parsing", [](TestCase &t)
++        {
++            t.IsTrue(ps2x::iop::detail::iopTrazaCdValue("1"), "1 turns the CD trace on");
++            t.IsFalse(ps2x::iop::detail::iopTrazaCdValue("0"), "0 leaves it off");
++            t.IsFalse(ps2x::iop::detail::iopTrazaCdValue(""), "an empty value leaves it off");
++            t.IsFalse(ps2x::iop::detail::iopTrazaCdValue(nullptr), "unset leaves it off");
++        });
++    });
+ }

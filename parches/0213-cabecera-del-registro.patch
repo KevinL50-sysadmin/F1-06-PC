@@ -1,0 +1,914 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 80c2234..40682f4 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -425,6 +425,9 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_vigilante.cpp
+     src/lib/ps2_vigilante_win.cpp
+     src/lib/ps2_salida.cpp
++    src/lib/ps2_cabecera.cpp
++    src/lib/ps2_cabecera_win.cpp
++    src/lib/ps2_version.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+@@ -432,6 +435,37 @@ add_library(ps2_runtime STATIC
+     src/lib/games_database.cpp
+ )
+ 
++# odd/tasks/fallos-con-log.md T3a: la version del paquete (scripts/paquete/version.txt del proyecto F1 06, la misma que
++# usa scripts/empaquetar.ps1) y el commit de git (hash corto, -dirty con cambios sin confirmar), para la cabecera del
++# registro. Solo ps2_version.cpp recibe estos defines: cambiarlos recompila ese archivo y nada mas (un define global
++# recompilaria las 14.000 funciones traducidas). Se leen al configurar (compilar-runner.cmd configura siempre).
++get_filename_component(PS2X_F1_RAIZ "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
++set(PS2X_VERSION_DEFINES)
++set(PS2X_VERSION_ARCHIVO "${PS2X_F1_RAIZ}/scripts/paquete/version.txt")
++if(EXISTS "${PS2X_VERSION_ARCHIVO}")
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS2X_VERSION_ARCHIVO}")
++    file(STRINGS "${PS2X_VERSION_ARCHIVO}" PS2X_VERSION_PAQUETE LIMIT_COUNT 1 REGEX "^[0-9A-Za-z.+-]+")
++    string(STRIP "${PS2X_VERSION_PAQUETE}" PS2X_VERSION_PAQUETE)
++    if(PS2X_VERSION_PAQUETE)
++        list(APPEND PS2X_VERSION_DEFINES "PS2X_VERSION_PAQUETE=\"${PS2X_VERSION_PAQUETE}\"")
++    endif()
++endif()
++find_package(Git QUIET)
++if(GIT_FOUND AND EXISTS "${PS2X_F1_RAIZ}/.git")
++    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${PS2X_F1_RAIZ}" rev-parse --short HEAD
++        OUTPUT_VARIABLE PS2X_VERSION_GIT RESULT_VARIABLE PS2X_GIT_RESULTADO OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
++    if(PS2X_GIT_RESULTADO EQUAL 0 AND PS2X_VERSION_GIT)
++        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${PS2X_F1_RAIZ}" status --porcelain
++            OUTPUT_VARIABLE PS2X_GIT_CAMBIOS OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
++        if(PS2X_GIT_CAMBIOS)
++            string(APPEND PS2X_VERSION_GIT "-dirty")
++        endif()
++        list(APPEND PS2X_VERSION_DEFINES "PS2X_VERSION_GIT=\"${PS2X_VERSION_GIT}\"")
++    endif()
++endif()
++message(STATUS "F1 06 version: ${PS2X_VERSION_DEFINES}")
++set_source_files_properties(src/lib/ps2_version.cpp PROPERTIES COMPILE_DEFINITIONS "${PS2X_VERSION_DEFINES}")
++
+ if(MSVC)
+     # The hot paths of the runtime (VU1 interpreter, software GS rasterizer, VIF) are built from many small
+     # out-of-class helpers. Builds that pass /Ob1 globally (to keep the translated functions quick to compile) never
+@@ -611,6 +645,8 @@ target_link_libraries(ps2_runtime PRIVATE ffmpeg)
+ # Fase 5 (T15): the netplay (Winsock 2) and its random nonces (BCryptGenRandom).
+ if(WIN32)
+     target_link_libraries(ps2_runtime PRIVATE shell32 ole32)
++    # fallos-con-log T3a: el plan de energia activo para la cabecera del registro (PowerGetActiveScheme).
++    target_link_libraries(ps2_runtime PRIVATE powrprof)
+     target_link_libraries(ps2_runtime PUBLIC ws2_32 bcrypt)
+ endif()
+ # Fase 5 (T15, N4): the guest's form has Spanish texts in UTF-8 (accents), drawn with a Windows font.
+diff --git a/ps2xRuntime/include/ps2_cabecera.h b/ps2xRuntime/include/ps2_cabecera.h
+new file mode 100644
+index 0000000..90a1864
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_cabecera.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <cstdint>
++#include <map>
++#include <ostream>
++#include <string>
++#include <string_view>
++
++// Cabecera del registro (odd/tasks/fallos-con-log.md T3a, S3): al abrirse F1-06.log, unas lineas cortas que dicen que
++// compilacion, en que PC y con que opciones va el juego de quien manda el registro:
++//   [version] 1.1.2 git=1a2b3c4-dirty compilado=2026-11-19T10:22Z
++//   [version] compilacion: F1-06.exe fecha_pe=6736A0F1 tam_imagen=04B2D000 pdb=ps2EntryRunner.pdb guid=... edad=1 base=0x...
++//   [sistema] windows=10.0.26300.7171 cpu="AMD Ryzen 7 5800X 8-Core Processor" hilos=16 nucleos=8 ram=31.9GB energia="Equilibrado" recomplauncher=no
++//   [opciones] efectivas: pantalla=ventana ... gs=cpu* ... (*=por variable de entorno)
++// La linea "compilacion:" es la del vigilante (ps2_vigilante.h, identidadCompilacion): con ella se encuentra el PDB.
++namespace ps2x::cabecera
++{
++    // La version del paquete (scripts/paquete/version.txt del proyecto, tambien la de scripts/empaquetar.ps1) y el
++    // commit de git (hash corto, "-dirty" con cambios sin confirmar) con que se compilo; "desconocida" / "desconocido"
++    // si CMake no los encontro. Solo ps2_version.cpp recibe esos defines (cambiarlos no recompila nada mas).
++    const char *versionPaquete();
++    const char *versionGit();
++
++    // La marca de tiempo del PE (segundos desde 1970, UTC) como 2026-11-19T10:22Z; 0: "desconocida".
++    std::string fechaDeMarca(uint32_t marca);
++
++    // "[version] <paquete> git=<git> compilado=<fecha>"; vacios: desconocida / desconocido / desconocida.
++    std::string lineaVersion(std::string_view paquete, std::string_view git, std::string_view compilado);
++
++    struct Sistema
++    {
++        std::string windows;        // 10.0.26300.7171 (mayor.menor.compilacion.revision); vacio: desconocido
++        std::string cpu;            // nombre del procesador (CPUID); vacio: desconocida
++        unsigned hilos = 0u;        // procesadores logicos; 0: desconocido
++        unsigned nucleos = 0u;      // nucleos fisicos; 0: desconocido
++        unsigned nucleosP = 0u;     // con nucleos de dos clases (P y E): los de rendimiento; si no, 0
++        unsigned nucleosE = 0u;     // y los de eficiencia
++        uint64_t ramBytes = 0u;     // memoria fisica total; 0: desconocida
++        std::string energia;        // nombre del plan de energia activo; vacio: desconocido
++        std::string recomplauncher; // valor de RECOMPLAUNCHER_VERSION; vacio: no
++    };
++
++    // "[sistema] windows=.. cpu=".." hilos=N nucleos=N[(PP+EE)] ram=N.NGB energia=".." recomplauncher=.."
++    std::string lineaSistema(const Sistema &sistema);
++
++    // "[opciones] efectivas: clave=valor ..." en el orden de optionSpecs() (ps2_options.h), solo las claves que esten
++    // en valores; las de forzadas (puestas por una variable de entorno) llevan '*' y la linea acaba en
++    // " (*=por variable de entorno)". Un valor vacio o con espacios va entre comillas.
++    std::string lineaOpciones(const std::map<std::string, std::string> &valores,
++                              const std::map<std::string, std::string> &forzadas);
++
++    // Lo que hay en este PC (Windows; en otros sistemas, todo desconocido salvo recomplauncher). No lanza.
++    Sistema leerSistema();
++
++    // Escribe la cabecera en out: version, compilacion, sistema y, si applyOptionsFile ya ha corrido, las opciones
++    // efectivas (startupOptions(): el archivo, el modo y las forzadas por variable). Nunca lanza: lo que falle sale
++    // como "[cabecera] error: ..." y el arranque sigue.
++    void escribir(std::ostream &out);
++}
+diff --git a/ps2xRuntime/include/ps2_vigilante.h b/ps2xRuntime/include/ps2_vigilante.h
+index 5ddadcb..72315e0 100644
+--- a/ps2xRuntime/include/ps2_vigilante.h
++++ b/ps2xRuntime/include/ps2_vigilante.h
+@@ -3,6 +3,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -85,4 +86,10 @@ namespace ps2x::vigilante
+     // "Vigilante" (Detector::parado tras su ultima muestra). false si el vigilante no corre o no hay latido con ese
+     // nombre. Seguro entre hilos.
+     bool latidoParado(std::string_view nombre);
++
++    // odd/tasks/fallos-con-log.md T3a: la identidad de esta compilacion, lo mismo que la linea "compilacion:" del
++    // informe sin su prefijo ("<exe> fecha_pe=.. tam_imagen=.. pdb=.. guid=.. edad=N base=0x.."), para la cabecera del
++    // registro; y la fecha del PE (segundos desde 1970, UTC). Fuera de Windows, vacia y 0.
++    std::string identidadCompilacion();
++    uint32_t marcaTiempoPe();
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_cabecera.cpp b/ps2xRuntime/src/lib/ps2_cabecera.cpp
+new file mode 100644
+index 0000000..ce22383
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_cabecera.cpp
+@@ -0,0 +1,154 @@
++// Cabecera del registro (odd/tasks/fallos-con-log.md T3a; ps2_cabecera.h): el formato de sus lineas y escribir().
++#include "ps2_cabecera.h"
++
++#include "ps2_options.h"
++#include "ps2_vigilante.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++#include <exception>
++#include <fstream>
++#include <sstream>
++
++namespace ps2x::cabecera
++{
++    namespace
++    {
++        std::string oDesconocido(std::string_view valor, const char *desconocido)
++        {
++            return valor.empty() ? std::string(desconocido) : std::string(valor);
++        }
++
++        // Entre comillas si esta vacio o tiene espacios (asi cada clave=valor se separa por espacios).
++        std::string paraLinea(std::string_view valor)
++        {
++            if (!valor.empty() && valor.find(' ') == std::string_view::npos)
++                return std::string(valor);
++            return "\"" + std::string(valor) + "\"";
++        }
++
++        std::string conocidoParaLinea(std::string_view valor, const char *desconocido)
++        {
++            return valor.empty() ? std::string(desconocido) : paraLinea(valor);
++        }
++    }
++
++    std::string fechaDeMarca(uint32_t marca)
++    {
++        if (marca == 0u)
++            return "desconocida";
++        const std::time_t segundos = static_cast<std::time_t>(marca);
++        std::tm utc{};
++#if defined(_WIN32)
++        if (gmtime_s(&utc, &segundos) != 0)
++            return "desconocida";
++#else
++        if (gmtime_r(&segundos, &utc) == nullptr)
++            return "desconocida";
++#endif
++        char texto[32] = {};
++        std::strftime(texto, sizeof(texto), "%Y-%m-%dT%H:%MZ", &utc);
++        return texto;
++    }
++
++    std::string lineaVersion(std::string_view paquete, std::string_view git, std::string_view compilado)
++    {
++        return "[version] " + oDesconocido(paquete, "desconocida") + " git=" + oDesconocido(git, "desconocido") +
++               " compilado=" + oDesconocido(compilado, "desconocida");
++    }
++
++    std::string lineaSistema(const Sistema &s)
++    {
++        std::string linea = "[sistema] windows=" + oDesconocido(s.windows, "desconocido");
++        linea += " cpu=" + conocidoParaLinea(s.cpu, "desconocida");
++        linea += " hilos=" + (s.hilos != 0u ? std::to_string(s.hilos) : std::string("desconocido"));
++        linea += " nucleos=" + (s.nucleos != 0u ? std::to_string(s.nucleos) : std::string("desconocido"));
++        if (s.nucleos != 0u && s.nucleosP != 0u && s.nucleosE != 0u)
++            linea += "(" + std::to_string(s.nucleosP) + "P+" + std::to_string(s.nucleosE) + "E)";
++        linea += " ram=";
++        if (s.ramBytes != 0u)
++        {
++            char gb[32] = {};
++            std::snprintf(gb, sizeof(gb), "%.1fGB", static_cast<double>(s.ramBytes) / static_cast<double>(1ull << 30));
++            linea += gb;
++        }
++        else
++            linea += "desconocida";
++        linea += " energia=" + conocidoParaLinea(s.energia, "desconocido");
++        linea += " recomplauncher=" + conocidoParaLinea(s.recomplauncher, "no");
++        return linea;
++    }
++
++    std::string lineaOpciones(const std::map<std::string, std::string> &valores,
++                              const std::map<std::string, std::string> &forzadas)
++    {
++        std::string linea = "[opciones] efectivas:";
++        bool hayForzadas = false;
++        for (const OptionSpec &spec : optionSpecs())
++        {
++            const auto valor = valores.find(spec.key);
++            if (valor == valores.end())
++                continue;
++            linea += " ";
++            linea += spec.key;
++            linea += "=" + paraLinea(valor->second);
++            if (forzadas.count(spec.key) != 0u)
++            {
++                linea += "*";
++                hayForzadas = true;
++            }
++        }
++        if (hayForzadas)
++            linea += " (*=por variable de entorno)";
++        return linea;
++    }
++
++    void escribir(std::ostream &out)
++    {
++        // Cada linea por su cuenta: si una falla, las demas salen igual.
++        const auto linea = [&out](const char *que, auto &&hacer)
++        {
++            try
++            {
++                out << hacer() << '\n';
++            }
++            catch (const std::exception &e)
++            {
++                out << "[cabecera] error (" << que << "): " << e.what() << '\n';
++            }
++            catch (...)
++            {
++                out << "[cabecera] error (" << que << ")\n";
++            }
++        };
++        linea("version", []
++              { return lineaVersion(versionPaquete(), versionGit(), fechaDeMarca(vigilante::marcaTiempoPe())); });
++        linea("compilacion", []
++              {
++                  const std::string identidad = vigilante::identidadCompilacion();
++                  return "[version] compilacion: " + (identidad.empty() ? std::string("desconocida") : identidad);
++              });
++        linea("sistema", [] { return lineaSistema(leerSistema()); });
++        // Las opciones como las usa el juego: las del archivo, salvo las que fija una variable puesta antes de
++        // applyOptionsFile (lo mismo que muestra el menu, makeOptionsMenuModel).
++        const StartupOptions &inicio = startupOptions();
++        if (!inicio.file.empty())
++            linea("opciones", [&inicio]
++                  {
++                      std::string texto;
++                      if (std::ifstream in(inicio.file, std::ios::binary); in)
++                      {
++                          std::stringstream contenido;
++                          contenido << in.rdbuf();
++                          texto = contenido.str();
++                      }
++                      const auto entorno = [](const char *nombre)
++                      { return static_cast<const char *>(std::getenv(nombre)); };
++                      const OptionsMenuModel modelo =
++                          makeOptionsMenuModel(texto, inicio.development, inicio.forced, entorno);
++                      return lineaOpciones(modelo.current, inicio.forced);
++                  });
++        out.flush();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_cabecera_win.cpp b/ps2xRuntime/src/lib/ps2_cabecera_win.cpp
+new file mode 100644
+index 0000000..eb98cd9
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_cabecera_win.cpp
+@@ -0,0 +1,173 @@
++// Cabecera del registro (odd/tasks/fallos-con-log.md T3a; ps2_cabecera.h): lo que se lee del PC para la linea
++// [sistema]. Cada dato por su cuenta: si uno no se puede leer queda desconocido y los demas salen igual.
++#include "ps2_cabecera.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <powrprof.h>
++#include <intrin.h>
++#endif
++
++namespace ps2x::cabecera
++{
++#if defined(_WIN32)
++    namespace
++    {
++        std::string aUtf8(const wchar_t *texto)
++        {
++            if (texto == nullptr || *texto == L'\0')
++                return {};
++            const int n = WideCharToMultiByte(CP_UTF8, 0, texto, -1, nullptr, 0, nullptr, nullptr);
++            if (n <= 1)
++                return {};
++            std::string utf8(static_cast<size_t>(n), '\0');
++            WideCharToMultiByte(CP_UTF8, 0, texto, -1, utf8.data(), n, nullptr, nullptr);
++            utf8.resize(static_cast<size_t>(n - 1));
++            return utf8;
++        }
++
++        std::string recortar(std::string texto)
++        {
++            const size_t inicio = texto.find_first_not_of(' ');
++            if (inicio == std::string::npos)
++                return {};
++            const size_t fin = texto.find_last_not_of(' ');
++            return texto.substr(inicio, fin - inicio + 1u);
++        }
++
++        // RtlGetVersion (GetVersionEx miente sin manifiesto) y la revision (UBR) del registro.
++        std::string versionDeWindows()
++        {
++            using RtlGetVersionFn = LONG(WINAPI *)(PRTL_OSVERSIONINFOW);
++            const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++            const auto leer =
++                ntdll != nullptr ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
++            RTL_OSVERSIONINFOW info{};
++            info.dwOSVersionInfoSize = sizeof(info);
++            if (leer == nullptr || leer(&info) != 0)
++                return {};
++            std::string version = std::to_string(info.dwMajorVersion) + "." + std::to_string(info.dwMinorVersion) +
++                                  "." + std::to_string(info.dwBuildNumber);
++            DWORD ubr = 0u;
++            DWORD tam = sizeof(ubr);
++            if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"UBR",
++                             RRF_RT_REG_DWORD, nullptr, &ubr, &tam) == ERROR_SUCCESS)
++                version += "." + std::to_string(ubr);
++            return version;
++        }
++
++        std::string nombreDeCpu()
++        {
++            int registros[4] = {};
++            __cpuid(registros, static_cast<int>(0x80000000u));
++            if (static_cast<unsigned>(registros[0]) < 0x80000004u)
++                return {};
++            char nombre[49] = {};
++            for (unsigned i = 0u; i < 3u; ++i)
++            {
++                __cpuid(registros, static_cast<int>(0x80000002u + i));
++                std::memcpy(nombre + i * 16u, registros, 16u);
++            }
++            return recortar(nombre);
++        }
++
++        // Nucleos fisicos y, con dos clases de eficiencia (Intel hibridos), cuantos de cada una.
++        void nucleos(Sistema &s)
++        {
++            s.hilos = static_cast<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
++            DWORD tam = 0u;
++            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &tam);
++            if (tam == 0u)
++                return;
++            std::vector<unsigned char> bufer(tam);
++            auto *info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(bufer.data());
++            if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &tam))
++                return;
++            unsigned total = 0u;
++            unsigned maxima = 0u;
++            unsigned minima = 255u;
++            std::vector<unsigned> clases;
++            for (DWORD desp = 0u; desp < tam;)
++            {
++                const auto *nucleo = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(bufer.data() + desp);
++                if (nucleo->Size == 0u)
++                    break;
++                if (nucleo->Relationship == RelationProcessorCore)
++                {
++                    const unsigned clase = nucleo->Processor.EfficiencyClass;
++                    clases.push_back(clase);
++                    maxima = clase > maxima ? clase : maxima;
++                    minima = clase < minima ? clase : minima;
++                    ++total;
++                }
++                desp += nucleo->Size;
++            }
++            s.nucleos = total;
++            if (total != 0u && maxima != minima)
++            {
++                // La clase mas alta es la de rendimiento.
++                for (const unsigned clase : clases)
++                    ++(clase == maxima ? s.nucleosP : s.nucleosE);
++            }
++        }
++
++        std::string planDeEnergia()
++        {
++            GUID *activo = nullptr;
++            if (PowerGetActiveScheme(nullptr, &activo) != ERROR_SUCCESS || activo == nullptr)
++                return {};
++            std::string nombre;
++            DWORD tam = 0u;
++            if (PowerReadFriendlyName(nullptr, activo, nullptr, nullptr, nullptr, &tam) == ERROR_SUCCESS && tam > 0u)
++            {
++                std::vector<wchar_t> texto(tam / sizeof(wchar_t) + 1u, L'\0');
++                if (PowerReadFriendlyName(nullptr, activo, nullptr, nullptr, reinterpret_cast<UCHAR *>(texto.data()),
++                                          &tam) == ERROR_SUCCESS)
++                    nombre = aUtf8(texto.data());
++            }
++            LocalFree(activo);
++            return nombre;
++        }
++    }
++
++    Sistema leerSistema()
++    {
++        Sistema s;
++        try
++        {
++            s.windows = versionDeWindows();
++            s.cpu = nombreDeCpu();
++            nucleos(s);
++            MEMORYSTATUSEX memoria{};
++            memoria.dwLength = sizeof(memoria);
++            if (GlobalMemoryStatusEx(&memoria))
++                s.ramBytes = memoria.ullTotalPhys;
++            s.energia = planDeEnergia();
++        }
++        catch (...)
++        {
++        }
++        if (const char *launcher = std::getenv("RECOMPLAUNCHER_VERSION"); launcher != nullptr)
++            s.recomplauncher = launcher;
++        return s;
++    }
++#else
++    Sistema leerSistema()
++    {
++        Sistema s;
++        if (const char *launcher = std::getenv("RECOMPLAUNCHER_VERSION"); launcher != nullptr)
++            s.recomplauncher = launcher;
++        return s;
++    }
++#endif
++}
+diff --git a/ps2xRuntime/src/lib/ps2_version.cpp b/ps2xRuntime/src/lib/ps2_version.cpp
+new file mode 100644
+index 0000000..4203efe
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_version.cpp
+@@ -0,0 +1,23 @@
++// odd/tasks/fallos-con-log.md T3a: la version del paquete y el commit de git con que se compilo. Los defines solo los
++// recibe este archivo (ps2xRuntime/CMakeLists.txt): cambiarlos no recompila nada mas.
++#include "ps2_cabecera.h"
++
++#ifndef PS2X_VERSION_PAQUETE
++#define PS2X_VERSION_PAQUETE "desconocida"
++#endif
++#ifndef PS2X_VERSION_GIT
++#define PS2X_VERSION_GIT "desconocido"
++#endif
++
++namespace ps2x::cabecera
++{
++    const char *versionPaquete()
++    {
++        return PS2X_VERSION_PAQUETE;
++    }
++
++    const char *versionGit()
++    {
++        return PS2X_VERSION_GIT;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+index 2062552..c996890 100644
+--- a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+@@ -128,6 +128,11 @@ namespace ps2x::vigilante
+                     WriteFile(g_salida, m_bufer, static_cast<DWORD>(m_n), &escritos, nullptr);
+                 m_n = 0u;
+             }
++            // T3a (fallos-con-log): lo escrito hasta ahora, sin escribirlo.
++            std::string_view vista() const
++            {
++                return std::string_view(m_bufer, m_n);
++            }
+ 
+         private:
+             char m_bufer[640];
+@@ -315,16 +320,16 @@ namespace ps2x::vigilante
+ 
+         // Exe, fecha del PE, tamano de la imagen, PDB (GUID y edad del registro CodeView RSDS) y base: con esto se
+         // encuentra el PDB guardado de esta compilacion.
+-        void escribirIdentidad()
++        // fallos-con-log T3a: tambien para la cabecera del registro (identidadCompilacion).
++        void identidad(Linea &l)
+         {
+-            Linea l;
+             const auto *base = reinterpret_cast<const uint8_t *>(GetModuleHandleW(nullptr));
+             wchar_t rutaW[MAX_PATH] = {};
+             char exe[MAX_PATH] = {};
+             GetModuleFileNameW(nullptr, rutaW, MAX_PATH);
+             const wchar_t *barra = wcsrchr(rutaW, L'\\');
+             aUtf8(barra != nullptr ? barra + 1 : rutaW, exe, sizeof(exe));
+-            inicio(l).texto("compilacion: ").texto(exe);
++            l.texto(exe);
+             if (const IMAGE_NT_HEADERS64 *nt = cabeceras(base))
+             {
+                 l.texto(" fecha_pe=").hex(nt->FileHeader.TimeDateStamp, 8);
+@@ -341,6 +346,13 @@ namespace ps2x::vigilante
+                 }
+             }
+             l.texto(" base=0x").hex(reinterpret_cast<uint64_t>(base), 16);
++        }
++
++        void escribirIdentidad()
++        {
++            Linea l;
++            inicio(l).texto("compilacion: ");
++            identidad(l);
+             l.escribir();
+         }
+ 
+@@ -596,6 +608,19 @@ namespace ps2x::vigilante
+         return true;
+     }
+ 
++    std::string identidadCompilacion()
++    {
++        Linea l;
++        identidad(l);
++        return std::string(l.vista());
++    }
++
++    uint32_t marcaTiempoPe()
++    {
++        const IMAGE_NT_HEADERS64 *nt = cabeceras(reinterpret_cast<const uint8_t *>(GetModuleHandleW(nullptr)));
++        return nt != nullptr ? nt->FileHeader.TimeDateStamp : 0u;
++    }
++
+     bool latidoParado(std::string_view nombre)
+     {
+         if (!g_arrancado.load(std::memory_order_relaxed))
+@@ -612,6 +637,16 @@ namespace ps2x::vigilante
+         g_ventana.store(static_cast<HWND>(ventana), std::memory_order_relaxed);
+     }
+ #else
++    std::string identidadCompilacion()
++    {
++        return {};
++    }
++
++    uint32_t marcaTiempoPe()
++    {
++        return 0u;
++    }
++
+     bool latidoParado(std::string_view nombre)
+     {
+         (void)nombre;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index c021407..ab819d7 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2_disc_setup.h"
+ #include "ps2_vigilante.h"
+ #include "ps2_salida.h"
++#include "ps2_cabecera.h"
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -169,10 +170,13 @@ namespace
+     // already redirected (the test scripts) are left alone, unless RecompLauncher started the game
+     // (RECOMPLAUNCHER_VERSION; its crash reports carry the log); PS2X_LOG=0 (registro = 0 in settings.ini) keeps the
+     // console (ps2x::shouldWriteLogFile). Fase 5 (T15): the netplay guest writes <exe name>-invitado.log (logName), so a host on the same PC
+-    // keeps its own.
++    // keeps its own. odd/tasks/fallos-con-log.md T3a: the log starts with the header of ps2_cabecera.h (version, build,
++    // system, effective options). Called at most once (g_logAttempted).
++    bool g_logAttempted = false;
+     void redirectConsoleToLogFile(const std::filesystem::path &executable, const std::filesystem::path &directory,
+                                   const std::string &logName)
+     {
++        g_logAttempted = true;
+ #if defined(_WIN32)
+         if (!ps2x::shouldWriteLogFile(_isatty(_fileno(stdout)) != 0, std::getenv("RECOMPLAUNCHER_VERSION"),
+                                       std::getenv("PS2X_LOG")))
+@@ -191,6 +195,7 @@ namespace
+         char stamp[32] = {};
+         std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+         std::cout << "[registro] " << stamp << " " << ps2x::pathForLog(executable) << std::endl;
++        ps2x::cabecera::escribir(std::cout);
+ #else
+         (void)executable;
+         (void)directory;
+@@ -198,6 +203,30 @@ namespace
+ #endif
+     }
+ 
++    // fallos-con-log T3a: an error before the log opened (no game folder, a boot source that throws, settings that
++    // cannot be read) opens it now, in the default folder of the mode (resolveUserPaths only computes it), with what
++    // was waiting for it, so the player's log has the error. Never throws.
++    void openLogLate(const std::filesystem::path &executable, bool guest)
++    {
++        try
++        {
++            std::error_code error;
++            const std::filesystem::path exeDirectory =
++                executable.empty() ? std::filesystem::current_path(error) : executable.parent_path();
++            const ps2x::UserPathsMode mode = ps2x::chooseUserPathsMode(false, exeDirectory);
++            const bool installed = mode == ps2x::UserPathsMode::Installed;
++            const ps2x::UserPaths paths = ps2x::resolveUserPaths(
++                mode, exeDirectory, installed ? ps2x::knownDocumentsDirectory() : std::filesystem::path{},
++                installed ? ps2x::knownLocalAppDataDirectory() : std::filesystem::path{});
++            redirectConsoleToLogFile(executable, paths.logsDirectory,
++                                     (executable.empty() ? std::string("F1-06") : executable.stem().string()) +
++                                         (guest ? "-invitado" : ""));
++        }
++        catch (...)
++        {
++        }
++    }
++
+     // Phase 1: where the player's files live (ps2_user_paths.h). Renames the v1.1.0 names (v1.1.1: partidas, registros,
+     // capturas, opciones.ini, controles.ini), moves or copies the old layout next to the .exe, creates the folders,
+     // reads settings.ini into the PS2X_* variables that are not set and returns the lines for the log, which only
+@@ -441,9 +470,16 @@ int main(int argc, char *argv[])
+ #endif
+     setupTerminateLogger();
+ 
++    // fallos-con-log T3a: what is written before the log opens waits here; an error before then opens it late
++    // (openLogLate) and writes this first.
++    std::filesystem::path lateExecutable;
++    bool lateGuest = false;
++    std::ostringstream bootLines;
++    std::vector<std::string> pathLines;
+     try
+     {
+         const std::filesystem::path executable = runningExecutable(argc >= 1 ? argv[0] : nullptr);
++        lateExecutable = executable;
+         // Fase 5 (T15): the netplay arguments go out first; the game sees the rest as before.
+         std::vector<std::string> arguments(argv + std::min(argc, 1), argv + argc);
+         std::error_code currentError;
+@@ -465,7 +501,7 @@ int main(int argc, char *argv[])
+         for (std::string &argument : arguments)
+             gameArgv.push_back(argument.data());
+         const bool guestMode = netplayOk && netplay.mode == ps2x::netplay::NetplayMode::Guest;
+-        std::ostringstream bootLines;
++        lateGuest = guestMode;
+         // v1.1.1: the v1.1.0 datos folder becomes data before the game is looked for, when it is looked for there (no
+         // game argument, no PS2X_ISO). Not by the guest: a host on the same PC may be running from it. Where the rename
+         // fails (Program Files without permission, a file in use) datos is still found (ps2x::iop::dataFolderIn).
+@@ -498,7 +534,6 @@ int main(int argc, char *argv[])
+         BootSource boot = found.value_or(BootSource{});
+         // Development: an ELF given by path (argument or PS2X_DEFAULT_BOOT_ELF) keeps the old layout.
+         const bool development = !discSetup && boot.imagePath.empty() && boot.cardDirectory.empty();
+-        std::vector<std::string> pathLines;
+         const ps2x::UserPaths userPaths = prepareUserPaths(executable, development, guestMode, pathLines);
+         redirectConsoleToLogFile(executable, userPaths.logsDirectory,
+                                  executable.stem().string() + (guestMode ? "-invitado" : ""));
+@@ -506,6 +541,8 @@ int main(int argc, char *argv[])
+             std::cout << bootLines.str();
+         for (const std::string &line : pathLines)
+             std::cout << line << std::endl;
++        bootLines.str({});
++        pathLines.clear();
+         if (discSetup)
+         {
+             const ps2x::disc::SetupOutcome outcome =
+@@ -703,10 +740,20 @@ int main(int argc, char *argv[])
+     }
+     catch (const std::exception &e)
+     {
++        if (!g_logAttempted)
++            openLogLate(lateExecutable, lateGuest);
++        std::cout << bootLines.str();
++        for (const std::string &line : pathLines)
++            std::cout << line << std::endl;
+         std::cerr << "[main] fatal exception: " << e.what() << std::endl;
+     }
+     catch (...)
+     {
++        if (!g_logAttempted)
++            openLogLate(lateExecutable, lateGuest);
++        std::cout << bootLines.str();
++        for (const std::string &line : pathLines)
++            std::cout << line << std::endl;
+         std::cerr << "[main] fatal exception: unknown" << std::endl;
+     }
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 48769db..c537e53 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -50,6 +50,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_game_graphics_tests.cpp
+     src/ps2_vigilante_tests.cpp
+     src/ps2_salida_tests.cpp
++    src/ps2_cabecera_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index e1f9a38..1265940 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -31,6 +31,7 @@ void register_ps2_game_font_tests();
+ void register_ps2_game_graphics_tests();
+ void register_ps2_vigilante_tests();
+ void register_ps2_salida_tests();
++void register_ps2_cabecera_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -66,6 +67,7 @@ int main()
+     register_ps2_game_graphics_tests();
+     register_ps2_vigilante_tests();
+     register_ps2_salida_tests();
++    register_ps2_cabecera_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_cabecera_tests.cpp b/ps2xTest/src/ps2_cabecera_tests.cpp
+new file mode 100644
+index 0000000..a950db2
+--- /dev/null
++++ b/ps2xTest/src/ps2_cabecera_tests.cpp
+@@ -0,0 +1,142 @@
++#include "MiniTest.h"
++#include "ps2_cabecera.h"
++#include "ps2_options.h"
++#include "ps2_vigilante.h"
++
++#include <map>
++#include <sstream>
++#include <string>
++
++// odd/tasks/fallos-con-log.md T3a (S3): the head of F1-06.log says which build, on which PC and with which options,
++// so a player's log identifies the failure.
++namespace
++{
++    using ps2x::cabecera::Sistema;
++
++    bool startsWith(const std::string &text, const std::string &prefix)
++    {
++        return text.compare(0, prefix.size(), prefix) == 0;
++    }
++
++    bool contains(const std::string &text, const std::string &part)
++    {
++        return text.find(part) != std::string::npos;
++    }
++}
++
++void register_ps2_cabecera_tests()
++{
++    MiniTest::Case("Cabecera", [](TestCase &tc)
++    {
++        tc.Run("version line: package version, git commit and build date", [](TestCase &t)
++        {
++            t.Equals(ps2x::cabecera::lineaVersion("1.1.2", "1a2b3c4-dirty", "2026-11-19T10:22Z"),
++                     std::string("[version] 1.1.2 git=1a2b3c4-dirty compilado=2026-11-19T10:22Z"), "all known");
++            t.Equals(ps2x::cabecera::lineaVersion("", "", ""),
++                     std::string("[version] desconocida git=desconocido compilado=desconocida"), "nothing known");
++        });
++
++        tc.Run("PE timestamp as an UTC date", [](TestCase &t)
++        {
++            t.Equals(ps2x::cabecera::fechaDeMarca(0x6736A0F1u), std::string("2024-11-15T01:16Z"), "0x6736A0F1");
++            t.Equals(ps2x::cabecera::fechaDeMarca(0u), std::string("desconocida"), "0: unknown");
++        });
++
++        tc.Run("the version compiled into the build is never empty", [](TestCase &t)
++        {
++            t.IsTrue(*ps2x::cabecera::versionPaquete() != '\0', "package version");
++            t.IsTrue(*ps2x::cabecera::versionGit() != '\0', "git commit");
++        });
++
++        tc.Run("system line: Windows, CPU, threads, cores, RAM, power plan, RecompLauncher", [](TestCase &t)
++        {
++            Sistema s;
++            s.windows = "10.0.26300.7171";
++            s.cpu = "AMD Ryzen 7 5800X 8-Core Processor";
++            s.hilos = 16u;
++            s.nucleos = 8u;
++            s.ramBytes = 32ull << 30;
++            s.energia = "Equilibrado";
++            t.Equals(ps2x::cabecera::lineaSistema(s),
++                     std::string("[sistema] windows=10.0.26300.7171 cpu=\"AMD Ryzen 7 5800X 8-Core Processor\" hilos=16 "
++                                 "nucleos=8 ram=32.0GB energia=Equilibrado recomplauncher=no"),
++                     "one class of cores, no RecompLauncher");
++
++            s.cpu = "12th Gen Intel(R) Core(TM) i7-12700H";
++            s.hilos = 20u;
++            s.nucleos = 14u;
++            s.nucleosP = 6u;
++            s.nucleosE = 8u;
++            s.ramBytes = (16ull << 30) - (200ull << 20);
++            s.energia = "Alto rendimiento";
++            s.recomplauncher = "1.4.0";
++            t.Equals(ps2x::cabecera::lineaSistema(s),
++                     std::string("[sistema] windows=10.0.26300.7171 cpu=\"12th Gen Intel(R) Core(TM) i7-12700H\" hilos=20 "
++                                 "nucleos=14(6P+8E) ram=15.8GB energia=\"Alto rendimiento\" recomplauncher=1.4.0"),
++                     "P and E cores, RecompLauncher");
++        });
++
++        tc.Run("system line with nothing known", [](TestCase &t)
++        {
++            t.Equals(ps2x::cabecera::lineaSistema(Sistema{}),
++                     std::string("[sistema] windows=desconocido cpu=desconocida hilos=desconocido nucleos=desconocido "
++                                 "ram=desconocida energia=desconocido recomplauncher=no"),
++                     "unknown values");
++        });
++
++        tc.Run("options line: settings order, forced marked, unknown keys left out", [](TestCase &t)
++        {
++            const std::map<std::string, std::string> values{
++                {"gs", "cpu"}, {"pantalla", "ventana"}, {"vsync", "1"}, {"no_existe", "x"}};
++            t.Equals(ps2x::cabecera::lineaOpciones(values, {}),
++                     std::string("[opciones] efectivas: pantalla=ventana vsync=1 gs=cpu"), "no forced option");
++            t.Equals(ps2x::cabecera::lineaOpciones(values, {{"gs", "PS2X_GS"}}),
++                     std::string("[opciones] efectivas: pantalla=ventana vsync=1 gs=cpu* (*=por variable de entorno)"),
++                     "gs forced");
++            t.Equals(ps2x::cabecera::lineaOpciones({{"pantalla", "a b"}, {"vsync", ""}}, {}),
++                     std::string("[opciones] efectivas: pantalla=\"a b\" vsync=\"\""), "spaces and empty quoted");
++        });
++
++        tc.Run("options line has every option of a parsed file", [](TestCase &t)
++        {
++            const std::string line = ps2x::cabecera::lineaOpciones(ps2x::parseOptions("").values, {});
++            size_t keys = 0u;
++            for (const char c : line)
++                keys += c == '=' ? 1u : 0u;
++            t.Equals(keys, ps2x::optionSpecs().size(), "one key=value per option");
++            t.IsTrue(startsWith(line, "[opciones] efectivas: pantalla=ventana "), "starts with the first option");
++        });
++
++#if defined(_WIN32)
++        tc.Run("this PC is read", [](TestCase &t)
++        {
++            const Sistema s = ps2x::cabecera::leerSistema();
++            t.IsTrue(startsWith(s.windows, "10.") , "Windows 10 or 11: " + s.windows);
++            t.IsTrue(!s.cpu.empty() && s.cpu.front() != ' ' && s.cpu.back() != ' ', "CPU name, trimmed: " + s.cpu);
++            t.IsTrue(s.hilos > 0u && s.nucleos > 0u && s.nucleos <= s.hilos, "threads and cores");
++            t.IsTrue(s.nucleosP + s.nucleosE == 0u || s.nucleosP + s.nucleosE == s.nucleos, "P+E = cores");
++            t.IsTrue(s.ramBytes > (1ull << 30), "RAM");
++            t.IsTrue(!s.energia.empty(), "power plan");
++        });
++
++        tc.Run("build identity of the watchdog, without its prefix", [](TestCase &t)
++        {
++            const std::string identity = ps2x::vigilante::identidadCompilacion();
++            t.IsTrue(startsWith(identity, "ps2x_tests.exe fecha_pe="), identity);
++            t.IsTrue(contains(identity, " tam_imagen=") && contains(identity, " base=0x"), identity);
++            t.IsTrue(ps2x::vigilante::marcaTiempoPe() != 0u, "PE timestamp");
++        });
++
++        tc.Run("the header writes version, build and system lines", [](TestCase &t)
++        {
++            std::ostringstream out;
++            ps2x::cabecera::escribir(out);
++            const std::string text = out.str();
++            t.IsTrue(startsWith(text, std::string("[version] ") + ps2x::cabecera::versionPaquete() + " git="), text);
++            t.IsTrue(contains(text, "\n[version] compilacion: ps2x_tests.exe fecha_pe="), text);
++            t.IsTrue(contains(text, "\n[sistema] windows=10."), text);
++            t.IsTrue(!contains(text, "[cabecera] error"), text);
++        });
++#endif
++    });
++}

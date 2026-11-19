@@ -82,6 +82,9 @@ owners.
      first run instead.
    - Portable: unzip the folder anywhere and open `F1-06.exe`. Everything is saved inside that folder, so you can
      move it or carry it on a USB stick.
+   - [RecompLauncher](https://recomplauncher.com/game/f1-06-pc): add F1 06 PC and pick your ISO once. The launcher
+     checks it against the known good dump, copies the game data and then starts the game with **Play**. The
+     graphics and display options also appear on the game's page in the launcher.
 2. **First run**: if the game data is not there yet, the game asks once for your Formula One 06 ISO. It offers an ISO
    found in your Downloads folder, on your Desktop or next to the `.exe` (or lets you browse for one), checks that it
    is the PAL version (SCES-53950), copies the game data with a cancellable progress bar (about 4 GB: portable, into
@@ -152,15 +155,30 @@ the runtime, so you can think of it as a native game with a small PS2 "operating
 **Which version of the game works?**
 Only the European PAL release, SCES-53950. Other regions use a different executable and are not supported.
 
+## Reporting a problem
+
+- **With [RecompLauncher](https://recomplauncher.com/game/f1-06-pc):** if the game closes because of a failure, the
+  launcher's crash report attaches `F1-06.log` for you.
+- **Otherwise:** open an issue at https://github.com/KevinL50-sysadmin/F1-06-PC/issues (you need a free GitHub
+  account), say what you were doing and attach `F1-06.log`.
+
+Where the log is:
+
+- Installed: `%LOCALAPPDATA%\F1-06\logs\F1-06.log` (paste that path into the File Explorer address bar).
+- Portable: `logs\F1-06.log` inside the game folder.
+
+Each start replaces the log; the previous session stays in `F1-06.anterior.log`, so attach that one if you opened
+the game again after the problem. If the game freezes, wait about 10 seconds before closing it: the log then records
+where it got stuck. The log holds the game version, your Windows, CPU, RAM, graphics card and game settings, plus
+folder paths that can include your Windows user name; nothing else from your PC.
+
 ## Support the project
 
 If you'd like to support the work, there is a Ko-fi: **https://ko-fi.com/kevinl50**. Donations fund the time spent on the port, the
 tools behind it and, hopefully one day, community servers. They never buy builds, features or game content:
 everything stays free for everyone.
 
-Bug reports are just as valuable
-([issues](https://github.com/KevinL50-sysadmin/F1-06-PC/issues)): please attach `F1-06.log` (portable: `logs\` inside the game folder; installed:
-`%LOCALAPPDATA%\F1-06\logs`).
+Bug reports are just as valuable: see [Reporting a problem](#reporting-a-problem).
 
 Follow progress and news on X: **https://x.com/KevinLA50**.
 
@@ -242,7 +260,9 @@ lo que más cuenta es la velocidad de un núcleo (por debajo de unos 4 GHz la sa
 [la última versión](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). El instalador crea los accesos "F1 06 PC"
 y puede copiar los datos de tu ISO durante la instalación. Si no, la primera vez el juego te pide la ISO una sola vez
 (te ofrece la que encuentre en Descargas o en el Escritorio, o la buscas tú), comprueba que es la PAL (SCES-53950),
-copia los datos con una barra de progreso y arranca; después, a jugar. La ISO solo se lee. Si Windows avisa con SmartScreen ("Windows protegió su PC"), pulsa "Más información" y "Ejecutar de todas
+copia los datos con una barra de progreso y arranca; después, a jugar. La ISO solo se lee. Con
+[RecompLauncher](https://recomplauncher.com/game/f1-06-pc) eliges la ISO una vez: la comprueba, copia los datos y luego
+basta con **Jugar**; las opciones gráficas y de pantalla también salen en la ficha del juego en el lanzador. Si Windows avisa con SmartScreen ("Windows protegió su PC"), pulsa "Más información" y "Ejecutar de todas
 formas". Vuelca tu propio disco: el proyecto no dice dónde descargar imágenes de juegos ni las distribuye.
 
 **Opciones:** OPCIONES > OPCIONES PC (GRÁFICOS PC, PANTALLA PC, AJUSTES PC, JUEGO EN RED PC). Teclas: F11 pantalla
@@ -252,6 +272,15 @@ completa, F10 aspecto, F12 foto, H HUD, F8 o R3 modo foto. Todo explicado en `LE
 a 42-45 fps unos segundos (con Alto rendimiento, 50); DETALLE ALTO cuesta un 16 % y MÁXIMO va a unos 25 fps en la
 salida; sin 60 fps; el juego en red es experimental (2 jugadores, firmado pero sin cifrar; falta la prueba en dos PC
 con cortafuegos real); la vibración del DualShock 4 no está probada; el `.exe` no está firmado.
+
+**Cómo enviar un fallo:** si juegas con RecompLauncher y el juego se cierra por un fallo, el informe de fallo del
+lanzador adjunta `F1-06.log` solo. Si no, abre un issue en https://github.com/KevinL50-sysadmin/F1-06-PC/issues (hace
+falta una cuenta gratuita de GitHub), cuenta qué estabas haciendo y adjunta `F1-06.log`. Está en
+`%LOCALAPPDATA%\F1-06\logs\F1-06.log` (instalado; pega la ruta en la barra del Explorador) o en `logs\F1-06.log`
+dentro de la carpeta del juego (portable). Cada arranque lo sustituye: la partida anterior queda en
+`F1-06.anterior.log`, adjúntalo si volviste a abrir el juego después del fallo. Si el juego se congela, espera unos 10
+segundos antes de cerrarlo: así el log anota dónde se quedó parado. El log lleva la versión del juego, tu Windows, CPU,
+RAM, tarjeta gráfica y opciones, y rutas de carpetas que pueden incluir tu nombre de usuario de Windows; nada más de tu PC.
 
 **Online:** hoy hay juego en red experimental para 2 PC. Un online con cuentas y servidores comunitarios es algo que
 nos gustaría explorar en el futuro: un objetivo, no una promesa.

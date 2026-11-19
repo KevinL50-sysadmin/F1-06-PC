@@ -11,6 +11,9 @@
 #include "ps2_host_overlay.h"
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "ps2_options_menu.h"
+#include "ps2_salida.h"
+#include "ps2_fallo.h"
+#include "ps2_lua_traza.h"
 #endif
 #include "ps2x/iop/iop_spu2_audio.h" // parche 0159: spu2QuietFrames
 #include "../lib/ps2_ai_difficulty.h" // desde ps2xRuntime/src/runner, donde se compila
@@ -48,6 +51,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <random>
@@ -60,6 +64,10 @@ bool f1EnNucleoEficiente();
 void f1NucleosDeRendimiento(bool rendimiento);
 // Vigilante T3 (al final): el paron de prueba del EE, fuera del espacio anonimo para que tenga nombre en la pila.
 void f1ParonDePruebaEe(double segundos);
+// fallos-con-log T3b (al final y en f1_fallos.cpp): los fallos de prueba de PS2X_PRUEBA_FALLO, con nombre en la pila.
+void f1FalloDePrueba(ps2x::fallo::Prueba tipo);
+void f1FalloDeAcceso();
+void f1FalloEnHiloAuxiliar();
 uint64_t f1CpuHilo();
 uint64_t f1Tsc();
 // kernel32 (1.4 T2): ciclos del hilo actual, sin <windows.h> (choca con raylib.h).
@@ -817,6 +825,14 @@ namespace
     PS2Runtime::RecompiledFunction g_finFotogramaOriginal = nullptr;
     PS2Runtime::RecompiledFunction g_esperaVblankOriginal = nullptr;
     std::atomic<uint64_t> g_finesFotograma{0u}, g_esperasVblank{0u};
+    // Para la linea "[salida] partida:" (fallos-con-log T3d): ultimo circuito elegido en RACE OPTIONS y peor
+    // paquetes VIF1/s (fotogramas/s) de las ventanas de 10 s de [f1-06:vif1fps] con la carrera en pantalla (las cargas no
+    // cuentan). g_finesFotograma solo avanza en carrera: no vale para la media de la partida (T4 D2).
+    std::atomic<int> g_ultimoCircuito{-1};
+    std::atomic<double> g_peorFpsCarrera{-1.0};
+    // Paquetes VIF1: uno por fotograma dibujado en cualquier pantalla (menus, videos, carrera), como paquetes/s de
+    // [f1-06:vif1fps]. g_ps2DisplayFlips cuenta dos por fotograma (T4 D2).
+    std::atomic<uint64_t> g_paquetesVif1{0u};
 
     // F1_VIGIA_MATRIZ=1 (diagnostico de la "V" de la cabina, parche 0108): un hilo busca cada segundo en la RAM del EE
     // las piezas (bloques de 0xD0 del heap 0x4C1710 con la vtable 0x412DC8 en +0xB0) cuya matriz tiene la fila 2 igual
@@ -1740,6 +1756,7 @@ namespace
             static uint32_t enNucleoE = 0;
             static double ultimo = 0.0;
             ++paquetes;
+            g_paquetesVif1.fetch_add(1u, std::memory_order_relaxed);
             if (f1EnNucleoEficiente())
                 ++enNucleoE;
             if ((paquetes & 15u) == 0u)
@@ -1818,6 +1835,13 @@ namespace
                                                        static_cast<double>(paquetes)
                                                  : 0.0);
                     std::cout << texto << std::endl;
+                    if (s_ventanaAb <= 0.0 && ps2x::raceOnScreen())
+                    {
+                        const double fps = static_cast<double>(paquetes) / segundos;
+                        const double peor = g_peorFpsCarrera.load(std::memory_order_relaxed);
+                        if (peor < 0.0 || fps < peor)
+                            g_peorFpsCarrera.store(fps, std::memory_order_relaxed);
+                    }
                     s_antes = d;
                     s_cadenaMin = ~0ull;
                     s_cadenaSuma = s_cadenas = s_aparcados = s_muestrasAparcados = 0;
@@ -5347,8 +5371,42 @@ namespace
         }
     }
 
+    // fallos-con-log T3c (S3): nombre de cada trozo de Lua cargado (lua_load, trazarLuaLoad) por Proto, para la traza
+    // de Lua de los errores (los trozos del juego no llevan su nombre: fuente "@X"; ps2_lua_traza.h).
+    ps2x::luatraza::Nombres g_nombresLua;
+
+    ps2x::luatraza::Memoria memoriaInvitado(const uint8_t *rdram)
+    {
+        return ps2x::luatraza::Memoria{rdram, PS2_RAM_SIZE};
+    }
+
+    // Tras un lua_load correcto (v0 = 0) el trozo es un cierre de Lua en la cima (L->top - 8: tipo 6, cierre; Proto en
+    // cierre + 12): se registran su Proto y sus hijas con el nombre del trozo.
+    void registrarTrozoLua(const uint8_t *rdram, uint32_t L, const std::string &nombre)
+    {
+        const ps2x::luatraza::Memoria mem = memoriaInvitado(rdram);
+        uint32_t top = 0u, tipo = 0u, cierre = 0u, proto = 0u;
+        uint8_t esC = 1u;
+        if (mem.leer32(L + 8u, top) && top >= 8u && mem.leer32(top - 8u, tipo) && tipo == 6u &&
+            mem.leer32(top - 4u, cierre) && mem.leer8(cierre + 6u, esC) && esC == 0u && mem.leer32(cierre + 12u, proto))
+            g_nombresLua.registrar(mem, proto, nombre);
+    }
+
+    // La traza de Lua de L (de L->ci hacia abajo, 20 marcos como mucho), una linea por marco.
+    void imprimirTrazaLua(const uint8_t *rdram, uint32_t L)
+    {
+        const ps2x::luatraza::Traza traza = ps2x::luatraza::recorrer(memoriaInvitado(rdram), L, 20u, &g_nombresLua);
+        std::cout << "[f1-06:lua-error]   traza de Lua (" << traza.marcos.size() << " marcos):" << std::endl;
+        for (size_t i = 0; i < traza.marcos.size(); ++i)
+            std::cout << "[f1-06:lua-error]     " << ps2x::luatraza::lineaMarco(i, traza.marcos[i]) << std::endl;
+        if (traza.omitidos != 0u)
+            std::cout << "[f1-06:lua-error]     (y " << traza.omitidos << " marcos mas)" << std::endl;
+    }
+
     // luaD_throw de Lua 5.0 (0x29F878: con L->errorJmp, en +0x50, hace longjmp; sin el, panic y exit(1)). Registra
-    // cada error de Lua con su mensaje (la cima de la pila, L->top - 8) para saber por que falla un script.
+    // cada error de Lua con su mensaje (la cima de la pila, L->top - 8) para saber por que falla un script, y la traza
+    // de Lua (T3c: script, funcion e instruccion de cada marco). Los protegidos, los 200 primeros; el que no esta
+    // protegido (acaba en exit(1) con la pantalla congelada), siempre.
     constexpr uint32_t kLuaThrow = 0x0029F878u;
     PS2Runtime::RecompiledFunction g_luaThrowOriginal = nullptr;
 
@@ -5356,19 +5414,25 @@ namespace
     {
         static uint32_t veces = 0;
         const uint32_t L = GPR_U32(ctx, 4);
-        if (veces++ < 200u)
+        const bool protegido = leer32(rdram, L + 0x50u) != 0u;
+        if (veces++ < 200u || !protegido)
         {
             const uint32_t top = leer32(rdram, L + 8u);
             const uint32_t base = leer32(rdram, L + 12u);
             std::string mensaje = "?";
-            if (top >= base + 8u)
+            if (top >= base + 8u && leer32(rdram, top - 8u) == 4u)
+            {
+                const auto texto = ps2x::luatraza::cadena(memoriaInvitado(rdram), leer32(rdram, top - 4u), 400u);
+                mensaje = texto ? "\"" + *texto + "\"" : "<cadena ilegible>";
+            }
+            else if (top >= base + 8u)
             {
                 // argumentoLua lee desde L->base: el indice de la cima es (top - 8 - base) / 8.
                 mensaje = argumentoLua(rdram, L, (top - 8u - base) / 8u);
             }
             std::cout << "[f1-06:lua-error] t=" << segundosDesdeArranque() << " codigo=" << GPR_U32(ctx, 5)
-                      << " protegido=" << (leer32(rdram, L + 0x50u) != 0u ? "si" : "NO") << " mensaje=" << mensaje
-                      << std::endl;
+                      << " protegido=" << (protegido ? "si" : "NO") << " mensaje=" << mensaje << std::endl;
+            imprimirTrazaLua(rdram, L);
             if (GPR_U32(ctx, 5) == 4u) // LUA_ERRMEM: el asignador del juego (G->frealloc, G+0xC, con G->ud en +0x10)
             {
                 const uint32_t G = leer32(rdram, L + 0x10u);
@@ -5377,6 +5441,8 @@ namespace
                           << std::endl;
             }
             imprimirPila(rdram, GPR_U32(ctx, 31), GPR_U32(ctx, 29), 12);
+            if (!protegido)
+                std::cout.flush();
         }
         g_luaThrowOriginal(rdram, ctx, runtime);
     }
@@ -6511,6 +6577,8 @@ end
         if (clave == "vueltas_gp")
         {
             g_vueltasGranPremio = conValor ? ps2x::trackFullLaps(rdram, PS2_RAM_SIZE, static_cast<int>(std::lround(valor))) : 0;
+            if (conValor)
+                g_ultimoCircuito.store(static_cast<int>(std::lround(valor)), std::memory_order_relaxed);
             resultado = static_cast<float>(g_vueltasGranPremio);
             std::cout << "[opciones-juego] RACE OPTIONS: circuito " << valor << ", " << g_vueltasGranPremio
                       << " vueltas el Gran Premio" << std::endl;
@@ -7290,6 +7358,8 @@ end
             }
         }
         g_luaLoadOriginal(rdram, ctx, runtime);
+        if (GPR_U32(ctx, 2) == 0u) // fallos-con-log T3c: el nombre del trozo para la traza de los errores de Lua
+            registrarTrozoLua(rdram, L, nombre);
         if (g_luaMemoria)
             std::cout << "[f1-06:lua-carga] t=" << segundosDesdeArranque() << " " << nombre << " bytes " << antes << " -> "
                       << leer32(rdram, G + 0x4Cu) << std::endl;
@@ -7321,8 +7391,8 @@ end
             instalarChivato(runtime, kOsGetenv, trazarOsGetenv, g_osGetenvOriginal);
         if (!g_modsLua.empty() || g_opcionesJuego)
             instalarChivato(runtime, kLuaLectorGetS, trazarLuaGetS, g_luaGetSOriginal);
-        if (g_luaMemoria || !g_luaVolcado.empty() || !g_modsLua.empty() || g_opcionesJuego)
-            instalarChivato(runtime, kLuaLoad, trazarLuaLoad, g_luaLoadOriginal);
+        // Siempre: guarda el nombre de cada trozo para la traza de los errores de Lua (fallos-con-log T3c).
+        instalarChivato(runtime, kLuaLoad, trazarLuaLoad, g_luaLoadOriginal);
     }
 
     // Asignador de Lua del juego (0x29B5B0(ud, bloque, tamanoViejo, tamanoNuevo) -> func_29C858 con el monton de
@@ -7432,8 +7502,70 @@ end
         g_luaVExecuteOriginal(rdram, ctx, runtime);
     }
 
+    // fallos-con-log T3c: PS2X_PRUEBA_FALLO=lua:<s> y exit:<s> (ps2_fallo.h, solo para probar los informes).
+    // lua: la siguiente llamada de Lua a la nativa end_frame (0x149FB0, tabla 0x43F998; el front-end la llama en cada
+    // fotograma) hace lo mismo que error("...") de Lua: deja el mensaje como unico argumento y salta a luaB_error
+    // (0x2AC8A0, el error de la biblioteca base), que lo lanza con lua_error/luaD_throw desde ese mismo marco. Asi el
+    // error sale de una funcion nativa llamada por un script del juego, con su pila de Lua real; si alli no hay pcall,
+    // panic y exit(1) como un error de verdad. El mensaje es un TString propio en un bufer del invitado (fuera de las
+    // listas del recolector, marked = 0: el recolector no lo libera ni lo toca).
+    constexpr uint32_t kLuaEndFrame = 0x00149FB0u;
+    constexpr uint32_t kLuaBError = 0x002AC8A0u;
+    PS2Runtime::RecompiledFunction g_luaEndFrameOriginal = nullptr;
+    std::atomic<bool> g_errorLuaDePrueba{false};
+
+    void errorLuaDePrueba(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const char kMensaje[] = "prueba: error de Lua a proposito (PS2X_PRUEBA_FALLO=lua)";
+        const uint32_t largo = static_cast<uint32_t>(sizeof(kMensaje) - 1u);
+        const uint32_t ts = runtime->guestMalloc(20u + largo + 1u, 16u);
+        const uint32_t L = GPR_U32(ctx, 4);
+        const uint32_t base = leer32(rdram, L + 12u);
+        if (ts == 0u || base == 0u)
+        {
+            std::cout << "[f1-06:lua-error] prueba: no se puede preparar el error de Lua" << std::endl;
+            g_luaEndFrameOriginal(rdram, ctx, runtime);
+            return;
+        }
+        auto poner32 = [rdram](uint32_t dir, uint32_t v) { std::memcpy(rdram + (dir & PS2_RAM_MASK), &v, 4u); };
+        poner32(ts, 0u);              // next
+        poner32(ts + 4u, 4u);         // tt = cadena, marked = 0, reserved = 0
+        poner32(ts + 8u, 0u);         // hash
+        poner32(ts + 12u, largo);     // len
+        poner32(ts + 16u, ts + 20u);  // texto
+        std::memcpy(rdram + ((ts + 20u) & PS2_RAM_MASK), kMensaje, largo + 1u);
+        poner32(base, 4u);            // L->base[0] = el mensaje
+        poner32(base + 4u, ts);
+        poner32(L + 8u, base + 8u);   // L->top: un solo argumento
+        std::cout << "[f1-06:lua-error] prueba: error(\"...\") desde end_frame (PS2X_PRUEBA_FALLO=lua) t="
+                  << segundosDesdeArranque() << std::endl;
+        runtime->lookupFunction(kLuaBError)(rdram, ctx, runtime);
+    }
+
+    void trazarLuaEndFrame(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_errorLuaDePrueba.exchange(false))
+        {
+            errorLuaDePrueba(rdram, ctx, runtime);
+            return;
+        }
+        g_luaEndFrameOriginal(rdram, ctx, runtime);
+    }
+
+    // exit: el juego llama a su exit(1) (0x102038, kExit; pasa por trazarExit como el exit(1) del panic de Lua) desde
+    // el hilo del juego, en lugar de dibujar ese fotograma.
+    void exitDePrueba(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cout << "[f1-06:exit] prueba: exit(1) del juego a proposito (PS2X_PRUEBA_FALLO=exit) t="
+                  << segundosDesdeArranque() << std::endl;
+        SET_GPR_U32(ctx, 4, 1u);
+        runtime->lookupFunction(0x00102038u)(rdram, ctx, runtime);
+    }
+
     void instalarChivatosLua(PS2Runtime &runtime)
     {
+        if (ps2x::fallo::leerPrueba(std::getenv("PS2X_PRUEBA_FALLO")).tipo == ps2x::fallo::Prueba::Lua)
+            instalarChivato(runtime, kLuaEndFrame, trazarLuaEndFrame, g_luaEndFrameOriginal);
         if (const char *perfil = std::getenv("F1_LUA_PERFIL"); perfil && std::atoi(perfil) != 0)
             instalarChivato(runtime, kLuaVExecute, trazarLuaVExecute, g_luaVExecuteOriginal);
         instalarChivato(runtime, 0x0028C9E8u, trazarLua_graphPush, g_lua_graphPushOriginal);
@@ -7458,6 +7590,29 @@ end
 
     void trazarRenderFotograma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // fallos-con-log T3b (pruebas de T4): PS2X_PRUEBA_FALLO=<acceso|excepcion|terminate|lua|exit>:<segundos> provoca
+        // ese fallo una vez, a los <segundos> del arranque, aqui (el hilo del juego, dentro de la funcion
+        // traducida que dibuja cada fotograma, ya en los menus). lua y exit (T3c): errorLuaDePrueba y exitDePrueba.
+        // Solo para probar los informes; sin la variable no hace nada (ps2_fallo.h).
+        static ps2x::fallo::PruebaFallo s_fallo = ps2x::fallo::leerPrueba(std::getenv("PS2X_PRUEBA_FALLO"));
+        if (s_fallo.tipo != ps2x::fallo::Prueba::Ninguna && segundosDesdeArranque() >= s_fallo.segundos)
+        {
+            const ps2x::fallo::Prueba tipo = s_fallo.tipo;
+            s_fallo.tipo = ps2x::fallo::Prueba::Ninguna;
+            if (tipo == ps2x::fallo::Prueba::Lua)
+            {
+                g_errorLuaDePrueba = true; // en la siguiente llamada de Lua a end_frame
+            }
+            else if (tipo == ps2x::fallo::Prueba::Exit)
+            {
+                exitDePrueba(rdram, ctx, runtime);
+                return;
+            }
+            else
+            {
+                f1FalloDePrueba(tipo);
+            }
+        }
         static uint32_t fotogramas = 0;
         static double ultimo = 0.0;
         if ((fotogramas % 10u) == 0u)
@@ -7488,11 +7643,14 @@ end
                 ps2x::noteGameLanguage(idioma);
             }
         }
-        if ((fotogramas++ % 50u) == 0u)
+        // Cada 600 renders del front-end (~10 s a 60 fps; antes cada 50): la media de toda la partida va en
+        // "[salida] partida:" (fallos-con-log T3d).
+        constexpr uint32_t kCadaFotogramas = 600u;
+        if ((fotogramas++ % kCadaFotogramas) == 0u)
         {
             const double ahora = segundosDesdeArranque();
-            std::cout << "[f1-06:fotograma] n=" << fotogramas - 1u << " t=" << ahora
-                      << " fps=" << (fotogramas > 1u ? 50.0 / (ahora - ultimo) : 0.0) << std::endl;
+            std::cout << "[f1-06:fotograma] n=" << fotogramas - 1u << " t=" << ahora << " fps="
+                      << (fotogramas > 1u ? static_cast<double>(kCadaFotogramas) / (ahora - ultimo) : 0.0) << std::endl;
             ultimo = ahora;
         }
         g_renderFotogramaOriginal(rdram, ctx, runtime);
@@ -7534,6 +7692,8 @@ end
                   << " ra=0x" << std::hex << GPR_U32(ctx, 31) << std::dec << " pila:" << std::endl;
         imprimirPila(rdram, GPR_U32(ctx, 31), GPR_U32(ctx, 29), 16);
         std::cout.flush();
+        // odd/tasks/fallos-con-log.md T2: el proceso sale distinto de 0 (p. ej. un error de Lua sin pcall).
+        ps2x::salida::anotarFallo(ps2x::salida::kExitDelJuego, "exit-del-juego");
         g_exitOriginal(rdram, ctx, runtime);
     }
 
@@ -7789,8 +7949,21 @@ end
             .detach();
     }
 
+    // Fuente de "[salida] partida:": solo atomicos, se llama tambien con el hilo del juego colgado.
+    ps2x::salida::Partida partidaParaSalida()
+    {
+        ps2x::salida::Partida partida;
+        partida.enCarrera = ps2x::raceOnScreen();
+        partida.circuito = g_ultimoCircuito.load(std::memory_order_relaxed);
+        partida.segundos = segundosDesdeArranque();
+        partida.fotogramas = g_paquetesVif1.load(std::memory_order_relaxed); // todas las pantallas (T4 D2)
+        partida.fpsMinimo = g_peorFpsCarrera.load(std::memory_order_relaxed);
+        return partida;
+    }
+
     void applyFormulaOne06(PS2Runtime &runtime)
     {
+        ps2x::salida::registrarPartida(&partidaParaSalida);
         // F1 06 siempre presenta 0/128; con ese plan B, si la instantanea pillaba el bufer 0 recien borrado, la ventana
         // ensenaba el del retrovisor o el del mapa de entorno (FBP 384/439, sin HUD) (parche 0104).
         ps2GsSetBlackDisplayFallback(false);
@@ -8015,6 +8188,29 @@ void f1ParonDePruebaEe(double segundos)
               << segundosDesdeArranque() << std::endl;
     std::this_thread::sleep_for(std::chrono::duration<double>(segundos));
     std::cout << "[vigilante] prueba: EE en marcha otra vez t=" << segundosDesdeArranque() << std::endl;
+}
+
+// fallos-con-log T3b: el fallo de PS2X_PRUEBA_FALLO (ps2_fallo.h). excepcion: std::runtime_error en el hilo del juego
+// (llega al catch de GameThread: informe "[excepcion]", sale con 10); terminate: std::runtime_error en un hilo auxiliar
+// "PruebaFallo" (nadie la recoge: std::terminate, informe "[terminate]" y abort); acceso y el hilo: f1_fallos.cpp.
+__declspec(noinline) void f1FalloDePrueba(ps2x::fallo::Prueba tipo)
+{
+    std::cout << "[fallo] prueba: PS2X_PRUEBA_FALLO t=" << segundosDesdeArranque() << std::endl;
+    switch (tipo)
+    {
+    case ps2x::fallo::Prueba::Acceso:
+        f1FalloDeAcceso();
+        break;
+    case ps2x::fallo::Prueba::Excepcion:
+        throw std::runtime_error("prueba: excepcion en el hilo del juego (PS2X_PRUEBA_FALLO=excepcion)");
+    case ps2x::fallo::Prueba::Terminate:
+        f1FalloEnHiloAuxiliar();
+        break;
+    case ps2x::fallo::Prueba::Lua:  // T3c: van en trazarRenderFotograma, con el contexto del EE
+    case ps2x::fallo::Prueba::Exit:
+    case ps2x::fallo::Prueba::Ninguna:
+        break;
+    }
 }
 
 PS2_REGISTER_GAME_OVERRIDE("Formula One 06 (SCES-53950)", "SCES_539.50", 0x00101BE8u, 0u, applyFormulaOne06)

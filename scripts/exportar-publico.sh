@@ -52,7 +52,9 @@ revisados=(
     docs/lanzamiento/img/replay-tv-camera.png docs/lanzamiento/img/cabecera-readme.png
     scripts/ab_ciclos.py scripts/ab_diagnostico.py scripts/ab_resumen.py scripts/bft_decodificar.py
     scripts/buscar_valor.py scripts/capturar-ventana.ps1 scripts/carrera-directa.ps1 scripts/cazar-cuelgue.ps1
-    scripts/comparar_partidas.py scripts/desfase-lineas.ps1 scripts/ee_xref.py scripts/elf_ps2.py
+    scripts/comparar_partidas.py scripts/comprobar-recomplauncher.py scripts/iop-t3-correr.ps1
+    scripts/paquete/recomplauncher.json scripts/paquete/version.txt docs/recomplauncher/developer-docs.md
+    scripts/desfase-lineas.ps1 scripts/ee_xref.py scripts/elf_ps2.py
     scripts/empaquetar.ps1 scripts/entradas_datos.py scripts/explorar.ps1 scripts/exportar-publico.sh
     scripts/filtrar_diff.py scripts/funciones_sin_optimizar.py scripts/gif_decodificar.py scripts/hacer-icono.ps1
     scripts/hacer-imagen-instalador.ps1 scripts/hacer-parche.sh scripts/instalador/F1-06.iss scripts/irx_importa.py
@@ -77,6 +79,8 @@ clasificar() {
         # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
         # comentarios.ps1 es una herramienta del autor para atender a la gente, no de los jugadores: privado.
         scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | scripts/comentarios.ps1 | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
+        # Pruebas del autor en su PC (GUI de RecompLauncher, instalador, fallos provocados): privado.
+        scripts/pruebas/fallos-t4.ps1 | scripts/rl-t4-*.ps1 | scripts/rl-t5-*.ps1 | scripts/rl-t8-*.ps1 | scripts/rl-t9-*.ps1) clase=privado ;;
         src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/*) clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;

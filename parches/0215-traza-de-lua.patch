@@ -1,0 +1,854 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index c7d021e..5cde996 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -428,6 +428,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_cabecera.cpp
+     src/lib/ps2_cabecera_win.cpp
+     src/lib/ps2_fallo.cpp
++    src/lib/ps2_lua_traza.cpp
+     src/lib/ps2_version.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+diff --git a/ps2xRuntime/include/ps2_fallo.h b/ps2xRuntime/include/ps2_fallo.h
+index 85cc291..71e20b9 100644
+--- a/ps2xRuntime/include/ps2_fallo.h
++++ b/ps2xRuntime/include/ps2_fallo.h
+@@ -22,12 +22,18 @@ namespace ps2x::fallo
+     // hilo del juego al dibujar un fotograma (src/f1_overrides.cpp), acceso = escritura en la direccion 0 (informe
+     // "[fallo]", sale con 0xC0000005), excepcion = std::runtime_error (informe "[excepcion]", sale con 10) y
+     // terminate = std::runtime_error en un hilo auxiliar "PruebaFallo" (informe "[terminate]", abort).
++    // T3c: lua = la funcion nativa end_frame del front-end (la llama Lua en cada fotograma) hace lo mismo que error()
++    // de Lua con un mensaje de prueba (informe "[f1-06:lua-error]" con la traza de Lua; sin pcall, panic y exit(1));
++    // exit = el juego llama a su exit(1) (0x102038) desde el hilo del juego (informe "[f1-06:exit]", el proceso sale con
++    // 11 al cerrarlo).
+     enum class Prueba
+     {
+         Ninguna,
+         Acceso,
+         Excepcion,
+         Terminate,
++        Lua,
++        Exit,
+     };
+ 
+     struct PruebaFallo
+@@ -36,7 +42,7 @@ namespace ps2x::fallo
+         double segundos = 0.0;
+     };
+ 
+-    // El valor de PS2X_PRUEBA_FALLO: "<tipo>:<segundos>" con tipo acceso, excepcion o terminate y segundos un numero
++    // El valor de PS2X_PRUEBA_FALLO: "<tipo>:<segundos>" con tipo acceso, excepcion, terminate, lua o exit y segundos un numero
+     // >= 0 (decimales con punto). nullptr, vacio o cualquier otra cosa: Ninguna (no se provoca nada).
+     PruebaFallo leerPrueba(const char *valor);
+ 
+diff --git a/ps2xRuntime/include/ps2_lua_traza.h b/ps2xRuntime/include/ps2_lua_traza.h
+new file mode 100644
+index 0000000..a44e08a
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_lua_traza.h
+@@ -0,0 +1,122 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++// Traza de Lua en los errores de Lua (odd/tasks/fallos-con-log.md T3c, S3): que script, que funcion y que instruccion
++// estaban en marcha cuando el juego lanzo un error de Lua (luaD_throw, src/f1_overrides.cpp del proyecto). Se lee la
++// memoria del invitado (la RAM del EE) sin llamar al juego, comprobando cada direccion: un puntero roto da un marco
++// "ilegible", nunca un fallo del proceso mientras se informa de otro.
++//
++// El Lua del juego es una 5.1-work (los trozos llevan "LuaQ" 0x51; scripts/lua50_ram.py, analisis/listado-ee-crudo.txt):
++//   lua_State: top +0x08, base +0x0C, ci +0x14, base_ci +0x28, errorJmp +0x50.
++//   CallInfo (16 bytes, sin campo de estado): base +0, top +4, savedpc +8, tailcalls +12. La funcion del marco es el
++//     TObject anterior a base (tipo 6 = funcion); la VM guarda su pc en ci->savedpc antes de cada llamada o error
++//     (luaV_execute 0x2A9DD0), apuntando a la instruccion siguiente.
++//   Closure: isC +6, proto (Lua) o funcion (C) +12.
++//   Proto: code +12, p (hijas) +16, lineinfo +20, source +32, sizecode +44, sizelineinfo +52, sizep +56,
++//     lineDefined +60.
++//   TString: tt +4 (4 = cadena), len +12, puntero al texto +16.
++// Los trozos del juego van sin depuracion: fuente "@X" y sin lineinfo (pero con lineDefined). Por eso el nombre del
++// script sale de lua_load (Nombres) y la posicion es la ruta de la funcion en el trozo (F0.3.1, la misma numeracion
++// que scripts/lua_volcados.py pseudo y lua50_ram.py --archivo) con su instruccion; la linea solo si hay lineinfo
++// (trozos de texto de los mods).
++namespace ps2x::luatraza
++{
++    // La RAM del invitado: solo se lee dentro de [0, tam).
++    struct Memoria
++    {
++        const uint8_t *datos = nullptr;
++        uint32_t tam = 0u;
++
++        // dir != 0 y [dir, dir + n) dentro de la RAM (sin desbordar).
++        bool valida(uint32_t dir, uint32_t n) const;
++        // Palabra de 32 bits (little endian) alineada a 4; false si no es valida.
++        bool leer32(uint32_t dir, uint32_t &valor) const;
++        bool leer8(uint32_t dir, uint8_t &valor) const;
++    };
++
++    // El texto de un TString (tipo 4), cortado a maximo caracteres (los no imprimibles salen como '.'); nullopt si la
++    // direccion o su texto no son validos o no es una cadena.
++    std::optional<std::string> cadena(const Memoria &mem, uint32_t tstring, size_t maximo = 200u);
++
++    // Donde va una funcion de Lua: pc = indice de la instruccion en curso ((savedpc - code) / 4 - 1), -1 si savedpc no
++    // cae en el codigo del Proto; linea = lineinfo[pc], -1 sin lineinfo o fuera de sizelineinfo.
++    struct Posicion
++    {
++        int pc = -1;
++        int linea = -1;
++    };
++    Posicion posicion(const Memoria &mem, uint32_t proto, uint32_t savedpc);
++
++    // Nombre del trozo (el de lua_load) de cada Proto cargado y su ruta dentro del trozo ("0" la principal, "0.2" su
++    // tercera hija...). code (el puntero al codigo del Proto) descarta entradas viejas de un Proto ya liberado cuya
++    // direccion se reutilizo.
++    class Nombres
++    {
++    public:
++        struct Entrada
++        {
++            std::string nombre;
++            std::string ruta;
++            uint32_t code = 0u;
++        };
++
++        // Registra el Proto principal de un trozo y todas sus hijas (hasta 32 niveles y 4096 Protos por trozo; los
++        // punteros no validos se saltan). Devuelve cuantos Protos registro. Con mas de kMaximo entradas empieza de cero.
++        size_t registrar(const Memoria &mem, uint32_t protoPrincipal, const std::string &nombre);
++        // La entrada de ese Proto si su code coincide; nullopt si no se conoce.
++        std::optional<Entrada> buscar(uint32_t proto, uint32_t code) const;
++        size_t tam() const;
++
++        static constexpr size_t kMaximo = 65536u;
++
++    private:
++        mutable std::mutex m_mutex;
++        std::unordered_map<uint32_t, Entrada> m_protos;
++    };
++
++    struct Marco
++    {
++        enum class Tipo
++        {
++            Lua,
++            C,
++            Ilegible,
++        };
++        Tipo tipo = Tipo::Ilegible;
++        uint32_t ci = 0u;
++        uint32_t funcion = 0u;   // Lua: el Proto; C: la funcion; Ilegible: 0
++        std::string fuente;      // Lua: Proto->source ("" si no se puede leer)
++        std::string nombre;      // Lua: nombre del trozo (Nombres) o ""
++        std::string ruta;        // Lua: ruta de la funcion en el trozo o ""
++        int lineaDefinida = 0;   // Lua: lineDefined
++        Posicion pos;            // Lua
++        uint32_t llamadasCola = 0u; // Lua: tailcalls perdidas bajo este marco
++    };
++
++    struct Traza
++    {
++        std::vector<Marco> marcos; // de L->ci (el mas reciente) hacia abajo, sin base_ci
++        size_t omitidos = 0u;      // marcos que no caben en maximo
++    };
++
++    // Recorre los CallInfo de L desde L->ci hasta base_ci (sin incluirlo), como mucho maximo marcos. Un marco que no se
++    // puede leer (ci fuera de [base_ci, base_ci + 16 * 4096] o desalineado, base o funcion no validas) acaba la traza con
++    // un marco Ilegible. L no valido: un solo marco Ilegible. nombres puede ser nullptr.
++    Traza recorrer(const Memoria &mem, uint32_t L, size_t maximo, const Nombres *nombres);
++
++    // Una linea por marco (sin prefijo ni salto de linea):
++    //   "#0 FrontEnd/Scripts/X.lua F0.3 instruccion 15 (funcion de la linea 120)"
++    //   "#0 Mod.lua:42 F0.3 instruccion 15 (funcion de la linea 40)"         (con lineinfo)
++    //   "#0 @X proto=0x00ABCDEF instruccion ? (funcion de la linea 120)"     (trozo no registrado, pc desconocido)
++    //   " (+2 llamadas de cola)" al final si hubo llamadas de cola
++    //   "#1 [C] 0x00149FB0"
++    //   "#2 marco ilegible ci=0x0012ABC0"
++    std::string lineaMarco(size_t indice, const Marco &marco);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_fallo.cpp b/ps2xRuntime/src/lib/ps2_fallo.cpp
+index 5a2e8cb..bd70f7f 100644
+--- a/ps2xRuntime/src/lib/ps2_fallo.cpp
++++ b/ps2xRuntime/src/lib/ps2_fallo.cpp
+@@ -87,6 +87,10 @@ namespace ps2x::fallo
+             tipo = Prueba::Excepcion;
+         else if (largo == 9u && std::strncmp(valor, "terminate", largo) == 0)
+             tipo = Prueba::Terminate;
++        else if (largo == 3u && std::strncmp(valor, "lua", largo) == 0)
++            tipo = Prueba::Lua;
++        else if (largo == 4u && std::strncmp(valor, "exit", largo) == 0)
++            tipo = Prueba::Exit;
+         const char *numero = dos + 1;
+         // Solo cifras y un punto: sin signo, espacios ni exponentes.
+         if (tipo == Prueba::Ninguna || *numero == '\0' || std::strspn(numero, "0123456789.") != std::strlen(numero))
+diff --git a/ps2xRuntime/src/lib/ps2_lua_traza.cpp b/ps2xRuntime/src/lib/ps2_lua_traza.cpp
+new file mode 100644
+index 0000000..a88ff79
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_lua_traza.cpp
+@@ -0,0 +1,280 @@
++// Traza de Lua (ps2_lua_traza.h): solo lee la RAM del invitado, comprobando cada direccion.
++#include "ps2_lua_traza.h"
++
++#include <cstdio>
++#include <cstring>
++#include <unordered_set>
++#include <utility>
++
++namespace ps2x::luatraza
++{
++    namespace
++    {
++        // lua_State
++        constexpr uint32_t kLCi = 0x14u;
++        constexpr uint32_t kLBaseCi = 0x28u;
++        // CallInfo
++        constexpr uint32_t kCiTam = 16u;
++        constexpr uint32_t kCiBase = 0u;
++        constexpr uint32_t kCiSavedpc = 8u;
++        constexpr uint32_t kCiTailcalls = 12u;
++        constexpr uint32_t kCiMaximos = 4096u; // ningun Lua del juego llega a tantos marcos
++        // TObject
++        constexpr uint32_t kTipoFuncion = 6u;
++        // Closure
++        constexpr uint32_t kClIsC = 6u;
++        constexpr uint32_t kClProto = 12u;
++        // Proto
++        constexpr uint32_t kPTt = 4u;
++        constexpr uint8_t kTipoProto = 9u;
++        constexpr uint32_t kPCode = 12u;
++        constexpr uint32_t kPHijas = 16u;
++        constexpr uint32_t kPLineinfo = 20u;
++        constexpr uint32_t kPSource = 32u;
++        constexpr uint32_t kPSizecode = 44u;
++        constexpr uint32_t kPSizelineinfo = 52u;
++        constexpr uint32_t kPSizep = 56u;
++        constexpr uint32_t kPLineDefined = 60u;
++        constexpr uint32_t kPTam = 72u;
++        // TString
++        constexpr uint32_t kTsTt = 4u;
++        constexpr uint8_t kTipoCadena = 4u;
++        constexpr uint32_t kTsLen = 12u;
++        constexpr uint32_t kTsTexto = 16u;
++        constexpr uint32_t kTsTam = 20u;
++
++        constexpr uint32_t kMaxNiveles = 32u;
++        constexpr size_t kMaxProtosPorTrozo = 4096u;
++
++        bool esProto(const Memoria &mem, uint32_t p)
++        {
++            uint8_t tt = 0u;
++            return (p & 3u) == 0u && mem.valida(p, kPTam) && mem.leer8(p + kPTt, tt) && tt == kTipoProto;
++        }
++
++        std::string hex8(uint32_t v)
++        {
++            char texto[16];
++            std::snprintf(texto, sizeof(texto), "0x%08X", v);
++            return texto;
++        }
++    }
++
++    bool Memoria::valida(uint32_t dir, uint32_t n) const
++    {
++        return datos != nullptr && dir != 0u && n <= tam && dir <= tam - n;
++    }
++
++    bool Memoria::leer32(uint32_t dir, uint32_t &valor) const
++    {
++        if ((dir & 3u) != 0u || !valida(dir, 4u))
++            return false;
++        std::memcpy(&valor, datos + dir, sizeof(valor));
++        return true;
++    }
++
++    bool Memoria::leer8(uint32_t dir, uint8_t &valor) const
++    {
++        if (!valida(dir, 1u))
++            return false;
++        valor = datos[dir];
++        return true;
++    }
++
++    std::optional<std::string> cadena(const Memoria &mem, uint32_t tstring, size_t maximo)
++    {
++        uint8_t tt = 0u;
++        uint32_t largo = 0u, texto = 0u;
++        if ((tstring & 3u) != 0u || !mem.valida(tstring, kTsTam) || !mem.leer8(tstring + kTsTt, tt) || tt != kTipoCadena ||
++            !mem.leer32(tstring + kTsLen, largo) || !mem.leer32(tstring + kTsTexto, texto))
++            return std::nullopt;
++        if (largo > mem.tam || (largo != 0u && !mem.valida(texto, largo)))
++            return std::nullopt;
++        const size_t n = largo < maximo ? largo : maximo;
++        std::string s;
++        s.reserve(n);
++        for (size_t i = 0; i < n; ++i)
++        {
++            const char c = static_cast<char>(mem.datos[texto + i]);
++            s.push_back(c >= 0x20 && c < 0x7F ? c : '.');
++        }
++        return s;
++    }
++
++    Posicion posicion(const Memoria &mem, uint32_t proto, uint32_t savedpc)
++    {
++        Posicion p;
++        uint32_t code = 0u, sizecode = 0u;
++        if (!esProto(mem, proto) || !mem.leer32(proto + kPCode, code) || !mem.leer32(proto + kPSizecode, sizecode))
++            return p;
++        if (code == 0u || (savedpc & 3u) != 0u || savedpc <= code || sizecode > (mem.tam / 4u))
++            return p;
++        const uint32_t siguiente = (savedpc - code) / 4u; // instruccion despues de la que corre
++        if (siguiente > sizecode)
++            return p;
++        p.pc = static_cast<int>(siguiente - 1u);
++        uint32_t lineinfo = 0u, sizelineinfo = 0u, linea = 0u;
++        if (mem.leer32(proto + kPLineinfo, lineinfo) && lineinfo != 0u && mem.leer32(proto + kPSizelineinfo, sizelineinfo) &&
++            static_cast<uint32_t>(p.pc) < sizelineinfo && mem.leer32(lineinfo + 4u * static_cast<uint32_t>(p.pc), linea))
++            p.linea = static_cast<int>(linea);
++        return p;
++    }
++
++    size_t Nombres::registrar(const Memoria &mem, uint32_t protoPrincipal, const std::string &nombre)
++    {
++        if (!esProto(mem, protoPrincipal))
++            return 0u;
++        std::vector<std::pair<uint32_t, std::pair<std::string, uint32_t>>> encontrados; // proto, (ruta, code)
++        std::unordered_set<uint32_t> vistos;
++        // Recorrido en profundidad con pila explicita: (proto, ruta, nivel).
++        struct Pendiente
++        {
++            uint32_t proto;
++            std::string ruta;
++            uint32_t nivel;
++        };
++        std::vector<Pendiente> pila{{protoPrincipal, "0", 0u}};
++        while (!pila.empty() && encontrados.size() < kMaxProtosPorTrozo)
++        {
++            Pendiente actual = std::move(pila.back());
++            pila.pop_back();
++            if (!esProto(mem, actual.proto) || !vistos.insert(actual.proto).second)
++                continue;
++            uint32_t code = 0u;
++            mem.leer32(actual.proto + kPCode, code);
++            encontrados.push_back({actual.proto, {actual.ruta, code}});
++            uint32_t hijas = 0u, sizep = 0u;
++            if (actual.nivel + 1u >= kMaxNiveles || !mem.leer32(actual.proto + kPHijas, hijas) ||
++                !mem.leer32(actual.proto + kPSizep, sizep) || hijas == 0u)
++                continue;
++            if (sizep > kMaxProtosPorTrozo)
++                sizep = kMaxProtosPorTrozo;
++            // Al reves, para sacar las hijas en orden.
++            for (uint32_t i = sizep; i-- > 0u;)
++            {
++                uint32_t hija = 0u;
++                if (!mem.leer32(hijas + 4u * i, hija) || hija == 0u)
++                    continue;
++                pila.push_back({hija, actual.ruta + "." + std::to_string(i), actual.nivel + 1u});
++            }
++        }
++        std::lock_guard<std::mutex> cerrojo(m_mutex);
++        if (m_protos.size() + encontrados.size() > kMaximo)
++            m_protos.clear();
++        for (auto &[proto, datos] : encontrados)
++            m_protos[proto] = Entrada{nombre, std::move(datos.first), datos.second};
++        return encontrados.size();
++    }
++
++    std::optional<Nombres::Entrada> Nombres::buscar(uint32_t proto, uint32_t code) const
++    {
++        std::lock_guard<std::mutex> cerrojo(m_mutex);
++        const auto it = m_protos.find(proto);
++        if (it == m_protos.end() || it->second.code != code)
++            return std::nullopt;
++        return it->second;
++    }
++
++    size_t Nombres::tam() const
++    {
++        std::lock_guard<std::mutex> cerrojo(m_mutex);
++        return m_protos.size();
++    }
++
++    Traza recorrer(const Memoria &mem, uint32_t L, size_t maximo, const Nombres *nombres)
++    {
++        Traza traza;
++        uint32_t ci = 0u, baseCi = 0u;
++        if ((L & 3u) != 0u || !mem.leer32(L + kLCi, ci) || !mem.leer32(L + kLBaseCi, baseCi))
++        {
++            Marco roto;
++            traza.marcos.push_back(roto);
++            return traza;
++        }
++        if (ci <= baseCi)
++            return traza;
++        for (; ci > baseCi; ci -= kCiTam)
++        {
++            if (traza.marcos.size() >= maximo)
++            {
++                traza.omitidos = (ci - baseCi) / kCiTam;
++                break;
++            }
++            Marco marco;
++            marco.ci = ci;
++            uint32_t base = 0u, tipoFuncion = 0u, cierre = 0u;
++            uint8_t esC = 0u;
++            const bool legible = (ci - baseCi) % kCiTam == 0u && (ci - baseCi) / kCiTam <= kCiMaximos &&
++                                 mem.valida(ci, kCiTam) && mem.leer32(ci + kCiBase, base) && base >= 8u &&
++                                 mem.leer32(base - 8u, tipoFuncion) && tipoFuncion == kTipoFuncion &&
++                                 mem.leer32(base - 4u, cierre) && mem.leer8(cierre + kClIsC, esC) &&
++                                 mem.leer32(cierre + kClProto, marco.funcion);
++            if (!legible)
++            {
++                marco.tipo = Marco::Tipo::Ilegible;
++                marco.funcion = 0u;
++                traza.marcos.push_back(std::move(marco));
++                break;
++            }
++            if (esC != 0u)
++            {
++                marco.tipo = Marco::Tipo::C;
++                traza.marcos.push_back(std::move(marco));
++                continue;
++            }
++            marco.tipo = Marco::Tipo::Lua;
++            const uint32_t proto = marco.funcion;
++            uint32_t source = 0u, lineDefined = 0u, savedpc = 0u, code = 0u;
++            if (esProto(mem, proto))
++            {
++                if (mem.leer32(proto + kPSource, source))
++                    marco.fuente = cadena(mem, source, 120u).value_or("");
++                if (mem.leer32(proto + kPLineDefined, lineDefined))
++                    marco.lineaDefinida = static_cast<int>(lineDefined);
++                mem.leer32(proto + kPCode, code);
++            }
++            if (mem.leer32(ci + kCiSavedpc, savedpc))
++                marco.pos = posicion(mem, proto, savedpc);
++            mem.leer32(ci + kCiTailcalls, marco.llamadasCola);
++            if (marco.llamadasCola > 1000000u)
++                marco.llamadasCola = 0u; // no es un contador de verdad
++            if (nombres != nullptr)
++                if (const auto entrada = nombres->buscar(proto, code))
++                {
++                    marco.nombre = entrada->nombre;
++                    marco.ruta = entrada->ruta;
++                }
++            traza.marcos.push_back(std::move(marco));
++        }
++        return traza;
++    }
++
++    std::string lineaMarco(size_t indice, const Marco &marco)
++    {
++        std::string s = "#" + std::to_string(indice) + " ";
++        switch (marco.tipo)
++        {
++        case Marco::Tipo::C:
++            return s + "[C] " + hex8(marco.funcion);
++        case Marco::Tipo::Ilegible:
++            return s + "marco ilegible ci=" + hex8(marco.ci);
++        case Marco::Tipo::Lua:
++            break;
++        }
++        if (!marco.nombre.empty())
++            s += marco.nombre;
++        else
++            s += marco.fuente.empty() ? "?" : marco.fuente;
++        if (marco.pos.linea >= 0)
++            s += ":" + std::to_string(marco.pos.linea);
++        if (!marco.ruta.empty())
++            s += " F" + marco.ruta;
++        else
++            s += " proto=" + hex8(marco.funcion);
++        s += " instruccion " + (marco.pos.pc >= 0 ? std::to_string(marco.pos.pc) : std::string("?"));
++        s += " (funcion de la linea " + std::to_string(marco.lineaDefinida) + ")";
++        if (marco.llamadasCola != 0u)
++            s += " (+" + std::to_string(marco.llamadasCola) + " llamadas de cola)";
++        return s;
++    }
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 37e9b80..693dfd9 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -52,6 +52,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_salida_tests.cpp
+     src/ps2_cabecera_tests.cpp
+     src/ps2_fallo_tests.cpp
++    src/ps2_lua_traza_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index ff4db10..114a350 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -33,6 +33,7 @@ void register_ps2_vigilante_tests();
+ void register_ps2_salida_tests();
+ void register_ps2_cabecera_tests();
+ void register_ps2_fallo_tests();
++void register_ps2_lua_traza_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -70,6 +71,7 @@ int main()
+     register_ps2_salida_tests();
+     register_ps2_cabecera_tests();
+     register_ps2_fallo_tests();
++    register_ps2_lua_traza_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_fallo_tests.cpp b/ps2xTest/src/ps2_fallo_tests.cpp
+index 0dd29bd..20218f1 100644
+--- a/ps2xTest/src/ps2_fallo_tests.cpp
++++ b/ps2xTest/src/ps2_fallo_tests.cpp
+@@ -51,10 +51,21 @@ void register_ps2_fallo_tests()
+             t.Equals(m.segundos, 0.0, "0 s");
+         });
+ 
++        tc.Run("PS2X_PRUEBA_FALLO: lua and exit (T3c)", [](TestCase &t)
++        {
++            const auto l = ps2x::fallo::leerPrueba("lua:15");
++            t.IsTrue(l.tipo == Prueba::Lua, "lua");
++            t.Equals(l.segundos, 15.0, "15 s");
++            const auto x = ps2x::fallo::leerPrueba("exit:0.5");
++            t.IsTrue(x.tipo == Prueba::Exit, "exit");
++            t.Equals(x.segundos, 0.5, "0.5 s");
++        });
++
+         tc.Run("PS2X_PRUEBA_FALLO: anything else triggers nothing", [](TestCase &t)
+         {
+             for (const char *valor : {"", "acceso", "acceso:", "acceso:-1", "acceso:15x", "acceso:15:3", "Acceso:15",
+-                                      "otro:15", ":15", "acceso: ", "acceso:abc"})
++                                      "otro:15", ":15", "acceso: ", "acceso:abc", "lua", "lua:", "Lua:15", "luas:15",
++                                      "exit:-1", "exit:x", "exi:15"})
+                 t.IsTrue(ps2x::fallo::leerPrueba(valor).tipo == Prueba::Ninguna, std::string("rejected: ") + valor);
+             t.IsTrue(ps2x::fallo::leerPrueba(nullptr).tipo == Prueba::Ninguna, "unset");
+         });
+diff --git a/ps2xTest/src/ps2_lua_traza_tests.cpp b/ps2xTest/src/ps2_lua_traza_tests.cpp
+new file mode 100644
+index 0000000..77a86c1
+--- /dev/null
++++ b/ps2xTest/src/ps2_lua_traza_tests.cpp
+@@ -0,0 +1,316 @@
++#include "MiniTest.h"
++#include "ps2_lua_traza.h"
++
++#include <cstring>
++#include <string>
++#include <vector>
++
++// odd/tasks/fallos-con-log.md T3c (S3): a Lua error in the log names the script, the function and the instruction
++// (the line when the chunk has line info), read from guest memory without ever trusting a pointer.
++namespace
++{
++    using namespace ps2x::luatraza;
++
++    // A small fake guest RAM with the game's Lua layout (ps2_lua_traza.h).
++    struct Ram
++    {
++        std::vector<uint8_t> b = std::vector<uint8_t>(0x10000u, 0u);
++        Memoria mem() const { return Memoria{b.data(), static_cast<uint32_t>(b.size())}; }
++        void w32(uint32_t dir, uint32_t v) { std::memcpy(&b[dir], &v, 4); }
++        void w8(uint32_t dir, uint8_t v) { b[dir] = v; }
++
++        // TString at dir with its text right after it (+20).
++        void tstring(uint32_t dir, const std::string &texto)
++        {
++            w8(dir + 4u, 4u);
++            w32(dir + 12u, static_cast<uint32_t>(texto.size()));
++            w32(dir + 16u, dir + 20u);
++            std::memcpy(&b[dir + 20u], texto.data(), texto.size());
++        }
++        // Proto at dir: tt 9, code, children, lineinfo, source...
++        void proto(uint32_t dir, uint32_t code, uint32_t sizecode, uint32_t source, int lineDefined,
++                   uint32_t hijas = 0u, uint32_t sizep = 0u, uint32_t lineinfo = 0u, uint32_t sizelineinfo = 0u)
++        {
++            w8(dir + 4u, 9u);
++            w32(dir + 12u, code);
++            w32(dir + 16u, hijas);
++            w32(dir + 20u, lineinfo);
++            w32(dir + 32u, source);
++            w32(dir + 44u, sizecode);
++            w32(dir + 52u, sizelineinfo);
++            w32(dir + 56u, sizep);
++            w32(dir + 60u, static_cast<uint32_t>(lineDefined));
++        }
++        // Lua closure at dir for proto; its TObject (type 6) at stack slot funcObj.
++        void funcion(uint32_t funcObj, uint32_t cierre, uint32_t protoOFuncion, bool esC)
++        {
++            w32(funcObj, 6u);
++            w32(funcObj + 4u, cierre);
++            w8(cierre + 6u, esC ? 1u : 0u);
++            w32(cierre + 12u, protoOFuncion);
++        }
++        void ci(uint32_t dir, uint32_t base, uint32_t savedpc, uint32_t tailcalls = 0u)
++        {
++            w32(dir, base);
++            w32(dir + 4u, base + 0x100u);
++            w32(dir + 8u, savedpc);
++            w32(dir + 12u, tailcalls);
++        }
++    };
++
++    constexpr uint32_t kL = 0x100u;
++    constexpr uint32_t kBaseCi = 0x200u;
++    constexpr uint32_t kStack = 0x1000u;
++
++    // Three frames above base_ci: #0 Lua (MainMenu.lua F0.1, pc 3), #1 C 0x149FB0, #2 Lua (F0, pc 7, unknown chunk).
++    Ram escena(Nombres &nombres, bool registrar = true)
++    {
++        Ram r;
++        r.tstring(0x3000u, "@X");
++        r.proto(0x4000u, 0x5000u, 20u, 0x3000u, 0, 0x4100u, 1u); // main F0
++        r.w32(0x4100u, 0x4200u);
++        r.proto(0x4200u, 0x5100u, 10u, 0x3000u, 120); // F0.0
++        r.proto(0x4400u, 0x5300u, 12u, 0x3000u, 33);  // another chunk, not registered
++        if (registrar)
++            nombres.registrar(r.mem(), 0x4000u, "FrontEnd/Scripts/Offline/MainMenu.lua");
++        r.w32(kL + 0x28u, kBaseCi);
++        r.ci(kBaseCi, kStack + 8u, 0u);
++        r.funcion(kStack + 0x10u, 0x6000u, 0x4400u, false); // #2
++        r.ci(kBaseCi + 0x10u, kStack + 0x18u, 0x5300u + 4u * 8u);
++        r.funcion(kStack + 0x40u, 0x6100u, 0x00149FB0u, true); // #1
++        r.ci(kBaseCi + 0x20u, kStack + 0x48u, 0u);
++        r.funcion(kStack + 0x80u, 0x6200u, 0x4200u, false); // #0
++        r.ci(kBaseCi + 0x30u, kStack + 0x88u, 0x5100u + 4u * 4u, 2u);
++        r.w32(kL + 0x14u, kBaseCi + 0x30u);
++        return r;
++    }
++}
++
++void register_ps2_lua_traza_tests()
++{
++    MiniTest::Case("LuaTraza", [](TestCase &tc)
++    {
++        tc.Run("memory: every address is range-checked", [](TestCase &t)
++        {
++            Ram r;
++            const Memoria m = r.mem();
++            t.IsFalse(m.valida(0u, 4u), "null");
++            t.IsTrue(m.valida(0xFFFCu, 4u), "last word");
++            t.IsFalse(m.valida(0xFFFDu, 4u), "crosses the end");
++            t.IsFalse(m.valida(0xFFFFFFFCu, 8u), "wraps around");
++            t.IsFalse(m.valida(0x20000u, 1u), "past the end");
++            r.w32(0x40u, 0x12345678u);
++            uint32_t v = 0u;
++            t.IsTrue(m.leer32(0x40u, v) && v == 0x12345678u, "aligned read");
++            t.IsFalse(m.leer32(0x42u, v), "unaligned word");
++            uint8_t c = 0u;
++            t.IsTrue(m.leer8(0x41u, c) && c == 0x56u, "byte");
++            t.IsFalse(Memoria{}.valida(0x10u, 1u), "no memory");
++        });
++
++        tc.Run("TString: text, cut to the maximum, rejected when not a string", [](TestCase &t)
++        {
++            Ram r;
++            r.tstring(0x100u, "@LaunchScripts/febootscript.lua");
++            t.Equals(cadena(r.mem(), 0x100u).value_or("<none>"), std::string("@LaunchScripts/febootscript.lua"), "text");
++            t.Equals(cadena(r.mem(), 0x100u, 7u).value_or("<none>"), std::string("@Launch"), "cut");
++            r.tstring(0x200u, std::string("a\nb", 3));
++            t.Equals(cadena(r.mem(), 0x200u).value_or("<none>"), std::string("a.b"), "non-printable as '.'");
++            r.w8(0x204u, 5u);
++            t.IsFalse(cadena(r.mem(), 0x200u).has_value(), "type 5 is not a string");
++            r.tstring(0x300u, "x");
++            r.w32(0x310u, 0xFFFFF0u);
++            t.IsFalse(cadena(r.mem(), 0x300u).has_value(), "text pointer outside RAM");
++            r.tstring(0x400u, "y");
++            r.w32(0x40Cu, 0x7FFFFFFFu);
++            t.IsFalse(cadena(r.mem(), 0x400u).has_value(), "absurd length");
++            t.IsFalse(cadena(r.mem(), 0u).has_value(), "null");
++            t.IsFalse(cadena(r.mem(), 0xFFF0u).has_value(), "header past the end");
++        });
++
++        tc.Run("position: instruction from savedpc, line from lineinfo", [](TestCase &t)
++        {
++            Ram r;
++            r.proto(0x100u, 0x1000u, 10u, 0u, 5, 0u, 0u, 0x2000u, 10u);
++            for (uint32_t i = 0; i < 10u; ++i)
++                r.w32(0x2000u + 4u * i, 50u + i);
++            Posicion p = posicion(r.mem(), 0x100u, 0x1000u + 4u * 4u);
++            t.Equals(p.pc, 3, "savedpc points after the running instruction");
++            t.Equals(p.linea, 53, "lineinfo[3]");
++            p = posicion(r.mem(), 0x100u, 0x1000u + 4u * 10u);
++            t.Equals(p.pc, 9, "last instruction");
++            t.Equals(p.linea, 59, "last line");
++            t.Equals(posicion(r.mem(), 0x100u, 0x1000u).pc, -1, "savedpc at code: nothing ran yet");
++            t.Equals(posicion(r.mem(), 0x100u, 0x1000u + 4u * 11u).pc, -1, "past the code");
++            t.Equals(posicion(r.mem(), 0x100u, 0x1002u).pc, -1, "unaligned savedpc");
++            t.Equals(posicion(r.mem(), 0x100u, 0x0FF0u).pc, -1, "before the code");
++        });
++
++        tc.Run("position: stripped chunk or short lineinfo gives no line", [](TestCase &t)
++        {
++            Ram r;
++            r.proto(0x100u, 0x1000u, 10u, 0u, 5);
++            Posicion p = posicion(r.mem(), 0x100u, 0x1000u + 4u * 2u);
++            t.Equals(p.pc, 1, "pc still known");
++            t.Equals(p.linea, -1, "no lineinfo");
++            r.proto(0x200u, 0x1000u, 10u, 0u, 5, 0u, 0u, 0x2000u, 2u);
++            p = posicion(r.mem(), 0x200u, 0x1000u + 4u * 5u);
++            t.Equals(p.pc, 4, "pc");
++            t.Equals(p.linea, -1, "pc beyond sizelineinfo");
++            r.proto(0x300u, 0x1000u, 10u, 0u, 5, 0u, 0u, 0xFFF0u, 10u);
++            t.Equals(posicion(r.mem(), 0x300u, 0x1000u + 4u * 8u).linea, -1, "lineinfo entry outside RAM");
++            t.Equals(posicion(r.mem(), 0xFFFCu, 0x1004u).pc, -1, "proto outside RAM");
++        });
++
++        tc.Run("names: the chunk tree gets lua_volcados paths, stale entries are ignored", [](TestCase &t)
++        {
++            Ram r;
++            r.proto(0x100u, 0x1000u, 4u, 0u, 0, 0x800u, 2u);
++            r.w32(0x800u, 0x200u);
++            r.w32(0x804u, 0x300u);
++            r.proto(0x200u, 0x1100u, 4u, 0u, 3);
++            r.proto(0x300u, 0x1200u, 4u, 0u, 9, 0x900u, 1u);
++            r.w32(0x900u, 0x400u);
++            r.proto(0x400u, 0x1300u, 4u, 0u, 10);
++            Nombres n;
++            t.Equals(n.registrar(r.mem(), 0x100u, "A.lua"), size_t{4}, "four protos");
++            t.Equals(n.buscar(0x100u, 0x1000u).value_or(Nombres::Entrada{}).ruta, std::string("0"), "main");
++            t.Equals(n.buscar(0x300u, 0x1200u).value_or(Nombres::Entrada{}).ruta, std::string("0.1"), "second child");
++            const auto nieta = n.buscar(0x400u, 0x1300u).value_or(Nombres::Entrada{});
++            t.Equals(nieta.ruta, std::string("0.1.0"), "grandchild");
++            t.Equals(nieta.nombre, std::string("A.lua"), "chunk name");
++            t.IsFalse(n.buscar(0x400u, 0x9999u).has_value(), "same address, other code: freed and reused");
++            t.IsFalse(n.buscar(0x500u, 0x1300u).has_value(), "unknown");
++            // Reloading another chunk at the same address replaces the entry.
++            n.registrar(r.mem(), 0x200u, "B.lua");
++            t.Equals(n.buscar(0x200u, 0x1100u).value_or(Nombres::Entrada{}).nombre, std::string("B.lua"), "replaced");
++        });
++
++        tc.Run("names: bad pointers and cycles are bounded", [](TestCase &t)
++        {
++            Ram r;
++            r.proto(0x100u, 0x1000u, 4u, 0u, 0, 0x800u, 3u);
++            r.w32(0x800u, 0x100u);     // itself: a cycle
++            r.w32(0x804u, 0xFFFFFF0u); // outside RAM
++            r.w32(0x808u, 0x600u);     // not a Proto (tt 0)
++            Nombres n;
++            t.Equals(n.registrar(r.mem(), 0x100u, "C.lua"), size_t{1}, "only the main proto");
++            t.Equals(n.registrar(r.mem(), 0xFFFF0u, "D.lua"), size_t{0}, "main outside RAM");
++            r.proto(0x200u, 0x1000u, 4u, 0u, 0, 0xFFF0u, 100u); // children array runs past the end
++            t.Equals(n.registrar(r.mem(), 0x200u, "E.lua"), size_t{1}, "children array outside RAM");
++        });
++
++        tc.Run("walk: Lua and C frames from L->ci down, without base_ci", [](TestCase &t)
++        {
++            Nombres nombres;
++            const Ram r = escena(nombres);
++            const Traza tr = recorrer(r.mem(), kL, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{3}, "three frames");
++            t.Equals(tr.omitidos, size_t{0}, "none left out");
++            if (tr.marcos.size() != 3u)
++                return;
++            const Marco &m0 = tr.marcos[0];
++            t.IsTrue(m0.tipo == Marco::Tipo::Lua, "#0 Lua");
++            t.Equals(m0.nombre, std::string("FrontEnd/Scripts/Offline/MainMenu.lua"), "#0 chunk");
++            t.Equals(m0.ruta, std::string("0.0"), "#0 path");
++            t.Equals(m0.fuente, std::string("@X"), "#0 source");
++            t.Equals(m0.pos.pc, 3, "#0 pc");
++            t.Equals(m0.lineaDefinida, 120, "#0 lineDefined");
++            t.Equals(m0.llamadasCola, 2u, "#0 tail calls");
++            t.IsTrue(tr.marcos[1].tipo == Marco::Tipo::C, "#1 C");
++            t.Equals(tr.marcos[1].funcion, 0x00149FB0u, "#1 function");
++            t.IsTrue(tr.marcos[2].tipo == Marco::Tipo::Lua, "#2 Lua");
++            t.Equals(tr.marcos[2].nombre, std::string(""), "#2 not registered");
++            t.Equals(tr.marcos[2].funcion, 0x4400u, "#2 proto");
++            t.Equals(tr.marcos[2].pos.pc, 7, "#2 pc");
++        });
++
++        tc.Run("walk: bounded to the maximum", [](TestCase &t)
++        {
++            Nombres nombres;
++            const Ram r = escena(nombres);
++            const Traza tr = recorrer(r.mem(), kL, 2u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{2}, "two frames");
++            t.Equals(tr.omitidos, size_t{1}, "one left out");
++        });
++
++        tc.Run("walk: a broken frame ends the trace, never a crash", [](TestCase &t)
++        {
++            Nombres nombres;
++            Ram r = escena(nombres);
++            r.w32(kBaseCi + 0x20u, 0xFFFFF00u); // #1 base outside RAM
++            Traza tr = recorrer(r.mem(), kL, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{2}, "#0 and the broken one");
++            if (tr.marcos.size() == 2u)
++            {
++                t.IsTrue(tr.marcos[1].tipo == Marco::Tipo::Ilegible, "#1 unreadable");
++                t.Equals(tr.marcos[1].ci, kBaseCi + 0x20u, "#1 ci");
++            }
++            r = escena(nombres);
++            r.w32(kStack + 0x80u, 5u); // #0 function object is a table
++            tr = recorrer(r.mem(), kL, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{1}, "stops at #0");
++            t.IsTrue(!tr.marcos.empty() && tr.marcos[0].tipo == Marco::Tipo::Ilegible, "#0 unreadable");
++            r = escena(nombres);
++            r.w32(kL + 0x14u, kBaseCi + 0x34u); // ci not on a CallInfo boundary
++            tr = recorrer(r.mem(), kL, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{1}, "misaligned ci");
++            r = escena(nombres);
++            r.w32(kL + 0x14u, kBaseCi - 0x10u); // ci below base_ci: nothing to show
++            t.Equals(recorrer(r.mem(), kL, 20u, &nombres).marcos.size(), size_t{0}, "ci below base_ci");
++            tr = recorrer(r.mem(), 0xFFFFFF00u, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{1}, "L outside RAM");
++            r = escena(nombres);
++            r.w32(0x4200u + 12u, 0xFFFF00u); // #0 proto code outside RAM: frame kept, pc unknown
++            tr = recorrer(r.mem(), kL, 20u, &nombres);
++            t.Equals(tr.marcos.size(), size_t{3}, "still three frames");
++            t.Equals(tr.marcos.empty() ? 0 : tr.marcos[0].pos.pc, -1, "pc unknown");
++        });
++
++        tc.Run("walk: without names the source is shown", [](TestCase &t)
++        {
++            Nombres nombres;
++            const Ram r = escena(nombres, false);
++            const Traza tr = recorrer(r.mem(), kL, 20u, nullptr);
++            t.Equals(tr.marcos.size(), size_t{3}, "three frames");
++            t.Equals(tr.marcos.empty() ? std::string() : tr.marcos[0].nombre, std::string(""), "no name");
++        });
++
++        tc.Run("frame lines", [](TestCase &t)
++        {
++            Marco m;
++            m.tipo = Marco::Tipo::Lua;
++            m.funcion = 0x00ABCDEFu;
++            m.fuente = "@X";
++            m.nombre = "FrontEnd/Scripts/X.lua";
++            m.ruta = "0.3";
++            m.lineaDefinida = 120;
++            m.pos = {15, -1};
++            t.Equals(lineaMarco(0, m), std::string("#0 FrontEnd/Scripts/X.lua F0.3 instruccion 15 (funcion de la linea 120)"),
++                     "registered chunk without lines");
++            m.nombre = "Mod.lua";
++            m.pos = {15, 42};
++            m.lineaDefinida = 40;
++            m.llamadasCola = 2u;
++            t.Equals(lineaMarco(0, m), std::string("#0 Mod.lua:42 F0.3 instruccion 15 (funcion de la linea 40) (+2 llamadas de cola)"),
++                     "with line info and tail calls");
++            m.nombre.clear();
++            m.ruta.clear();
++            m.pos = {-1, -1};
++            m.lineaDefinida = 120;
++            m.llamadasCola = 0u;
++            t.Equals(lineaMarco(0, m), std::string("#0 @X proto=0x00ABCDEF instruccion ? (funcion de la linea 120)"),
++                     "unregistered chunk, unknown pc");
++            m.fuente.clear();
++            t.Equals(lineaMarco(4, m), std::string("#4 ? proto=0x00ABCDEF instruccion ? (funcion de la linea 120)"),
++                     "unreadable source");
++            Marco c;
++            c.tipo = Marco::Tipo::C;
++            c.funcion = 0x00149FB0u;
++            t.Equals(lineaMarco(1, c), std::string("#1 [C] 0x00149FB0"), "C function");
++            Marco x;
++            x.ci = 0x0012ABC0u;
++            t.Equals(lineaMarco(12, x), std::string("#12 marco ilegible ci=0x0012ABC0"), "unreadable frame");
++        });
++    });
++}

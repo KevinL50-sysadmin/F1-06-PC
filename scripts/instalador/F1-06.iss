@@ -1,7 +1,8 @@
 ; Instalador de F1 06 recompilado (Inno Setup 6). No se compila a mano: lo hace scripts\empaquetar.ps1 -Instalador,
 ; que pasa la carpeta portable ya hecha (Origen), el nombre del .exe, la version, la fecha, el icono (Icono:
 ; build\icono\F1-06.ico, el logo del juego, de scripts\hacer-icono.ps1) y la carpeta de salida.
-; Instala el .exe, las DLL, data\, README.txt (ingles), LEEME.txt (espanol) y licenses\; sin portable.txt, asi que el
+; Instala el .exe, las DLL, data\, README.txt (ingles), LEEME.txt (espanol), recomplauncher.json (RecompLauncher) y
+; licenses\; sin portable.txt, asi que el
 ; juego guarda lo del usuario en Documentos\My Games\F1-06 (config, saves, mods, screenshots) y los registros en
 ; AppData\Local\F1-06\logs.
 ; v1.1.1 (odd/tasks/player-folders.md): la carpeta del jugador va en ingles. Al actualizar desde la 1.1.0 se quitan
@@ -12,7 +13,8 @@
 ; solo lo dejan en ~81 %), y lzma2/fast reduce mas los .WAD de graficos sin pasar de unos minutos.
 ; Lanzamiento T1: con /DSinDatos (empaquetar.ps1 -SinDatos, la version publica) no lleva data\: un solo Setup.exe
 ; con la pagina "Elige tu copia del juego (ISO)", que al instalar ejecuta {#NombreExe} --extraer-iso <iso> --ventana
-; (su barra de progreso, cancelable). En blanco, el juego pide la ISO la primera vez que se abre.
+; (su barra de progreso, cancelable; en silencio, sin --ventana: fallos-con-log T9). En blanco, el juego pide la ISO
+; la primera vez que se abre.
 
 #ifndef Origen
   #error Falta /DOrigen=<carpeta portable>: compila con scripts\empaquetar.ps1 -Instalador
@@ -120,6 +122,8 @@ Source: "{#Origen}\{#NombreExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Origen}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Origen}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Origen}\LEEME.txt"; DestDir: "{app}"; Flags: ignoreversion
+; RecompLauncher (odd/tasks/recomplauncher-json.md): junto al .exe; sin portable.txt usa las rutas de Documentos y AppData
+Source: "{#Origen}\recomplauncher.json"; DestDir: "{app}"; Flags: ignoreversion
 ; Licencias de paraLLEl-GS (LGPL) y sus dependencias, con su codigo fuente (lo genera empaquetar.ps1)
 Source: "{#Origen}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 #ifndef SinDatos
@@ -228,19 +232,66 @@ begin
   end;
 end;
 
+// fallos-con-log T9 (L31): las lineas de un flujo del .exe en el registro de /LOG, como mucho 60. Las "progress
+// <0-1> <texto>" (para RecompLauncher, una por centesima) no van: solo la ultima.
+procedure RegistrarSalida(const Flujo: String; const Lineas: TArrayOfString);
+var
+  I, Escritas: Integer;
+  UltimoProgreso: String;
+begin
+  Escritas := 0;
+  UltimoProgreso := '';
+  for I := 0 to GetArrayLength(Lineas) - 1 do
+    if Copy(Lineas[I], 1, 9) = 'progress ' then
+      UltimoProgreso := Lineas[I]
+    else if Escritas < 60 then
+    begin
+      Log(Flujo + ': ' + Lineas[I]);
+      Escritas := Escritas + 1;
+    end;
+  if UltimoProgreso <> '' then
+    Log(Flujo + ' (ultima progress): ' + UltimoProgreso);
+  if Escritas = 60 then
+    Log(Flujo + ': ... (se cortan las demas lineas)');
+end;
+
 // Tras copiar los archivos: el .exe comprueba la ISO y la copia en {app}\data con su ventana de progreso (y sus
 // mensajes de error). Si no se copia, el juego la pide al abrirse.
+// fallos-con-log T9 (L31): en silencio (/SILENT, /VERYSILENT) va sin --ventana: una ventana del .exe (error o
+// progreso, salen visibles aunque se oculte el proceso) dejaba la instalacion esperando sin limite y sin rastro.
+// En los dos casos la orden, el codigo de salida y las lineas [disco] del .exe quedan en el registro de /LOG.
 procedure CopiarIso;
 var
-  Iso: String;
+  Iso, Parametros: String;
   Codigo: Integer;
+  Salida: TExecOutput;
+  Hecho: Boolean;
 begin
   Iso := Trim(PaginaIso.Values[0]);
   if Iso = '' then
     Exit;
   WizardForm.StatusLabel.Caption := CustomMessage('IsoCopiando');
-  if not Exec(ExpandConstant('{app}\{#NombreExe}'), '--extraer-iso "' + Iso + '" --ventana', ExpandConstant('{app}'),
-      SW_HIDE, ewWaitUntilTerminated, Codigo) or (Codigo <> 0) then
+  Parametros := '--extraer-iso "' + Iso + '"';
+  if not WizardSilent then
+    Parametros := Parametros + ' --ventana';
+  Log('Copia de la ISO: ' + ExpandConstant('{app}\{#NombreExe}') + ' ' + Parametros);
+  try
+    Hecho := ExecAndCaptureOutput(ExpandConstant('{app}\{#NombreExe}'), Parametros, ExpandConstant('{app}'),
+      SW_SHOWNORMAL, ewWaitUntilTerminated, Codigo, Salida);
+  except
+    Hecho := False;
+    Codigo := -1;
+    Log('Copia de la ISO: ' + GetExceptionMessage);
+  end;
+  if Hecho then
+  begin
+    RegistrarSalida('salida', Salida.StdOut);
+    RegistrarSalida('errores', Salida.StdErr);
+    Log('Copia de la ISO: codigo de salida ' + IntToStr(Codigo));
+  end
+  else if Codigo <> -1 then
+    Log('Copia de la ISO: no se pudo ejecutar (' + SysErrorMessage(Codigo) + ')');
+  if not Hecho or (Codigo <> 0) then
     SuppressibleMsgBox(CustomMessage('IsoSinCopiar'), mbInformation, MB_OK, IDOK);
 end;
 #endif

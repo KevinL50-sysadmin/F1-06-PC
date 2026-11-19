@@ -1,28 +1,28 @@
-// Informe de fallos del port de F1 06: si el proceso se cae (excepcion sin manejar), escribe en stderr el codigo, la
-// direccion y la pila con simbolos del PDB ("[fallo]"). Como cada funcion del juego es una funcion del host
-// (sub_XXXXXX), sirve tambien de pila del EE. El runner se compila por lotes (unity) junto a archivos que incluyen
-// raylib, que choca con windows.h: por eso las pocas declaraciones de Win32 y dbghelp que hacen falta van aqui.
+// Informe de fallos del port de F1 06: si el proceso se cae (excepcion sin manejar), escribe en el registro el codigo,
+// la direccion y el informe de ps2_fallo.h ("[fallo]": identidad de la compilacion, hilo, pc y ra del EE y la pila como
+// modulo+0xdesp, que scripts/simbolizar.ps1 traduce con el PDB guardado de esa version; odd/tasks/fallos-con-log.md
+// T3b). Como cada funcion del juego es una funcion del host (sub_XXXXXX), la pila sirve tambien de pila del EE. El
+// filtro devuelve EXCEPTION_CONTINUE_SEARCH: Windows termina el proceso con el codigo de la excepcion (p. ej.
+// 0xC0000005), que RecompLauncher ve como fallo. El runner se compila por lotes (unity) junto a archivos que incluyen
+// raylib, que choca con windows.h: por eso las pocas declaraciones de Win32 que hacen falta van aqui.
 // Tambien, por lo mismo, lo de los nucleos del procesador (f1EnNucleoEficiente, f1NucleosDeRendimiento).
+#include "ps2_fallo.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <intrin.h>
-
-#pragma comment(lib, "dbghelp.lib")
+#include <stdexcept>
+#include <thread>
 
 extern "C"
 {
     __declspec(dllimport) void *__stdcall SetUnhandledExceptionFilter(void *filtro);
     __declspec(dllimport) void *__stdcall GetCurrentProcess();
     __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId();
-    __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long saltar, unsigned long cuantos,
-                                                                             void **pila, unsigned long *hash);
-    __declspec(dllimport) int __stdcall SymInitialize(void *proceso, const char *ruta, int invadir);
-    __declspec(dllimport) unsigned long __stdcall SymSetOptions(unsigned long opciones);
-    __declspec(dllimport) int __stdcall SymFromAddr(void *proceso, uint64_t dir, uint64_t *desp, void *simbolo);
-    __declspec(dllimport) int __stdcall SymGetLineFromAddr64(void *proceso, uint64_t dir, unsigned long *desp,
-                                                             void *linea);
     __declspec(dllimport) void *__stdcall GetCurrentThread();
+    __declspec(dllimport) void *__stdcall GetModuleHandleW(const wchar_t *modulo);
+    __declspec(dllimport) void *__stdcall GetProcAddress(void *modulo, const char *nombre);
     __declspec(dllimport) unsigned long __stdcall GetCurrentProcessorNumber();
     __declspec(dllimport) int __stdcall GetSystemCpuSetInformation(void *info, unsigned long largo,
                                                                    unsigned long *devuelto, void *proceso,
@@ -180,33 +180,7 @@ unsigned f1NucleosAparcados()
 
 namespace
 {
-    // SYMBOL_INFO, IMAGEHLP_LINE64 y EXCEPTION_RECORD (x64) con lo que se usa.
-    struct FalloSimbolo
-    {
-        unsigned long SizeOfStruct;
-        unsigned long TypeIndex;
-        uint64_t Reserved[2];
-        unsigned long Index;
-        unsigned long Size;
-        uint64_t ModBase;
-        unsigned long Flags;
-        uint64_t Value;
-        uint64_t Address;
-        unsigned long Register;
-        unsigned long Scope;
-        unsigned long Tag;
-        unsigned long NameLen;
-        unsigned long MaxNameLen;
-        char Name[512];
-    };
-    struct FalloLinea
-    {
-        unsigned long SizeOfStruct;
-        void *Key;
-        unsigned long LineNumber;
-        char *FileName;
-        uint64_t Address;
-    };
+    // EXCEPTION_RECORD (x64) con lo que se usa.
     struct FalloRegistro
     {
         unsigned long ExceptionCode;
@@ -221,24 +195,6 @@ namespace
         FalloRegistro *ExceptionRecord;
         uint8_t *ContextRecord; // CONTEXT: Rsp en +0x98, Rip en +0xF8
     };
-
-    void falloImprimir(void *proceso, uint64_t dir, int n)
-    {
-        FalloSimbolo sym{};
-        sym.SizeOfStruct = 88u; // sizeof(SYMBOL_INFO) con Name[1]
-        sym.MaxNameLen = sizeof(sym.Name) - 1u;
-        uint64_t desp = 0;
-        FalloLinea linea{};
-        linea.SizeOfStruct = sizeof(linea);
-        unsigned long despLinea = 0;
-        const bool conNombre = SymFromAddr(proceso, dir, &desp, &sym) != 0;
-        const bool conLinea = SymGetLineFromAddr64(proceso, dir, &despLinea, &linea) != 0;
-        std::fprintf(stderr, "[fallo]   #%d 0x%llx %s+0x%llx", n, static_cast<unsigned long long>(dir),
-                     conNombre ? sym.Name : "?", static_cast<unsigned long long>(desp));
-        if (conLinea)
-            std::fprintf(stderr, " (%s:%lu)", linea.FileName, linea.LineNumber);
-        std::fprintf(stderr, "\n");
-    }
 
     long __stdcall falloInformar(FalloPunteros *info)
     {
@@ -256,22 +212,18 @@ namespace
                          r->ExceptionInformation[0] == 8 ? "ejecutar" : r->ExceptionInformation[0] == 1 ? "escribir" : "leer",
                          static_cast<unsigned long long>(r->ExceptionInformation[1]));
         std::fprintf(stderr, "\n");
-        void *proceso = GetCurrentProcess();
-        SymSetOptions(0x2u | 0x4u | 0x10u); // UNDNAME, DEFERRED_LOADS, LOAD_LINES
-        SymInitialize(proceso, nullptr, 1);
-        if (rip == 0 && rsp != 0)
-        {
-            uint64_t vuelta = 0;
-            std::memcpy(&vuelta, reinterpret_cast<const void *>(rsp), 8);
-            std::fprintf(stderr, "[fallo] salto a 0; quien llamo:\n");
-            falloImprimir(proceso, vuelta, 0);
-        }
-        // Desde aqui, la pila pasa por el despachador de excepciones y sigue en el punto del fallo.
+        // Desde aqui, la pila pasa por el despachador de excepciones y sigue en el punto del fallo. Con un salto a la
+        // direccion 0 no hay marco del fallo: el #0 es entonces quien llamo (la vuelta en la cima de la pila).
         void *pila[64] = {};
-        const unsigned short n = RtlCaptureStackBackTrace(0, 64, pila, nullptr);
-        std::fprintf(stderr, "[fallo] pila (incluye el despachador de excepciones):\n");
-        for (unsigned short i = 0; i < n; ++i)
-            falloImprimir(proceso, reinterpret_cast<uint64_t>(pila[i]), i);
+        int n = 0;
+        const bool saltoACero = rip == 0 && rsp != 0;
+        if (saltoACero)
+            std::memcpy(&pila[n++], reinterpret_cast<const void *>(rsp), 8);
+        n += ps2x::fallo::pilaActual(pila + n, 64 - n, 0);
+        ps2x::fallo::escribirInforme("[fallo] ",
+                                     saltoACero ? "pila (salto a 0: #0 es quien llamo; luego el despachador de excepciones)"
+                                                : "pila (incluye el despachador de excepciones)",
+                                     pila, n);
         std::fflush(stderr);
         std::fflush(stdout);
         return 0;
@@ -282,4 +234,27 @@ namespace
         SetUnhandledExceptionFilter(reinterpret_cast<void *>(&falloInformar));
         return true;
     }();
+}
+
+// PS2X_PRUEBA_FALLO (ps2_fallo.h, solo para las pruebas de T4): el fallo de cada tipo, aparte (no en linea) para que
+// salga con su nombre en la pila. acceso: escritura en la direccion 0 en el hilo del juego (el informe "[fallo]").
+__declspec(noinline) void f1FalloDeAcceso()
+{
+    volatile int *volatile nulo = nullptr;
+    std::fprintf(stderr, "[fallo] prueba: escritura en la direccion 0 a proposito (PS2X_PRUEBA_FALLO=acceso)\n");
+    *nulo = 0x0F106;
+}
+
+// terminate: std::runtime_error en un hilo auxiliar "PruebaFallo" que nadie recoge (std::terminate, "[terminate]").
+__declspec(noinline) void f1FalloEnHiloAuxiliar()
+{
+    std::thread([]
+                {
+                    using Nombrar = long(__stdcall *)(void *, const wchar_t *); // SetThreadDescription (Windows 10 1607)
+                    if (const auto nombrar = reinterpret_cast<Nombrar>(
+                            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")))
+                        nombrar(GetCurrentThread(), L"PruebaFallo");
+                    throw std::runtime_error("prueba: excepcion en un hilo auxiliar (PS2X_PRUEBA_FALLO=terminate)");
+                })
+        .detach();
 }

@@ -1,7 +1,7 @@
 # Empaqueta F1 06 recompilado como un juego de PC, portable o con instalador (las dos cosas con los datos dentro).
 # Portable: una carpeta (por defecto dist\F1-06-portable) con el .exe, sus DLL, portable.txt, README.txt (ingles) y
 # LEEME.txt (espanol), "Play online - Guest.cmd" (abre el .exe con --invitado: el formulario del juego en red), data\ y
-# mods\ vacia. portable.txt hace que el .exe guarde config\, saves\, logs\, screenshots\ y cache\ en su carpeta (los
+# mods\ vacia, y recomplauncher.json (de scripts\paquete; RecompLauncher, odd/tasks/recomplauncher-json.md). portable.txt hace que el .exe guarde config\, saves\, logs\, screenshots\ y cache\ en su carpeta (los
 # crea al abrirse); sin el (instalado) van a Documentos\My Games\F1-06 y AppData\Local\F1-06\logs y cache.
 # v1.1.1 (odd/tasks/player-folders.md): la carpeta del jugador va en ingles (antes datos\, partidas\, registros\,
 # capturas\, licencias\, LEEME.txt solo y "Jugar en red - Invitado.cmd"); el juego renombra las viejas al abrirse.
@@ -24,7 +24,8 @@
 # dist\F1-06-publico, el zip en dist\F1-06-publico.zip y el instalador en dist\instalador-publico. El .exe pide la ISO del
 # jugador la primera vez (o el instalador, en su pagina "Elige tu copia del juego (ISO)", con F1-06.exe --extraer-iso)
 # y la copia en data\. Un data\ que ya haya en esa carpeta (p. ej. de probarlo) se deja, pero no entra en el paquete.
-# Solo se borra lo que crea este script (.exe, .dll, README.txt, LEEME.txt, portable.txt, el .cmd, licenses\, el .zip y
+# Solo se borra lo que crea este script (.exe, .dll, README.txt, LEEME.txt, portable.txt, recomplauncher.json, el .cmd,
+# licenses\, el .zip y
 # el instalador) y sus nombres de la v1.1.0 ("Jugar en red - Invitado.cmd" y licencias\); config\, saves\, logs\,
 # screenshots\, cache\, lo que haya en mods\ y las carpetas viejas del jugador (partidas\, registros\...) nunca se tocan.
 # Simbolos (vigilante T4): el paquete no lleva el PDB; el .exe empaquetado y su PDB se guardan aparte en
@@ -48,11 +49,13 @@ param(
     [string]$Simbolos = 'dist\simbolos'
 )
 $ErrorActionPreference = 'Stop'
-# Version del paquete: el unico sitio donde se cambia (README.txt, LEEME.txt e instalador).
-$version = '1.1.1'
-$fecha = Get-Date -Format 'yyyy-MM-dd'
 $raiz = Split-Path -Parent $PSScriptRoot
 Set-Location $raiz
+# Version del paquete (README.txt, LEEME.txt e instalador): se cambia solo en scripts\paquete\version.txt, que tambien
+# lee CMake al compilar el .exe (linea [version] de la cabecera del registro; odd/tasks/fallos-con-log.md T3a).
+$version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'paquete\version.txt') -TotalCount 1).Trim()
+if ($version -notmatch '^[0-9A-Za-z.+-]+$') { throw "scripts\paquete\version.txt no tiene una version valida: '$version'" }
+$fecha = Get-Date -Format 'yyyy-MM-dd'
 if ($Iso -and $Datos) { throw 'Usa -Iso o -Datos, no los dos' }
 if ($SinDatos -and ($Iso -or $Datos)) { throw '-SinDatos no lleva -Iso ni -Datos' }
 if ($SinDatos -and -not $PSBoundParameters.ContainsKey('Destino')) { $Destino = 'dist\F1-06-publico' }
@@ -101,7 +104,7 @@ if ((Get-Item $icono).LastWriteTime -gt (Get-Item $exeOrigen).LastWriteTime) {
 if (Test-Path $carpeta) {
     Get-ChildItem $carpeta -File |
         Where-Object { $_.Extension -in '.exe', '.dll' -or
-            $_.Name -in 'README.txt', 'LEEME.txt', 'portable.txt', $cmdInvitado, $cmdInvitadoViejo } |
+            $_.Name -in 'README.txt', 'LEEME.txt', 'portable.txt', 'recomplauncher.json', $cmdInvitado, $cmdInvitadoViejo } |
         Remove-Item -Force
     # licencias\ (v1.1.0) solo tiene lo que puso este script: se rehace como licenses\.
     $licenciasViejas = Join-Path $carpeta 'licencias'
@@ -156,6 +159,13 @@ Set-Content -Path (Join-Path $carpeta $cmdInvitado) -Encoding Ascii -Value @(
     'rem Juego en red: abre la ventana del invitado (jugador 2) para conectarse al PC del anfitrion (ver LEEME.txt).',
     'rem Online play: opens the guest window (player 2) to connect to the host PC (see README.txt).',
     ('start "" "%~dp0{0}" --invitado' -f $Nombre))
+# recomplauncher.json: RecompLauncher (instalar con la ISO del jugador, opciones en su ficha) lo lee junto al .exe. Se
+# copia tal cual de scripts\paquete (se comprueba con scripts\comprobar-recomplauncher.py); antes, que sea JSON.
+$fuenteLauncher = Join-Path $raiz 'scripts\paquete\recomplauncher.json'
+if (-not (Test-Path $fuenteLauncher)) { throw "Falta $fuenteLauncher" }
+try { Get-Content -LiteralPath $fuenteLauncher -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null }
+catch { throw "$fuenteLauncher no es JSON valido: $($_.Exception.Message)" }
+Copy-Item -LiteralPath $fuenteLauncher -Destination (Join-Path $carpeta 'recomplauncher.json') -Force
 $carpetaMods = Join-Path $carpeta 'mods'
 if (-not (Test-Path $carpetaMods)) { New-Item -ItemType Directory -Path $carpetaMods | Out-Null }
 
@@ -364,6 +374,10 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
   falla, es lo que hay que mirar. Si el juego se queda congelado 10 segundos, anota ahi donde estaba parada
   cada parte del juego y, si sigue, cuanto duro el paron; esa espera se cambia con vigilante en
   config\settings.ini (3 a 600 segundos; 0 lo apaga).
+  Para enviar un fallo: si juegas desde RecompLauncher y el juego se cierra por un fallo, RecompLauncher te
+  ofrece enviar el informe con este registro ya adjunto. Si no, abre un issue en
+  https://github.com/KevinL50-sysadmin/F1-06-PC/issues (hace falta una cuenta de GitHub), cuenta que pasaba y
+  adjunta F1-06.log. El registro puede llevar tu nombre de usuario de Windows en las rutas.
 - cache\vulkan-pipelines.bin: los graficos ya preparados para tu tarjeta grafica (gs = gpu), para que no haya
   tirones la segunda vez que ves cada cosa. Ocupa unos 20 a 50 MB y se puede borrar sin problema: el juego lo
   vuelve a crear (las primeras partidas despues pueden ir a tirones un momento). Tras cambiar de tarjeta grafica o
@@ -376,6 +390,8 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
 - portable.txt (solo en la version portable): hace que todo se guarde en la carpeta del juego. Sin el, el
   juego usa las carpetas de la version instalada.
 - Play online - Guest.cmd (solo en la version portable): abre la ventana del invitado del juego en red.
+- recomplauncher.json: lo lee RecompLauncher para instalar el juego con tu ISO y mostrar sus opciones en la ficha
+  del juego. El juego no lo usa; si no usas RecompLauncher, puedes ignorarlo.
 - config\red.ini: la ultima direccion y el puerto a los que se conecto este PC como invitado (nunca la contrasena).
 
 Opciones del PC dentro del juego
@@ -680,6 +696,10 @@ folder when updating.
   fails, it is what has to be looked at. If the game freezes for 10 seconds, it writes there where every part
   of the game was stuck and, if it carries on, how long the freeze lasted; change that wait with vigilante in
   config\settings.ini (3 to 600 seconds; 0 turns it off).
+  To report a problem: if you play from RecompLauncher and the game closes because of a failure, RecompLauncher
+  offers to send the report with this log already attached. Otherwise, open an issue at
+  https://github.com/KevinL50-sysadmin/F1-06-PC/issues (a GitHub account is needed), say what was happening and
+  attach F1-06.log. The log may contain your Windows user name in its paths.
 - cache\vulkan-pipelines.bin: the graphics already prepared for your graphics card (gs = gpu), so that there is
   no stutter the second time you see each thing. It takes about 20 to 50 MB and can be deleted without problem:
   the game creates it again (the first races afterwards may stutter for a moment). After changing graphics card
@@ -692,6 +712,8 @@ folder when updating.
 - portable.txt (only in the portable version): makes everything be saved in the game folder. Without it, the
   game uses the folders of the installed version.
 - Play online - Guest.cmd (only in the portable version): opens the online play guest window.
+- recomplauncher.json: read by RecompLauncher to set the game up from your ISO and show its options on the game's
+  page. The game itself does not use it; if you do not use RecompLauncher, you can ignore it.
 - config\red.ini: the last address and port this PC connected to as a guest (never the password).
 
 PC options inside the game
@@ -893,7 +915,7 @@ WARNING: the data\ folder contains the files of your disc. It is for personal us
 "@
 Set-Content -Path (Join-Path $carpeta 'README.txt') -Value $readme -Encoding UTF8
 $tamExe = (Get-Item $exeDestino).Length
-Write-Host ("Listo: {0} ({1:N0} bytes), portable.txt, README.txt, LEEME.txt, {2} y mods\ en {3}" -f $Nombre, $tamExe,
+Write-Host ("Listo: {0} ({1:N0} bytes), portable.txt, recomplauncher.json, README.txt, LEEME.txt, {2} y mods\ en {3}" -f $Nombre, $tamExe,
     $cmdInvitado, $carpeta)
 if ($conDatos) {
     $tamDatos = (Get-ChildItem $carpetaDatos -Recurse -File | Measure-Object -Property Length -Sum).Sum
@@ -904,7 +926,8 @@ if ($conDatos) {
 
 # Lo que va en el paquete: lo que pone este script, nunca lo que crea el juego al abrirse (ni un datos\ viejo).
 $archivosPaquete = @(Get-ChildItem $carpeta -File |
-    Where-Object { $_.Extension -in '.exe', '.dll' -or $_.Name -in 'README.txt', 'LEEME.txt', 'portable.txt', $cmdInvitado })
+    Where-Object { $_.Extension -in '.exe', '.dll' -or
+        $_.Name -in 'README.txt', 'LEEME.txt', 'portable.txt', 'recomplauncher.json', $cmdInvitado })
 if (Test-Path $carpetaLicencias) { $archivosPaquete += @(Get-ChildItem $carpetaLicencias -Recurse -File) }
 if ($conDatos) { $archivosPaquete += @(Get-ChildItem $carpetaDatos -Recurse -File) }
 

@@ -1,0 +1,96 @@
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index c8b0b44..f5ba4db 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -150,14 +150,15 @@ namespace ps2x
+              "Dibujo de los graficos: gpu = en la tarjeta grafica (Vulkan), lo normal; cpu = modo Software, mas lento\n"
+              "(el dibujo de referencia). Si falta pgs_puente.dll junto al juego o Vulkan, se usa cpu.",
+              "cpu"},
+-            // The player gets x4 + double resolution (measured free on an RTX 4070 Ti, odd/tasks/fase3 L2); development
+-            // keeps the native picture so the measuring scripts stay comparable.
+-            {"supersampling", "PS2X_GS_SSAA", "4", {{"1", "1"}, {"2", "2"}, {"4", "4"}, {"8", "8"}, {"16", "16"}}, 0, 0,
++            // The player gets x2 without double resolution (0218: x4 + double resolution kept the GPU GS thread at
++            // 100 % on an RTX 5060, odd/tasks/fallos-con-log L16b); an existing settings.ini keeps its values.
++            // Development keeps the native picture so the measuring scripts stay comparable.
++            {"supersampling", "PS2X_GS_SSAA", "2", {{"1", "1"}, {"2", "2"}, {"4", "4"}, {"8", "8"}, {"16", "16"}}, 0, 0,
+              "Supersampling del GS por GPU (bordes mas suaves): 1 = sin supersampling; 2, 4, 8 o 16 muestras por\n"
+              "pixel. Cuanto mas alto, mas trabajo para la tarjeta grafica; con una grafica modesta, baja a 1 o 2. Con\n"
+              "gs = cpu no se usa.",
+              "1"},
+-            {"alta_resolucion", "PS2X_GS_ALTA_RES", "1", {{"0", "0"}, {"1", "1"}}, 0, 0,
++            {"alta_resolucion", "PS2X_GS_ALTA_RES", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Salida a doble resolucion del GS por GPU: 1 = imagen con el doble de ancho y de alto (mas nitida),\n"
+              "sacada de las muestras del supersampling, que debe ser 4 o mas; 0 = resolucion nativa. Con gs = cpu no\n"
+              "se usa.",
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index 715ce23..b6223da 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -567,12 +567,12 @@ void register_ps2_gs_gpu_tests()
+             t.Equals(backend->ScanoutsRun() - before, uint64_t{2}, "both scanouts run");
+         });
+ 
+-        tc.Run("supersampling and alta_resolucion default to 4 and 1 for the player, 1 and 0 in development", [](TestCase &t)
++        tc.Run("supersampling and alta_resolucion default to 2 and 0 for the player, 1 and 0 in development", [](TestCase &t)
+         {
+             for (const bool development : {false, true})
+             {
+-                const std::string ssaa = development ? "1" : "4";
+-                const std::string high = development ? "0" : "1";
++                const std::string ssaa = development ? "1" : "2";
++                const std::string high = "0";
+                 const std::string text = ps2x::defaultOptionsText(development);
+                 t.IsTrue(text.find("\nsupersampling = " + ssaa + "\n") != std::string::npos,
+                          "the default file has supersampling = " + ssaa);
+@@ -612,8 +612,15 @@ void register_ps2_gs_gpu_tests()
+             t.Equals(bad.values.at("supersampling"), std::string("1"), "supersampling falls back to 1 in development");
+             t.Equals(bad.values.at("alta_resolucion"), std::string("0"), "alta_resolucion falls back to 0 in development");
+             const ps2x::OptionsFile badPlayer = ps2x::parseOptions("supersampling = 3\nalta_resolucion = 2\n");
+-            t.Equals(badPlayer.values.at("supersampling"), std::string("4"), "supersampling falls back to 4 for the player");
+-            t.Equals(badPlayer.values.at("alta_resolucion"), std::string("1"), "alta_resolucion falls back to 1 for the player");
++            t.Equals(badPlayer.values.at("supersampling"), std::string("2"), "supersampling falls back to 2 for the player");
++            t.Equals(badPlayer.values.at("alta_resolucion"), std::string("0"), "alta_resolucion falls back to 0 for the player");
++            const ps2x::OptionsFile missing = ps2x::parseOptions("filtro = nitido\n");
++            t.Equals(missing.values.at("supersampling"), std::string("2"), "a file without supersampling gets 2");
++            t.Equals(missing.values.at("alta_resolucion"), std::string("0"), "a file without alta_resolucion gets 0");
++            const ps2x::OptionsFile kept = ps2x::parseOptions("supersampling = 4\nalta_resolucion = 1\n");
++            t.Equals(kept.values.at("supersampling"), std::string("4"), "an existing supersampling = 4 is kept");
++            t.Equals(kept.values.at("alta_resolucion"), std::string("1"), "an existing alta_resolucion = 1 is kept");
++            t.IsTrue(kept.warnings.empty(), "without warnings");
+             t.Equals(bad.warnings.size(), size_t{2}, "one warning each");
+             t.IsTrue(bad.warnings.size() == 2u &&
+                          bad.warnings[0] == "[opciones] opciones.ini:1: valor no valido '3' para supersampling; se usa 1 "
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 0daf6af..2381b21 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -211,12 +211,15 @@ void register_ps2_options_menu_tests()
+         tc.Run("setMenuOption validates the value and supersampling under 4 turns alta_resolucion off", [](TestCase &t)
+         {
+             ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
+-            t.Equals(model.current.at("supersampling"), std::string("4"), "the player's x4");
+-            t.Equals(model.current.at("alta_resolucion"), std::string("1"), "and double resolution");
+-            t.IsTrue(ps2x::highResolutionAvailable(model), "available with x4 and the GPU GS");
++            t.Equals(model.current.at("supersampling"), std::string("2"), "the player's x2");
++            t.Equals(model.current.at("alta_resolucion"), std::string("0"), "without double resolution");
++            t.IsFalse(ps2x::highResolutionAvailable(model), "not available with x2");
+             t.IsFalse(ps2x::setMenuOption(model, "filtro", "borroso"), "an invalid value is refused");
+             t.IsFalse(ps2x::setMenuOption(model, "no_existe", "1"), "an unknown key is refused");
+             t.IsFalse(ps2x::menuHasChanges(model), "nothing changed");
++            t.IsTrue(ps2x::setMenuOption(model, "supersampling", "4"), "x4");
++            t.IsTrue(ps2x::highResolutionAvailable(model), "available with x4 and the GPU GS");
++            t.IsTrue(ps2x::setMenuOption(model, "alta_resolucion", "1"), "double resolution");
+             t.IsTrue(ps2x::setMenuOption(model, "supersampling", "2"), "x2");
+             t.Equals(model.current.at("alta_resolucion"), std::string("0"), "alta_resolucion goes off under x4");
+             t.IsFalse(ps2x::highResolutionAvailable(model), "and is not available");
+@@ -402,8 +405,8 @@ void register_ps2_options_menu_tests()
+             };
+             t.Equals(number("filtro"), 3.0f, "fsr: the fourth choice");
+             t.Equals(number("pantalla"), 0.0f, "ventana: the first");
+-            t.Equals(number("supersampling"), 4.0f, "integer choices are their value");
+-            t.Equals(number("alta_resolucion"), 1.0f, "alta_resolucion 1");
++            t.Equals(number("supersampling"), 2.0f, "integer choices are their value");
++            t.Equals(number("alta_resolucion"), 0.0f, "alta_resolucion 0");
+             t.Equals(number("vsync"), 1.0f, "vsync 1");
+             t.Equals(number("mostrar_fps"), 0.0f, "mostrar_fps 0");
+             t.Equals(number("volumen"), 100.0f, "no choices: the value");

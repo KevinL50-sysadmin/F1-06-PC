@@ -1,6 +1,8 @@
-# Traduce los informes del vigilante de un registro (F1-06.log de un jugador) a nombres de funcion con el PDB exacto de
-# esa compilacion. El paquete no lleva el PDB, asi que el informe solo da modulo+0xDESPL y la identidad de la
-# compilacion (linea "[vigilante] compilacion: <exe> fecha_pe=.. tam_imagen=.. pdb=.. guid=.. edad=N base=0x..").
+# Traduce los informes del vigilante ("[vigilante]") y los de fallo (odd/tasks/fallos-con-log.md T3b: "[fallo]" del
+# filtro de excepciones, "[excepcion]" del hilo del juego y "[terminate]") de un registro (F1-06.log de un jugador) a
+# nombres de funcion con el PDB exacto de esa compilacion. El paquete no lleva el PDB, asi que el informe solo da
+# modulo+0xDESPL y la identidad de la compilacion (linea "[<informe>] compilacion: <exe> fecha_pe=.. tam_imagen=..
+# pdb=.. guid=.. edad=N base=0x.."; cada marco se traduce con la ultima linea "compilacion:" leida antes que el).
 # Cada marco "#i <exe>+0xDESPL" del .exe del juego pasa a "#i <exe>+0xDESPL funcion+0xDESPL [archivo:linea]"; los de
 # otros modulos (ntdll.dll, KERNELBASE.dll, ucrtbase.dll...) y el resto del registro salen tal cual.
 # El PDB se busca, en este orden, en -Pdb, en <Simbolos>\<version>_<guid>_<edad>\ (por defecto dist\simbolos; lo
@@ -244,8 +246,9 @@ $compilacion = $null
 $traducidos = 0
 $sinTraducir = 0
 $salidaLineas = New-Object System.Collections.Generic.List[string]
-$reCompilacion = '\[vigilante\] compilacion: (?<exe>\S+) .*?tam_imagen=(?<tam>[0-9A-Fa-f]+) pdb=(?<pdb>\S+) guid=(?<guid>[0-9A-Fa-f]{32}) edad=(?<edad>\d+)'
-$reMarco = '^(?<pre>.*\[vigilante\]\s+#\d+ )(?<mod>[^\s+]+)\+0x(?<off>[0-9A-Fa-f]+)\s*$'
+$informes = '(?:vigilante|fallo|excepcion|terminate)'
+$reCompilacion = '\[' + $informes + '\] compilacion: (?<exe>\S+) .*?tam_imagen=(?<tam>[0-9A-Fa-f]+) pdb=(?<pdb>\S+) guid=(?<guid>[0-9A-Fa-f]{32}) edad=(?<edad>\d+)'
+$reMarco = '^(?<pre>.*\[' + $informes + '\]\s+#\d+ )(?<mod>[^\s+]+)\+0x(?<off>[0-9A-Fa-f]+)\s*$'
 
 foreach ($linea in $lineas) {
     if ($linea -match $reCompilacion) {

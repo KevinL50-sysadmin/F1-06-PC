@@ -1,0 +1,160 @@
+diff --git a/ps2xRuntime/include/ps2_fallo.h b/ps2xRuntime/include/ps2_fallo.h
+index 71e20b9..dc9854d 100644
+--- a/ps2xRuntime/include/ps2_fallo.h
++++ b/ps2xRuntime/include/ps2_fallo.h
+@@ -78,6 +78,10 @@ namespace ps2x::fallo
+     // catch la pila del throw ya no existe. Una vez, al arrancar (main.cpp).
+     void instalarCapturaDeLanzamientos();
+ 
++    // Valor de PS2X_CAPTURA_LANZAMIENTOS: solo "0" (con o sin espacios) la apaga, para medir su coste (T4, L14). Sin
++    // ella, [excepcion] sale sin la pila del throw.
++    bool capturaDeLanzamientosActiva(const char *valor);
++
+     // La pila del ultimo throw de C++ de este hilo (instalarCapturaDeLanzamientos). Devuelve cuantos marcos copio en
+     // marcos (0: ninguno). olvidar: la borra despues (un informe no repite una pila vieja).
+     int pilaDelLanzamiento(void **marcos, int max, bool olvidar);
+diff --git a/ps2xRuntime/include/ps2_salida.h b/ps2xRuntime/include/ps2_salida.h
+index 28ededc..78ab3c9 100644
+--- a/ps2xRuntime/include/ps2_salida.h
++++ b/ps2xRuntime/include/ps2_salida.h
+@@ -29,7 +29,7 @@ namespace ps2x::salida
+         bool enCarrera = false;   // si no, menu (front-end)
+         int circuito = -1;        // indice del ultimo circuito elegido; -1 = desconocido (no se escribe)
+         double segundos = 0.0;    // desde el arranque
+-        uint64_t fotogramas = 0u; // fotogramas que el juego termino
++        uint64_t fotogramas = 0u; // fotogramas dibujados en cualquier pantalla (menus, videos y carrera)
+         double fpsMinimo = -1.0;  // peor ventana de 10 s con la carrera en pantalla; < 0 = ninguna (no se escribe)
+     };
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_fallo.cpp b/ps2xRuntime/src/lib/ps2_fallo.cpp
+index bd70f7f..4a4401c 100644
+--- a/ps2xRuntime/src/lib/ps2_fallo.cpp
++++ b/ps2xRuntime/src/lib/ps2_fallo.cpp
+@@ -7,6 +7,20 @@
+ 
+ namespace ps2x::fallo
+ {
++    bool capturaDeLanzamientosActiva(const char *valor)
++    {
++        if (valor == nullptr)
++            return true;
++        while (*valor == ' ')
++            ++valor;
++        if (*valor != '0')
++            return true;
++        ++valor;
++        while (*valor == ' ')
++            ++valor;
++        return *valor != 0;
++    }
++
+     namespace
+     {
+         // Escribe en un bufer fijo, sin reservar memoria ni usar el CRT (sirve dentro de un filtro de excepciones).
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 214a3b5..5b1b0ee 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -4074,7 +4074,7 @@ void PS2Runtime::run()
+ 
+         if (WindowShouldClose())
+         {
+-            RUNTIME_LOG("[run] window close requested, breaking out of loop");
++            RUNTIME_LOG("[run] window close requested, breaking out of loop\n");
+             // odd/tasks/fallos-con-log.md T2 (S2): solo cuenta el cuelgue que sigue al cerrar. Solo el EE: la ventana
+             // da vueltas mientras se cierra, y un paron del que el juego se recupero ya no esta parado.
+             if (ps2x::vigilante::latidoParado("EE"))
+@@ -4082,6 +4082,13 @@ void PS2Runtime::run()
+                 std::cout << "[salida] el EE sigue colgado al cerrar la ventana" << std::endl;
+                 ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "cuelgue-al-cerrar");
+             }
++            // L14: la imagen lleva el umbral del vigilante sin cambiar (p. ej. el menu congelado tras un error de Lua
++            // protegido): tambien es un cuelgue que sigue al cerrar.
++            else if (ps2x::vigilante::latidoParado("pantalla"))
++            {
++                std::cout << "[salida] la imagen sigue parada al cerrar la ventana" << std::endl;
++                ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "imagen-parada-al-cerrar");
++            }
+             requestStop();
+             break;
+         }
+@@ -4120,5 +4127,5 @@ void PS2Runtime::run()
+     }
+     CloseWindow();
+ 
+-    RUNTIME_LOG("[run] exiting loop");
++    RUNTIME_LOG("[run] exiting loop\n");
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+index 5a19e09..921562b 100644
+--- a/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_vigilante_win.cpp
+@@ -24,6 +24,7 @@
+ // cerrojo de los FILE del CRT.
+ 
+ #include "ps2_vigilante.h"
++#include <cstdlib>
+ #include "ps2_fallo.h" // fallos-con-log T3b: los informes de fallo usan lo mismo (al final del archivo)
+ 
+ #include <algorithm>
+@@ -855,7 +856,9 @@ namespace ps2x::fallo
+ 
+     void instalarCapturaDeLanzamientos()
+     {
+-        static const bool s_instalado = AddVectoredExceptionHandler(1, capturarLanzamiento) != nullptr;
++        // PS2X_CAPTURA_LANZAMIENTOS=0: sin el manejador, para medir su coste (fallos-con-log T4, L14).
++        static const bool s_instalado = capturaDeLanzamientosActiva(std::getenv("PS2X_CAPTURA_LANZAMIENTOS")) &&
++                                        AddVectoredExceptionHandler(1, capturarLanzamiento) != nullptr;
+         (void)s_instalado;
+     }
+ 
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index c3185c9..729e0e7 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -10,6 +10,7 @@
+ #include "ps2_salida.h"
+ #include "ps2_cabecera.h"
+ #include "ps2_fallo.h"
++#include "runtime/ps2_ab.h" // g_ps2DisplayFlips: latido "pantalla" del vigilante (fallos-con-log L14)
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -765,9 +766,12 @@ int main(int argc, char *argv[])
+         // Vigilante T2 (ps2_vigilante.h): when the EE's VBlanks or the window's loop stop for vigilante seconds, the
+         // log gets the stack of every thread. The guest (above) runs no game and has none.
+         const int vigilante = ps2x::vigilante::leerUmbral(std::getenv("PS2X_VIGILANTE"));
++        // "pantalla" (fallos-con-log T4, L14): los cambios de la imagen; se paran del todo tras un error de Lua
++        // protegido o exit() del juego, con VBlanks y ventana vivos. En partida normal nunca mas de 2,95 s (L13).
+         if (ps2x::vigilante::arrancar(vigilante, {{"EE", &runtime.memory().gs().vsyncTick},
+-                                                  {"ventana", &ps2x::vigilante::latidoVentana()}}))
+-            std::cout << "[vigilante] umbral " << vigilante << " s (latidos EE y ventana)" << std::endl;
++                                                  {"ventana", &ps2x::vigilante::latidoVentana()},
++                                                  {"pantalla", &g_ps2DisplayFlips}}))
++            std::cout << "[vigilante] umbral " << vigilante << " s (latidos EE, ventana y pantalla)" << std::endl;
+         else
+             std::cout << "[vigilante] apagado" << std::endl;
+ 
+diff --git a/ps2xTest/src/ps2_fallo_tests.cpp b/ps2xTest/src/ps2_fallo_tests.cpp
+index 20218f1..97a9739 100644
+--- a/ps2xTest/src/ps2_fallo_tests.cpp
++++ b/ps2xTest/src/ps2_fallo_tests.cpp
+@@ -110,4 +110,18 @@ void register_ps2_fallo_tests()
+                      std::string("[fallo] ee sin datos (el juego aun no corre)"), "before the game runs");
+         });
+     });
++
++    // T4 (user decision L14): PS2X_CAPTURA_LANZAMIENTOS=0 leaves out the vectored handler to measure its cost.
++    MiniTest::Case("CapturaLanzamientos", [](TestCase &tc)
++    {
++        tc.Run("on unless the variable is exactly 0", [](TestCase &t)
++        {
++            t.IsTrue(ps2x::fallo::capturaDeLanzamientosActiva(nullptr), "unset: on");
++            t.IsTrue(ps2x::fallo::capturaDeLanzamientosActiva(""), "empty: on");
++            t.IsTrue(ps2x::fallo::capturaDeLanzamientosActiva("1"), "1: on");
++            t.IsTrue(ps2x::fallo::capturaDeLanzamientosActiva("no"), "anything else: on");
++            t.IsFalse(ps2x::fallo::capturaDeLanzamientosActiva("0"), "0: off");
++            t.IsFalse(ps2x::fallo::capturaDeLanzamientosActiva(" 0 "), "0 with spaces: off");
++        });
++    });
+ }

@@ -1,0 +1,164 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "F1 06 PC",
+  "game": {
+    "kind": "iso",
+    "label": "Your disc image (.iso) of Formula One 06 for PS2, the European PAL release, serial SCES-53950.",
+    "check": { "iso9660": "SCES_539.50" },
+    "dumps": [
+      { "name": "Europe, Australia (v1.01)", "size": 4418568192, "crc32": "de5021a1" }
+    ]
+  },
+  "prepare": {
+    "program": ["F1-06.exe"],
+    "args": ["--extraer-iso", "{game}"],
+    "label": "Copying the game data from your disc (about 4.2 GB)",
+    "timeout": 1800,
+    "version": "1",
+    "done": ["{install}/data/F1-06-disco.txt"]
+  },
+  "start": {
+    "program": ["F1-06.exe"]
+  },
+  "saves": [
+    "{install}/saves",
+    "{documents}/My Games/F1-06/saves"
+  ],
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        { "path": "{install}/config/settings.ini", "if": "{install}/portable.txt" },
+        { "path": "{documents}/My Games/F1-06/config/settings.ini" }
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "id": "pantalla",
+      "label": "Window mode",
+      "help": "How the game opens; F11 switches between a window and full screen while playing.",
+      "choices": [
+        { "label": "Window", "set": { "pantalla": "ventana" } },
+        { "label": "Borderless", "set": { "pantalla": "sin_bordes" } },
+        { "label": "Full screen", "set": { "pantalla": "completa" } }
+      ],
+      "defaults": { "pantalla": "ventana" }
+    },
+    {
+      "id": "filtro",
+      "label": "Scaling filter",
+      "help": "How the picture is enlarged to the window: FSR enlarges and sharpens it, CRT looks like an old TV.",
+      "choices": [
+        { "label": "Nearest", "set": { "filtro": "cercano" } },
+        { "label": "Bilinear", "set": { "filtro": "bilineal" } },
+        { "label": "Sharp pixels", "set": { "filtro": "nitido" } },
+        { "label": "AMD FSR 1", "set": { "filtro": "fsr" } },
+        { "label": "CRT", "set": { "filtro": "crt" } }
+      ],
+      "defaults": { "filtro": "fsr" }
+    },
+    {
+      "id": "supersampling",
+      "label": "Supersampling",
+      "help": "Smoother edges drawn on the graphics card; on a modest card, use Off or 2x.",
+      "choices": [
+        { "label": "Off", "set": { "supersampling": "1" } },
+        { "label": "2x", "set": { "supersampling": "2" } },
+        { "label": "4x", "set": { "supersampling": "4" } },
+        { "label": "8x", "set": { "supersampling": "8" } },
+        { "label": "16x", "set": { "supersampling": "16" } }
+      ],
+      "defaults": { "supersampling": "2" }
+    },
+    {
+      "id": "alta_resolucion",
+      "label": "Double resolution",
+      "help": "Twice the width and height for a sharper picture; it only works with supersampling at 4x or more.",
+      "choices": [
+        { "label": "Off", "set": { "alta_resolucion": "0" } },
+        { "label": "On", "set": { "alta_resolucion": "1" } }
+      ],
+      "defaults": { "alta_resolucion": "0" }
+    },
+    {
+      "id": "vsync",
+      "label": "V-Sync",
+      "help": "Changes the picture in step with the monitor, without tearing; the game runs at the same speed either way.",
+      "choices": [
+        { "label": "Off", "set": { "vsync": "0" } },
+        { "label": "On", "set": { "vsync": "1" } }
+      ],
+      "defaults": { "vsync": "1" }
+    },
+    {
+      "id": "aspecto",
+      "label": "Aspect ratio",
+      "help": "The shape of the picture: Game's option follows the widescreen setting in the game's own menu, and F10 changes it while playing.",
+      "choices": [
+        { "label": "Game's option", "set": { "aspecto": "auto" } },
+        { "label": "4:3", "set": { "aspecto": "4:3" } },
+        { "label": "16:9", "set": { "aspecto": "16:9" } },
+        { "label": "Square pixels", "set": { "aspecto": "pixel" } }
+      ],
+      "defaults": { "aspecto": "auto" }
+    },
+    {
+      "id": "detalle_coches",
+      "label": "Car detail",
+      "help": "How far away the other cars keep their detailed model; Maximum costs the most.",
+      "choices": [
+        { "label": "Reduced", "set": { "detalle_coches": "0" } },
+        { "label": "PS2", "set": { "detalle_coches": "1" } },
+        { "label": "High", "set": { "detalle_coches": "2" } },
+        { "label": "Maximum", "set": { "detalle_coches": "3" } }
+      ],
+      "defaults": { "detalle_coches": "1" }
+    },
+    {
+      "id": "distancia_circuito",
+      "label": "Track draw distance",
+      "help": "How far away trackside scenery such as stands and trees is drawn, compared with the PS2.",
+      "choices": [
+        { "label": "PS2", "set": { "distancia_circuito": "100" } },
+        { "label": "Far", "set": { "distancia_circuito": "150" } },
+        { "label": "Very far", "set": { "distancia_circuito": "200" } }
+      ],
+      "defaults": { "distancia_circuito": "100" }
+    },
+    {
+      "id": "mostrar_fps",
+      "label": "FPS counter",
+      "help": "Shows the frames per second in the top right corner of the game.",
+      "choices": [
+        { "label": "Off", "set": { "mostrar_fps": "0" } },
+        { "label": "On", "set": { "mostrar_fps": "1" } }
+      ],
+      "defaults": { "mostrar_fps": "0" }
+    }
+  ],
+  "looks": {
+    "graphics": "opengl",
+    "lines": 512
+  },
+  "folders": {
+    "saves": [
+      { "path": "{install}/saves", "if": "{install}/portable.txt" },
+      { "path": "{documents}/My Games/F1-06/saves" }
+    ],
+    "logs": [
+      { "path": "{install}/logs", "if": "{install}/portable.txt" },
+      { "path": "{local}/F1-06/logs" }
+    ],
+    "screenshots": [
+      { "path": "{install}/screenshots", "if": "{install}/portable.txt" },
+      { "path": "{documents}/My Games/F1-06/screenshots" }
+    ],
+    "config": [
+      { "path": "{install}/config", "if": "{install}/portable.txt" },
+      { "path": "{documents}/My Games/F1-06/config" }
+    ]
+  }
+}
