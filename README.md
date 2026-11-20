@@ -50,12 +50,12 @@ with its own fonts, colours and controller navigation: no overlays, no external 
 
 | | |
 |---|---|
-| ![22-car grid seen from above, scenery distance VERY FAR](docs/lanzamiento/img/grid-22-cars-aerial.png) | ![Cockpit at the start lights, car detail MAXIMUM](docs/lanzamiento/img/cockpit-start-lights.png) |
-| *Silverstone grid, 22 cars, SCENERY DISTANCE: VERY FAR* | *Start lights from the cockpit, CAR DETAIL: MAXIMUM* |
-| ![Replay with the TV camera at the start](docs/lanzamiento/img/replay-tv-camera.png) | ![In-race cockpit view with the HUD](docs/lanzamiento/img/cockpit-hud.png) |
-| *Replay, TV camera* | *In race, cockpit camera and HUD* |
-| ![PC GRAPHICS page inside the game's OPTIONS menu](docs/lanzamiento/img/menu-pc-graphics.png) | |
-| *PC GRAPHICS, a native page in the game's OPTIONS menu* | |
+| ![Photo mode with its control bar: the pack under the Bridgestone bridge at Hockenheim](docs/lanzamiento/img/v113-modo-foto-barra-hockenheim-peloton-x4.png) | ![First-lap pack through the hairpin at Montreal](docs/lanzamiento/img/v113-montreal-varios-horquilla-x4.png) |
+| *Photo mode with its control bar, Hockenheim* | *First lap through the hairpin, Montreal* |
+| ![Red Bull, BMW and Toyota leading a long pack uphill at Istanbul](docs/lanzamiento/img/v113-istanbul-redbull-toyota-subida-x4.png) | ![Ferrari, Renault, McLaren and Honda through the hairpin at Sepang](docs/lanzamiento/img/v113-sepang-ferrari-renault-curva-x4.png) |
+| *Climbing out of turn 1, Istanbul* | *Hairpin battle, Sepang* |
+| ![Ferrari and Renault through the Loews hairpin at Monaco, TV camera](docs/lanzamiento/img/v112-monaco-ferrari-horquilla-x4.png) | ![PC GRAPHICS page inside the game's OPTIONS menu](docs/lanzamiento/img/v112-menu-pc-graphics.png) |
+| *Loews hairpin, Monaco, TV camera* | *PC GRAPHICS, a native page in the game's OPTIONS menu* |
 
 Screenshots are in-game captures from the game's own data; the trademarks and logos visible in them belong to their
 owners.
