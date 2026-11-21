@@ -53,7 +53,7 @@ revisados=(
     docs/lanzamiento/img/grid-22-cars-aerial.png docs/lanzamiento/img/menu-pc-graphics.png
     docs/lanzamiento/img/replay-tv-camera.png docs/lanzamiento/img/cabecera-readme.png
     docs/lanzamiento/img/v113-modo-foto-barra-hockenheim-peloton-x4.png docs/lanzamiento/img/v113-montreal-varios-horquilla-x4.png
-    docs/lanzamiento/img/v113-istanbul-redbull-toyota-subida-x4.png docs/lanzamiento/img/v113-sepang-ferrari-renault-curva-x4.png
+    docs/lanzamiento/img/v113-repeticion-barra-montreal-honda-x4.png docs/lanzamiento/img/v113-sepang-ferrari-renault-curva-x4.png
     docs/lanzamiento/img/v112-monaco-ferrari-horquilla-x4.png docs/lanzamiento/img/v112-menu-pc-graphics.png
     scripts/ab_ciclos.py scripts/ab_diagnostico.py scripts/ab_resumen.py scripts/bft_decodificar.py
     scripts/buscar_valor.py scripts/capturar-ventana.ps1 scripts/carrera-directa.ps1 scripts/cazar-cuelgue.ps1
