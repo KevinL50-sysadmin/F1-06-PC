@@ -1,0 +1,125 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index d332923..172966a 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ // Phase 1 (F1 06): opciones.ini, the player's settings. Each option stands for a PS2X_* variable; a variable that is
+@@ -83,6 +84,12 @@ namespace ps2x
+     std::vector<EnvironmentSetting> optionsEnvironment(
+         const OptionsFile &options, const std::function<const char *(const char *)> &getEnvironment);
+ 
++    // 1.1.3 (issue #3): takes the leading NAME=value words (NAME of capitals, digits and _, not starting with a digit)
++    // out of the command line and returns them, in order, to be set as variables; it also drops a literal "%command%".
++    // Launchers without Steam's "VAR=value %command%" pass those words as arguments, which the game took for its ELF.
++    // Only before the first other word, as in a shell: a flag's value ("--clave Clave=...") and paths stay.
++    std::vector<std::pair<std::string, std::string>> takeEnvironmentArguments(std::vector<std::string> &arguments);
++
+     // Reads opciones.ini (creating it with the defaults of the mode if missing) and sets the variables it decides. The
+     // lines for the log ("[opciones] ...") are appended to messages. It also leaves startupOptions() for the menu.
+     void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages,
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 02a48af..4d3a06d 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -507,6 +507,33 @@ namespace ps2x
+         return settings;
+     }
+ 
++    std::vector<std::pair<std::string, std::string>> takeEnvironmentArguments(std::vector<std::string> &arguments)
++    {
++        const auto nameChar = [](char c, bool first)
++        {
++            return (c >= 'A' && c <= 'Z') || c == '_' || (!first && c >= '0' && c <= '9');
++        };
++        std::vector<std::pair<std::string, std::string>> variables;
++        std::vector<std::string> rest;
++        bool leading = true; // only before the first other word: a value ("--clave Clave=...") is never one
++        for (std::string &argument : arguments)
++        {
++            if (argument == "%command%")
++                continue;
++            const size_t equals = argument.find('=');
++            bool name = leading && equals != std::string::npos && equals > 0u;
++            for (size_t i = 0u; name && i < equals; ++i)
++                name = nameChar(argument[i], i == 0u);
++            leading = leading && name;
++            if (name)
++                variables.emplace_back(argument.substr(0u, equals), argument.substr(equals + 1u));
++            else
++                rest.push_back(std::move(argument));
++        }
++        arguments = std::move(rest);
++        return variables;
++    }
++
+     void applyOptionsFile(const std::filesystem::path &file, std::vector<std::string> &messages, bool development)
+     {
+         std::string text;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 729e0e7..bc986bc 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -529,6 +529,16 @@ int main(int argc, char *argv[])
+         lateExecutable = executable;
+         // Fase 5 (T15): the netplay arguments go out first; the game sees the rest as before.
+         std::vector<std::string> arguments(argv + std::min(argc, 1), argv + argc);
++        // 1.1.3 (issue #3): NAME=value arguments are variables (launchers without Steam's "VAR=value %command%").
++        for (const auto &[name, value] : ps2x::takeEnvironmentArguments(arguments))
++        {
++#if defined(_WIN32)
++            _putenv_s(name.c_str(), value.c_str());
++#else
++            setenv(name.c_str(), value.c_str(), 1);
++#endif
++            bootLines << "[argumentos] variable " << name << '=' << value << std::endl;
++        }
+         std::error_code currentError;
+         if (const int code = ps2x::disc::runDiscCommand(
+                 arguments, executable.empty() ? std::filesystem::current_path(currentError) : executable.parent_path(),
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 405e944..952dae2 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -2697,5 +2697,36 @@ void register_ps2_options_menu_tests()
+             t.IsFalse(ps2x::gameRand(small.data(), static_cast<uint32_t>(small.size()), value), "a RAM without 0x3F8D64");
+             t.IsFalse(ps2x::gameRand(nullptr, 0u, value), "no RAM");
+         });
++
++        tc.Run("NAME=value arguments become variables and leave the rest for the game, in order", [](TestCase &t)
++        {
++            // 1.1.3 (issue #3): launchers without Steam's "VAR=value %command%" pass those words as arguments.
++            std::vector<std::string> arguments = {"F1_IOP_HILOS=5", "F1_SPU_TRAZA=1", "PS2X_A=", "%command%",
++                                                  "juego.elf", "PS2X_B=1", "C:\\a=b\\juego.elf", "%command%"};
++            const std::vector<std::pair<std::string, std::string>> variables =
++                ps2x::takeEnvironmentArguments(arguments);
++            const std::vector<std::pair<std::string, std::string>> expectedVariables = {
++                {"F1_IOP_HILOS", "5"}, {"F1_SPU_TRAZA", "1"}, {"PS2X_A", ""}};
++            const std::vector<std::string> expectedRest = {"juego.elf", "PS2X_B=1", "C:\\a=b\\juego.elf"};
++            t.IsTrue(variables == expectedVariables, "the leading NAME=value words, in order, with an empty value kept");
++            t.IsTrue(arguments == expectedRest, "the rest as it was, without %command%, from the first other word on");
++
++            std::vector<std::string> odd = {"=x", "9A=1", "f1=06.iso"};
++            t.IsTrue(ps2x::takeEnvironmentArguments(odd).empty(), "no name, a digit first or small letters: no variable");
++            t.IsTrue(odd == std::vector<std::string>{"=x", "9A=1", "f1=06.iso"}, "left as they were");
++
++            std::vector<std::string> netplay = {"--anfitrion", "--clave", "CLAVE=12345678", "F1_IOP_HILOS=5"};
++            t.IsTrue(ps2x::takeEnvironmentArguments(netplay).empty(), "a flag's value is never a variable");
++            t.IsTrue(netplay == std::vector<std::string>{"--anfitrion", "--clave", "CLAVE=12345678", "F1_IOP_HILOS=5"},
++                     "the password stays for the netplay arguments");
++
++            std::vector<std::string> disc = {"--extraer-iso", "D:\\F1=06.iso", "--ventana"};
++            t.IsTrue(ps2x::takeEnvironmentArguments(disc).empty(), "disc commands: no variables");
++            t.IsTrue(disc == std::vector<std::string>{"--extraer-iso", "D:\\F1=06.iso", "--ventana"}, "unchanged");
++
++            std::vector<std::string> plain = {"juego.iso"};
++            t.IsTrue(ps2x::takeEnvironmentArguments(plain).empty(), "no variables in a plain launch");
++            t.IsTrue(plain == std::vector<std::string>{"juego.iso"}, "a plain launch is left as it was");
++        });
+     });
+ }

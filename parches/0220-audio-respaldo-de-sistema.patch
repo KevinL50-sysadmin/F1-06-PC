@@ -1,0 +1,779 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 5cde996..0a2aada 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -89,6 +89,85 @@ else()
+     )
+     FetchContent_MakeAvailable(raylib)
+ 
++    # Patch 0220 (odd/tasks/audio-proton.md): raylib 5.5's InitAudioDevice lets miniaudio pick the backend (the first
++    # context that initializes) and gives no reason when it fails. raylib is fetched (not one of our patches), so the
++    # build compiles a copy of raudio.c with a small hook: ps2xRaudioSelectBackend() chooses the one backend the next
++    # InitAudioDevice uses, and the failure, the backend and the device it opened can be read back
++    # (ps2_audio_sistema.h; the runtime tries WASAPI, DirectSound and WinMM in turn). Each replaced text must be found
++    # once, or the configure stops: a new raylib needs this reviewed.
++    get_target_property(PS2X_RAYLIB_SRC_DIR raylib SOURCE_DIR)
++    set(PS2X_RAUDIO_ORIGINAL "${PS2X_RAYLIB_SRC_DIR}/raudio.c")
++    set(PS2X_RAUDIO_COPY "${CMAKE_CURRENT_BINARY_DIR}/raudio_ps2x/raudio.c")
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS2X_RAUDIO_ORIGINAL}")
++    file(READ "${PS2X_RAUDIO_ORIGINAL}" PS2X_RAUDIO_TEXT)
++    string(REPLACE "\r\n" "\n" PS2X_RAUDIO_TEXT "${PS2X_RAUDIO_TEXT}")
++    function(ps2x_raudio_replace from to)
++        string(FIND "${PS2X_RAUDIO_TEXT}" "${from}" first)
++        string(FIND "${PS2X_RAUDIO_TEXT}" "${from}" last REVERSE)
++        if(first EQUAL -1 OR NOT first EQUAL last)
++            message(FATAL_ERROR "Patch 0220: raudio.c does not have this text exactly once: ${from}")
++        endif()
++        string(REPLACE "${from}" "${to}" text "${PS2X_RAUDIO_TEXT}")
++        set(PS2X_RAUDIO_TEXT "${text}" PARENT_SCOPE)
++    endfunction()
++    ps2x_raudio_replace("void InitAudioDevice(void)\n{\n" [=[/* PS2X patch 0220: the backend of the next InitAudioDevice and what it gave (ps2_audio_sistema.h). */
++static int ps2xRaudioBackend = -1; /* a ma_backend, or -1: miniaudio's own order */
++static ma_result ps2xRaudioFailure = MA_SUCCESS;
++static const char *ps2xRaudioStage = "";
++static char ps2xRaudioFailureText[160];
++static void ps2xRaudioNoteFailure(ma_result result, const char *stage)
++{
++    ps2xRaudioFailure = result;
++    ps2xRaudioStage = stage;
++}
++int ps2xRaudioSelectBackend(const char *name)
++{
++    if (name == NULL || name[0] == 0) { ps2xRaudioBackend = -1; return 1; }
++    if (strcmp(name, "wasapi") == 0) { ps2xRaudioBackend = (int)ma_backend_wasapi; return 1; }
++    if (strcmp(name, "directsound") == 0) { ps2xRaudioBackend = (int)ma_backend_dsound; return 1; }
++    if (strcmp(name, "winmm") == 0) { ps2xRaudioBackend = (int)ma_backend_winmm; return 1; }
++    return 0;
++}
++const char *ps2xRaudioLastFailure(void)
++{
++    snprintf(ps2xRaudioFailureText, sizeof(ps2xRaudioFailureText), "%s: %s (%d)", ps2xRaudioStage,
++             ma_result_description(ps2xRaudioFailure), (int)ps2xRaudioFailure);
++    return ps2xRaudioFailureText;
++}
++const char *ps2xRaudioBackendName(void) { return AUDIO.System.isReady ? ma_get_backend_name(AUDIO.System.context.backend) : ""; }
++const char *ps2xRaudioDeviceName(void) { return AUDIO.System.isReady ? AUDIO.System.device.playback.name : ""; }
++const char *ps2xRaudioDeviceFormat(void) { return AUDIO.System.isReady ? ma_get_format_name(AUDIO.System.device.playback.internalFormat) : ""; }
++unsigned int ps2xRaudioDeviceSampleRate(void) { return AUDIO.System.isReady ? AUDIO.System.device.playback.internalSampleRate : 0u; }
++unsigned int ps2xRaudioDeviceChannels(void) { return AUDIO.System.isReady ? AUDIO.System.device.playback.internalChannels : 0u; }
++unsigned int ps2xRaudioDevicePeriodFrames(void) { return AUDIO.System.isReady ? AUDIO.System.device.playback.internalPeriodSizeInFrames : 0u; }
++unsigned int ps2xRaudioDevicePeriods(void) { return AUDIO.System.isReady ? AUDIO.System.device.playback.internalPeriods : 0u; }
++
++void InitAudioDevice(void)
++{
++]=])
++    ps2x_raudio_replace("ma_result result = ma_context_init(NULL, 0, &ctxConfig, &AUDIO.System.context);"
++        [=[ma_backend ps2xBackends[1];
++    ma_uint32 ps2xBackendCount = 0;
++    if (ps2xRaudioBackend >= 0) { ps2xBackends[0] = (ma_backend)ps2xRaudioBackend; ps2xBackendCount = 1; }
++    ps2xRaudioNoteFailure(MA_SUCCESS, "");
++    ma_result result = ma_context_init((ps2xBackendCount > 0) ? ps2xBackends : NULL, ps2xBackendCount, &ctxConfig, &AUDIO.System.context);]=])
++    ps2x_raudio_replace("TRACELOG(LOG_WARNING, \"AUDIO: Failed to initialize context\");"
++        "ps2xRaudioNoteFailure(result, \"contexto\");\n        TRACELOG(LOG_WARNING, \"AUDIO: Failed to initialize context\");")
++    ps2x_raudio_replace("TRACELOG(LOG_WARNING, \"AUDIO: Failed to initialize playback device\");"
++        "ps2xRaudioNoteFailure(result, \"dispositivo\");\n        TRACELOG(LOG_WARNING, \"AUDIO: Failed to initialize playback device\");")
++    ps2x_raudio_replace("TRACELOG(LOG_WARNING, \"AUDIO: Failed to create mutex for mixing\");"
++        "ps2xRaudioNoteFailure(MA_ERROR, \"mutex\");\n        TRACELOG(LOG_WARNING, \"AUDIO: Failed to create mutex for mixing\");")
++    ps2x_raudio_replace("TRACELOG(LOG_WARNING, \"AUDIO: Failed to start playback device\");"
++        "ps2xRaudioNoteFailure(result, \"arranque\");\n        TRACELOG(LOG_WARNING, \"AUDIO: Failed to start playback device\");\n        ma_mutex_uninit(&AUDIO.System.lock);")
++    file(WRITE "${PS2X_RAUDIO_COPY}.tmp" "${PS2X_RAUDIO_TEXT}")
++    configure_file("${PS2X_RAUDIO_COPY}.tmp" "${PS2X_RAUDIO_COPY}" COPYONLY)
++    get_target_property(PS2X_RAYLIB_SOURCES raylib SOURCES)
++    list(TRANSFORM PS2X_RAYLIB_SOURCES REPLACE "^raudio\\.c$" "${PS2X_RAUDIO_COPY}")
++    if(NOT "${PS2X_RAUDIO_COPY}" IN_LIST PS2X_RAYLIB_SOURCES)
++        message(FATAL_ERROR "Patch 0220: raudio.c is not among raylib's sources: ${PS2X_RAYLIB_SOURCES}")
++    endif()
++    set_property(TARGET raylib PROPERTY SOURCES ${PS2X_RAYLIB_SOURCES})
++
+     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+         FetchContent_Declare(
+             imgui
+@@ -393,6 +472,7 @@ add_library(ps2_runtime STATIC
+     src/lib/game_overrides.cpp
+     src/lib/gs/ps2_gif_arbiter.cpp
+     src/lib/ps2_audio.cpp
++    src/lib/ps2_audio_sistema.cpp
+     src/lib/ps2_audio_vag.cpp
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+diff --git a/ps2xRuntime/include/ps2_audio_sistema.h b/ps2xRuntime/include/ps2_audio_sistema.h
+new file mode 100644
+index 0000000..7e0b86d
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_audio_sistema.h
+@@ -0,0 +1,86 @@
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// Audio en Linux/Proton (odd/tasks/audio-proton.md, patch 0220): which Windows audio system the game's sound goes
++// through. raylib's raudio opens miniaudio with its own default order and keeps the first context that initializes,
++// even when the device then fails or never asks for sound (what Wine/Proton can do with WASAPI). The runtime instead
++// tries WASAPI, DirectSound and WinMM one by one (InitAudioDevice with a single miniaudio backend, chosen through the
++// hook of the raudio copy the CMake build makes) and keeps the first whose device opens, starts and consumes frames.
++// settings.ini's audio_backend (PS2X_AUDIO_BACKEND) puts one first. These are the pure parts; the log lines start with
++// "[audio] " and go to stdout (F1-06.log).
++namespace ps2x::audio
++{
++    // The order to try: the names of miniaudio backends as audio_backend writes them ("wasapi", "directsound",
++    // "winmm"). auto (or unset, empty): wasapi, directsound, winmm. A forced one first, then the others in that order
++    // (a fallback, so a forced system that fails does not leave the game silent). Case-insensitive, spaces trimmed. A
++    // bad value is auto with valid = false. Away from Windows the order is {""}: miniaudio's own choice.
++    struct BackendOrder
++    {
++        std::vector<std::string> order;
++        std::string setting; // auto, wasapi, directsound or winmm (auto for a bad value)
++        bool valid = true;
++    };
++    BackendOrder backendOrder(const char *setting, bool windows);
++
++    // "WASAPI", "DirectSound", "WinMM"; "predeterminado" for "" (miniaudio's own choice); the name itself otherwise.
++    std::string backendDisplayName(std::string_view name);
++
++    // A comma-separated list (the test-only PS2X_AUDIO_PRUEBA_FALLO and PS2X_AUDIO_PRUEBA_SILENCIO) names this
++    // backend, case-insensitive. False for a null list.
++    bool listNames(const char *list, std::string_view name);
++
++    // What opening one backend gave: its device opened and consumed frames (detail: the openedLine), it failed
++    // (detail: miniaudio's reason) or it opened but consumed nothing while waited for (detail: unused).
++    enum class AttemptResult
++    {
++        Opened,
++        Failed,
++        Silent,
++    };
++    struct Attempt
++    {
++        AttemptResult result = AttemptResult::Failed;
++        std::string detail;
++    };
++
++    struct OpenSteps
++    {
++        std::function<Attempt(const std::string &backend)> open;
++        std::function<void()> close; // closes the device of a Silent attempt that is not kept
++        std::function<void(const std::string &line)> log;
++    };
++
++    // Tries order in turn and returns the backend kept (found = false when none works). A failure logs "[audio] <name> no disponible: <detail>" and goes on; a silent device is closed and the next one
++    // tried, except the last, which is kept with a warning (it may still start late); an opened one logs its detail.
++    struct OpenResult
++    {
++        bool found = false;
++        std::string backend;
++        bool silent = false; // kept although it consumed nothing
++    };
++    OpenResult openFirstWorking(const std::vector<std::string> &order, const OpenSteps &steps);
++
++    struct DeviceInfo
++    {
++        std::string backend; // miniaudio's name of the context's backend (ma_get_backend_name)
++        std::string device;  // the playback device's name
++        std::string format;  // the device's internal format (ma_get_format_name: f32, s16...)
++        unsigned sampleRate = 0;
++        unsigned channels = 0;
++        unsigned periodFrames = 0;
++        unsigned periods = 0;
++    };
++    // [audio] sistema=WASAPI dispositivo="Altavoces" formato=f32 48000 Hz 2 canales periodo=480x3 fotogramas
++    std::string openedLine(const std::string &backend, const DeviceInfo &info);
++
++    // The line a few seconds after opening: how many frames the device consumed, or a warning when it took none.
++    std::string playbackLine(uint64_t frames, double seconds);
++
++    // The first lines: the order, and a warning for a bad PS2X_AUDIO_BACKEND value (raw is the value given).
++    std::vector<std::string> orderLines(const BackendOrder &order, const char *raw);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_audio_sistema.cpp b/ps2xRuntime/src/lib/ps2_audio_sistema.cpp
+new file mode 100644
+index 0000000..a886829
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_audio_sistema.cpp
+@@ -0,0 +1,146 @@
++#include "ps2_audio_sistema.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++
++namespace ps2x::audio
++{
++    namespace
++    {
++        constexpr const char *kWindowsOrder[] = {"wasapi", "directsound", "winmm"};
++
++        std::string trimmedLower(std::string_view text)
++        {
++            size_t begin = 0u, end = text.size();
++            while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
++                ++begin;
++            while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1u])))
++                --end;
++            std::string result(text.substr(begin, end - begin));
++            for (char &c : result)
++                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            return result;
++        }
++    }
++
++    BackendOrder backendOrder(const char *setting, bool windows)
++    {
++        BackendOrder result;
++        const std::string value = trimmedLower(setting != nullptr ? setting : "");
++        const bool known = std::find(std::begin(kWindowsOrder), std::end(kWindowsOrder), value) != std::end(kWindowsOrder);
++        result.valid = value.empty() || value == "auto" || known;
++        result.setting = known ? value : "auto";
++        if (!windows)
++        {
++            result.order = {""};
++            return result;
++        }
++        if (known)
++            result.order.push_back(value);
++        for (const char *name : kWindowsOrder)
++            if (value != name)
++                result.order.emplace_back(name);
++        return result;
++    }
++
++    std::string backendDisplayName(std::string_view name)
++    {
++        if (name == "wasapi")
++            return "WASAPI";
++        if (name == "directsound")
++            return "DirectSound";
++        if (name == "winmm")
++            return "WinMM";
++        if (name.empty())
++            return "predeterminado";
++        return std::string(name);
++    }
++
++    bool listNames(const char *list, std::string_view name)
++    {
++        if (list == nullptr)
++            return false;
++        const std::string wanted = trimmedLower(name);
++        std::string_view rest(list);
++        while (true)
++        {
++            const size_t comma = rest.find(',');
++            if (trimmedLower(rest.substr(0u, comma)) == wanted)
++                return true;
++            if (comma == std::string_view::npos)
++                return false;
++            rest.remove_prefix(comma + 1u);
++        }
++    }
++
++    OpenResult openFirstWorking(const std::vector<std::string> &order, const OpenSteps &steps)
++    {
++        OpenResult result;
++        for (size_t i = 0u; i < order.size(); ++i)
++        {
++            const std::string &backend = order[i];
++            const std::string name = backendDisplayName(backend);
++            const Attempt attempt = steps.open(backend);
++            if (attempt.result == AttemptResult::Opened)
++            {
++                steps.log(attempt.detail);
++                result.found = true;
++                result.backend = backend;
++                return result;
++            }
++            if (attempt.result == AttemptResult::Failed)
++            {
++                steps.log("[audio] " + name + " no disponible: " + attempt.detail);
++                continue;
++            }
++            if (i + 1u < order.size())
++            {
++                steps.log("[audio] " + name + " no disponible: se abrio pero no pidio sonido en 1,5 s");
++                steps.close();
++                continue;
++            }
++            steps.log("[audio] AVISO: " + name +
++                      " se abrio pero no pidio sonido en 1,5 s; se queda por ser el ultimo (puede que no suene)");
++            result.found = true;
++            result.backend = backend;
++            result.silent = true;
++            return result;
++        }
++        steps.log("[audio] ningun sistema de audio funciona: el juego sigue sin sonido");
++        return result;
++    }
++
++    std::string openedLine(const std::string &backend, const DeviceInfo &info)
++    {
++        const std::string system = backend.empty() ? info.backend : backendDisplayName(backend);
++        return "[audio] sistema=" + system + " dispositivo=\"" + info.device + "\" formato=" + info.format + " " +
++               std::to_string(info.sampleRate) + " Hz " + std::to_string(info.channels) + " canales periodo=" +
++               std::to_string(info.periodFrames) + "x" + std::to_string(info.periods) + " fotogramas";
++    }
++
++    std::string playbackLine(uint64_t frames, double seconds)
++    {
++        char time[32];
++        std::snprintf(time, sizeof(time), "%.1f", seconds);
++        std::string text(time);
++        std::replace(text.begin(), text.end(), '.', ',');
++        if (frames == 0u)
++            return "[audio] AVISO: el dispositivo no ha consumido ningun fotograma en " + text +
++                   " s: probablemente no suena nada (prueba otro audio_backend en settings.ini)";
++        return "[audio] reproduciendo: " + std::to_string(frames) + " fotogramas consumidos en " + text + " s";
++    }
++
++    std::vector<std::string> orderLines(const BackendOrder &order, const char *raw)
++    {
++        std::vector<std::string> lines;
++        if (!order.valid)
++            lines.push_back(std::string("[audio] AVISO: PS2X_AUDIO_BACKEND=\"") + (raw != nullptr ? raw : "") +
++                            "\" no vale (auto, wasapi, directsound o winmm): se usa auto");
++        std::string names;
++        for (const std::string &backend : order.order)
++            names += (names.empty() ? "" : ", ") + backendDisplayName(backend);
++        lines.push_back("[audio] audio_backend=" + order.setting + ": orden " + names);
++        return lines;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index aec8b08..02a48af 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -231,6 +231,14 @@ namespace ps2x
+              "mucho 64 ms si hay cortes) o alta (128 ms fijos, para un PC lento)."},
+             {"audio_mono", "PS2X_AUDIO_MONO", "0", {{"0", "0"}, {"1", "1"}}, 0, 0,
+              "Sonido: 0 = estereo; 1 = mono (los dos canales juntos, para un solo altavoz o un solo oido)."},
++            // Audio en Linux/Proton (patch 0220, ps2_audio_sistema.h): read once when the window opens, so it is only in
++            // this file (no row of the game's pages nor of the F2 window).
++            {"audio_backend", "PS2X_AUDIO_BACKEND", "auto",
++             {{"auto", "auto"}, {"wasapi", "wasapi"}, {"directsound", "directsound"}, {"winmm", "winmm"}}, 0, 0,
++             "Sistema de audio de Windows: auto (prueba WASAPI, luego DirectSound y luego WinMM, y se queda con el\n"
++             "primero que funcione), wasapi, directsound o winmm (empieza por ese; si falla, sigue con los otros). En\n"
++             "Linux con Proton o Wine, si no hay sonido, prueba directsound o winmm. El registro (F1-06.log) dice cual\n"
++             "se abrio en las lineas [audio]."},
+             {"vibracion", "PS2X_VIBRACION", "100", {}, 0, 100,
+              "Fuerza de la vibracion del mando y del volante, de 0 (sin vibracion) a 100. La de cada mando se puede\n"
+              "quitar tambien en controls.ini."},
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5b1b0ee..dfee9c1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -28,6 +28,7 @@
+ #include "ps2_vigilante.h"
+ #include "ps2_salida.h"
+ #include "ps2_fallo.h"
++#include "ps2_audio_sistema.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -138,8 +139,31 @@ namespace
+     int g_startVolume = 100;
+     std::atomic<float> g_outputVolumeScale{1.0f};
+     std::atomic<bool> g_outputVolumeReady{false};
++
++    // Patch 0220 (audio-proton): the frames the audio device asked the SPU2 stream for (its thread runs the stream's
++    // callback), to see that the backend kept really plays (ps2_audio_sistema.h). g_audioCountFrames off is the
++    // test-only PS2X_AUDIO_PRUEBA_SILENCIO: a device that never asks for sound.
++    std::atomic<uint64_t> g_audioFramesConsumed{0u};
++    std::atomic<bool> g_audioCountFrames{true};
++    double g_audioOpenedAt = -1.0; // GetTime() when the backend was kept; -1: no device or already reported
+ }
+ 
++#if !defined(PLATFORM_VITA)
++// Patch 0220: the hook of the raudio.c copy the CMake build compiles (ps2xRuntime/CMakeLists.txt).
++extern "C"
++{
++    int ps2xRaudioSelectBackend(const char *name);
++    const char *ps2xRaudioLastFailure(void);
++    const char *ps2xRaudioBackendName(void);
++    const char *ps2xRaudioDeviceName(void);
++    const char *ps2xRaudioDeviceFormat(void);
++    unsigned int ps2xRaudioDeviceSampleRate(void);
++    unsigned int ps2xRaudioDeviceChannels(void);
++    unsigned int ps2xRaudioDevicePeriodFrames(void);
++    unsigned int ps2xRaudioDevicePeriods(void);
++}
++#endif
++
+ void ps2SetGameWidescreen(int on)
+ {
+     g_gameWidescreen.store(on != 0 ? 1 : 0, std::memory_order_relaxed);
+@@ -1985,52 +2009,113 @@ bool PS2Runtime::initialize(const char *title)
+                              0x0001u /* SWP_NOSIZE */ | 0x0010u /* SWP_NOACTIVATE */ | 0x0040u /* SWP_SHOWWINDOW */);
+         }
+ #endif
+-        InitAudioDevice();
+-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+         // Patch 0111: the SPU2 output (ps2xIOP) through a raylib stream that the audio device's thread fills. The
+         // automated runs (background window) keep it silent so they do not play over the user's sound; PS2X_SONIDO=1
+         // makes them audible.
++        // Patch 0220 (odd/tasks/audio-proton.md): the Windows audio systems are tried in turn (audio_backend,
++        // PS2X_AUDIO_BACKEND; ps2_audio_sistema.h): each opens the device with one miniaudio backend and the stream,
++        // and is kept once the device asks for frames (Wine/Proton can open WASAPI and never ask). Test only:
++        // PS2X_AUDIO_PRUEBA_FALLO=<list> makes those fail before opening, PS2X_AUDIO_PRUEBA_SILENCIO=<list> makes them
++        // look silent.
++        static AudioStream s_spu2Stream{};
++        {
++            const char *requested = std::getenv("PS2X_AUDIO_BACKEND");
++#if defined(_WIN32)
++            const ps2x::audio::BackendOrder order = ps2x::audio::backendOrder(requested, true);
++#else
++            const ps2x::audio::BackendOrder order = ps2x::audio::backendOrder(requested, false);
++#endif
++            for (const std::string &line : ps2x::audio::orderLines(order, requested))
++                std::cout << line << std::endl;
++            const char *failList = std::getenv("PS2X_AUDIO_PRUEBA_FALLO");
++            const char *silentList = std::getenv("PS2X_AUDIO_PRUEBA_SILENCIO");
++            ps2x::audio::OpenSteps steps;
++            steps.log = [](const std::string &line) { std::cout << line << std::endl; };
++            steps.close = []()
++            {
++                StopAudioStream(s_spu2Stream);
++                UnloadAudioStream(s_spu2Stream);
++                s_spu2Stream = AudioStream{};
++                CloseAudioDevice();
++            };
++            steps.open = [&](const std::string &backend) -> ps2x::audio::Attempt
++            {
++                if (ps2x::audio::listNames(failList, backend))
++                    return {ps2x::audio::AttemptResult::Failed, "fallo simulado (PS2X_AUDIO_PRUEBA_FALLO)"};
++                ps2xRaudioSelectBackend(backend.c_str());
++                InitAudioDevice();
++                if (!IsAudioDeviceReady())
++                    return {ps2x::audio::AttemptResult::Failed, ps2xRaudioLastFailure()};
++                SetAudioStreamBufferSizeDefault(1024);
++                s_spu2Stream = LoadAudioStream(48000, 16, 2);
++                g_audioCountFrames.store(!ps2x::audio::listNames(silentList, backend));
++                g_audioFramesConsumed.store(0u);
++                SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames)
++                                       {
++                                           int16_t *out = static_cast<int16_t *>(buffer);
++                                           const size_t got = ps2x::iop::readSpu2Audio(out, frames);
++                                           if (got < frames)
++                                               std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
++                                           // Fase 5 (T13, T14): silent in the photo mode and while the replay is paused or rewinds.
++                                           const float scale = ps2x::photoModeActive() || ps2x::replayScrubMuted()
++                                                                   ? 0.0f
++                                                                   : g_outputVolumeScale.load(std::memory_order_relaxed);
++                                           if (scale != 1.0f)
++                                               for (size_t i = 0; i < got * 2u; ++i)
++                                                   out[i] = static_cast<int16_t>(std::clamp(
++                                                       static_cast<int>(std::lround(out[i] * scale)), -32768, 32767));
++                                           if (g_audioCountFrames.load(std::memory_order_relaxed))
++                                               g_audioFramesConsumed.fetch_add(frames, std::memory_order_relaxed);
++                                           // PS2X_SALIDA_WAV=<path> (debugging, phase 3 T8): what the callback hands to the
++                                           // device (after the zero fill and the live volume), as 48 kHz stereo after a
++                                           // 44-byte header left at zero, like PS2X_SPU2_WAV when the game is killed (the
++                                           // scripts read it raw).
++                                           static FILE *s_outputWav = []() -> FILE *
++                                           {
++                                               const char *path = std::getenv("PS2X_SALIDA_WAV");
++                                               FILE *file = path ? std::fopen(path, "wb") : nullptr;
++                                               if (file)
++                                               {
++                                                   const uint8_t header[44]{};
++                                                   std::fwrite(header, 1, sizeof(header), file);
++                                               }
++                                               return file;
++                                           }();
++                                           if (s_outputWav)
++                                               std::fwrite(out, sizeof(int16_t) * 2u, frames, s_outputWav); });
++                const char *soundEnv = std::getenv("PS2X_SONIDO");
++                if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
++                    SetAudioStreamVolume(s_spu2Stream, 0.0f);
++                PlayAudioStream(s_spu2Stream);
++                // The device asks for its first period within a few ms; 1.5 s without any is a silent device.
++                for (int waited = 0; waited < 150 && g_audioFramesConsumed.load() == 0u; ++waited)
++                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                if (g_audioFramesConsumed.load() == 0u)
++                    return {ps2x::audio::AttemptResult::Silent, {}};
++                ps2x::audio::DeviceInfo info;
++                info.backend = ps2xRaudioBackendName();
++                info.device = ps2xRaudioDeviceName();
++                info.format = ps2xRaudioDeviceFormat();
++                info.sampleRate = ps2xRaudioDeviceSampleRate();
++                info.channels = ps2xRaudioDeviceChannels();
++                info.periodFrames = ps2xRaudioDevicePeriodFrames();
++                info.periods = ps2xRaudioDevicePeriods();
++                return {ps2x::audio::AttemptResult::Opened, ps2x::audio::openedLine(backend, info)};
++            };
++            const ps2x::audio::OpenResult opened = ps2x::audio::openFirstWorking(order.order, steps);
++            g_audioCountFrames.store(true); // a silent device kept as the last one is measured for real
++            if (opened.found)
++            {
++                g_audioFramesConsumed.store(0u);
++                g_audioOpenedAt = GetTime();
++            }
++        }
++        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+         if (IsAudioDeviceReady())
+         {
+-            SetAudioStreamBufferSizeDefault(1024);
+-            static AudioStream s_spu2Stream = LoadAudioStream(48000, 16, 2);
+             if (const char *volume = std::getenv("PS2X_VOLUMEN"))
+                 g_startVolume = std::clamp(std::atoi(volume), 0, 100);
+             g_outputVolumeReady.store(true);
+-            // PS2X_SALIDA_WAV=<path> (debugging, phase 3 T8): what the callback hands to the device (after the zero
+-            // fill and the live volume), as 48 kHz stereo after a 44-byte header left at zero, like PS2X_SPU2_WAV when
+-            // the game is killed (the scripts read it raw).
+-            static FILE *s_outputWav = []() -> FILE *
+-            {
+-                const char *path = std::getenv("PS2X_SALIDA_WAV");
+-                FILE *file = path ? std::fopen(path, "wb") : nullptr;
+-                if (file)
+-                {
+-                    const uint8_t header[44]{};
+-                    std::fwrite(header, 1, sizeof(header), file);
+-                }
+-                return file;
+-            }();
+-            SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames)
+-                                   {
+-                                       int16_t *out = static_cast<int16_t *>(buffer);
+-                                       const size_t got = ps2x::iop::readSpu2Audio(out, frames);
+-                                       if (got < frames)
+-                                           std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
+-                                       // Fase 5 (T13, T14): silent in the photo mode and while the replay is paused or rewinds.
+-                                       const float scale = ps2x::photoModeActive() || ps2x::replayScrubMuted()
+-                                                               ? 0.0f
+-                                                               : g_outputVolumeScale.load(std::memory_order_relaxed);
+-                                       if (scale != 1.0f)
+-                                           for (size_t i = 0; i < got * 2u; ++i)
+-                                               out[i] = static_cast<int16_t>(std::clamp(
+-                                                   static_cast<int>(std::lround(out[i] * scale)), -32768, 32767));
+-                                       if (s_outputWav)
+-                                           std::fwrite(out, sizeof(int16_t) * 2u, frames, s_outputWav); });
+-            const char *soundEnv = std::getenv("PS2X_SONIDO");
+-            if (backgroundWindow && (soundEnv == nullptr || soundEnv[0] != '1'))
+-                SetAudioStreamVolume(s_spu2Stream, 0.0f);
+-            PlayAudioStream(s_spu2Stream);
+         }
+ #endif
+         // Patch 0100: PS2X_PANTALLA_COMPLETA=1 started in borderless full screen. Phase 3 (T2): the presenter starts
+@@ -4072,6 +4157,16 @@ void PS2Runtime::run()
+             }
+         }
+ 
++#if !defined(PLATFORM_VITA)
++        // Patch 0220 (S3): two seconds after the audio system was kept, whether its device is taking the sound.
++        if (g_audioOpenedAt >= 0.0 && GetTime() - g_audioOpenedAt >= 2.0)
++        {
++            std::cout << ps2x::audio::playbackLine(g_audioFramesConsumed.load(), GetTime() - g_audioOpenedAt)
++                      << std::endl;
++            g_audioOpenedAt = -1.0;
++        }
++#endif
++
+         if (WindowShouldClose())
+         {
+             RUNTIME_LOG("[run] window close requested, breaking out of loop\n");
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index d6e9984..405e944 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "MiniTest.h"
+ #include "ps2_options.h"
+ #include "ps2_ai_difficulty.h"
++#include "ps2_audio_sistema.h"
+ #include "ps2_camera_fov.h"
+ #include "ps2_game_rand.h"
+ #include "ps2_hud.h"
+@@ -2379,6 +2380,179 @@ void register_ps2_options_menu_tests()
+         });
+     });
+ 
++    // Audio en Linux/Proton (odd/tasks/audio-proton.md, patch 0220): the Windows audio system, its option and its log.
++    MiniTest::Case("AudioBackend", [](TestCase &tc)
++    {
++        using Order = std::vector<std::string>;
++
++        // S2: audio_backend = auto | wasapi | directsound | winmm, auto by default, PS2X_AUDIO_BACKEND.
++        tc.Run("audio_backend: auto by default, its variable, its values and a bad value", [](TestCase &t)
++        {
++            t.Equals(ps2x::parseOptions("").values.at("audio_backend"), std::string("auto"), "auto for the player");
++            t.Equals(fileValue("", "audio_backend", true), std::string("auto"), "auto in development too");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "\naudio_backend = auto\n"), "the template has it");
++            t.IsTrue(contains(ps2x::defaultOptionsText(false), "# Sistema de audio de Windows"),
++                     "with its Spanish comment");
++            for (const char *value : {"auto", "wasapi", "directsound", "winmm"})
++            {
++                const ps2x::OptionsFile file = ps2x::parseOptions(std::string("audio_backend = ") + value + "\n");
++                t.IsTrue(file.warnings.empty(), std::string(value) + ": no warning");
++                t.Equals(file.values.at("audio_backend"), std::string(value), std::string(value) + ": kept");
++                std::map<std::string, std::string> variables;
++                for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(file, environmentOf({})))
++                    variables[setting.variable] = setting.value;
++                t.Equals(variables["PS2X_AUDIO_BACKEND"], std::string(value), std::string(value) + ": -> PS2X_AUDIO_BACKEND");
++            }
++            t.Equals(fileValue("audio_backend = DirectSound\n", "audio_backend"), std::string("directsound"),
++                     "case-insensitive");
++            const ps2x::OptionsFile bad = ps2x::parseOptions("audio_backend = pulseaudio\n");
++            t.Equals(bad.warnings.size(), size_t{1u}, "a system off the list warns");
++            t.Equals(bad.values.at("audio_backend"), std::string("auto"), "and takes auto");
++            const Environment environment = {{"PS2X_AUDIO_BACKEND", "winmm"}};
++            const ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "audio_backend = wasapi\n", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)),
++                environmentOf(environment));
++            t.Equals(forced.current.at("audio_backend"), std::string("winmm"), "the variable wins over the file");
++            for (int page = 1; page <= 6; ++page)
++                for (const std::string &key : ps2x::gameOptionsPageKeys(page))
++                    t.IsTrue(key != "audio_backend", "audio_backend is only in settings.ini (applies when the game starts)");
++        });
++
++        // S1: WASAPI, DirectSound, WinMM; a forced one first, the others after it.
++        tc.Run("backendOrder: auto tries WASAPI, DirectSound and WinMM; a forced one goes first", [](TestCase &t)
++        {
++            const Order all = {"wasapi", "directsound", "winmm"};
++            for (const char *setting : {"auto", "", "  AUTO "})
++            {
++                const ps2x::audio::BackendOrder order = ps2x::audio::backendOrder(setting, true);
++                t.IsTrue(order.order == all, std::string("auto order for '") + setting + "'");
++                t.IsTrue(order.valid, std::string("valid: '") + setting + "'");
++                t.Equals(order.setting, std::string("auto"), std::string("setting auto for '") + setting + "'");
++            }
++            t.IsTrue(ps2x::audio::backendOrder(nullptr, true).order == all, "unset: auto");
++            t.IsTrue(ps2x::audio::backendOrder("wasapi", true).order == all, "wasapi: the auto order");
++            t.IsTrue(ps2x::audio::backendOrder("directsound", true).order == Order{"directsound", "wasapi", "winmm"},
++                     "directsound first, then WASAPI and WinMM");
++            t.IsTrue(ps2x::audio::backendOrder(" WinMM", true).order == Order{"winmm", "wasapi", "directsound"},
++                     "winmm first (case and spaces ignored)");
++            t.Equals(ps2x::audio::backendOrder(" WinMM", true).setting, std::string("winmm"), "its setting");
++            const ps2x::audio::BackendOrder bad = ps2x::audio::backendOrder("pulse", true);
++            t.IsFalse(bad.valid, "a bad value is reported");
++            t.IsTrue(bad.order == all, "and tries the auto order");
++            t.Equals(bad.setting, std::string("auto"), "as auto");
++            t.IsTrue(ps2x::audio::backendOrder("directsound", false).order == Order{""},
++                     "away from Windows: miniaudio's own choice");
++            t.Equals(ps2x::audio::backendDisplayName("wasapi"), std::string("WASAPI"), "WASAPI");
++            t.Equals(ps2x::audio::backendDisplayName("directsound"), std::string("DirectSound"), "DirectSound");
++            t.Equals(ps2x::audio::backendDisplayName("winmm"), std::string("WinMM"), "WinMM");
++            t.Equals(ps2x::audio::backendDisplayName(""), std::string("predeterminado"), "miniaudio's own");
++            t.IsTrue(ps2x::audio::listNames("wasapi", "wasapi"), "one name");
++            t.IsTrue(ps2x::audio::listNames("WASAPI, directsound", "directsound"), "a list, any case and spaces");
++            t.IsFalse(ps2x::audio::listNames("wasapi,directsound", "winmm"), "not on the list");
++            t.IsFalse(ps2x::audio::listNames("wasapix", "wasapi"), "whole names only");
++            t.IsFalse(ps2x::audio::listNames(nullptr, "wasapi"), "no list");
++        });
++
++        // S1 + S3: the first backend that opens and consumes frames is kept, and the log says why the others were not.
++        tc.Run("openFirstWorking keeps the first backend that opens and consumes, logging each failure", [](TestCase &t)
++        {
++            const Order all = {"wasapi", "directsound", "winmm"};
++            const auto run = [&](std::map<std::string, ps2x::audio::Attempt> results, Order &tried, int &closes,
++                                 std::vector<std::string> &lines)
++            {
++                ps2x::audio::OpenSteps steps;
++                steps.open = [&tried, results](const std::string &backend)
++                {
++                    tried.push_back(backend);
++                    return results.at(backend);
++                };
++                steps.close = [&closes] { ++closes; };
++                steps.log = [&lines](const std::string &line) { lines.push_back(line); };
++                return ps2x::audio::openFirstWorking(all, steps);
++            };
++            const ps2x::audio::Attempt opened{ps2x::audio::AttemptResult::Opened, "[audio] sistema=X"};
++            const ps2x::audio::Attempt failed{ps2x::audio::AttemptResult::Failed, "dispositivo: Failed to open (-1)"};
++            const ps2x::audio::Attempt silent{ps2x::audio::AttemptResult::Silent, ""};
++
++            Order tried;
++            int closes = 0;
++            std::vector<std::string> lines;
++            ps2x::audio::OpenResult result = run({{"wasapi", opened}, {"directsound", opened}, {"winmm", opened}},
++                                                 tried, closes, lines);
++            t.IsTrue(result.found && result.backend == "wasapi" && !result.silent, "WASAPI works: kept");
++            t.IsTrue(tried == Order{"wasapi"}, "nothing else tried");
++            t.IsTrue(lines == std::vector<std::string>{"[audio] sistema=X"}, "the opened line");
++
++            tried.clear(), lines.clear(), closes = 0;
++            result = run({{"wasapi", failed}, {"directsound", silent}, {"winmm", opened}}, tried, closes, lines);
++            t.IsTrue(result.found && result.backend == "winmm" && !result.silent, "WinMM after two that fail");
++            t.IsTrue(tried == all, "in order");
++            t.Equals(closes, 1, "the silent DirectSound device is closed");
++            t.IsTrue(lines == std::vector<std::string>{
++                                  "[audio] WASAPI no disponible: dispositivo: Failed to open (-1)",
++                                  "[audio] DirectSound no disponible: se abrio pero no pidio sonido en 1,5 s",
++                                  "[audio] sistema=X"},
++                     "each failure explained");
++
++            tried.clear(), lines.clear(), closes = 0;
++            result = run({{"wasapi", silent}, {"directsound", failed}, {"winmm", silent}}, tried, closes, lines);
++            t.IsTrue(result.found && result.backend == "winmm" && result.silent, "the last silent one is kept");
++            t.Equals(closes, 1, "only WASAPI closed");
++            t.Equals(lines.size(), size_t{3u}, "three lines");
++            t.Equals(lines.empty() ? std::string() : lines.back(), std::string("[audio] AVISO: WinMM se abrio pero no pidio sonido en 1,5 s; se queda "
++                                              "por ser el ultimo (puede que no suene)"),
++                     "the last silent one warned");
++
++            tried.clear(), lines.clear(), closes = 0;
++            result = run({{"wasapi", failed}, {"directsound", failed}, {"winmm", failed}}, tried, closes, lines);
++            t.IsFalse(result.found, "none works");
++            t.Equals(lines.size(), size_t{4u}, "three failures and the summary");
++            t.Equals(lines.empty() ? std::string() : lines.back(), std::string("[audio] ningun sistema de audio funciona: el juego sigue sin sonido"),
++                     "the summary");
++        });
++
++        // S3: the log lines.
++        tc.Run("the audio log lines say the system, device, format, order and whether frames are consumed", [](TestCase &t)
++        {
++            ps2x::audio::DeviceInfo info;
++            info.backend = "WASAPI";
++            info.device = "Altavoces (Realtek(R) Audio)";
++            info.format = "f32";
++            info.sampleRate = 48000u;
++            info.channels = 2u;
++            info.periodFrames = 480u;
++            info.periods = 3u;
++            t.Equals(ps2x::audio::openedLine("wasapi", info),
++                     std::string("[audio] sistema=WASAPI dispositivo=\"Altavoces (Realtek(R) Audio)\" formato=f32 48000 Hz "
++                                 "2 canales periodo=480x3 fotogramas"),
++                     "opened");
++            info.backend = "WinMM";
++            t.Equals(ps2x::audio::openedLine("", info).rfind("[audio] sistema=WinMM dispositivo=", 0), size_t{0u},
++                     "miniaudio's own choice: the backend it took");
++            t.Equals(ps2x::audio::playbackLine(96000u, 2.0),
++                     std::string("[audio] reproduciendo: 96000 fotogramas consumidos en 2,0 s"), "frames consumed");
++            t.Equals(ps2x::audio::playbackLine(0u, 2.0),
++                     std::string("[audio] AVISO: el dispositivo no ha consumido ningun fotograma en 2,0 s: "
++                                 "probablemente no suena nada (prueba otro audio_backend en settings.ini)"),
++                     "none consumed");
++            const std::vector<std::string> autoLines =
++                ps2x::audio::orderLines(ps2x::audio::backendOrder("auto", true), "auto");
++            t.IsTrue(autoLines == std::vector<std::string>{"[audio] audio_backend=auto: orden WASAPI, DirectSound, WinMM"},
++                     "the order");
++            const std::vector<std::string> badLines =
++                ps2x::audio::orderLines(ps2x::audio::backendOrder("pulse", true), "pulse");
++            t.IsTrue(badLines == std::vector<std::string>{"[audio] AVISO: PS2X_AUDIO_BACKEND=\"pulse\" no vale (auto, "
++                                                          "wasapi, directsound o winmm): se usa auto",
++                                                          "[audio] audio_backend=auto: orden WASAPI, DirectSound, WinMM"},
++                     "a bad value warned");
++            t.IsTrue(ps2x::audio::orderLines(ps2x::audio::backendOrder("x", false), "x") ==
++                         std::vector<std::string>{"[audio] AVISO: PS2X_AUDIO_BACKEND=\"x\" no vale (auto, wasapi, "
++                                                  "directsound o winmm): se usa auto",
++                                                  "[audio] audio_backend=auto: orden predeterminado"},
++                     "away from Windows");
++        });
++    });
++
+     // Fase 5 (T10): any number of laps in RACE OPTIONS, stored as the game's own race distance.
+     MiniTest::Case("RaceLaps", [](TestCase &tc)
+     {
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index 6eb0f19..302b82a 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -748,7 +748,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{34}, "thirty-four options (fase 5: fifteen more; lejania: two; vigilante: one; controles: five)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{35}, "thirty-five options (fase 5: fifteen more; lejania: two; vigilante: one; controles: five; audio: one)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

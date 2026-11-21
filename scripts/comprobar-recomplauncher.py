@@ -17,6 +17,7 @@ from pathlib import Path
 RAIZ = Path(__file__).resolve().parent.parent
 OPCIONES_CPP = RAIZ / "third_party/PS2Recomp/ps2xRuntime/src/lib/ps2_options.cpp"
 EXE = "F1-06.exe"
+CLAVES_BOTON = {"boton_acelerar", "boton_frenar", "boton_subir_marcha", "boton_bajar_marcha", "boton_mirar_atras"}
 PREPARE_ARGS = ["--extraer-iso", "{game}"]
 DONE = ["{install}/data/F1-06-disco.txt"]
 
@@ -31,10 +32,16 @@ def fallo(texto):
 def opciones_del_juego(texto):
     """{clave: (valor por defecto del jugador, valores admitidos o None, minimo, maximo)} de optionSpecs()."""
     specs = {}
-    patron = re.compile(r'\{"(\w+)",\s*"PS2X_\w+",\s*"([^"]*)",\s*\{(.*?)\},\s*(-?\d+),\s*(-?\d+),', re.S)
+    # The value list is either inline ({{"0", "0"}, ...}) or a helper call (drivingButtonChoices()), read from its body.
+    patron = re.compile(r'\{"(\w+)",\s*"PS2X_\w+",\s*"([^"]*)",\s*(?:\{(.*?)\}|(\w+)\(\)),\s*(-?\d+),\s*(-?\d+),',
+                        re.S)
     for m in patron.finditer(texto):
-        valores = re.findall(r'\{"([^"]+)",\s*(?:"[^"]*"|nullptr)\}', m.group(3))
-        specs[m.group(1)] = (m.group(2), valores or None, int(m.group(4)), int(m.group(5)))
+        lista = m.group(3)
+        if m.group(4):
+            cuerpo = re.search(r'\b' + m.group(4) + r'\(\)\s*\{\s*return\s*\{(.*?)\};', texto, re.S)
+            lista = cuerpo.group(1) if cuerpo else ""
+        valores = re.findall(r'\{"([^"]+)",\s*(?:"[^"]*"|nullptr)\}', lista)
+        specs[m.group(1)] = (m.group(2), valores or None, int(m.group(5)), int(m.group(6)))
     return specs
 
 
@@ -87,6 +94,13 @@ def comprobar_ajustes(datos):
         for clave in ajuste.get("when", {}):
             if clave not in specs:
                 fallo(f"settings {nombre}: when con la clave desconocida {clave}")
+        # Driving buttons: the launcher writes each key on its own, so a choice that sets them must set all five
+        # with no button used twice (the game would reset all of them to the original buttons).
+        for elegido in ajuste.get("choices", []):
+            botones = {c: v for c, v in elegido.get("set", {}).items() if c in CLAVES_BOTON}
+            if botones and (set(botones) != CLAVES_BOTON or len(set(botones.values())) != len(botones)):
+                fallo(f"settings {nombre}: {elegido.get('label')} debe poner las {len(CLAVES_BOTON)} acciones "
+                      f"con botones distintos: {botones}")
         claves = {c for e in ajuste.get("choices", []) for c in e.get("set", {})}
         if claves - set(ajuste.get("defaults", {})):
             fallo(f"settings {nombre}: faltan en defaults {sorted(claves - set(ajuste.get('defaults', {})))}")

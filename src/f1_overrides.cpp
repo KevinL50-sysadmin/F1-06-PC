@@ -2937,6 +2937,269 @@ namespace
         }
     }
 
+    // Controles personalizados (controles-personalizados T2, S2/S4): OPCIONES PC > CONTROLES PC elige el boton fisico
+    // de ACELERAR, FRENAR, SUBIR MARCHA, BAJAR MARCHA y MIRAR ATRAS (settings.ini boton_*, parche 0219). Mientras se
+    // conduce, el boton del juego de cada accion (X, cuadrado, R2, L2, R1) recibe el estado del boton elegido: su bit
+    // (byte 3, activo a 0) y su presion (bytes 8-19 del DualShock 2). Se calcula sobre una copia del informe (es una
+    // permutacion, no se encadena). O y L1 (sin uso en carrera) pasan tal cual salvo que una accion los use: entonces
+    // se leen sueltos. Con los botones del juego original el informe no cambia.
+    // El bloque entre F1CONTROLES-PURO-INICIO y -FIN solo usa <cstdint>: la prueba lo extrae y lo compila aparte.
+    // F1CONTROLES-PURO-INICIO
+    namespace controles
+    {
+        constexpr int kBotones = 7;  // cruz cuadrado circulo l1 r1 l2 r2 (el numero de la fila del ajuste, 0-6)
+        constexpr int kAcciones = 5; // acelerar frenar subir_marcha bajar_marcha mirar_atras
+        struct BotonPad
+        {
+            uint8_t bit;     // del byte 3, activo a 0
+            uint8_t presion; // byte de presion
+        };
+        constexpr BotonPad kBoton[kBotones] = {{6u, 14u}, {7u, 15u}, {5u, 13u}, {2u, 16u},
+                                               {3u, 18u}, {0u, 17u}, {1u, 19u}};
+        constexpr int kBotonDelJuego[kAcciones] = {0, 1, 6, 5, 4}; // cruz cuadrado r2 l2 r1
+
+        inline bool eleccionValida(const int elegido[kAcciones])
+        {
+            for (int a = 0; a < kAcciones; ++a)
+            {
+                if (elegido[a] < 0 || elegido[a] >= kBotones)
+                    return false;
+                for (int b = 0; b < a; ++b)
+                    if (elegido[b] == elegido[a])
+                        return false;
+            }
+            return true;
+        }
+
+        inline bool esDelJuego(const int elegido[kAcciones])
+        {
+            for (int a = 0; a < kAcciones; ++a)
+                if (elegido[a] != kBotonDelJuego[a])
+                    return false;
+            return true;
+        }
+
+        // informe: los 20 primeros bytes del de scePadRead. Una eleccion invalida (fuera de 0-6 o con dos acciones en
+        // un boton) no cambia nada.
+        inline void reasignar(uint8_t *informe, const int elegido[kAcciones])
+        {
+            if (!eleccionValida(elegido) || esDelJuego(elegido))
+                return;
+            const uint8_t byte3 = informe[3];
+            uint8_t presion[kBotones];
+            for (int b = 0; b < kBotones; ++b)
+                presion[b] = informe[kBoton[b].presion];
+            uint8_t salida = byte3;
+            for (int b = 0; b < kBotones; ++b)
+            {
+                int fuente = b; // -1: suelto
+                bool delJuego = false;
+                for (int a = 0; a < kAcciones; ++a)
+                    if (kBotonDelJuego[a] == b)
+                    {
+                        fuente = elegido[a];
+                        delJuego = true;
+                    }
+                if (!delJuego)
+                    for (int a = 0; a < kAcciones; ++a)
+                        if (elegido[a] == b)
+                            fuente = -1;
+                const uint8_t mascara = static_cast<uint8_t>(1u << kBoton[b].bit);
+                const bool pulsado = fuente >= 0 && (byte3 & (1u << kBoton[fuente].bit)) == 0u;
+                salida = static_cast<uint8_t>(pulsado ? (salida & ~mascara) : (salida | mascara));
+                informe[kBoton[b].presion] = fuente >= 0 ? presion[fuente] : 0u;
+            }
+            informe[3] = salida;
+        }
+    }
+    // F1CONTROLES-PURO-FIN
+
+    namespace controles
+    {
+        const char *const kNombres[kBotones] = {"cruz", "cuadrado", "circulo", "l1", "r1", "l2", "r2"};
+        const char *const kClaves[kAcciones] = {"boton_acelerar", "boton_frenar", "boton_subir_marcha",
+                                                "boton_bajar_marcha", "boton_mirar_atras"};
+        const char *const kVariables[kAcciones] = {"PS2X_BOTON_ACELERAR", "PS2X_BOTON_FRENAR", "PS2X_BOTON_SUBIR_MARCHA",
+                                                   "PS2X_BOTON_BAJAR_MARCHA", "PS2X_BOTON_MIRAR_ATRAS"};
+
+        // El ajuste (settings.ini, o la variable si lo fija); sin el, el boton del juego original.
+        int botonElegido(int accion)
+        {
+#if defined(PS2X_ENABLE_DEBUG_UI)
+            float valor = 0.0f;
+            if (PS2OptionsMenu::gameOptionNumber(kClaves[accion], valor))
+            {
+                const long n = std::lround(valor);
+                if (n >= 0 && n < kBotones)
+                    return static_cast<int>(n);
+            }
+#endif
+            if (const char *variable = std::getenv(kVariables[accion]))
+                for (int b = 0; b < kBotones; ++b)
+                    if (std::strcmp(variable, kNombres[b]) == 0)
+                        return b;
+            return kBotonDelJuego[accion];
+        }
+
+        // Lo que decide si se conduce (S2), por separado para el registro de PS2X_PAD_DEPURAR.
+        struct Conduccion
+        {
+            bool foto = false;        // modo foto del PC
+            bool partida = false;     // *0x3FE3EC apunta a una partida
+            bool pasoCarrera = false; // metodo +0x134 de su tabla +0x7C = 0x195900 (como medirIa)
+            uint32_t servidor = 0u;   // partida +0x20: pause.server_state() (4 en marcha; 3 pausa, 0 y 6 fuera)
+            uint32_t menu = 0u;       // partida +0x568 (el menu de pausa para pilotar; al pausar la carrera sigue en 0)
+            uint32_t repeticion = 0u; // partida +0x24
+            uint32_t coche = 0u;      // HUD del jugador +0x20: estado de su coche (4 en carrera)
+            uint32_t aviso = 0u;      // HUD del jugador +0x44: el aviso de la cola (0x25 ninguno)
+            bool activo = false;
+            bool operator==(const Conduccion &o) const
+            {
+                return foto == o.foto && partida == o.partida && pasoCarrera == o.pasoCarrera &&
+                       servidor == o.servidor && menu == o.menu && repeticion == o.repeticion && coche == o.coche &&
+                       aviso == o.aviso && activo == o.activo;
+            }
+        };
+
+        struct Estado
+        {
+            int elegido[kAcciones] = {0, 1, 6, 5, 4};
+            double leidoEn = -1.0e9;
+            bool mirado[2] = {false, false};
+            Conduccion conduccion[2]; // la ultima registrada de cada puerto
+            uint8_t ultimo[2][18] = {};
+            unsigned informes[2] = {0u, 0u};
+            unsigned cambios = 0u; // de conduccion, registrados
+        };
+        Estado g_estado; // hilo del EE (scePadRead)
+
+        bool depurar()
+        {
+            static const bool s_depurar = []
+            {
+                const char *v = std::getenv("PS2X_PAD_DEPURAR");
+                return v != nullptr && v[0] != '0';
+            }();
+            return s_depurar;
+        }
+
+        // Avisos de la cola del HUD (gestor en HUD +0x30: aviso actual en +0x40, su tipo en +0x44; tipos de la fabrica
+        // func_1F8590) que esperan una pulsacion: 1 clasificacion de la carrera (CONTINUE), 12 OVL_COM_WFRC "Waiting
+        // for race completion", 14 OVL_COM_RET (retirado), 15 OVL_COM_DISQ "Disqualified", 17 y 21 los de la salida y
+        // del final (func_219080). Los informativos (13 WOP, 16 FLC, 22 FT, 31 PIT_LPL, 36) no quitan la reasignacion.
+        bool avisoConPulsacion(uint32_t tipo)
+        {
+            return tipo == 1u || tipo == 12u || tipo == 14u || tipo == 15u || tipo == 17u || tipo == 21u;
+        }
+
+        // Conduciendo (S2): fuera del modo foto; partida en *0x3FE3EC en el paso de carrera, en marcha (+0x20 = 4: con
+        // el menu de pausa es 3), sin menu (+0x568) ni repeticion (+0x24); y el coche del jugador en carrera (+0x20 de
+        // su HUD = 4: 3 en la parrilla antes de la salida, 1 tras retirarse o ser descalificado, 6 en boxes) sin un
+        // aviso que espere una pulsacion. El HUD es el del puerto en *(*0x3FE5BC + 0x34) (vector: +0x3C cuantos; el
+        // del jugador 1 si no hay otro); lo crea func_1F19B8 y lo actualiza func_1F9078 (car +0x240 -> HUD +0x20).
+        Conduccion conduciendo(const uint8_t *rdram, uint32_t puerto)
+        {
+            Conduccion c;
+            const auto puntero = [](uint32_t d) { return d >= 0x00100000u && d < 0x02000000u && (d & 3u) == 0u; };
+            c.foto = ps2x::photoModeActive();
+            const uint32_t juego = leer32(rdram, 0x003FE3ECu);
+            c.partida = puntero(juego);
+            if (c.partida)
+            {
+                const uint32_t vtabla = leer32(rdram, juego + 0x7Cu);
+                c.pasoCarrera = puntero(vtabla) && leer32(rdram, vtabla + 0x134u) == 0x00195900u;
+                c.servidor = leer32(rdram, juego + 0x20u);
+                c.menu = leer32(rdram, juego + 0x568u);
+                c.repeticion = leer32(rdram, juego + 0x24u);
+            }
+            const uint32_t global = leer32(rdram, 0x003FE5BCu);
+            const uint32_t huds = puntero(global) ? leer32(rdram, global + 0x34u) : 0u;
+            if (puntero(huds))
+            {
+                const uint32_t cuantos = leer32(rdram, global + 0x3Cu);
+                const uint32_t hud = leer32(rdram, huds + 4u * (puerto < cuantos && puerto < 4u ? puerto : 0u));
+                if (puntero(hud))
+                {
+                    c.coche = leer32(rdram, hud + 0x20u);
+                    c.aviso = leer32(rdram, hud + 0x44u);
+                }
+            }
+            c.activo = !c.foto && c.partida && c.pasoCarrera && c.servidor == 4u && c.menu == 0u &&
+                       c.repeticion == 0u && c.coche == 4u && !avisoConPulsacion(c.aviso);
+            return c;
+        }
+
+        // Tras la lectura original y antes de las pulsaciones de prueba y del piloto (que pulsan botones del juego).
+        void aplicar(uint8_t *rdram, uint32_t puerto, uint32_t datos, double ahora)
+        {
+            Estado &e = g_estado;
+            if (ahora - e.leidoEn >= 1.0) // OPCIONES PC y F2 lo cambian en caliente
+            {
+                e.leidoEn = ahora;
+                int nuevo[kAcciones];
+                for (int a = 0; a < kAcciones; ++a)
+                    nuevo[a] = botonElegido(a);
+                if (std::memcmp(nuevo, e.elegido, sizeof(nuevo)) != 0)
+                {
+                    std::memcpy(e.elegido, nuevo, sizeof(nuevo));
+                    if (depurar())
+                        std::cout << "[f1-06:controles] t=" << ahora << " ajustes acelerar=" << kNombres[nuevo[0]]
+                                  << " frenar=" << kNombres[nuevo[1]] << " subir_marcha=" << kNombres[nuevo[2]]
+                                  << " bajar_marcha=" << kNombres[nuevo[3]] << " mirar_atras=" << kNombres[nuevo[4]]
+                                  << (eleccionValida(nuevo) ? "" : " (invalidos: sin reasignar)") << std::endl;
+                }
+            }
+            if (puerto > 1u)
+                return;
+            const Conduccion c = conduciendo(rdram, puerto);
+            const bool activo = c.activo;
+            if (!e.mirado[puerto] || !(c == e.conduccion[puerto]))
+            {
+                // Registra cada cambio de lo que decide (asi se ve el motivo), no solo el de activa/inactiva.
+                e.mirado[puerto] = true;
+                e.conduccion[puerto] = c;
+                if (depurar() && e.cambios++ < 200u)
+                {
+                    char texto[200];
+                    std::snprintf(texto, sizeof(texto),
+                                  "puerto=%u conduciendo=%d: foto=%d partida=%d paso_carrera=%d servidor=%u menu=%u "
+                                  "repeticion=%u coche=%u aviso=0x%x",
+                                  puerto, int(activo), int(c.foto), int(c.partida), int(c.pasoCarrera), c.servidor,
+                                  c.menu, c.repeticion, c.coche, c.aviso);
+                    std::cout << "[f1-06:controles] t=" << ahora << (activo ? " activa" : " inactiva") << " ("
+                              << texto << ", del juego=" << esDelJuego(e.elegido) << ")" << std::endl;
+                }
+            }
+            if (!activo || esDelJuego(e.elegido))
+                return;
+            uint8_t informe[20];
+            for (uint32_t i = 0; i < 20u; ++i)
+                informe[i] = rdram[(datos + i) & PS2_RAM_MASK];
+            reasignar(informe, e.elegido);
+            for (uint32_t i = 0; i < 20u; ++i)
+                rdram[(datos + i) & PS2_RAM_MASK] = informe[i];
+            if (depurar() && e.informes[puerto] < 500u)
+            {
+                uint8_t resumen[18];
+                resumen[0] = informe[2];
+                resumen[1] = informe[3];
+                std::memcpy(resumen + 2, informe + 8, 12);
+                std::memset(resumen + 14, 0, 4);
+                if (std::memcmp(resumen, e.ultimo[puerto], sizeof(resumen)) != 0)
+                {
+                    std::memcpy(e.ultimo[puerto], resumen, sizeof(resumen));
+                    ++e.informes[puerto];
+                    char texto[96];
+                    std::snprintf(texto, sizeof(texto), "botones=%02x%02x presiones=", informe[3], informe[2]);
+                    std::cout << "[f1-06:controles] t=" << ahora << " puerto=" << puerto << " " << texto;
+                    for (int i = 8; i < 20; ++i)
+                        std::cout << (i == 8 ? "" : ",") << int(informe[i]);
+                    std::cout << std::endl;
+                }
+            }
+        }
+    }
+
     namespace volante
     {
         void espejo(const uint8_t *rdram, uint32_t datos);
@@ -2949,6 +3212,8 @@ namespace
         const uint32_t datos = GPR_U32(ctx, 6);
         g_scePadReadOriginal(rdram, ctx, runtime);
         const double ahora = segundosDesdeArranque();
+        if (GPR_U32(ctx, 2) != 0u) // ambos puertos: el jugador 2 y el invitado en red comparten el ajuste
+            controles::aplicar(rdram, puerto, datos, ahora);
         if (puerto < 2u && (lecturas[puerto]++ % 1000u) == 0u)
             std::cout << "[f1-06:pad] scePadRead puerto=" << puerto << " lectura=" << lecturas[puerto] << " t=" << ahora
                       << " v0=" << GPR_U32(ctx, 2) << " modo=0x" << std::hex << int(rdram[(datos + 1u) & PS2_RAM_MASK])
@@ -5654,7 +5919,7 @@ namespace
     // "ps2x:<opcion>" el valor de la opcion (ps2x::menuOptionNumber) y "ps2x:<opcion>", v la cambia en caliente (sobre el
     // modelo de PS2OptionsMenu: PS2OptionsMenu::setGameOptionNumber, aplicado en el siguiente fotograma); "ps2x:pagina"[, v]
     // dice si DisplaySettings abre nuestras filas (1 GRAFICOS PC, 2 AJUSTES PC, 3 PANTALLA PC, 4 JUEGO EN RED PC, 5 la
-    // lista OPCIONES PC que lleva a las otras cuatro) o las del juego (0); "ps2x:abrir" toma los valores que F11/F10 hayan cambiado y "ps2x:guardar" escribe settings.ini (las
+    // lista OPCIONES PC que lleva a las otras, 6 CONTROLES PC) o las del juego (0); "ps2x:abrir" toma los valores que F11/F10 hayan cambiado y "ps2x:guardar" escribe settings.ini (las
     // claves de PANTALLA PC y JUEGO EN RED PC, en puentePantallaPc y puenteJuegoEnRed). Las demas claves van a la funcion
     // original.
     // F1_OPCIONES_JUEGO=0 lo desactiva (los trozos se cargan tal cual).
@@ -5682,10 +5947,10 @@ if Menu and Menu.addMenuItem then
       if llamada then llamada(m) end
     end)
     local titulo = "PC OPTIONS"
-    local nota = "The PC's graphics, display, settings and netplay."
+    local nota = "The PC's graphics, display, settings, controls and netplay."
     if game.language() == game.spanish then
       titulo = "OPCIONES PC"
-      nota = "Gr\195\161ficos, pantalla, ajustes y juego en red del PC."
+      nota = "Gr\195\161ficos, pantalla, ajustes, controles y juego en red del PC."
     end
     return anadir(self, i, titulo, salida, nota, function() G("ps2x:pagina", 5) end)
   end
@@ -5806,7 +6071,8 @@ end
     // (Nativizacion T7) igual en el menu principal; la pausa no lleva esa fila ni recuerda nada: las filas de mas de
     // GRAFICOS PC van en un trozo aparte (=ps2x:graficos-pc), que la pausa tambien carga desde Nativizacion T10 (modo
     // de pantalla y volumen, sin VALORES POR DEFECTO).
-    // OPCIONES PC (pagina 5, Foto y repeticion T2): la lista de las cuatro paginas del menu principal, con filas
+    // CONTROLES PC (pagina 6, Controles personalizados T1) como AJUSTES PC: VALORES POR DEFECTO, recordar y descartar.
+    // OPCIONES PC (pagina 5, Foto y repeticion T2): la lista de las paginas del PC del menu principal, con filas
     // ClassConfigMenuButton (como LOAD en DownloadContent: X elige la fila) y los botones SELEC./ATRAS. X abre la pagina
     // en el mismo nodo (se rehace como tras VALORES POR DEFECTO); en esas paginas, CONFIRM (guarda) y Atras/RESTABL.
     // (deshacen) vuelven a OPCIONES PC con el cursor en su fila, y Atras en OPCIONES PC vuelve a OPTIONS.
@@ -5823,7 +6089,8 @@ if Menu and Menu.customActivate and Menu.pauseCustomActivate and Menu.insertItem
   local principal = false
   local filaPc = 1
   local botones = Menu.mButtonAdjustFunc
-  local trozos = {[2] = "=ps2x:ajustes-pc", [3] = "=ps2x:pantalla-pc", [4] = "=ps2x:juego-en-red", [5] = "=ps2x:opciones-pc"}
+  local trozos = {[2] = "=ps2x:ajustes-pc", [3] = "=ps2x:pantalla-pc", [4] = "=ps2x:juego-en-red", [5] = "=ps2x:opciones-pc",
+    [6] = "=ps2x:controles-pc"}
 
   -- El menu recuerda la fila elegida; al pasar a una pagina con menos filas (de la 10 de AJUSTES PC a las 6 del
   -- juego) onActivate indexaria una fila que no existe: al cambiar de pagina se empieza por la primera.
@@ -5912,6 +6179,10 @@ if Menu and Menu.customActivate and Menu.pauseCustomActivate and Menu.insertItem
       if espanol() then return "OPCIONES PC" end
       return "PC OPTIONS"
     end
+    if n == 6 then
+      if espanol() then return "CONTROLES PC" end
+      return "PC CONTROLS"
+    end
     if espanol() then return "GR\195\129FICOS PC" end
     return "PC GRAPHICS"
   end
@@ -5958,7 +6229,7 @@ if Menu and Menu.customActivate and Menu.pauseCustomActivate and Menu.insertItem
       self.mPreviousMenuItem = fila
     end
     rehacer = false
-    recordada = n == 1 or n == 2 or n == 3 or n == 4
+    recordada = n == 1 or n == 2 or n == 3 or n == 4 or n == 6
     principal = recordada or n == 5
     if n == 5 then self.mButtonAdjustFunc = gNavigationButtons.setSelectBack else self.mButtonAdjustFunc = botones end
     if principal then
@@ -6077,6 +6348,9 @@ return function(fila, T, onoff, lista)
   boton(2, T("AJUSTES PC", "PC SETTINGS"),
     T("Ajustes del PC: v\195\173deos de inicio, latencia y sonido mono, vibraci\195\179n, daltonismo y tecla de foto.",
       "PC settings: intro videos, audio latency, mono sound, vibration, colour blindness filter and photo key."))
+  boton(6, T("CONTROLES PC", "PC CONTROLS"),
+    T("Controles del PC: el bot\195\179n de acelerar, frenar, subir y bajar de marcha y mirar atr\195\161s al conducir.",
+      "PC controls: the buttons to accelerate, brake, shift up, shift down and look behind when driving."))
   boton(4, T("JUEGO EN RED PC", "PC NETPLAY"),
     T("Juego en red del PC: anfitri\195\179n, puerto, calidad de la imagen, direcciones p\195\186blicas, estado y contrase\195\177a.",
       "PC netplay: host, port, picture quality, public addresses, state and password."))
@@ -6152,6 +6426,55 @@ return function(fila, T, onoff, lista, G, rehacer)
   defecto.hasChanged = function() return false end
   table.insert(lista, {defecto, T("Izquierda o derecha: las filas de esta p\195\161gina vuelven a sus valores por defecto. CONFIRM los guarda.",
     "Left or right: the rows of this page go back to their default values. CONFIRM saves them.")})
+end
+)lua";
+
+    // CONTROLES PC (Controles personalizados T1): el boton de cada accion de conduccion (boton_acelerar...,
+    // ps2x::gameOptionsPageKeys(6)), en un trozo que la pagina pide al abrirse (=ps2x:controles-pc). Cada fila vale el
+    // numero de su boton en settings.ini (0 cruz ... 6 R2). Elegir un boton que tiene otra accion los intercambia en el
+    // runtime (ps2x::setMenuOption), asi que cada cambio rehace la pagina para que la otra fila muestre su boton nuevo.
+    // VALORES POR DEFECTO, como en AJUSTES PC. La fuente del juego no tiene los simbolos de los botones: van con texto.
+    constexpr const char *kTrozoControlesPc = "controles-pc";
+    constexpr const char *kPaginaControlesPc = R"lua(
+return function(fila, T, onoff, lista, G, rehacer)
+  local botones = {{"X", 0}, {T("CUADRADO", "SQUARE"), 1}, {T("C\195\141RCULO", "CIRCLE"), 2}, {"L1", 3}, {"R1", 4},
+    {"L2", 5}, {"R2", 6}}
+  local cambio = T(" Si otra acci\195\179n lo tiene, se intercambian.", " If another action has it, they swap.")
+  local function control(clave, nombre, ayuda)
+    fila(clave, nombre, botones, ayuda .. cambio)
+    local item = lista[table.getn(lista)][1]
+    local poner = item.setGetFunction
+    item.setGetFunction = function(v)
+      local r = poner(v)
+      if v ~= nil then rehacer() end
+      return r
+    end
+  end
+  control("boton_acelerar", T("ACELERAR", "ACCELERATE"),
+    T("El bot\195\179n que acelera al conducir.", "The button that accelerates when driving."))
+  control("boton_frenar", T("FRENAR", "BRAKE"),
+    T("El bot\195\179n que frena (y da marcha atr\195\161s con el coche parado).",
+      "The button that brakes (and reverses with the car stopped)."))
+  control("boton_subir_marcha", T("SUBIR MARCHA", "GEAR UP"),
+    T("El bot\195\179n que sube de marcha.", "The button that shifts up a gear."))
+  control("boton_bajar_marcha", T("BAJAR MARCHA", "GEAR DOWN"),
+    T("El bot\195\179n que baja de marcha.", "The button that shifts down a gear."))
+  control("boton_mirar_atras", T("MIRAR ATR\195\129S", "LOOK BEHIND"),
+    T("El bot\195\179n que mira hacia atr\195\161s mientras se mantiene.", "The button that looks behind while held."))
+  local aplicar = T("APLICAR", "APPLY")
+  local defecto = ClassConfigMenuToggleItem()
+  defecto.mTitle = T("VALORES POR DEFECTO", "DEFAULT VALUES")
+  defecto.mValueMappings = {{aplicar, 1}, {aplicar, 0}, {aplicar, 2}}
+  defecto.setGetFunction = function(v)
+    if v == nil then return 0 end
+    if v ~= 0 then
+      G("ps2x:por_defecto")
+      rehacer()
+    end
+  end
+  defecto.hasChanged = function() return false end
+  table.insert(lista, {defecto, T("Izquierda o derecha: los botones del juego original (X, CUADRADO, R2, L2 y R1). CONFIRM los guarda.",
+    "Left or right: the original game's buttons (X, SQUARE, R2, L2 and R1). CONFIRM saves them.")})
 end
 )lua";
 
@@ -6926,7 +7249,11 @@ end
 
     const char *nombrePagina(int pagina)
     {
-        return pagina == 4 ? "JUEGO EN RED PC" : pagina == 3 ? "PANTALLA PC" : pagina == 2 ? "AJUSTES PC" : "GRAFICOS PC";
+        return pagina == 6   ? "CONTROLES PC"
+               : pagina == 4 ? "JUEGO EN RED PC"
+               : pagina == 3 ? "PANTALLA PC"
+               : pagina == 2 ? "AJUSTES PC"
+                             : "GRAFICOS PC";
     }
 
     bool puentePantallaPc(const std::string &clave, bool conValor, float valor, bool &hay, float &resultado)
@@ -7190,6 +7517,12 @@ end
             bytes.assign(texto.begin(), texto.end());
             detalle = "pagina JUEGO EN RED PC";
         }
+        else if (nombre == std::string(kPrefijoOriginalLua) + kTrozoControlesPc)
+        {
+            const std::string texto = kPaginaControlesPc;
+            bytes.assign(texto.begin(), texto.end());
+            detalle = "pagina CONTROLES PC";
+        }
         else if (nombre == std::string(kPrefijoOriginalLua) + kTrozoOpcionesPc)
         {
             const std::string texto = kPaginaOpcionesPc;
@@ -7385,7 +7718,7 @@ end
         }
 #endif
         std::cout << "[opciones-juego] "
-                  << (g_opcionesJuego ? "OPTIONS > OPCIONES PC (GRAFICOS PC, PANTALLA PC, AJUSTES PC y JUEGO EN RED PC)" : "desactivadas")
+                  << (g_opcionesJuego ? "OPTIONS > OPCIONES PC (GRAFICOS PC, PANTALLA PC, AJUSTES PC, CONTROLES PC y JUEGO EN RED PC)" : "desactivadas")
                   << std::endl;
         if (g_opcionesJuego)
             instalarChivato(runtime, kOsGetenv, trazarOsGetenv, g_osGetenvOriginal);

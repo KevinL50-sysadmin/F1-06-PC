@@ -1,0 +1,437 @@
+diff --git a/ps2xRuntime/include/ps2_options.h b/ps2xRuntime/include/ps2_options.h
+index 8ec9097..d332923 100644
+--- a/ps2xRuntime/include/ps2_options.h
++++ b/ps2xRuntime/include/ps2_options.h
+@@ -131,7 +131,9 @@ namespace ps2x
+                                           const std::map<std::string, std::string> &forced,
+                                           const std::function<const char *(const char *)> &getEnvironment);
+     // False (and nothing changes) for an unknown key, a forced option or a bad value. supersampling under 4 turns
+-    // alta_resolucion off (the double resolution output needs 4 samples or more).
++    // alta_resolucion off (the double resolution output needs 4 samples or more). Controles personalizados T1: a
++    // driving action's button (gameOptionsPageKeys(6)) held by another action swaps them (false if that one is forced),
++    // so two actions never share a button; makeOptionsMenuModel, parseOptions and the resets keep that too.
+     bool setMenuOption(OptionsMenuModel &model, const std::string &key, const std::string &value);
+     // Back to the saved values, or to the defaults of the mode (not saved yet); forced options do not change.
+     void discardMenuChanges(OptionsMenuModel &model);
+@@ -140,7 +142,8 @@ namespace ps2x
+     // ignored.
+     void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys);
+     // Nativizacion T7: the options of each page of the game's OPTIONS that has a DEFAULT VALUES row (1 PC GRAPHICS in
+-    // the main menu, 2 PC SETTINGS, 3 PC DISPLAY, 4 PC NETPLAY; src/f1_overrides.cpp); empty for any other page.
++    // the main menu, 2 PC SETTINGS, 3 PC DISPLAY, 4 PC NETPLAY, 6 PC CONTROLS; src/f1_overrides.cpp); empty for any
++    // other page (5 is the PC OPTIONS list).
+     const std::vector<std::string> &gameOptionsPageKeys(int page);
+     // Nativizacion T6: red_puerto, red_calidad and red_publicas apply when the host starts, so they are fixed while it
+     // runs or is asked to start (hosting): the game's OPTIONS > PC NETPLAY page cannot change them (nor the test-only
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index f5ba4db..aec8b08 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -78,6 +78,13 @@ namespace ps2x
+             return parseWindowSize(value, width, height);
+         }
+ 
++        // Controles personalizados T1: the buttons a driving action can have (controles.ini's names).
++        std::vector<OptionChoice> drivingButtonChoices()
++        {
++            return {{"cruz", "cruz"}, {"cuadrado", "cuadrado"}, {"circulo", "circulo"}, {"l1", "l1"},
++                    {"r1", "r1"},     {"l2", "l2"},             {"r2", "r2"}};
++        }
++
+         const char *const kUnknownKeysHeader =
+             "\n# Opciones que este juego no conoce (escritas a mano o de otra version); se conservan tal cual:\n";
+ 
+@@ -104,6 +111,58 @@ namespace ps2x
+             static StartupOptions record;
+             return record;
+         }
++
++        // Controles personalizados T1: the driving actions' buttons (CONTROLES PC, page 6).
++        bool drivingButtonKey(std::string_view key)
++        {
++            const std::vector<std::string> &keys = gameOptionsPageKeys(6);
++            return std::find(keys.begin(), keys.end(), key) != keys.end();
++        }
++
++        bool drivingButtonsDistinct(const std::map<std::string, std::string> &values)
++        {
++            std::set<std::string> buttons;
++            for (const std::string &key : gameOptionsPageKeys(6))
++                if (const auto found = values.find(key); found != values.end() && !buttons.insert(found->second).second)
++                    return false;
++            return true;
++        }
++
++        // Two actions on one button (a file written by hand, a variable): the actions that are not forced take the
++        // defaults of the mode; if a forced one still shares a button, each other action that does takes the first
++        // free button, in the order of its choices. False when nothing changes.
++        bool repairDrivingButtons(std::map<std::string, std::string> &values,
++                                  const std::map<std::string, std::string> &forced, bool development)
++        {
++            if (drivingButtonsDistinct(values))
++                return false;
++            const std::vector<std::string> &keys = gameOptionsPageKeys(6);
++            for (const std::string &key : keys)
++                if (forced.count(key) == 0u)
++                    values[key] = optionDefault(*findSpec(key), development);
++            for (const std::string &key : keys)
++            {
++                if (forced.count(key) != 0u)
++                    continue;
++                bool shared = false;
++                std::set<std::string> used;
++                for (const std::string &other : keys)
++                    if (other != key)
++                    {
++                        used.insert(values[other]);
++                        shared = shared || values[other] == values[key];
++                    }
++                if (!shared)
++                    continue;
++                for (const OptionChoice &choice : findSpec(key)->choices)
++                    if (used.count(choice.value) == 0u)
++                    {
++                        values[key] = choice.value;
++                        break;
++                    }
++            }
++            return true;
++        }
+     }
+ 
+     // One line per option. A new option needs its PS2X_* variable to be read by the runtime as usual.
+@@ -242,6 +301,22 @@ namespace ps2x
+              "Juego en red: 0 = el anfitrion solo acepta invitados de la red local y de VPN privadas (Tailscale,\n"
+              "ZeroTier); 1 = tambien de direcciones publicas (Internet con un puerto abierto en el router, Hamachi\n"
+              "25.x, Radmin VPN 26.x)."},
++            // Controles personalizados T1: the button of each driving action, also the rows of the game's OPTIONS > PC
++            // CONTROLS (src/f1_overrides.cpp). Choosing a button another action holds swaps them (setMenuOption); a
++            // file with two actions on one button takes the original game's five (parseOptions). The choices keep
++            // controles.ini's names; their order is the number of the game's row.
++            {"boton_acelerar", "PS2X_BOTON_ACELERAR", "cruz", drivingButtonChoices(), 0, 0,
++             "Boton de acelerar al conducir: cruz, cuadrado, circulo, l1, r1, l2 o r2 (cruz en el juego original).\n"
++             "Cada boton es de una sola accion: si dos acciones de conduccion tienen el mismo, todas vuelven a las\n"
++             "del juego original. En repeticiones, modo foto, pausa y menus los botones hacen lo de siempre."},
++            {"boton_frenar", "PS2X_BOTON_FRENAR", "cuadrado", drivingButtonChoices(), 0, 0,
++             "Boton de frenar (y de marcha atras con el coche parado): los mismos valores (cuadrado en el juego)."},
++            {"boton_subir_marcha", "PS2X_BOTON_SUBIR_MARCHA", "r2", drivingButtonChoices(), 0, 0,
++             "Boton de subir de marcha: los mismos valores (r2 en el juego)."},
++            {"boton_bajar_marcha", "PS2X_BOTON_BAJAR_MARCHA", "l2", drivingButtonChoices(), 0, 0,
++             "Boton de bajar de marcha: los mismos valores (l2 en el juego)."},
++            {"boton_mirar_atras", "PS2X_BOTON_MIRAR_ATRAS", "r1", drivingButtonChoices(), 0, 0,
++             "Boton de mirar atras: los mismos valores (r1 en el juego)."},
+         };
+         return specs;
+     }
+@@ -389,6 +464,9 @@ namespace ps2x
+             }
+             result.values[spec->key] = value;
+         }
++        if (repairDrivingButtons(result.values, {}, development))
++            result.warnings.push_back(where + " dos acciones de conduccion con el mismo boton; los botones de "
++                                              "conduccion vuelven a los del juego original");
+         return result;
+     }
+ 
+@@ -554,6 +632,7 @@ namespace ps2x
+             if (!value.empty())
+                 model.current[key] = value;
+         }
++        repairDrivingButtons(model.current, model.forced, development);
+         return model;
+     }
+ 
+@@ -563,6 +642,15 @@ namespace ps2x
+         const std::string text = lower(trim(value));
+         if (spec == nullptr || model.forced.count(key) != 0u || !validValue(*spec, text))
+             return false;
++        // Controles personalizados T1 (S3): the action that holds the button takes this one's (not a forced one).
++        if (drivingButtonKey(key))
++            for (const std::string &other : gameOptionsPageKeys(6))
++                if (other != key && model.current[other] == text)
++                {
++                    if (model.forced.count(other) != 0u)
++                        return false;
++                    model.current[other] = model.current[key];
++                }
+         model.current[key] = text;
+         if (key == "supersampling" && std::atoi(text.c_str()) < 4 && model.forced.count("alta_resolucion") == 0u)
+             model.current["alta_resolucion"] = "0";
+@@ -574,6 +662,7 @@ namespace ps2x
+         for (const OptionSpec &spec : optionSpecs())
+             if (model.forced.count(spec.key) == 0u)
+                 model.current[spec.key] = model.saved[spec.key];
++        repairDrivingButtons(model.current, model.forced, model.development);
+     }
+ 
+     void resetMenuToDefaults(OptionsMenuModel &model)
+@@ -581,6 +670,7 @@ namespace ps2x
+         for (const OptionSpec &spec : optionSpecs())
+             if (model.forced.count(spec.key) == 0u)
+                 model.current[spec.key] = optionDefault(spec, model.development);
++        repairDrivingButtons(model.current, model.forced, model.development);
+     }
+ 
+     void resetMenuOptionsToDefaults(OptionsMenuModel &model, const std::vector<std::string> &keys)
+@@ -588,6 +678,7 @@ namespace ps2x
+         for (const std::string &key : keys)
+             if (const OptionSpec *spec = findSpec(key); spec != nullptr && model.forced.count(key) == 0u)
+                 model.current[key] = optionDefault(*spec, model.development);
++        repairDrivingButtons(model.current, model.forced, model.development);
+     }
+ 
+     const std::vector<std::string> &gameOptionsPageKeys(int page)
+@@ -600,6 +691,8 @@ namespace ps2x
+              "cargas_rapidas", "fov", "tecla_modo_foto"},
+             {"aspecto", "tamano_ventana", "gs"},
+             {"red_puerto", "red_calidad", "red_publicas"},
++            {}, // 5: the PC OPTIONS list
++            {"boton_acelerar", "boton_frenar", "boton_subir_marcha", "boton_bajar_marcha", "boton_mirar_atras"},
+         };
+         return page > 0 && static_cast<size_t>(page) < pages.size() ? pages[static_cast<size_t>(page)] : pages[0];
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 32bc080..1f6c8cc 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -54,6 +54,17 @@ namespace
+         std::vector<Row> rows;
+     };
+ 
++    // Controles personalizados T1: the buttons of the driving actions.
++    std::vector<Choice> drivingButtons()
++    {
++        return {{"cruz", "Cruz"}, {"cuadrado", "Cuadrado"}, {"circulo", "Círculo"}, {"l1", "L1"},
++                {"r1", "R1"},     {"l2", "L2"},             {"r2", "R2"}};
++    }
++
++    constexpr const char *kDrivingButtonHint =
++        "El botón de esta acción al conducir. Si otra acción lo tiene, se intercambian. En repeticiones, modo foto, "
++        "pausa y menús los botones hacen lo de siempre.";
++
+     const std::vector<Section> &sections()
+     {
+         static const std::vector<Section> list = {
+@@ -170,6 +181,14 @@ namespace
+                {{"0", "No (red local y VPN privadas)"}, {"1", "Sí (Hamachi, Radmin, Internet)"}},
+                "No: solo entra un invitado de tu red local o de una VPN privada (Tailscale, ZeroTier). Sí: también "
+                "desde Hamachi, Radmin VPN o Internet con un puerto abierto en el router."}}},
++            // Controles personalizados T1: at the end, so kNetplaySection keeps its place. Choosing a button another
++            // action holds swaps them (ps2x::setMenuOption).
++            {"Controles",
++             {{"boton_acelerar", "Acelerar", drivingButtons(), kDrivingButtonHint},
++              {"boton_frenar", "Frenar", drivingButtons(), kDrivingButtonHint},
++              {"boton_subir_marcha", "Subir marcha", drivingButtons(), kDrivingButtonHint},
++              {"boton_bajar_marcha", "Bajar marcha", drivingButtons(), kDrivingButtonHint},
++              {"boton_mirar_atras", "Mirar atrás", drivingButtons(), kDrivingButtonHint}}},
+         };
+         return list;
+     }
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 2381b21..d6e9984 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -20,6 +20,7 @@
+ #include <fstream>
+ #include <functional>
+ #include <map>
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -291,11 +292,15 @@ void register_ps2_options_menu_tests()
+                      "PC SETTINGS: its eleven rows");
+             t.IsTrue(ps2x::gameOptionsPageKeys(3) == Keys{"aspecto", "tamano_ventana", "gs"}, "PC DISPLAY");
+             t.IsTrue(ps2x::gameOptionsPageKeys(4) == Keys{"red_puerto", "red_calidad", "red_publicas"}, "PC NETPLAY");
++            // Controles personalizados T1: PC CONTROLS, page 6 (5 is the PC OPTIONS list, without DEFAULT VALUES).
++            t.IsTrue(ps2x::gameOptionsPageKeys(6) == Keys{"boton_acelerar", "boton_frenar", "boton_subir_marcha",
++                                                           "boton_bajar_marcha", "boton_mirar_atras"},
++                     "PC CONTROLS: its five rows");
+             t.IsTrue(ps2x::gameOptionsPageKeys(0).empty() && ps2x::gameOptionsPageKeys(5).empty() &&
+-                         ps2x::gameOptionsPageKeys(-1).empty(),
+-                     "the game's own page and unknown pages: none");
++                         ps2x::gameOptionsPageKeys(7).empty() && ps2x::gameOptionsPageKeys(-1).empty(),
++                     "the game's own page, the PC OPTIONS list and unknown pages: none");
+             std::map<std::string, int> pageOf;
+-            for (int page = 1; page <= 4; ++page)
++            for (int page = 1; page <= 6; ++page)
+                 for (const std::string &key : ps2x::gameOptionsPageKeys(page))
+                 {
+                     bool known = false;
+@@ -724,6 +729,163 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "detalle_coches"), std::string("1"), "the other options keep their values");
+         });
+ 
++        // Controles personalizados T1 (S1): the button of each driving action, one of cross, square, circle, L1, R1, L2
++        // and R2; the original game's by default.
++        tc.Run("the driving button options have their defaults, variables, checks and numbers", [](TestCase &t)
++        {
++            const std::vector<std::pair<const char *, const char *>> defaults = {
++                {"boton_acelerar", "cruz"}, {"boton_frenar", "cuadrado"}, {"boton_subir_marcha", "r2"},
++                {"boton_bajar_marcha", "l2"}, {"boton_mirar_atras", "r1"}};
++            for (const auto &[key, value] : defaults)
++            {
++                t.Equals(ps2x::parseOptions("").values.at(key), std::string(value), std::string(key) + ": the game's");
++                t.Equals(fileValue("", key, true), std::string(value), std::string(key) + ": also in development");
++                t.IsTrue(contains(ps2x::defaultOptionsText(false), std::string(key) + " = " + value + "\n"),
++                         std::string(key) + ": the template has it");
++            }
++            t.IsTrue(ps2x::parseOptions(ps2x::defaultOptionsText(false)).warnings.empty(), "the template gives no warning");
++
++            const ps2x::OptionsFile file = ps2x::parseOptions("boton_subir_marcha = r1\nboton_mirar_atras = circulo\n"
++                                                              "boton_bajar_marcha = l1\nboton_frenar = L2\n");
++            t.IsTrue(file.warnings.empty(), "valid buttons on different actions give no warning");
++            t.Equals(file.values.at("boton_frenar"), std::string("l2"), "case-insensitive");
++            std::map<std::string, std::string> variables;
++            for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(file, environmentOf({})))
++                variables[setting.variable] = setting.value;
++            t.Equals(variables["PS2X_BOTON_ACELERAR"], std::string("cruz"), "boton_acelerar -> PS2X_BOTON_ACELERAR");
++            t.Equals(variables["PS2X_BOTON_FRENAR"], std::string("l2"), "boton_frenar -> PS2X_BOTON_FRENAR");
++            t.Equals(variables["PS2X_BOTON_SUBIR_MARCHA"], std::string("r1"), "-> PS2X_BOTON_SUBIR_MARCHA");
++            t.Equals(variables["PS2X_BOTON_BAJAR_MARCHA"], std::string("l1"), "-> PS2X_BOTON_BAJAR_MARCHA");
++            t.Equals(variables["PS2X_BOTON_MIRAR_ATRAS"], std::string("circulo"), "-> PS2X_BOTON_MIRAR_ATRAS");
++
++            for (const char *line : {"boton_acelerar = triangulo\n", "boton_frenar = r3\n", "boton_mirar_atras = 1\n"})
++            {
++                const ps2x::OptionsFile bad = ps2x::parseOptions(line);
++                t.Equals(bad.warnings.size(), size_t{1u}, std::string("a button off the list warns: ") + line);
++                for (const auto &[key, value] : defaults)
++                    t.Equals(bad.values.at(key), std::string(value), std::string("and takes the default: ") + key);
++            }
++
++            const Environment environment = {{"PS2X_BOTON_MIRAR_ATRAS", "circulo"}};
++            const ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "boton_mirar_atras = l1\n", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)),
++                environmentOf(environment));
++            t.Equals(forced.current.at("boton_mirar_atras"), std::string("circulo"), "the variable wins over the file");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "boton_acelerar", value), "a number for the game's row");
++            t.Equals(value, 0.0f, "cross: the first choice");
++            t.IsTrue(ps2x::menuOptionNumber(model, "boton_subir_marcha", value), "gear up");
++            t.Equals(value, 6.0f, "R2: the last choice");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 2.0f), "circle for looking back");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("circulo"), "is circulo");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 3.0f), "L1 for looking back");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("l1"), "is l1");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 7.0f), "past R2");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", -1.0f), "before cross");
++            t.IsFalse(ps2x::setMenuOption(model, "boton_mirar_atras", "triangulo"), "triangle is not on the list");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("l1"), "refused values change nothing");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "boton_mirar_atras"), std::string("l1"), "CONFIRM writes it");
++            t.Equals(fileValue(saved, "boton_acelerar"), std::string("cruz"), "the other actions keep their buttons");
++        });
++
++        // Controles personalizados T1 (S3): choosing a button another action holds swaps them; two actions never share
++        // a button.
++        tc.Run("choosing a button another driving action holds swaps the two", [](TestCase &t)
++        {
++            const std::vector<std::string> &keys = ps2x::gameOptionsPageKeys(6);
++            const auto distinct = [&keys](const ps2x::OptionsMenuModel &model)
++            {
++                std::set<std::string> buttons;
++                for (const std::string &key : keys)
++                    buttons.insert(model.current.at(key));
++                return buttons.size() == keys.size();
++            };
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.IsTrue(ps2x::setMenuOption(model, "boton_acelerar", "r2"), "R2 for accelerating");
++            t.Equals(model.current.at("boton_acelerar"), std::string("r2"), "accelerate is R2");
++            t.Equals(model.current.at("boton_subir_marcha"), std::string("cruz"), "gear up takes cross");
++            t.Equals(model.current.at("boton_frenar"), std::string("cuadrado"), "brake does not change");
++            t.Equals(model.current.at("boton_bajar_marcha"), std::string("l2"), "gear down does not change");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("r1"), "look back does not change");
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_frenar", 5.0f), "L2 for braking, as the game's row");
++            t.Equals(model.current.at("boton_frenar"), std::string("l2"), "brake is L2");
++            t.Equals(model.current.at("boton_bajar_marcha"), std::string("cuadrado"), "gear down takes square");
++            t.IsTrue(ps2x::setMenuOption(model, "boton_frenar", "l2"), "the same button again");
++            t.Equals(model.current.at("boton_bajar_marcha"), std::string("cuadrado"), "changes nothing");
++            t.IsTrue(ps2x::setMenuOption(model, "boton_mirar_atras", "circulo"), "a free button");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("circulo"), "look back is circle");
++            t.Equals(model.current.at("boton_acelerar"), std::string("r2"), "nobody else changes");
++            t.IsTrue(distinct(model), "never two actions on one button");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "boton_subir_marcha"), std::string("cruz"), "CONFIRM writes the swapped one too");
++            t.Equals(fileValue(saved, "boton_bajar_marcha"), std::string("cuadrado"), "both of them");
++            t.IsTrue(ps2x::parseOptions(saved).warnings.empty(), "and the file reads back without warnings");
++
++            // Back to the page's values one by one (the game's Back: "ps2x:descartar"), through the same swaps.
++            const std::map<std::string, std::string> opened = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({})).current;
++            for (const std::string &key : keys)
++                ps2x::setMenuOption(model, key, opened.at(key));
++            for (const std::string &key : keys)
++                t.Equals(model.current.at(key), opened.at(key), key + ": back to its button");
++            ps2x::setMenuOption(model, "boton_acelerar", "l1");
++            ps2x::setMenuOption(model, "boton_frenar", "cruz");
++            ps2x::resetMenuOptionsToDefaults(model, keys);
++            for (const std::string &key : keys)
++                t.Equals(model.current.at(key), opened.at(key), key + ": DEFAULT VALUES");
++
++            const Environment environment = {{"PS2X_BOTON_FRENAR", "cuadrado"}};
++            ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            t.IsFalse(ps2x::setMenuOption(forced, "boton_acelerar", "cuadrado"), "a forced action keeps its button");
++            t.Equals(forced.current.at("boton_acelerar"), std::string("cruz"), "and the other one keeps its own");
++            t.Equals(forced.current.at("boton_frenar"), std::string("cuadrado"), "nothing swaps");
++            t.IsFalse(ps2x::setMenuOption(forced, "boton_frenar", "cruz"), "nor can the forced one change");
++            t.IsTrue(ps2x::setMenuOption(forced, "boton_acelerar", "r1"), "a swap between free actions");
++            t.Equals(forced.current.at("boton_mirar_atras"), std::string("cruz"), "still works");
++        });
++
++        // Controles personalizados T1 (S3): a settings.ini written by hand with two actions on one button takes the
++        // original game's five buttons (with a warning); a variable that forces a taken button moves the other action
++        // to a free one.
++        tc.Run("a settings.ini with two driving actions on one button falls back to the game's buttons", [](TestCase &t)
++        {
++            const std::vector<std::pair<const char *, const char *>> defaults = {
++                {"boton_acelerar", "cruz"}, {"boton_frenar", "cuadrado"}, {"boton_subir_marcha", "r2"},
++                {"boton_bajar_marcha", "l2"}, {"boton_mirar_atras", "r1"}};
++            // The last one: a bad value takes the default (cross), which brake also has.
++            const std::vector<std::pair<const char *, size_t>> files = {
++                {"boton_acelerar = r2\n", 1u}, {"boton_frenar = l1\nboton_mirar_atras = l1\nfov = 10\n", 1u},
++                {"boton_acelerar = 7\nboton_frenar = cruz\n", 2u}};
++            for (const auto &[text, warnings] : files)
++            {
++                const ps2x::OptionsFile file = ps2x::parseOptions(text);
++                t.Equals(file.warnings.size(), warnings, std::string("it warns: ") + text);
++                t.IsTrue(contains(file.warnings.back(), "mismo boton"), "saying why");
++                for (const auto &[key, value] : defaults)
++                    t.Equals(file.values.at(key), std::string(value), std::string(key) + " back to the game's");
++            }
++            t.Equals(ps2x::parseOptions("boton_frenar = l1\nboton_mirar_atras = l1\nfov = 10\n").values.at("fov"),
++                     std::string("10"), "the other options keep the file's values");
++            const ps2x::OptionsFile swapped = ps2x::parseOptions("boton_acelerar = r2\nboton_subir_marcha = cruz\n");
++            t.IsTrue(swapped.warnings.empty(), "a swap written by hand is fine");
++            t.Equals(swapped.values.at("boton_acelerar"), std::string("r2"), "and kept");
++
++            const ps2x::OptionsMenuModel model =
++                ps2x::makeOptionsMenuModel("boton_acelerar = r2\n", false, {}, environmentOf({}));
++            t.Equals(model.saved.at("boton_acelerar"), std::string("cruz"), "the menu starts from the game's buttons");
++            t.IsTrue(model.current == model.saved, "with nothing to save");
++
++            const Environment environment = {{"PS2X_BOTON_ACELERAR", "r2"}};
++            const ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            t.Equals(forced.current.at("boton_acelerar"), std::string("r2"), "the variable wins");
++            t.Equals(forced.current.at("boton_subir_marcha"), std::string("cruz"), "gear up moves to the free cross");
++            t.Equals(forced.current.at("boton_frenar"), std::string("cuadrado"), "the others keep theirs");
++        });
++
+         // Fase 5 (T16): a finer opponent AI (dificultad_ia = 0, the game's three levels, or 1 to 100).
+         tc.Run("the dificultad_ia option has its default, variable, checks and number", [](TestCase &t)
+         {
+diff --git a/ps2xTest/src/ps2_user_paths_tests.cpp b/ps2xTest/src/ps2_user_paths_tests.cpp
+index fe4d7d0..6eb0f19 100644
+--- a/ps2xTest/src/ps2_user_paths_tests.cpp
++++ b/ps2xTest/src/ps2_user_paths_tests.cpp
+@@ -748,7 +748,7 @@ void register_ps2_user_paths_tests()
+                          std::string("key line of ") + spec.key);
+                 t.IsTrue(spec.comment != nullptr && spec.comment[0] != '\0', std::string("comment of ") + spec.key);
+             }
+-            t.Equals(ps2x::optionSpecs().size(), size_t{29}, "twenty-nine options (fase 5: fifteen more; lejania: two; vigilante: one)");
++            t.Equals(ps2x::optionSpecs().size(), size_t{34}, "thirty-four options (fase 5: fifteen more; lejania: two; vigilante: one; controles: five)");
+ 
+             const std::string development = ps2x::defaultOptionsText(true);
+             const ps2x::OptionsFile parsedDevelopment = ps2x::parseOptions(development, "opciones.ini", true);

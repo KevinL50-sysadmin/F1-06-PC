@@ -350,10 +350,12 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
   3 maximo), la distancia del escenario (distancia_circuito = 100, como en la PS2; 150 o 200 por ciento), la
   dificultad de los rivales (dificultad_ia = 0, la del juego; 1 a 100, un punto entre
   facil, 0, media, 50, y dificil, 100) y, para el juego en red, el puerto (red_puerto), la calidad de la imagen
-  (red_calidad: baja, media o alta) y si acepta direcciones publicas (red_publicas). La contrasena del juego en red
+  (red_calidad: baja, media o alta) y si acepta direcciones publicas (red_publicas), y el boton de cada accion de
+  conduccion (boton_acelerar, boton_frenar, boton_subir_marcha, boton_bajar_marcha y boton_mirar_atras: cruz,
+  cuadrado, circulo, l1, r1, l2 o r2). La contrasena del juego en red
   nunca se guarda. Cada opcion viene explicada dentro; borralo para volver a los valores por defecto. Lo mas comodo es
-  cambiarlas desde el propio menu del juego (OPCIONES > OPCIONES PC: $graficosPc, PANTALLA PC, AJUSTES PC y JUEGO
-  EN RED PC, ver abajo), que guarda este archivo.
+  cambiarlas desde el propio menu del juego (OPCIONES > OPCIONES PC: $graficosPc, PANTALLA PC, AJUSTES PC,
+  CONTROLES PC y JUEGO EN RED PC, ver abajo), que guarda este archivo.
 - config\controls.ini: los controles (mando, teclado y volante). Tambien viene explicado dentro. Para jugar dos
   a pantalla partida (SPLIT SCREEN), anade al final una seccion [jugador2] con el mando del segundo jugador
   (mando = 1, el segundo mando) o sus teclas (cruz = tecla:M, ...); sin ella el juego pide el segundo mando. Si tu
@@ -378,6 +380,10 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
   ofrece enviar el informe con este registro ya adjunto. Si no, abre un issue en
   https://github.com/KevinL50-sysadmin/F1-06-PC/issues (hace falta una cuenta de GitHub), cuenta que pasaba y
   adjunta F1-06.log. El registro puede llevar tu nombre de usuario de Windows en las rutas.
+  Sonido: el juego prueba WASAPI, luego DirectSound y luego WinMM, y se queda con el primero que suena. Con
+  audio_backend en config\settings.ini (auto, wasapi, directsound o winmm; variable PS2X_AUDIO_BACKEND) el
+  elegido va primero y los otros quedan de respaldo. Las lineas [audio] del registro dicen cual se abrio. Sin
+  sonido en Linux (Proton o Wine): prueba audio_backend = directsound o winmm y, si sigue igual, envia F1-06.log.
 - cache\vulkan-pipelines.bin: los graficos ya preparados para tu tarjeta grafica (gs = gpu), para que no haya
   tirones la segunda vez que ves cada cosa. Ocupa unos 20 a 50 MB y se puede borrar sin problema: el juego lo
   vuelve a crear (las primeras partidas despues pueden ir a tirones un momento). Tras cambiar de tarjeta grafica o
@@ -397,8 +403,8 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
 Opciones del PC dentro del juego
 --------------------------------
 En OPCIONES del menu principal, debajo de OPCIONES DE PANTALLA, esta la entrada OPCIONES PC (PC OPTIONS si el
-juego no esta en espanol). Lleva a cuatro paginas: $graficosPc (PC GRAPHICS), PANTALLA PC (PC DISPLAY), AJUSTES PC
-(PC SETTINGS) y JUEGO EN RED PC (PC NETPLAY); cruz entra en la pagina elegida y, al salir de ella (ACEPTAR o
+juego no esta en espanol). Lleva a cinco paginas: $graficosPc (PC GRAPHICS), PANTALLA PC (PC DISPLAY), AJUSTES PC
+(PC SETTINGS), CONTROLES PC (PC CONTROLS) y JUEGO EN RED PC (PC NETPLAY); cruz entra en la pagina elegida y, al salir de ella (ACEPTAR o
 atras), se vuelve a esta lista. Cada pagina tiene al final una fila VALORES POR DEFECTO (izquierda o derecha) que
 devuelve las de esa pagina a los valores de serie.
 - ${graficosPc}: filtro de la imagen, supersampling, doble resolucion, sincronizacion vertical, contador de FPS,
@@ -420,6 +426,14 @@ devuelve las de esa pagina a los valores de serie.
   menos y el arranque hasta la presentacion unos 15 s menos; los fundidos y los consejos se ven igual), campo de
   vision (NORMAL o de +5 % a +30 %: las camaras de la carrera, como la cabina, el morro o la persecucion, ven mas a
   los lados; el HUD y los menus no cambian) y tecla del modo foto.
+- CONTROLES PC: el boton de ACELERAR, FRENAR, SUBIR MARCHA, BAJAR MARCHA y MIRAR ATRAS, entre X, CUADRADO,
+  CIRCULO, L1, R1, L2 y R2 (de serie, los del juego original: X, CUADRADO, R2, L2 y R1). Si eliges un boton que ya
+  usa otra accion, se intercambian: nunca hay dos acciones en un boton. Solo cuenta mientras conduces; en la
+  repeticion, el modo foto, la pausa y los menus los botones hacen lo de siempre. Acelerar y frenar conservan la
+  presion del boton elegido: con los gatillos (RT y LT del mando de Xbox, que son R2 y L2) el acelerador y el freno
+  son progresivos. La marcha atras sigue siendo mantener el freno con el coche parado. Es aparte de controls.ini
+  (que dice que boton o tecla del PC es cada boton de la PS2). En RecompLauncher esta como "Driving controls", con
+  tres esquemas completos.
 - JUEGO EN RED PC: $anfitrionFila (APAGADO o ENCENDIDO), puerto, calidad de la imagen (baja, media o alta) y
   $publicasFila (NO o SI); ESTADO (apagado, esperando al invitado, invitado conectado o no se pudo empezar; su
   ayuda, abajo, da el motivo del fallo o la direccion del invitado conectado) y DIRECCION (la de este PC y el
@@ -587,10 +601,35 @@ Windows 10/11 de 64 bits. Necesitas tu propia copia del juego (Formula One 06 de
 .iso) y unos 4,3 GB libres para sus archivos. Una tarjeta grafica con Vulkan para el modo
 normal; sin ella el juego dibuja en modo Software (mas lento).
 
+Procesador: lo que mas cuenta es la velocidad de un nucleo. Si no llega, el juego no se salta fotogramas: va a
+camara lenta. Lo que sabemos hasta ahora:
+- Recomendado (segun los jugadores): un procesador de sobremesa como un Core i5-6600K o un Ryzen 5 3400G, o mas
+  nuevo.
+- Minimo: sin establecer. Las CPU de estacion de trabajo antiguas y las de portatil de bajo consumo van por debajo
+  de 50 fotogramas por segundo en carrera.
+- Medido en el PC del desarrollador (Core i7-13700): 50 en sus nucleos de rendimiento; solo con sus 8 nucleos
+  eficientes, como si fuera una CPU mas lenta, 25-33 en carrera con la 1.1.2 y 41-43 con la 1.1.3 (+22-25 %).
+- Medido en el log de un jugador: Xeon E5-2687W (2012, 3,0 GHz), unos 20 en carrera con la 1.1.2. La mejora de la
+  1.1.3 esta medida en los nucleos eficientes de arriba, aun no en esa CPU.
+- Segun los jugadores (RecompLauncher, "va bien", sin cifras): Core i5-6600K + GTX 1080, Ryzen 5 3400G + RX 6600,
+  Ryzen 5 5600GT con su grafica integrada, Ryzen 5 5500, Ryzen 7 5700X, Core i5-14600K, Xeon E5-2667 v4, entre
+  otros. Con problemas: un portatil con Ryzen 5 3500U (Vega 8, 6 GB de RAM).
+Tarjeta grafica: cualquiera con Vulkan; con los valores de serie (supersampling x2, doble resolucion apagada) va
+bien hasta con la grafica integrada de un Ryzen 5 5600GT, segun su jugador.
+
 Rendimiento: el juego va a 50 fotogramas por segundo, como el original. La salida con los 22 coches es el momento
 mas exigente: con el plan de energia Equilibrado de Windows y otros programas abiertos el procesador puede bajar
 su frecuencia y la salida caer a unos 42-45 fotogramas por segundo durante unos segundos. Para ir siempre a 50,
 usa el plan Alto rendimiento (Configuracion > Sistema > Energia) o cierra lo que no uses mientras juegas.
+- Deja el dibujo de los graficos en GPU (el de serie); el modo Software (CPU) es mucho mas lento.
+- El supersampling y la doble resolucion solo cargan la tarjeta grafica: subelos si le sobra, bajalos si va muy
+  cargada. Con un procesador justo no ayudan.
+- Programas de captura o streaming (Sunshine, OBS...): en la 1.1.2, con Sunshine abierto en el PC de un jugador, los
+  menus iban a tirones porque el juego esperaba a la tarjeta grafica en cada imagen. Desde la 1.1.3 ya no espera
+  cuando la tarjeta va retrasada: se salta esa copia. Si aun ves tirones con uno de ellos abierto, puedes probar
+  esto (no esta confirmado que lo arregle): Panel de control de NVIDIA > Administrar la configuracion 3D >
+  Configuracion de programa > F1-06.exe > metodo de presentacion de Vulkan/OpenGL (Vulkan/OpenGL present method)
+  en Preferir nativo (Prefer native). O cierra el programa mientras juegas en el PC.
 $(if ($conDatos) { "
 AVISO: la carpeta data\ contiene los archivos de tu disco. Es solo para uso personal: no la compartas." } else { "" })
 "@
@@ -672,11 +711,13 @@ folder when updating.
   5 to 30, that percentage wider), the detail of distant cars (detalle_coches = 1, as on the PS2; 0 reduced,
   2 high and 3 maximum), the scenery distance (distancia_circuito = 100, as on the PS2; 150 or 200 percent), the
   opponents' difficulty (dificultad_ia = 0, the game's; 1 to 100, a point between easy, 0, medium, 50, and
-  hard, 100) and, for online play, the port (red_puerto), the picture quality (red_calidad: baja, media or alta)
-  and whether it accepts public addresses (red_publicas). The online play password is never saved. Each option
+  hard, 100), for online play, the port (red_puerto), the picture quality (red_calidad: baja, media or alta)
+  and whether it accepts public addresses (red_publicas), and the button for each driving action (boton_acelerar,
+  boton_frenar, boton_subir_marcha, boton_bajar_marcha and boton_mirar_atras: cruz, cuadrado, circulo, l1, r1, l2
+  or r2). The online play password is never saved. Each option
   is explained inside (in Spanish); delete the file to go back to the default values. The easiest way is to
-  change them from the game's own menu (OPTIONS > PC OPTIONS: PC GRAPHICS, PC DISPLAY, PC SETTINGS and PC
-  NETPLAY, see below), which saves this file.
+  change them from the game's own menu (OPTIONS > PC OPTIONS: PC GRAPHICS, PC DISPLAY, PC SETTINGS, PC CONTROLS
+  and PC NETPLAY, see below), which saves this file.
 - config\controls.ini: the controls (gamepad, keyboard and steering wheel). It is also explained inside. To play
   two players on split screen (SPLIT SCREEN), add at the end a [jugador2] section with the second player's
   gamepad (mando = 1, the second gamepad) or their keys (cruz = tecla:M, ...); without it the game asks for the
@@ -700,6 +741,10 @@ folder when updating.
   offers to send the report with this log already attached. Otherwise, open an issue at
   https://github.com/KevinL50-sysadmin/F1-06-PC/issues (a GitHub account is needed), say what was happening and
   attach F1-06.log. The log may contain your Windows user name in its paths.
+  Sound: the game tries WASAPI, then DirectSound, then WinMM, and keeps the first one that plays. With
+  audio_backend in config\settings.ini (auto, wasapi, directsound or winmm; variable PS2X_AUDIO_BACKEND) the
+  chosen one goes first and the others stay as fallback. The [audio] lines in the log say which one opened. No
+  sound on Linux (Proton or Wine): try audio_backend = directsound or winmm and, if nothing changes, send F1-06.log.
 - cache\vulkan-pipelines.bin: the graphics already prepared for your graphics card (gs = gpu), so that there is
   no stutter the second time you see each thing. It takes about 20 to 50 MB and can be deleted without problem:
   the game creates it again (the first races afterwards may stutter for a moment). After changing graphics card
@@ -719,8 +764,8 @@ folder when updating.
 PC options inside the game
 --------------------------
 In OPTIONS in the main menu, below the display options (OPCIONES DE PANTALLA in Spanish), is the PC OPTIONS entry
-(OPCIONES PC if the game is in Spanish). It leads to four pages: PC GRAPHICS (GRAFICOS PC), PC DISPLAY (PANTALLA
-PC), PC SETTINGS (AJUSTES PC) and PC NETPLAY (JUEGO EN RED PC); cross enters the chosen page and, when leaving it
+(OPCIONES PC if the game is in Spanish). It leads to five pages: PC GRAPHICS (GRAFICOS PC), PC DISPLAY (PANTALLA
+PC), PC SETTINGS (AJUSTES PC), PC CONTROLS (CONTROLES PC) and PC NETPLAY (JUEGO EN RED PC); cross enters the chosen page and, when leaving it
 (accept or back), you return to this list. Each page has at the end a DEFAULT VALUES row (left or right) that
 sets the options of that page back to their defaults.
 - PC GRAPHICS: image filter, supersampling, double resolution, vertical sync, FPS counter, screen mode, master
@@ -740,6 +785,14 @@ sets the options of that page back to their defaults.
   presentation about 15 s less; the fades and the tips are shown the same), field of view (NORMAL or from +5 % to
   +30 %: the race cameras, such as the cockpit, the nose or the chase one, see more to the sides; the HUD and the
   menus do not change) and photo mode key.
+- PC CONTROLS: the button for ACCELERATE, BRAKE, GEAR UP, GEAR DOWN and LOOK BEHIND, among X, SQUARE, CIRCLE, L1,
+  R1, L2 and R2 (by default, the original game's: X, SQUARE, R2, L2 and R1). If you choose a button another action
+  already uses, the two swap: there are never two actions on one button. It only counts while driving; in replays,
+  photo mode, the pause and the menus the buttons do what they always do. Accelerate and brake keep the pressure of
+  the chosen button: with the triggers (RT and LT on an Xbox controller, which are R2 and L2) throttle and brake
+  are progressive. Reverse is still holding the brake with the car stopped. It is separate from controls.ini (which
+  says which PC button or key is each PS2 button). In RecompLauncher it is "Driving controls", with three complete
+  layouts.
 - PC NETPLAY: HOST (OFF or ON), port, picture quality (low, medium or high) and PUBLIC ADDRESSES (NO or YES);
   STATE (off, waiting for the guest, guest connected or could not start; its help, below, gives the reason for
   the failure or the address of the connected guest) and ADDRESS (this PC's and the port), which only inform
@@ -906,10 +959,32 @@ Windows 10/11 64-bit. You need your own copy of the game (Formula One 06 for PS2
 and about 4.3 GB free for its files. A graphics card with Vulkan for the normal mode; without it the game draws in
 Software mode (slower).
 
+Processor: single-core speed matters most. If it cannot keep up, the game does not skip frames: it runs in slow
+motion. What we know so far:
+- Recommended (reported by players): a desktop processor like a Core i5-6600K or a Ryzen 5 3400G, or newer.
+- Minimum: not established. Older workstation CPUs and low-power laptop CPUs run races below 50 frames per second.
+- Measured on the developer's PC (Core i7-13700): 50 on its performance cores; limited to its 8 efficiency cores,
+  as a stand-in for a slower CPU, 25-33 in a race on 1.1.2 and 41-43 on 1.1.3 (+22-25 %).
+- Measured from a player's log: Xeon E5-2687W (2012, 3.0 GHz), about 20 in a race on 1.1.2. The 1.1.3 gains are
+  measured on the efficiency cores above, not on that CPU yet.
+- Reported by players (RecompLauncher, "runs well", no figures): Core i5-6600K + GTX 1080, Ryzen 5 3400G + RX
+  6600, Ryzen 5 5600GT with its integrated graphics, Ryzen 5 5500, Ryzen 7 5700X, Core i5-14600K, Xeon E5-2667 v4,
+  among others. With problems: a laptop with a Ryzen 5 3500U (Vega 8, 6 GB of RAM).
+Graphics card: any with Vulkan; with the default values (supersampling x2, double resolution off) even the
+integrated graphics of a Ryzen 5 5600GT runs well, according to its player.
+
 Performance: the game runs at 50 frames per second, like the original. The start with the 22 cars is the most
 demanding moment: with the Balanced power plan of Windows and other programs open, the processor may lower its
 frequency and the start drop to about 42-45 frames per second for a few seconds. To always run at 50, use the
 High performance plan (Settings > System > Power) or close what you do not use while playing.
+- Keep the graphics renderer on GPU (the default); the Software (CPU) mode is much slower.
+- Supersampling and double resolution only load the graphics card: raise them if it has room, lower them if it is
+  very busy. With a processor that is just enough they do not help.
+- Capture or streaming tools (Sunshine, OBS...): on 1.1.2, with Sunshine open on a player's PC, the menus stuttered
+  because the game waited for the graphics card on every picture. Since 1.1.3 it no longer waits when the card
+  falls behind: it skips that copy. If you still see stutter with one of them open, you can try this (not a
+  confirmed fix): NVIDIA Control Panel > Manage 3D settings > Program Settings > F1-06.exe > Vulkan/OpenGL present
+  method: Prefer native. Or close the tool while you play on the PC.
 $(if ($conDatos) { "
 WARNING: the data\ folder contains the files of your disc. It is for personal use only: do not share it." } else { "" })
 "@

@@ -6,6 +6,7 @@
 # y los .patch de parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los
 # borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario),
 # scripts/comentarios.ps1 (herramienta del autor para leer y contestar comentarios de la gente),
+# scripts/cerrojo-pc.sh (coordina el PC del autor entre sus sesiones de trabajo),
 # scripts/exportar-personales.txt (patrones privados de datos personales), .git-blame-ignore-revs (nombra
 # commits privados) y, por supuesto, cualquier dato del juego. Un archivo nuevo en src/, parches/, gpu/, config/,
 # scripts/, docs/ o .github/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
@@ -47,9 +48,13 @@ revisados=(
     config/recomp.toml
     gpu/pgs_puente/CMakeLists.txt gpu/pgs_puente/LICENSE.txt gpu/pgs_puente/compilar.cmd
     gpu/pgs_puente/compose_circuits.comp gpu/pgs_puente/pgs_puente.cpp gpu/pgs_puente/pgs_puente.h
+    gpu/pgs_puente/pgs_readback_ring.h
     docs/lanzamiento/img/cockpit-hud.png docs/lanzamiento/img/cockpit-start-lights.png
     docs/lanzamiento/img/grid-22-cars-aerial.png docs/lanzamiento/img/menu-pc-graphics.png
     docs/lanzamiento/img/replay-tv-camera.png docs/lanzamiento/img/cabecera-readme.png
+    docs/lanzamiento/img/v113-modo-foto-barra-hockenheim-peloton-x4.png docs/lanzamiento/img/v113-montreal-varios-horquilla-x4.png
+    docs/lanzamiento/img/v113-istanbul-redbull-toyota-subida-x4.png docs/lanzamiento/img/v113-sepang-ferrari-renault-curva-x4.png
+    docs/lanzamiento/img/v112-monaco-ferrari-horquilla-x4.png docs/lanzamiento/img/v112-menu-pc-graphics.png
     scripts/ab_ciclos.py scripts/ab_diagnostico.py scripts/ab_resumen.py scripts/bft_decodificar.py
     scripts/buscar_valor.py scripts/capturar-ventana.ps1 scripts/carrera-directa.ps1 scripts/cazar-cuelgue.ps1
     scripts/comparar_partidas.py scripts/comprobar-recomplauncher.py scripts/iop-t3-correr.ps1
@@ -78,9 +83,12 @@ clasificar() {
         src/*.cpp | src/*.h | parches/*.patch) clase=publico ;;
         # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
         # comentarios.ps1 es una herramienta del autor para atender a la gente, no de los jugadores: privado.
-        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | scripts/comentarios.ps1 | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
+        # cerrojo-pc.sh coordina el PC del autor entre sus sesiones de trabajo: privado.
+        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | scripts/comentarios.ps1 | scripts/cerrojo-pc.sh | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
+        # Candidatas de capturas que el README no usa (las que usa estan en revisados).
+        docs/lanzamiento/img/v11[0-9]-*) clase=privado ;;
         # Pruebas del autor en su PC (GUI de RecompLauncher, instalador, fallos provocados): privado.
-        scripts/pruebas/fallos-t4.ps1 | scripts/rl-t4-*.ps1 | scripts/rl-t5-*.ps1 | scripts/rl-t8-*.ps1 | scripts/rl-t9-*.ps1) clase=privado ;;
+        scripts/pruebas/fallos-t4.ps1 | scripts/rl-t4-*.ps1 | scripts/rl-t5-*.ps1 | scripts/rl-t8-*.ps1 | scripts/rl-t9-*.ps1 | scripts/rl-t12-*) clase=privado ;;
         src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/*) clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;
@@ -151,7 +159,7 @@ done
 cd "$arbol"
 
 excluidas=(odd ESTADO.md ROADMAP.md analisis .git-blame-ignore-revs config/recomp.toml.antes-entradas logs
-           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt scripts/comentarios.ps1 juego mc0 mc1 datos data build tools
+           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt scripts/comentarios.ps1 scripts/cerrojo-pc.sh juego mc0 mc1 datos data build tools
            third_party)
 for ruta in "${excluidas[@]}"; do
     [ ! -e "$ruta" ] || fallo "ruta excluida presente: $ruta"

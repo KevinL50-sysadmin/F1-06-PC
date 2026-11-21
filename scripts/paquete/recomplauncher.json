@@ -137,6 +137,17 @@
         { "label": "On", "set": { "mostrar_fps": "1" } }
       ],
       "defaults": { "mostrar_fps": "0" }
+    },
+    {
+      "id": "controles",
+      "label": "Driving controls",
+      "help": "Which buttons accelerate, brake and change gear while driving; replays, photo mode and menus keep their usual buttons. Each action can also be changed one by one in the game: OPTIONS > PC OPTIONS > PC CONTROLS.",
+      "choices": [
+        { "label": "Original: X/Square accelerate and brake, R2/L2 gears", "set": { "boton_acelerar": "cruz", "boton_frenar": "cuadrado", "boton_subir_marcha": "r2", "boton_bajar_marcha": "l2", "boton_mirar_atras": "r1" } },
+        { "label": "Triggers: R2/L2 accelerate and brake, X/Square gears", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "cruz", "boton_bajar_marcha": "cuadrado", "boton_mirar_atras": "r1" } },
+        { "label": "Triggers: R2/L2 accelerate and brake, R1/L1 gears, Circle looks behind", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "r1", "boton_bajar_marcha": "l1", "boton_mirar_atras": "circulo" } }
+      ],
+      "defaults": { "boton_acelerar": "cruz", "boton_frenar": "cuadrado", "boton_subir_marcha": "r2", "boton_bajar_marcha": "l2", "boton_mirar_atras": "r1" }
     }
   ],
   "looks": {

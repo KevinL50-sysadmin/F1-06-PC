@@ -4,6 +4,49 @@ All notable changes for players are listed here, newest first. Each GitHub relea
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] - 2026-11-21
+
+### Added
+
+- Custom driving controls: the new **OPTIONS > PC OPTIONS > PC CONTROLS** page lets you choose the button for
+  ACCELERATE, BRAKE, GEAR UP, GEAR DOWN and LOOK BEHIND among X, Square, Circle, L1, R1, L2 and R2 (by default the
+  original game's: X, Square, R2, L2 and R1). Choosing a button another action uses swaps them. It only applies
+  while driving (replays, photo mode, the pause and the menus keep the usual buttons), and accelerate and brake keep
+  the button's pressure, so the analog triggers (RT/LT on an Xbox controller) give progressive throttle and brake.
+  RecompLauncher has the same setting as "Driving controls" presets.
+- `audio_backend = auto | wasapi | directsound | winmm` in `config\settings.ini` (environment variable
+  `PS2X_AUDIO_BACKEND`) chooses which Windows audio system the game tries first; the others stay as fallback.
+- `F1-06.log` now has `[audio]` lines: which audio system opened, with which device and format, and whether the
+  sound is really playing.
+- Launch arguments of the form `NAME=value` at the start of the command line (for example `F1_SPU_TRAZA=1`; capital
+  letters, digits and `_`) now set that environment variable, for launchers without Steam's `VAR=value %command%`
+  syntax such as RecompLauncher; a literal `%command%` is ignored.
+  Before, the game took them for the game file and closed. `F1-06.log` lists them as `[argumentos] variable ...`.
+
+### Changed
+
+- Faster races on older and low-power processors: part of the work that draws the cars and the track (the PS2's
+  vector unit) kept running into a very slow path on processors that are slow with certain tiny numbers. The game
+  now avoids it, with exactly the same result. Measured on the developer's PC limited to its efficiency cores, as a
+  stand-in for a slower CPU: races run about 20-25 % faster (around 34 to 42 fps). Fast desktop processors that
+  already reach 50 fps see no change. Not yet measured on an older CPU like the one in issue #1.
+- The game's threads now wait for each other for a fixed time instead of a fixed number of processor pauses (much
+  shorter on older CPUs), and the graphics thread is woken up more cheaply. This is meant for older processors; on
+  modern ones it makes no difference (measured). `F1-06.log` counts these waits in its `[gs:gpu]` and `[iop:hilo]`
+  lines.
+
+### Fixed
+
+- Stutter with capture or streaming tools such as Sunshine: when the graphics card falls behind, the graphics
+  thread no longer stops to wait for it on every frame; it skips that frame's copy instead. This should mean fewer
+  stutters in the menus with these tools open (not yet confirmed on an affected PC; if you still see stutter, see
+  *Performance tips* in the README). `F1-06.log` counts the skipped copies in its `[gs:gpu]` lines.
+- Sound output on Linux with Proton or Wine: if WASAPI fails to open, or opens but stays silent, the game now falls
+  back to DirectSound and then WinMM instead of staying mute. If there is still no sound, try
+  `audio_backend = directsound` or `winmm` and send `F1-06.log`. This does not fix every case yet: a Proton setup
+  where the audio device opens fine but the game's own sound driver stays silent is still under investigation
+  (issue #3).
+
 ## [1.1.2] - 2026-11-19
 
 ### Added
@@ -84,6 +127,7 @@ First public release. It contains no game data: on the first start you choose yo
   feedback; split screen; experimental online play between two PCs.
 - Installer and portable package.
 
+[1.1.3]: https://github.com/KevinL50-sysadmin/F1-06-PC/releases/tag/v1.1.3
 [1.1.2]: https://github.com/KevinL50-sysadmin/F1-06-PC/releases/tag/v1.1.2
 [1.1.1]: https://github.com/KevinL50-sysadmin/F1-06-PC/releases/tag/v1.1.1
 [1.1.0]: https://github.com/KevinL50-sysadmin/F1-06-PC/releases/tag/v1.1.0

@@ -66,10 +66,34 @@ owners.
 - A graphics card with Vulkan for the normal (GPU) mode; without it the game draws in software mode (slower).
 - **Your own copy of Formula One 06 for PS2, European PAL version (SCES-53950)**, dumped from your own disc to an
   `.iso` file.
-- CPU: no minimum has been established (the port has been measured on a single PC). The game's main thread is
-  CPU-bound, so single-core speed matters most: the race start with 22 cars is the most demanding moment, and when
-  the cores stay below about 4 GHz (for example with Windows' *Balanced* power plan) it drops under 50 fps for a few
-  seconds (see *Known limitations*). As a guideline, a recent desktop processor with high boost clocks.
+- CPU: single-core speed matters most. The game's main thread (the PS2's main processor and its vector unit, which
+  draws the cars and the track) is CPU-bound, and races with 22 cars are the heaviest part. When the CPU cannot keep
+  up, the game does not skip frames: it runs in slow motion. What we know so far:
+  - **Recommended** (reported by players): a desktop CPU like a **Core i5-6600K or Ryzen 5 3400G, or newer**.
+  - **Minimum**: not established. Older workstation CPUs and low-power laptop CPUs run races below 50 fps.
+  - *Measured* on the developer's PC (Core i7-13700): 50 fps on its performance cores. Limited to its 8 efficiency
+    cores, as a stand-in for a slower CPU: 25-33 fps in a race on 1.1.2, and 41-43 fps with the 1.1.3 changes
+    (+22-25 %, A/B in the same race).
+  - *Measured* from a player's log: Xeon E5-2687W (2012, 3.0 GHz), about 20 fps in a race on 1.1.2. The 1.1.3 gains
+    are measured on the efficiency cores above, not on that CPU yet.
+  - *Reported* by players in RecompLauncher ("runs well", no fps given): Core i5-6600K + GTX 1080, Ryzen 5 3400G +
+    RX 6600, Ryzen 5 5600GT with its integrated graphics, Ryzen 5 5500, Ryzen 7 5700X, Core i5-14600K, Core
+    i7-13700F, Ryzen 7 9700X, Xeon E5-2667 v4. With problems: a Ryzen 5 3500U laptop (Vega 8, 6 GB of RAM).
+- Graphics card: any card with Vulkan. With the default settings (supersampling 2x, double resolution off) even the
+  integrated graphics of a Ryzen 5 5600GT is reported to run well.
+
+### Performance tips
+
+- Keep the graphics renderer on **GPU** (the default); the CPU (software) mode is much slower.
+- **Supersampling** and **double resolution** only load the graphics card. Raise them if your GPU has room; lower
+  them if its usage is high. On a CPU-bound PC they do not help: in a player's logs, a race ran at about the same ~20 fps
+  with supersampling 4x + double resolution as with 2x and no double resolution.
+- Use Windows' *High performance* power plan (see *Known limitations*).
+- **Capture and streaming tools** (Sunshine, OBS...): on 1.1.2, with Sunshine open on one player's PC, the graphics
+  thread waited for the graphics card on every frame and the menus stuttered. Since 1.1.3 it no longer waits when the
+  card falls behind: it skips that frame copy instead. If you still see stutter with a capture or streaming tool
+  open, you can try this (not a confirmed fix): NVIDIA Control Panel > Manage 3D settings > Program Settings >
+  `F1-06.exe` > **Vulkan/OpenGL present method: Prefer native**. Or close the tool while you play on the PC.
 
 ## Installation
 
@@ -97,8 +121,8 @@ Dump your own disc: the project will never tell you where to download a game ima
 
 ## Controls and options
 
-- All PC options are in **OPTIONS > PC OPTIONS** in the main menu, with four pages: **PC GRAPHICS**, **PC DISPLAY**,
-  **PC SETTINGS** and **PC NETPLAY**. Each page has a DEFAULT VALUES row. Changes are visible at once; ACCEPT saves them to
+- All PC options are in **OPTIONS > PC OPTIONS** in the main menu, with five pages: **PC GRAPHICS**, **PC DISPLAY**,
+  **PC SETTINGS**, **PC CONTROLS** and **PC NETPLAY**. Each page has a DEFAULT VALUES row. Changes are visible at once; ACCEPT saves them to
   `config\settings.ini`. The race pause menu also has PC GRAPHICS and PHOTO MODE.
 - Keys: **F11** fullscreen / window, **F10** aspect, **F12** screenshot, **H** HUD mode, **F8** photo mode. With a
   controller, **R3** enters and leaves photo mode and **L3** shows or hides the help bar. Close the window (X or
@@ -106,6 +130,13 @@ Dump your own disc: the project will never tell you where to download a game ima
 - Photo mode: left stick moves the camera, right stick turns it, R2/L2 up/down, L1/R1 tilt, d-pad up/down zoom,
   d-pad left/right changes car, △ cycles the race cameras, ○ takes the photo, START returns to the race (keyboard:
   W S A D, R F, arrows, Q E, Z X, TAB, V).
+- Driving controls (**PC CONTROLS**): choose the button for ACCELERATE, BRAKE, GEAR UP, GEAR DOWN and LOOK BEHIND
+  among X, Square, Circle, L1, R1, L2 and R2 (defaults, as in the original game: X, Square, R2, L2, R1). Choosing a
+  button another action uses swaps them. It only applies while driving: replays, photo mode, pause and menus keep the
+  usual buttons. Accelerate and brake keep the button's pressure, so analog triggers (RT/LT = R2/L2 on an Xbox
+  controller) give progressive throttle and brake. Reverse: hold brake with the car stopped. RecompLauncher offers
+  the same as "Driving controls" presets. This is separate from `controls.ini`, which maps your physical inputs to
+  PS2 buttons.
 - Replays: SELECT pauses, R2 fast-forward (x2, then x4), L2 rewinds (keyboard: K, L, J).
 - Controls are configured in `config\controls.ini` (pad, keyboard, wheel; a `[jugador2]` section for the second
   player). Wheel settings in its `[volante]` section: set `grados_volante` to the rotation configured in G HUB (900
@@ -114,6 +145,12 @@ Dump your own disc: the project will never tell you where to download a game ima
   password; the guest opens `Play online - Guest.cmd` (installed: "F1 06 PC - Jugar en red (invitado)" in the Start
   menu; or `F1-06.exe --invitado`) and does not need the game data. Image
   quality low / medium / high uses about 4 / 8 / 15 Mbit/s. Full details in `README.txt` inside the package (Spanish: `LEEME.txt`).
+- Audio: the game tries WASAPI, then DirectSound, then WinMM, and keeps the first one that really plays (one that
+  opens but stays silent for 1.5 s is skipped). `audio_backend = auto | wasapi | directsound | winmm` in
+  `config\settings.ini` (or the environment variable `PS2X_AUDIO_BACKEND`) puts the chosen one first; the others stay
+  as fallback. The `[audio]` lines in `F1-06.log` say which one opened, its format and whether sound is playing.
+  **No sound on Linux (Proton/Wine)?** Try `audio_backend = directsound` or `winmm`, and if it still fails, send
+  `F1-06.log` (see [Reporting a problem](#reporting-a-problem)).
 
 ## Known limitations
 
@@ -253,8 +290,23 @@ respuesta; pantalla partida y juego en red por IP (experimental); carpeta `mods\
 regresiones completas guionizadas).
 
 **Requisitos:** Windows 10/11 de 64 bits, tarjeta gráfica con Vulkan (sin ella, modo Software, más lento) y **tu
-propia copia de Formula One 06 PAL (SCES-53950)**, volcada de tu disco a una `.iso`. CPU: sin mínimo establecido;
-lo que más cuenta es la velocidad de un núcleo (por debajo de unos 4 GHz la salida baja de 50 fps unos segundos).
+propia copia de Formula One 06 PAL (SCES-53950)**, volcada de tu disco a una `.iso`. CPU: lo que más cuenta es la
+velocidad de un núcleo; si no llega, el juego va a cámara lenta (no se salta fotogramas). Recomendado (según los
+jugadores): un procesador de sobremesa como un **Core i5-6600K o un Ryzen 5 3400G, o más nuevo**. Mínimo: sin
+establecer; las CPU de estación de trabajo antiguas y las de portátil de bajo consumo van por debajo de 50 fps en
+carrera. Medido en el PC del desarrollador (Core i7-13700): 50 fps en sus núcleos de rendimiento; solo con sus 8
+núcleos eficientes, 25-33 fps en carrera con la 1.1.2 y 41-43 con la 1.1.3 (+22-25 %). Medido en el log de un
+jugador: Xeon E5-2687W a 3,0 GHz, unos 20 fps en carrera con la 1.1.2 (la mejora de la 1.1.3 aún no se ha medido
+ahí). Los jugadores dicen que va bien con Core i5-6600K, Ryzen 5 3400G, Ryzen 5 5600GT con su gráfica integrada,
+Ryzen 5 5500, Ryzen 7 5700X y Xeon E5-2667 v4, entre otros; con problemas en un portátil con Ryzen 5 3500U y 6 GB.
+
+**Rendimiento:** deja el dibujo en GPU (el de serie). El supersampling y la doble resolución solo cargan la tarjeta
+gráfica: con una CPU justa no ayudan. Usa el plan de energía Alto rendimiento. Con programas de captura o streaming
+(Sunshine, OBS...): en la 1.1.2 los menús podían ir a tirones; desde la 1.1.3 el juego ya no espera a la tarjeta
+cuando va retrasada. Si aún ves tirones con uno de ellos abierto, puedes probar (no está confirmado que lo arregle):
+Panel de control de NVIDIA > Administrar la configuración 3D > Configuración de programa > `F1-06.exe` > método de
+presentación de Vulkan/OpenGL (*Vulkan/OpenGL present method*) en **Preferir nativo** (*Prefer native*), o cerrar
+el programa mientras juegas en el PC.
 
 **Instalación:** descarga el instalador o el `.zip` portable de
 [la última versión](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). El instalador crea los accesos "F1 06 PC"
@@ -267,6 +319,11 @@ formas". Vuelca tu propio disco: el proyecto no dice dónde descargar imágenes 
 
 **Opciones:** OPCIONES > OPCIONES PC (GRÁFICOS PC, PANTALLA PC, AJUSTES PC, JUEGO EN RED PC). Teclas: F11 pantalla
 completa, F10 aspecto, F12 foto, H HUD, F8 o R3 modo foto. Todo explicado en `LEEME.txt` dentro del paquete.
+
+**Sonido:** el juego prueba WASAPI, luego DirectSound y luego WinMM, y se queda con el primero que suena;
+`audio_backend = auto | wasapi | directsound | winmm` en `config\settings.ini` (o `PS2X_AUDIO_BACKEND`) pone ese
+primero y deja los otros de respaldo. Las líneas `[audio]` de `F1-06.log` dicen cuál se abrió. ¿Sin sonido en Linux
+(Proton/Wine)? Prueba `audio_backend = directsound` o `winmm` y, si sigue igual, envía `F1-06.log`.
 
 **Limitaciones conocidas:** con el plan de energía Equilibrado y programas abiertos, la salida con 22 coches puede bajar
 a 42-45 fps unos segundos (con Alto rendimiento, 50); DETALLE ALTO cuesta un 16 % y MÁXIMO va a unos 25 fps en la

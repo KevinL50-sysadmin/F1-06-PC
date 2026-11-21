@@ -100,6 +100,10 @@ enum
     /* Each enabled circuit is scanned out alone, unblended and with its alpha (PMODE MMOD 1, ALP 0xFF; SLBG 0), and the
        images are read back one under the other, circuit 1 first: the caller merges them (pgs_frame.circuits). */
     PGS_SCANOUT_SPLIT_CIRCUITS = 1u << 6,
+    /* Only 3 readback slots are used and, when all 3 are in flight, wait for the oldest one and reuse its slot without
+       harvesting it (the behaviour before pgs_get_readback_stats, for A/B tests). By default a finished one is harvested first (the next
+       pgs_get_frame hands it out) and, if it has not finished, this scanout is not read back: nothing waits. */
+    PGS_SCANOUT_WAIT_OLDEST_READBACK = 1u << 7,
 };
 
 typedef struct pgs_frame
@@ -127,6 +131,20 @@ typedef struct pgs_stats
     uint64_t fifo_bytes;     /* local -> host FIFO bytes read */
     uint64_t vram_maps;      /* pgs_map_vram_read/write calls */
 } pgs_stats;
+
+/* The scanout readbacks (pgs_get_readback_stats), counted since pgs_create. Up to 4 are in flight (3 with
+   PGS_SCANOUT_WAIT_OLDEST_READBACK). */
+typedef struct pgs_readback_stats
+{
+    uint32_t struct_size;        /* the caller sets sizeof(pgs_readback_stats); only that much is written */
+    uint32_t in_flight;          /* readbacks not handed out or dropped yet */
+    uint64_t started;            /* readbacks started (pgs_vsync/pgs_vsync_composed returned 1) */
+    uint64_t skipped;            /* scanouts not read back: the oldest readback in flight had not finished */
+    uint64_t dropped;            /* readbacks never handed out: a newer one finished first */
+    uint64_t harvested_on_reuse; /* finished readbacks taken when their slot was needed by a new one */
+    uint64_t fence_waits;        /* waits for the GPU: pgs_get_frame with wait, PGS_SCANOUT_WAIT_OLDEST_READBACK */
+    uint64_t fence_wait_ns;      /* time spent in them */
+} pgs_readback_stats;
 
 PGS_API uint32_t pgs_api_version(void);
 
@@ -167,7 +185,8 @@ PGS_API void pgs_read_transfer_fifo(pgs_context *context, void *data, uint32_t n
 
 /* Scans out the display (as at a vertical blank) with these registers and field (0/1) and starts reading the
    image back. Returns 1 if there was an image (one per enabled circuit with PGS_SCANOUT_SPLIT_CIRCUITS), 0 if not
-   (display off, unknown video mode). */
+   (display off, unknown video mode) or if it is not read back because the oldest readback in flight has not finished
+   (pgs_readback_stats.skipped; never waits for the GPU unless PGS_SCANOUT_WAIT_OLDEST_READBACK). */
 PGS_API int pgs_vsync(pgs_context *context, const pgs_priv_regs *regs, uint32_t field, uint32_t scanout_flags);
 /* How pgs_vsync_composed merges the circuits: as a CPU presenter that reads the display in pixels (our runtime's
    GSCpuBackend). Out of the circuits in circuits, each scanned out alone (PGS_SCANOUT_SPLIT_CIRCUITS), it makes a
@@ -192,10 +211,13 @@ typedef struct pgs_compose_info
    compose is doubled: the frame is (2 * width) x (2 * height). */
 PGS_API int pgs_vsync_composed(pgs_context *context, const pgs_priv_regs *regs, uint32_t field, uint32_t scanout_flags,
                                const pgs_compose_info *compose);
-/* The newest frame read back. wait = 0: only if its readback is finished. Returns 1 with *frame filled, else 0. */
+/* The newest frame read back. wait = 0: only if its readback is finished. Returns 1 with *frame filled, else 0.
+   A frame taken when its readback slot was needed (pgs_vsync) is handed out by the next call (no frame is lost). */
 PGS_API int pgs_get_frame(pgs_context *context, int wait, pgs_frame *frame);
 
 PGS_API void pgs_get_stats(pgs_context *context, pgs_stats *stats);
+/* Since T4 of 1.1.3, without a new API version: look it up as optional (an older DLL does not have it). */
+PGS_API void pgs_get_readback_stats(pgs_context *context, pgs_readback_stats *stats);
 
 /* Changes the super-sampling rate (1, 2, 4, 8 or 16) and PGS_CREATE_SUPER_SAMPLED_TEXTURES at once, between frames:
    it waits for the GPU and clears the super samples (the next frame is drawn again at the new rate). Above the

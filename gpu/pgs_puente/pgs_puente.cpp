@@ -2,6 +2,7 @@
 
 #define PGS_PUENTE_BUILD 1
 #include "pgs_puente.h"
+#include "pgs_readback_ring.h"
 
 #include "context.hpp"
 #include "device.hpp"
@@ -11,6 +12,7 @@
 #include "compose_circuits.spv.h" // kComposeCircuitsSpirv, built from compose_circuits.comp
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -26,6 +28,13 @@ namespace
         if (error == nullptr || errorSize == 0u)
             return;
         std::snprintf(error, errorSize, "%s", message);
+    }
+
+    uint64_t nowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
     }
 
     // A scanout image copied to a host buffer; finished when its fence signals.
@@ -106,7 +115,7 @@ struct pgs_context
     uint32_t superSampling = 1u;        // the rate in use
     uint32_t maxSuperSampling = 1u;     // the highest one local memory has room for
 
-    static constexpr uint32_t kReadbacks = 3u;
+    static constexpr uint32_t kReadbacks = pgs_readback::kSlots;
     Readback readbacks[kReadbacks];
     uint32_t nextReadback = 0u;
     uint64_t readbackSerial = 0u; // serial of the newest readback started
@@ -115,8 +124,10 @@ struct pgs_context
     std::vector<uint8_t> frame; // the frame handed out by pgs_get_frame
     pgs_frame frameInfo{};
     uint64_t frameSerial = 0u;
+    bool frameUnread = false; // frameInfo was harvested when its slot was needed and not handed out yet
 
     pgs_stats stats{};
+    pgs_readback_stats readbackStats{};
 };
 
 namespace
@@ -136,7 +147,17 @@ namespace
         for (int attempt = 0; attempt < static_cast<int>(pgs_context::kReadbacks) && newest >= 0; ++attempt)
         {
             Readback &readback = context.readbacks[newest];
-            const bool done = wait ? (readback.fence->wait(), true) : readback.fence->wait_timeout(0);
+            bool done = false;
+            if (wait)
+            {
+                const uint64_t start = nowNs();
+                readback.fence->wait();
+                ++context.readbackStats.fence_waits;
+                context.readbackStats.fence_wait_ns += nowNs() - start;
+                done = true;
+            }
+            else
+                done = readback.fence->wait_timeout(0);
             if (done)
             {
                 const size_t bytes = static_cast<size_t>(readback.width) * readback.height * 4u;
@@ -150,6 +171,8 @@ namespace
                 for (uint32_t i = 0; i < pgs_context::kReadbacks; ++i)
                     if (context.readbacks[i].pending && context.readbackSerials[i] <= serial)
                     {
+                        if (context.readbackSerials[i] < serial)
+                            ++context.readbackStats.dropped;
                         context.readbacks[i].pending = false;
                         context.readbacks[i].fence.reset();
                     }
@@ -165,6 +188,7 @@ namespace
                 context.frameInfo.scale = readback.scale;
                 context.frameInfo.super_sampling = readback.superSampling;
                 context.frameInfo.serial = ++context.frameSerial;
+                context.frameUnread = true;
                 ++context.stats.frames;
                 return true;
             }
@@ -274,11 +298,39 @@ namespace
             width = compose->width * scale;
             height = compose->height * scale;
         }
+        // The slot of the oldest readback (pgs_readback_ring.h). Waiting for it cost a slow GPU (~50 ms behind, as with
+        // a screen capture running) ~18 ms per scanout and left this thread at 100 %: a finished one is harvested
+        // (pgs_get_frame hands it out) and an unfinished one is not waited for, this scanout is not read back.
+        // The previous mode uses only 3 slots, as before T4 (pgs_readback::slotsInUse).
+        const bool waitForOldest = (scanout_flags & PGS_SCANOUT_WAIT_OLDEST_READBACK) != 0u;
+        context.nextReadback = pgs_readback::slotToUse(context.nextReadback, waitForOldest);
         Readback &readback = context.readbacks[context.nextReadback];
+        const bool finished = readback.pending && !waitForOldest && readback.fence->wait_timeout(0);
+        switch (pgs_readback::slotAction(readback.pending, finished, waitForOldest))
+        {
+        case pgs_readback::SlotAction::Use:
+            break;
+        case pgs_readback::SlotAction::HarvestThenUse:
+            ++context.readbackStats.harvested_on_reuse;
+            harvest(context, false); // takes the newest finished one: this slot's or a newer one, freeing this slot
+            break;
+        case pgs_readback::SlotAction::WaitThenUse:
+        {
+            const uint64_t start = nowNs();
+            readback.fence->wait(); // as before T4: let the oldest finish and reuse its buffers without harvesting it
+            ++context.readbackStats.fence_waits;
+            context.readbackStats.fence_wait_ns += nowNs() - start;
+            ++context.readbackStats.dropped;
+            readback.pending = false;
+            break;
+        }
+        case pgs_readback::SlotAction::Skip:
+            ++context.readbackStats.skipped;
+            return 0;
+        }
         context.readbackSerials[context.nextReadback] = ++context.readbackSerial;
-        context.nextReadback = (context.nextReadback + 1u) % pgs_context::kReadbacks;
-        if (readback.pending)
-            readback.fence->wait(); // three scanouts in flight: let the oldest finish before reusing its buffers
+        context.nextReadback = pgs_readback::nextSlot(context.nextReadback, waitForOldest);
+        ++context.readbackStats.started;
         const VkDeviceSize bytes = VkDeviceSize(width) * height * 4u;
         if (!readback.buffer || readback.buffer->get_create_info().size < bytes)
         {
@@ -583,8 +635,10 @@ extern "C"
     {
         if (context == nullptr || frame == nullptr)
             return 0;
-        if (!harvest(*context, wait != 0))
+        // A frame harvested when its readback slot was needed (scanoutAndRead) is handed out here too.
+        if (!harvest(*context, wait != 0) && !context->frameUnread)
             return 0;
+        context->frameUnread = false;
         *frame = context->frameInfo;
         return 1;
     }
@@ -593,6 +647,18 @@ extern "C"
     {
         if (context != nullptr && stats != nullptr)
             *stats = context->stats;
+    }
+
+    PGS_API void pgs_get_readback_stats(pgs_context *context, pgs_readback_stats *stats)
+    {
+        if (context == nullptr || stats == nullptr || stats->struct_size < sizeof(uint32_t))
+            return;
+        pgs_readback_stats current = context->readbackStats;
+        current.struct_size = std::min<uint32_t>(stats->struct_size, sizeof(pgs_readback_stats));
+        current.in_flight = 0u;
+        for (const Readback &readback : context->readbacks)
+            current.in_flight += readback.pending ? 1u : 0u;
+        std::memcpy(stats, &current, current.struct_size);
     }
 
     PGS_API uint32_t pgs_set_quality(pgs_context *context, uint32_t super_sampling, uint32_t flags)

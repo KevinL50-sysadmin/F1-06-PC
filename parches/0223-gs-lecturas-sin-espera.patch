@@ -1,0 +1,182 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 6082f07..5a7116f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_gpu_bridge.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/ps2_ab.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_user_paths.h"
+ 
+@@ -72,6 +73,12 @@ namespace
+     {
+         uint64_t gif_bytes, gif_transfers, vsyncs, frames, fifo_bytes, vram_maps;
+     };
++    // pgs_get_readback_stats (optional: since T4 of 1.1.3, same API version).
++    struct PgsReadbackStats
++    {
++        uint32_t struct_size, in_flight;
++        uint64_t started, skipped, dropped, harvested_on_reuse, fence_waits, fence_wait_ns;
++    };
+     enum : uint32_t
+     {
+         kScanoutForceProgressive = 1u << 0,
+@@ -79,6 +86,7 @@ namespace
+         kScanoutAdaptHorizontal = 1u << 4,
+         kScanoutHighRes = 1u << 5,
+         kScanoutSplitCircuits = 1u << 6,
++        kScanoutWaitOldestReadback = 1u << 7, // A/B mode 185 (T4 of 1.1.3): wait for the oldest readback, as before
+     };
+     enum : uint32_t
+     {
+@@ -107,6 +115,7 @@ namespace
+         int (*vsync_composed)(pgs_context *, const PgsPrivRegs *, uint32_t, uint32_t, const PgsComposeInfo *);
+         int (*get_frame)(pgs_context *, int, PgsFrame *);
+         void (*get_stats)(pgs_context *, PgsStats *);
++        void (*get_readback_stats)(pgs_context *, PgsReadbackStats *); // optional (nullptr with an older DLL)
+         uint32_t (*set_quality)(pgs_context *, uint32_t, uint32_t);
+         uint32_t (*get_super_sampling)(pgs_context *);
+     };
+@@ -614,7 +623,7 @@ struct GSGpuBackend::Impl
+     uint64_t lastFrameSerial = 0u;
+     GSPresentationRequest lastScanoutRequest{};
+     // The requests of the last scanouts started (pgs_vsync returned 1), by pgs_frame.scanout: split frames are
+-    // composed with their own registers, not with the newest ones (up to three readbacks are in flight).
++    // composed with their own registers, not with the newest ones (up to four readbacks are in flight).
+     static constexpr uint32_t kScanoutHistory = 8u;
+     GSPresentationRequest scanoutRequests[kScanoutHistory]{};
+     uint64_t scanoutsStarted = 0u;
+@@ -623,6 +632,8 @@ struct GSGpuBackend::Impl
+     std::atomic<uint64_t> statPackets{0u}, statBytes{0u}, statScanouts{0u}, statFrames{0u};
+     std::atomic<uint64_t> statVramReads{0u}, statVramRefreshes{0u}, statSnapshots{0u}, statLocalToHost{0u};
+     std::atomic<uint64_t> statLocalToHostBytes{0u}, statWaitNs{0u}, statPushNs{0u};
++    std::atomic<uint64_t> statQueueFullNs{0u}; // part of statWaitNs: producers waiting for room in the queue
++    PgsReadbackStats lastReadbackStats{};     // the DLL's counters at the last report (GS GPU thread)
+     uint64_t statCoalesced = 0u, statScanoutNs = 0u, statFrameNs = 0u; // GS GPU thread
+     uint64_t busyNs = 0u; // GS GPU thread
+     int64_t reportAt = 0;
+@@ -637,7 +648,9 @@ struct GSGpuBackend::Impl
+             {
+                 const int64_t waitStart = nowNs();
+                 room.wait(lock, [&]() { return pending.size() <= kMaxPending || stop; });
+-                statWaitNs.fetch_add(static_cast<uint64_t>(nowNs() - waitStart), std::memory_order_relaxed);
++                const uint64_t waited = static_cast<uint64_t>(nowNs() - waitStart);
++                statWaitNs.fetch_add(waited, std::memory_order_relaxed);
++                statQueueFullNs.fetch_add(waited, std::memory_order_relaxed);
+             }
+             const size_t offset = pending.size();
+             pending.resize(offset + sizeof(Header) + padded);
+@@ -803,6 +816,10 @@ struct GSGpuBackend::Impl
+         PgsPrivRegs regs{request.pmode, smode1For(command.smode1, display), request.smode2, request.dispfb1,
+                          request.display1, request.dispfb2, request.display2, 0u, 0u, 0u, request.bgcolor};
+         uint32_t flags = scanoutFlags;
++        // A/B mode 185 (T4 of 1.1.3): the DLL waits for the oldest readback in flight as before (by default it skips
++        // the readback of this scanout instead, so a slow GPU does not hold this thread).
++        if (g_ps2AbMode.load(std::memory_order_relaxed) == 185)
++            flags |= kScanoutWaitOldestReadback;
+         if (translateCrtc && hleDisplayRegisters(request.smode2, display))
+         {
+             const bool pal = ((regs.smode1 >> 13u) & 3u) == 3u;
+@@ -861,12 +878,31 @@ struct GSGpuBackend::Impl
+         const uint64_t scanouts = take(statScanouts), frames = take(statFrames);
+         const uint64_t reads = take(statVramReads), refreshes = take(statVramRefreshes);
+         const uint64_t snapshots = take(statSnapshots), l2h = take(statLocalToHost), l2hBytes = take(statLocalToHostBytes);
+-        const uint64_t waitNs = take(statWaitNs), pushNs = take(statPushNs);
++        const uint64_t waitNs = take(statWaitNs), pushNs = take(statPushNs), queueFullNs = take(statQueueFullNs);
++        // The DLL's readbacks over these 10 s (T4 of 1.1.3): scanouts not read back because the oldest readback had
++        // not finished, readbacks dropped for a newer one, harvested when their slot was needed, and fence waits.
++        char readbackText[192] = "";
++        if (api.get_readback_stats != nullptr)
++        {
++            PgsReadbackStats current{};
++            current.struct_size = sizeof(current);
++            api.get_readback_stats(context, &current);
++            const PgsReadbackStats &last = lastReadbackStats;
++            std::snprintf(readbackText, sizeof(readbackText),
++                          " | lecturas de escaneo: sin leer=%llu tiradas=%llu cosechadas al reutilizar=%llu en vuelo=%u, "
++                          "esperas de vallas=%llu (%.0f ms)",
++                          static_cast<unsigned long long>(current.skipped - last.skipped),
++                          static_cast<unsigned long long>(current.dropped - last.dropped),
++                          static_cast<unsigned long long>(current.harvested_on_reuse - last.harvested_on_reuse),
++                          current.in_flight, static_cast<unsigned long long>(current.fence_waits - last.fence_waits),
++                          static_cast<double>(current.fence_wait_ns - last.fence_wait_ns) / 1e6);
++            lastReadbackStats = current;
++        }
+         std::fprintf(stderr,
+                      "[gs:gpu] 10 s: paquetes=%.0f/s %.2f MB/s escaneos=%.1f/s (fusionados %.1f/s, %.3f ms cada uno) "
+                      "fotogramas=%.1f/s (%.3f ms cada uno) | lecturas: "
+                      "ReadVram=%llu (copias de VRAM %llu) SnapshotVram=%llu local->host=%llu (%llu bytes) | "
+-                     "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms\n",
++                     "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms (cola llena %.0f ms)%s\n",
+                      static_cast<double>(packets) / seconds, static_cast<double>(bytes) / seconds / 1e6,
+                      static_cast<double>(scanouts) / seconds, static_cast<double>(statCoalesced) / seconds,
+                      scanouts != 0u ? static_cast<double>(statScanoutNs) / 1e6 / static_cast<double>(scanouts) : 0.0,
+@@ -876,7 +912,8 @@ struct GSGpuBackend::Impl
+                      static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(l2h),
+                      static_cast<unsigned long long>(l2hBytes), static_cast<double>(busyNs) / 1e6,
+                      100.0 * static_cast<double>(busyNs) / static_cast<double>(elapsed),
+-                     static_cast<double>(pushNs) / 1e6, static_cast<double>(waitNs) / 1e6);
++                     static_cast<double>(pushNs) / 1e6, static_cast<double>(waitNs) / 1e6,
++                     static_cast<double>(queueFullNs) / 1e6, readbackText);
+         busyNs = 0u;
+         statCoalesced = statScanoutNs = statFrameNs = 0u;
+     }
+@@ -1310,6 +1347,7 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(const std::filesystem::path &
+     resolve(api.get_stats, "pgs_get_stats");
+     resolve(api.set_quality, "pgs_set_quality");
+     resolve(api.get_super_sampling, "pgs_get_super_sampling");
++    api.get_readback_stats = reinterpret_cast<decltype(api.get_readback_stats)>(symbol("pgs_get_readback_stats"));
+     if (!complete || api.api_version() != kPgsApiVersion)
+     {
+         error = dll.string() + " no tiene la API esperada (version " + std::to_string(kPgsApiVersion) + ")";
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index b6223da..2b9da58 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/gs/gs_gpu_bridge.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_test_sync.h"
++#include "../../../../gpu/pgs_puente/pgs_readback_ring.h" // the readback ring rule of pgs_puente.dll
+ 
+ #include <chrono>
+ #include <cstdint>
+@@ -988,5 +989,37 @@ void register_ps2_gs_gpu_tests()
+                      "rewritten");
+             t.IsFalse(ps2GsGpuSameDevice(saved, testDevice()), "for this device");
+         });
++        tc.Run("the readback ring harvests a finished oldest readback and never waits for an unfinished one", [](TestCase &t)
++        {
++            using pgs_readback::SlotAction;
++            using pgs_readback::slotAction;
++            // T4 (S2): with a slow GPU (~50 ms per readback) waiting for the oldest readback cost ~18 ms per scanout.
++            t.IsTrue(pgs_readback::kSlots >= 4u && pgs_readback::kSlots <= 6u, "a ring of 4 to 6 readbacks");
++            t.IsTrue(slotAction(false, false, false) == SlotAction::Use, "a free slot is used");
++            t.IsTrue(slotAction(false, false, true) == SlotAction::Use, "a free slot is used also in the previous mode");
++            t.IsTrue(slotAction(true, true, false) == SlotAction::HarvestThenUse,
++                     "a finished oldest readback is harvested before its slot is reused");
++            t.IsTrue(slotAction(true, false, false) == SlotAction::Skip,
++                     "an unfinished oldest readback is not waited for: the scanout is not read back");
++            t.IsTrue(slotAction(true, true, true) == SlotAction::WaitThenUse,
++                     "the previous mode reuses the slot as before, without harvesting (its fence wait returns at once)");
++            t.IsTrue(slotAction(true, false, true) == SlotAction::WaitThenUse,
++                     "the previous mode (A/B 185, PGS_SCANOUT_WAIT_OLDEST_READBACK) waits for the oldest");
++        });
++        tc.Run("the previous readback mode keeps 3 readbacks in flight, the new one the whole ring", [](TestCase &t)
++        {
++            using pgs_readback::nextSlot;
++            using pgs_readback::slotToUse;
++            using pgs_readback::slotsInUse;
++            // A/B 185 must wait exactly as before T4: for the oldest of 3, not of 4.
++            t.IsTrue(slotsInUse(true) == 3u, "the previous mode uses 3 slots");
++            t.IsTrue(slotsInUse(false) == pgs_readback::kSlots, "the new mode uses every slot");
++            t.IsTrue(nextSlot(0u, true) == 1u && nextSlot(1u, true) == 2u && nextSlot(2u, true) == 0u,
++                     "the previous mode cycles 0, 1, 2");
++            t.IsTrue(nextSlot(2u, false) == 3u && nextSlot(pgs_readback::kSlots - 1u, false) == 0u,
++                     "the new mode cycles through the whole ring");
++            t.IsTrue(slotToUse(3u, true) == 0u, "switching to the previous mode on slot 3 goes back to slot 0");
++            t.IsTrue(slotToUse(2u, true) == 2u && slotToUse(3u, false) == 3u, "a slot in range is kept");
++        });
+     });
+ }

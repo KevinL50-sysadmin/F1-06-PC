@@ -1,0 +1,539 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ab.h b/ps2xRuntime/include/runtime/ps2_ab.h
+index c9a8f9e..05d57ef 100644
+--- a/ps2xRuntime/include/runtime/ps2_ab.h
++++ b/ps2xRuntime/include/runtime/ps2_ab.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
++#include <cstddef>
+ #include <cstdint>
+ 
+ // A/B switch for performance work. Optimized paths that keep their previous implementation check it: 0 runs the
+@@ -100,9 +102,74 @@ extern std::atomic<uint64_t> g_ps2Vu1HostPairs;
+ extern std::atomic<uint64_t> g_ps2GsEeWaitNs;
+ extern std::atomic<uint64_t> g_ps2Vu1GsWaitNs; // ... of it, inside the VU1 runs (XGKICK)
+ extern std::atomic<uint64_t> g_ps2GsWakes; // times the producers woke the GS thread
++// Patch 0225 (gs_frontend.cpp). A/B mode 187 (ps2spin::kAbPauseCount, below): the spin waits of
++// the GS GIF thread and of the IOP hand-off count pauses again instead of lasting a time, and the GIF packets are
++// published with a full barrier each, as before patch 0225. ps2GsGifStatsText: for the 10 s "[gs:gpu]" and
++// "[gs:hilo]" lines, by mode (patch 0225 and A/B 187), the time the GS GIF worker ran, how much of it it slept, its
++// sleeps and the wake-ups the other threads gave it since the last call (which starts them again).
++void ps2GsGifStatsText(char *text, size_t size);
+ extern std::atomic<uint64_t> g_ps2DisplayFlips; // DISPFB1/2 writes that changed the buffer shown (patch 0106)
+ 
+ // Called by the EE thread (patch 0069): own = true keeps it on a performance core of its own (both of its
+ // hyper-threads) and every other thread of the process off that core, with 7 cores or more; false undoes it (the EE
+ // thread on every performance core). Returns the core index used, or -1.
+ int ps2EeOwnCore(bool own);
++
++// Patch 0225 (T3 of 1.1.3): spin-then-sleep waits that last a time instead of a number of PAUSE instructions. PAUSE
++// takes 34 ns on this PC's P cores, 16 ns on its E cores and ~3 ns on Sandy Bridge (logs/rend-t1/pausa.txt), so the
++// waits that counted pauses (GS GIF worker 4000, GIF sync and room 2000, IOP hand-off 256) lasted ~10 times less on an
++// old Xeon and its threads fell asleep (and paid the wake-up) sooner. Now each lasts what its count lasted on the P
++// cores (budgetNs), the clock read every kClockEvery pauses. A/B mode 187: the pause count of before.
++namespace ps2spin
++{
++    constexpr int kAbPauseCount = 187;
++    constexpr int64_t kPauseNs = 34;     // one PAUSE on this PC's P cores
++    constexpr uint32_t kClockEvery = 16u; // pauses between clock reads (steady_clock is QueryPerformanceCounter)
++
++    constexpr int64_t budgetNs(uint32_t pauses) { return static_cast<int64_t>(pauses) * kPauseNs; }
++    constexpr bool byTime(int abMode) { return abMode != kAbPauseCount; }
++
++    struct SteadyNs
++    {
++        int64_t operator()() const
++        {
++            return std::chrono::duration_cast<std::chrono::nanoseconds>(
++                       std::chrono::steady_clock::now().time_since_epoch())
++                .count();
++        }
++    };
++
++    // spend() before each pause: false once the budget is gone (byTime: budgetNs(pauses) since the timer was made;
++    // otherwise `pauses` pauses), and from then on. No budget (pauses = 0): no pause at all.
++    template <typename NowNs = SteadyNs>
++    class SpinTimer
++    {
++    public:
++        SpinTimer(uint32_t pauses, bool byTime, NowNs now = NowNs{})
++            : m_now(now), m_pauses(pauses), m_byTime(byTime), m_spent(pauses == 0u)
++        {
++            if (m_byTime && !m_spent)
++                m_end = m_now() + budgetNs(pauses);
++        }
++
++        bool spend()
++        {
++            if (m_spent)
++                return false;
++            ++m_count;
++            if (!m_byTime)
++                m_spent = m_count > m_pauses;
++            else if (m_count % kClockEvery == 1u && m_count > 1u) // after every kClockEvery pauses
++                m_spent = m_now() >= m_end;
++            return !m_spent;
++        }
++
++    private:
++        NowNs m_now;
++        int64_t m_end = 0;
++        uint32_t m_pauses;
++        uint32_t m_count = 0u;
++        bool m_byTime;
++        bool m_spent;
++    };
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index bd3aea9..a4c59fc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -27,6 +27,45 @@ void ps2GsSnapshotsAsBandJobs(bool enabled);
+ 
+ void ps2GsThreadCores(int &applied, uint32_t &chunks, uint32_t &onEfficiency, bool bandWorker); // gs_threaded_backend.cpp
+ 
++// Patch 0225: the GS GIF worker by mode (0: patch 0225, 1: A/B mode 187), for ps2GsGifStatsText.
++namespace
++{
++    struct GifWaitStats
++    {
++        std::atomic<uint64_t> ns{0u};      // the worker's time in that mode
++        std::atomic<uint64_t> sleepNs{0u}; // ... asleep
++        std::atomic<uint64_t> sleeps{0u};
++        std::atomic<uint64_t> wakes{0u}; // wake-ups the other threads gave it
++    };
++    GifWaitStats g_gifWaitStats[2];
++
++    inline GifWaitStats &gifWaitStats(int abMode) { return g_gifWaitStats[ps2spin::byTime(abMode) ? 0 : 1]; }
++}
++
++void ps2GsGifStatsText(char *text, size_t size)
++{
++    double seconds[2], asleep[2], sleeps[2], wakes[2];
++    for (int i = 0; i < 2; ++i)
++    {
++        GifWaitStats &s = g_gifWaitStats[i];
++        seconds[i] = static_cast<double>(s.ns.exchange(0u, std::memory_order_relaxed)) / 1e9;
++        asleep[i] = static_cast<double>(s.sleepNs.exchange(0u, std::memory_order_relaxed)) / 1e9;
++        sleeps[i] = static_cast<double>(s.sleeps.exchange(0u, std::memory_order_relaxed));
++        wakes[i] = static_cast<double>(s.wakes.exchange(0u, std::memory_order_relaxed));
++    }
++    const auto rate = [](double count, double s) { return s > 0.0 ? count / s : 0.0; };
++    std::snprintf(text, size,
++                  " | hilo GIF, esperas por tiempo: %.1f s, dormido %.0f %%, dormidas=%.0f/s despertares=%.0f/s; "
++                  "por pausas (A/B 187): %.1f s, dormido %.0f %%, dormidas=%.0f/s despertares=%.0f/s",
++                  seconds[0], 100.0 * rate(asleep[0], seconds[0]), rate(sleeps[0], seconds[0]),
++                  rate(wakes[0], seconds[0]), seconds[1], 100.0 * rate(asleep[1], seconds[1]),
++                  rate(sleeps[1], seconds[1]), rate(wakes[1], seconds[1]));
++}
++
++#if defined(_WIN32)
++extern "C" __declspec(dllimport) void __stdcall FlushProcessWriteBuffers(void); // kernel32 (Windows Vista and later)
++#endif
++
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+@@ -483,9 +522,7 @@ namespace
+             }
+             writeHeader(pos, sizeBytes, &gs);
+             std::memcpy(m_ring.get() + pos + 16u, data, sizeBytes);
+-            m_tail.store(tail + need, std::memory_order_seq_cst);
+-            if (m_sleeping.load(std::memory_order_seq_cst))
+-                wake();
++            publish(tail + need);
+             return true;
+         }
+ 
+@@ -507,9 +544,7 @@ namespace
+             }
+             writeHeader(pos, kSnapshotMarker, nullptr);
+             std::memcpy(m_ring.get() + pos + 16u, &request, sizeof(request));
+-            m_tail.store(tail + need, std::memory_order_seq_cst);
+-            if (m_sleeping.load(std::memory_order_seq_cst))
+-                wake();
++            publish(tail + need);
+             return true;
+         }
+ 
+@@ -520,11 +555,12 @@ namespace
+             if (m_done.load(std::memory_order_acquire) >= target)
+                 return;
+             const auto start = std::chrono::steady_clock::now();
+-            for (uint32_t spins = 0u; m_done.load(std::memory_order_acquire) < target; ++spins)
++            ps2spin::SpinTimer<> spin(kSyncSpins, ps2spin::byTime(g_ps2AbMode.load(std::memory_order_relaxed)));
++            while (m_done.load(std::memory_order_acquire) < target)
+             {
+                 if (m_sleeping.load(std::memory_order_seq_cst))
+                     wake();
+-                if (spins < 2000u)
++                if (spin.spend())
+                     _mm_pause();
+                 else
+                     std::this_thread::yield();
+@@ -538,6 +574,33 @@ namespace
+         }
+ 
+     private:
++        // Patch 0225: pauses before sleeping or yielding, as a time (ps2spin::budgetNs: what they last on this PC's P
++        // cores) unless A/B mode 187 asks for the count of before.
++        static constexpr uint32_t kWorkerSpins = 4000u; // 136 us
++        static constexpr uint32_t kSyncSpins = 2000u;   // 68 us, sync and waitForRoom
++
++        // Makes the record ending at newTail visible and wakes a sleeping worker. Patch 0225: the store of m_tail was a
++        // seq_cst one (XCHG, which waits for the packet copy to leave the store buffer) for the m_sleeping test after
++        // it; now a plain release store, and the worker, before it sleeps, makes every thread of the process go
++        // through a full barrier (FlushProcessWriteBuffers, once per sleep instead of once per packet). So either the
++        // worker sees the new tail or this thread sees m_sleeping. A/B mode 187 (and outside Windows): as before.
++        void publish(uint64_t newTail)
++        {
++#if defined(_WIN32)
++            if (g_ps2AbMode.load(std::memory_order_relaxed) != ps2spin::kAbPauseCount)
++            {
++                m_tail.store(newTail, std::memory_order_release);
++                std::atomic_signal_fence(std::memory_order_seq_cst); // the load below stays after the store
++                if (m_sleeping.load(std::memory_order_relaxed))
++                    wake();
++                return;
++            }
++#endif
++            m_tail.store(newTail, std::memory_order_seq_cst);
++            if (m_sleeping.load(std::memory_order_seq_cst))
++                wake();
++        }
++
+         void start()
+         {
+             m_ring = std::make_unique<uint8_t[]>(kRingBytes);
+@@ -557,11 +620,12 @@ namespace
+             if (end - m_done.load(std::memory_order_acquire) <= kRingBytes)
+                 return;
+             const auto start = std::chrono::steady_clock::now();
+-            for (uint32_t spins = 0u; end - m_done.load(std::memory_order_acquire) > kRingBytes; ++spins)
++            ps2spin::SpinTimer<> spin(kSyncSpins, ps2spin::byTime(g_ps2AbMode.load(std::memory_order_relaxed)));
++            while (end - m_done.load(std::memory_order_acquire) > kRingBytes)
+             {
+                 if (m_sleeping.load(std::memory_order_seq_cst))
+                     wake();
+-                if (spins < 2000u)
++                if (spin.spend())
+                     _mm_pause();
+                 else
+                     std::this_thread::yield();
+@@ -574,6 +638,7 @@ namespace
+ 
+         void wake()
+         {
++            gifWaitStats(g_ps2AbMode.load(std::memory_order_relaxed)).wakes.fetch_add(1u, std::memory_order_relaxed);
+             {
+                 std::lock_guard<std::mutex> lock(m_mutex);
+             }
+@@ -587,6 +652,8 @@ namespace
+             int coresApplied = 0;
+             uint32_t coreChunks = 0u, coreOnEfficiency = 0u;
+             uint64_t head = 0u;
++            bool lastSleepCheap = false; // patch 0225: the last sleep was in a mode whose publish has no full barrier
++            int64_t statsNs = ps2spin::SteadyNs{}();
+             for (;;)
+             {
+                 ps2GsThreadCores(coresApplied, coreChunks, coreOnEfficiency, false); // off the EE's own core
+@@ -594,7 +661,13 @@ namespace
+                 if (head == tail)
+                 {
+                     // Spin a while (the EE sends packets in bursts), then sleep until submit wakes it.
+-                    for (uint32_t spins = 0u; spins < 4000u && head == tail; ++spins)
++                    const int abMode = g_ps2AbMode.load(std::memory_order_relaxed);
++                    GifWaitStats &stats = gifWaitStats(abMode);
++                    const int64_t idleNs = ps2spin::SteadyNs{}();
++                    stats.ns.fetch_add(static_cast<uint64_t>(idleNs - statsNs), std::memory_order_relaxed);
++                    statsNs = idleNs;
++                    ps2spin::SpinTimer<> spin(kWorkerSpins, ps2spin::byTime(abMode));
++                    while (head == tail && spin.spend())
+                     {
+                         _mm_pause();
+                         tail = m_tail.load(std::memory_order_acquire);
+@@ -603,8 +676,24 @@ namespace
+                     {
+                         std::unique_lock<std::mutex> lock(m_mutex);
+                         m_sleeping.store(true, std::memory_order_seq_cst);
++#if defined(_WIN32)
++                        // See publish. Also on the first sleep after going from another mode to 187 (a publish still
++                        // in flight may have read the old mode), and when the mode changed while spinning (it is read
++                        // again here, after m_sleeping: a 187 -> 0 switch in that gap would publish without a barrier).
++                        const bool cheap = abMode != ps2spin::kAbPauseCount ||
++                                           g_ps2AbMode.load(std::memory_order_relaxed) != ps2spin::kAbPauseCount;
++                        if (cheap || lastSleepCheap)
++                            FlushProcessWriteBuffers();
++                        lastSleepCheap = cheap;
++#endif
+                         if (m_tail.load(std::memory_order_seq_cst) == head)
++                        {
++                            const int64_t sleepStart = ps2spin::SteadyNs{}();
+                             m_wake.wait_for(lock, std::chrono::milliseconds(1));
++                            stats.sleeps.fetch_add(1u, std::memory_order_relaxed);
++                            stats.sleepNs.fetch_add(static_cast<uint64_t>(ps2spin::SteadyNs{}() - sleepStart),
++                                                    std::memory_order_relaxed);
++                        }
+                         m_sleeping.store(false, std::memory_order_seq_cst);
+                         continue;
+                     }
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 5a7116f..2610314 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -898,11 +898,13 @@ struct GSGpuBackend::Impl
+                           static_cast<double>(current.fence_wait_ns - last.fence_wait_ns) / 1e6);
+             lastReadbackStats = current;
+         }
++        char gifText[256] = "";
++        ps2GsGifStatsText(gifText, sizeof(gifText)); // patch 0225
+         std::fprintf(stderr,
+                      "[gs:gpu] 10 s: paquetes=%.0f/s %.2f MB/s escaneos=%.1f/s (fusionados %.1f/s, %.3f ms cada uno) "
+                      "fotogramas=%.1f/s (%.3f ms cada uno) | lecturas: "
+                      "ReadVram=%llu (copias de VRAM %llu) SnapshotVram=%llu local->host=%llu (%llu bytes) | "
+-                     "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms (cola llena %.0f ms)%s\n",
++                     "hilo GS GPU=%.0f ms (%.1f %%), encolar=%.0f ms, esperas por lecturas=%.0f ms (cola llena %.0f ms)%s%s\n",
+                      static_cast<double>(packets) / seconds, static_cast<double>(bytes) / seconds / 1e6,
+                      static_cast<double>(scanouts) / seconds, static_cast<double>(statCoalesced) / seconds,
+                      scanouts != 0u ? static_cast<double>(statScanoutNs) / 1e6 / static_cast<double>(scanouts) : 0.0,
+@@ -913,7 +915,7 @@ struct GSGpuBackend::Impl
+                      static_cast<unsigned long long>(l2hBytes), static_cast<double>(busyNs) / 1e6,
+                      100.0 * static_cast<double>(busyNs) / static_cast<double>(elapsed),
+                      static_cast<double>(pushNs) / 1e6, static_cast<double>(waitNs) / 1e6,
+-                     static_cast<double>(queueFullNs) / 1e6, readbackText);
++                     static_cast<double>(queueFullNs) / 1e6, readbackText, gifText);
+         busyNs = 0u;
+         statCoalesced = statScanoutNs = statFrameNs = 0u;
+     }
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 0a9a065..45bf291 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -576,12 +576,14 @@ void GSThreadedBackend::WorkerLoop()
+         {
+             const double seconds = std::chrono::duration<double>(chunkEnd - reportStart).count();
+             const double producerWait = 1e-9 * static_cast<double>(m_producerWaitNs.exchange(0u, std::memory_order_relaxed));
+-            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu dormidas/s=%.0f nucleosE=%u%%\n",
++            char gifText[256] = "";
++            ps2GsGifStatsText(gifText, sizeof(gifText)); // patch 0225
++            std::fprintf(stderr, "[gs:hilo] ocupado=%.0f%% ordenes/s=%.0f colaLlena=%llu esperaEE=%.0f%% vaciados=%llu dormidas/s=%.0f nucleosE=%u%%%s\n",
+                          100.0 * std::chrono::duration<double>(busyTime).count() / seconds, commandsRun / seconds,
+                          static_cast<unsigned long long>(m_fullWaits.exchange(0u, std::memory_order_relaxed)),
+                          100.0 * producerWait / seconds,
+                          static_cast<unsigned long long>(m_drains.exchange(0u, std::memory_order_relaxed)),
+-                         sleeps / seconds, coreChunks != 0u ? 100u * coreOnEfficiency / coreChunks : 0u);
++                         sleeps / seconds, coreChunks != 0u ? 100u * coreOnEfficiency / coreChunks : 0u, gifText);
+             coreChunks = 0u;
+             coreOnEfficiency = 0u;
+             reportStart = chunkEnd;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 9fb99f2..595fb62 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -9,6 +9,7 @@
+ #include "ps2x/iop/ps2_iso_image.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ #include "ThreadNaming.h"
++#include "runtime/ps2_ab.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -28,17 +29,24 @@ namespace
+     thread_local bool t_onIopWorker = false;
+ 
+     // Pauses this many times for the state to leave `from`, then sleeps on it (both sides of the hand-off: a batch
+-    // lasts tens of microseconds and the next one comes about 1 ms later).
++    // lasts tens of microseconds and the next one comes about 1 ms later). Patch 0225: as long as those pauses last
++    // on this PC's P cores (8.7 us; ps2spin in runtime/ps2_ab.h), not as many, unless A/B mode 187. slept: whether it slept.
+     constexpr uint32_t kHandOffSpins = 256u;
+ 
+-    uint32_t waitWhile(std::atomic<uint32_t> &state, uint32_t from, uint32_t spins)
++    uint32_t waitWhile(std::atomic<uint32_t> &state, uint32_t from, uint32_t spins, bool *slept = nullptr)
+     {
+         uint32_t value = state.load(std::memory_order_acquire);
+-        for (uint32_t i = 0u; value == from && i < spins; ++i)
++        if (value == from)
+         {
+-            _mm_pause();
+-            value = state.load(std::memory_order_acquire);
++            ps2spin::SpinTimer<> spin(spins, ps2spin::byTime(g_ps2AbMode.load(std::memory_order_relaxed)));
++            while (value == from && spin.spend())
++            {
++                _mm_pause();
++                value = state.load(std::memory_order_acquire);
++            }
+         }
++        if (slept != nullptr)
++            *slept = value == from;
+         while (value == from)
+         {
+             state.wait(from, std::memory_order_acquire);
+@@ -47,6 +55,12 @@ namespace
+         return value;
+     }
+ 
++    // Patch 0225: 0 waits by time, 1 A/B mode 187 (the statistics by mode of WorkerStats).
++    int modeIndex()
++    {
++        return ps2spin::byTime(g_ps2AbMode.load(std::memory_order_relaxed)) ? 0 : 1;
++    }
++
+     uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start)
+     {
+         return static_cast<uint64_t>(
+@@ -659,7 +673,13 @@ void PS2IopHostAdapter::workerMain()
+     t_onIopWorker = true;
+     for (;;)
+     {
+-        if (waitWhile(m_batchState, 0u, kHandOffSpins) == 2u)
++        bool slept = false;
++        const uint32_t state = waitWhile(m_batchState, 0u, kHandOffSpins, &slept);
++        if (slept)
++        {
++            m_workerSleeps[modeIndex()].fetch_add(1u, std::memory_order_relaxed);
++        }
++        if (state == 2u)
+         {
+             return;
+         }
+@@ -689,6 +709,7 @@ void PS2IopHostAdapter::handOffBatch(ps2x::iop::IopSubsystem &iop, uint64_t eeCy
+     m_batchIop = &iop;
+     m_batchCycles = eeCycles;
+     ++m_stats.handOffs;
++    ++m_stats.handOffsBy[modeIndex()];
+     m_batchState.store(1u, std::memory_order_release);
+     m_batchState.notify_all();
+ }
+@@ -718,7 +739,11 @@ bool PS2IopHostAdapter::iopSync()
+     if (m_batchState.load(std::memory_order_acquire) == 1u)
+     {
+         const auto start = std::chrono::steady_clock::now();
+-        (void)waitWhile(m_batchState, 1u, kHandOffSpins);
++        const int mode = modeIndex();
++        bool slept = false;
++        (void)waitWhile(m_batchState, 1u, kHandOffSpins, &slept);
++        m_stats.eeSleeps[mode] += slept ? 1u : 0u;
++        ++m_stats.waitsBy[mode];
+         ++m_stats.waits;
+         m_stats.waitNs += nanosecondsSince(start);
+     }
+@@ -759,7 +784,25 @@ PS2IopHostAdapter::WorkerStats PS2IopHostAdapter::takeWorkerStats()
+     WorkerStats stats = m_stats;
+     stats.busyNs = m_workerBusyNs.exchange(0u, std::memory_order_relaxed);
+     stats.foreignSyncs = m_foreignSyncs.exchange(0u, std::memory_order_relaxed);
++    for (int i = 0; i < 2; ++i)
++    {
++        stats.workerSleeps[i] = m_workerSleeps[i].exchange(0u, std::memory_order_relaxed);
++    }
+     m_stats = WorkerStats{};
++    // Patch 0225: the sleeps of both sides of the hand-off by mode since the last call (every 10 s, just before the
++    // "[iop:hilo]" line of EeScheduler).
++    if (stats.handOffs != 0u || stats.waits != 0u)
++    {
++        std::fprintf(stderr,
++                     "[iop:hilo] dormidas, esperas por tiempo: EE=%llu de %llu esperas, IOP=%llu en %llu entregas; "
++                     "por pausas (A/B 187): EE=%llu de %llu, IOP=%llu en %llu\n",
++                     static_cast<unsigned long long>(stats.eeSleeps[0]), static_cast<unsigned long long>(stats.waitsBy[0]),
++                     static_cast<unsigned long long>(stats.workerSleeps[0]),
++                     static_cast<unsigned long long>(stats.handOffsBy[0]),
++                     static_cast<unsigned long long>(stats.eeSleeps[1]), static_cast<unsigned long long>(stats.waitsBy[1]),
++                     static_cast<unsigned long long>(stats.workerSleeps[1]),
++                     static_cast<unsigned long long>(stats.handOffsBy[1]));
++    }
+     return stats;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 20949a2..5129fad 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -118,6 +118,12 @@ public:
+         uint64_t waitNs = 0u;   // time the EE spent in those waits
+         uint64_t busyNs = 0u;   // time the worker spent running batches
+         uint64_t foreignSyncs = 0u; // iopSync calls from another thread (neither the hand-off thread nor the worker)
++        // Patch 0225, by mode ([0] waits by time, [1] A/B mode 187): batches given, EE waits, of them those that
++        // slept (spin budget spent), and times the worker slept waiting for a batch.
++        uint64_t handOffsBy[2] = {0u, 0u};
++        uint64_t waitsBy[2] = {0u, 0u};
++        uint64_t eeSleeps[2] = {0u, 0u};
++        uint64_t workerSleeps[2] = {0u, 0u};
+     };
+     // The counts since the last call (the EE thread).
+     WorkerStats takeWorkerStats();
+@@ -170,4 +176,5 @@ private:
+     std::atomic<uint64_t> m_workerBusyNs{0u};
+     std::atomic<uint64_t> m_foreignSyncs{0u};
+     std::atomic<bool> m_foreignSyncWarned{false};
++    std::atomic<uint64_t> m_workerSleeps[2]{}; // patch 0225, by mode as WorkerStats::workerSleeps
+ };
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 9249b83..f68aa0f 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -10,6 +10,7 @@
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
++#include "runtime/ps2_ab.h"
+ #include "Stubs/Helpers/Support.h"
+ #include "Stubs/GS.h"
+ #include "gs_test_sync.h"
+@@ -4966,5 +4967,56 @@ void register_ps2_gs_tests()
+                                             true),
+                       "another DBX");
+         });
++        // Patch 0225 (T3 of 1.1.3): the spin-then-sleep waits last a time, not a number of PAUSEs (34 ns on this PC's P
++        // cores, 16 on its E cores, ~3 on Sandy Bridge), unless A/B mode 187 asks for the pause count of before.
++        tc.Run("spin waits by time keep the wall time of this PC's P cores on any PAUSE length", [](TestCase &t)
++        {
++            t.Equals(ps2spin::budgetNs(4000u), static_cast<int64_t>(136000), "GS GIF worker: 4000 x 34 ns");
++            t.Equals(ps2spin::budgetNs(2000u), static_cast<int64_t>(68000), "GIF sync and room: 2000 x 34 ns");
++            t.Equals(ps2spin::budgetNs(256u), static_cast<int64_t>(8704), "IOP hand-off: 256 x 34 ns");
++            t.IsTrue(ps2spin::byTime(0), "mode 0 waits by time");
++            t.IsTrue(ps2spin::byTime(186), "other A/B modes too");
++            t.IsFalse(ps2spin::byTime(ps2spin::kAbPauseCount), "A/B mode 187 counts pauses as before");
++            t.Equals(ps2spin::kAbPauseCount, 187, "the A/B mode is 187");
++
++            struct FakeClock
++            {
++                const int64_t *ns;
++                int64_t operator()() const { return *ns; }
++            };
++            const auto pausesWith = [](uint32_t pauses, bool byTime, int64_t pauseNs)
++            {
++                int64_t now = 1000;
++                ps2spin::SpinTimer<FakeClock> timer(pauses, byTime, FakeClock{&now});
++                uint32_t spent = 0u;
++                while (timer.spend() && spent < 10000000u)
++                {
++                    now += pauseNs; // the PAUSE itself
++                    ++spent;
++                }
++                return spent;
++            };
++            const uint32_t sandy = pausesWith(4000u, true, 3);
++            t.IsTrue(sandy >= 136000u / 3u && sandy <= 136000u / 3u + ps2spin::kClockEvery,
++                     "3 ns pauses (Sandy Bridge): ~45,000 of them for the same 136 us, got " + std::to_string(sandy));
++            const uint32_t pCore = pausesWith(4000u, true, 34);
++            t.IsTrue(pCore >= 4000u && pCore <= 4000u + ps2spin::kClockEvery,
++                     "34 ns pauses (P cores): ~4000 as before, got " + std::to_string(pCore));
++            const uint32_t eCore = pausesWith(256u, true, 16);
++            t.IsTrue(eCore >= 544u && eCore <= 544u + ps2spin::kClockEvery,
++                     "16 ns pauses (E cores), IOP: ~544 for 8.7 us, got " + std::to_string(eCore));
++            t.Equals(pausesWith(4000u, false, 3), 4000u, "mode 187: 4000 pauses whatever they last");
++            t.Equals(pausesWith(256u, false, 34), 256u, "mode 187: 256 pauses");
++            t.Equals(pausesWith(0u, true, 3), 0u, "no budget, no pause (stopIopWorker)");
++            t.Equals(pausesWith(0u, false, 3), 0u, "no budget, no pause, by count");
++
++            // Once spent it stays spent (the GIF sync goes on yielding).
++            int64_t now = 0;
++            ps2spin::SpinTimer<FakeClock> timer(16u, true, FakeClock{&now});
++            while (timer.spend())
++                now += 34;
++            now = 0; // even if the clock went backwards
++            t.IsFalse(timer.spend(), "a spent budget does not come back");
++        });
+     });
+ }

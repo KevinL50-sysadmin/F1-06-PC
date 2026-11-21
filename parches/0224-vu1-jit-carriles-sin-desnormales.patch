@@ -1,0 +1,497 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+index 26b47ce..857c797 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_blocks.h
+@@ -642,6 +642,10 @@ namespace
+         // Patch 0097: compiled for code whose MAC and status flags nothing reads (BlockEngine::macStatusDead).
+         void *jitNoFlags = nullptr;
+         bool jitNoFlagsTried = false;
++        // Patch 0224: A/B mode 186 (FMAC lanes not masked, as before) when MAC and status are read (with
++        // BlockEngine::macStatusDead it goes in jitCalls).
++        void *jitOld = nullptr;
++        bool jitOldTried = false;
+         std::vector<JitCommitRange> jitRanges;
+         // Patch 0081: what a chain into this schedule checks (set when compiled): 1 fallback, 2 hasD, 4 hasT,
+         // 8 xgkickFirst.
+@@ -2017,6 +2021,23 @@ namespace
+                 s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
+                 ++engine.stats.jitBlocks;
+             }
++            else if (abModeAll == kJitAbNoMask && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
++                     (s->jitCalls != nullptr ||
++                      (!s->jitCallsTried && jitCompile<Host>(engine, *s, host, kJitNoFlagsNoMask))))
++            {
++                // A/B mode 186: patch 0097's compile without patch 0224's masked FMAC lanes.
++                reinterpret_cast<JitCode>(s->jitCalls)(&vu, &st, &host);
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
++                ++engine.stats.jitBlocks;
++            }
++            else if (abModeAll == kJitAbNoMask && s_jitEnabled &&
++                     (s->jitOld != nullptr || (!s->jitOldTried && jitCompile<Host>(engine, *s, host, kJitAbNoMask))))
++            {
++                // A/B mode 186: the plain compile without patch 0224's masked FMAC lanes.
++                reinterpret_cast<JitCode>(s->jitOld)(&vu, &st, &host);
++                s = static_cast<Schedule *>(const_cast<void *>(st.jitLast));
++                ++engine.stats.jitBlocks;
++            }
+             else if (abMode == 0 && s_jitEnabled && engine.macStatusDead && s_jitSse41 &&
+                 (s->jitNoFlags != nullptr || (!s->jitNoFlagsTried && jitCompile<Host>(engine, *s, host, kJitNoFlags))))
+             {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+index f541154..16a1c6a 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -28,6 +28,10 @@
+     constexpr int kJitNoFlags = 1000;
+     // Patch 0099: the same without jitEmitDeadFlagCommit and kindOnly, in Schedule::jitCalls (A/B mode 102).
+     constexpr int kJitNoFlagsPlain = 1001;
++    // Patch 0224: kJitNoFlags without the masked lanes of jitEmitFmac, in Schedule::jitCalls (A/B mode 186).
++    constexpr int kJitNoFlagsNoMask = 1002;
++    // Patch 0224: the A/B mode (and jitCompile alternative, in Schedule::jitOld) of the code before it.
++    constexpr int kJitAbNoMask = 186;
+ 
+     // Patch 0083: PS2X_VU1_JIT_PEGAJOSAS=0: every FMAC flag entry worked out and committed whole (as before).
+     const bool s_jitStickyFlags = []()
+@@ -439,15 +443,22 @@
+         JcScale3,
+         JcTwo31,   // 2147483648.0f
+         JcClipBytes, // pshufb: bytes 0, 4, 1, 5, 2, 6 (x+ x- y+ y- z+ z-), the rest zero
++        JcLanes,     // patch 0224: 16 rows, JcLanes + c: all ones in the lanes of components c (x = bit 0 = lane 0)
+     };
+-    alignas(16) const uint32_t kJitConst[15][4] = {
++    alignas(16) const uint32_t kJitConst[31][4] = {
+         {0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u}, {0u, 0u, 0u, 0u},
+         {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu}, {0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu},
+         {0xFFu, 0xFFu, 0xFFu, 0xFFu}, {254u, 254u, 254u, 254u}, {1u, 1u, 1u, 1u}, {23u, 23u, 23u, 23u},
+         {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u},
+         {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}, {0x41800000u, 0x41800000u, 0x41800000u, 0x41800000u},
+         {0x45800000u, 0x45800000u, 0x45800000u, 0x45800000u}, {0x47000000u, 0x47000000u, 0x47000000u, 0x47000000u},
+-        {0x4F000000u, 0x4F000000u, 0x4F000000u, 0x4F000000u}, {0x05010400u, 0x80800602u, 0x80808080u, 0x80808080u}};
++        {0x4F000000u, 0x4F000000u, 0x4F000000u, 0x4F000000u}, {0x05010400u, 0x80800602u, 0x80808080u, 0x80808080u},
++#define PS2_JIT_LANES(c) {(c) & 1u ? ~0u : 0u, (c) & 2u ? ~0u : 0u, (c) & 4u ? ~0u : 0u, (c) & 8u ? ~0u : 0u}
++        PS2_JIT_LANES(0u), PS2_JIT_LANES(1u), PS2_JIT_LANES(2u), PS2_JIT_LANES(3u), PS2_JIT_LANES(4u),
++        PS2_JIT_LANES(5u), PS2_JIT_LANES(6u), PS2_JIT_LANES(7u), PS2_JIT_LANES(8u), PS2_JIT_LANES(9u),
++        PS2_JIT_LANES(10u), PS2_JIT_LANES(11u), PS2_JIT_LANES(12u), PS2_JIT_LANES(13u), PS2_JIT_LANES(14u),
++        PS2_JIT_LANES(15u)};
++#undef PS2_JIT_LANES
+ 
+     // normalize4 on xmm x (rax = kJitConst), with xmm3-xmm5 as scratch: bits & ~(D & 0x7FFFFFFF) | (maxE & 0x7F7FFFFF)
+     // with D = zero exponent | maximum exponent. The same as normalize4: a zero exponent keeps the sign alone, the
+@@ -528,9 +539,16 @@
+     // noEntry (patch 0097): no flag entry at all (nothing reads MAC or status, and its commit is left out too).
+     // kindOnly (patch 0099): nothing reads MAC or status, but the entry is committed after the schedule: only its
+     // kind, with status and sticky zero (so its commit adds nothing to the D and I bits).
++    // maskLanes (patch 0224; A/B mode 186: not): with a partial destination, the lanes it does not write are zeroed in
++    // a (and in b from a register and in ACC for MADD/MSUB) before the arithmetic. An operand read raw because its
++    // written lanes are known normal keeps whatever the other lanes hold, often integer data (FTOI results, packed
++    // words), which are denormals as floats: ADDPS/MULPS on them took a microcode assist per instruction, about 11-17
++    // times dearer on the Gracemont E cores than on the P cores (rendimiento-cpu-antiguas L5/L9). Those lanes are never
++    // stored (the blend and the flag masks take the components only), so the results are the same bits; 0 op 0 (or 0
++    // + a normalized broadcast) needs no assist.
+     inline bool jitEmitFmac(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool zeros = true,
+                             const void *lateSlow = nullptr, bool stickyOnly = false, JitNormShadow *shadow = nullptr,
+-                            bool noEntry = false, bool kindOnly = false)
++                            bool noEntry = false, bool kindOnly = false, bool maskLanes = true)
+     {
+         using B = JitEmitter;
+         const FmacOp &op = p.fmac;
+@@ -587,11 +605,20 @@
+                                                         : false;
+         if (!bKnown)
+             jitNormalize(e, 1);
++        const bool mask = maskLanes && (comp & 0xFu) != 0xFu;
++        if (mask)
++        {
++            e.cst({0x0F, 0x54}, 0, JcLanes + comp); // andps: a
++            if (op.source != FmacSourceBc && op.source != FmacSourceQ && op.source != FmacSourceI)
++                e.cst({0x0F, 0x54}, 1, JcLanes + comp); // andps: b (a broadcast is one normalized value)
++        }
+         if (madd)
+         {
+             e.loadXmm(2, B::Vu, offsetof(VU1State, acc));
+             if ((known.acc & comp) != comp)
+                 jitNormalize(e, 2);
++            if (mask)
++                e.cst({0x0F, 0x54}, 2, JcLanes + comp); // andps: c
+             // product = xmm4, value = xmm3
+             e.movaps(4, 0);
+             e.rr({0x0F, 0x59}, 4, 1); // mulps
+@@ -853,7 +880,12 @@
+     // upperEarly<upperSimple<Kind>, Dst> does them (simpleOpSse2: the same SSE operations, in the rounding mode the
+     // run set; no flags). False (the call stays) for anything else.
+     // late (patch 0081): the result whole to st.jitUp.value, for jitEmitUpperDst after the lower instruction.
+-    inline bool jitEmitSimple(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool late = false)
++    // maskLanes (patch 0224, as in jitEmitFmac; A/B mode 186: not): FTOI of a partial destination whose source is read
++    // raw (its written lanes known normal) zeroes the other lanes before MULPS and CMPLEPS, which saw the integer data
++    // there (denormal as floats) and took a microcode assist. Those lanes are never stored, so the bits are the same.
++    // The other SimpleOps do no float arithmetic on their source (integer compares, ANDs, CVTDQ2PS of integers).
++    inline bool jitEmitSimple(JitEmitter &e, const BlockPair &p, const JitKnownNormal &known, bool late = false,
++                              bool maskLanes = true)
+     {
+         const SimpleOp &op = p.simple;
+         if (p.upperPath != UpperSimple || !s_jitSse41 || p.upperFlags != 0u)
+@@ -922,6 +954,8 @@
+         case SimpleFtoi:
+             if ((known.vf[op.fs] & comp) != comp)
+                 jitNormalize(e, 0);
++            else if (maskLanes && (comp & 0xFu) != 0xFu)
++                e.cst({0x0F, 0x54}, 0, JcLanes + comp); // andps: the lanes it writes (patch 0224)
+             e.cst({0x0F, 0x59}, 0, JcScale0 + op.param); // mulps: scaled
+             e.rr({0xF3, 0x0F, 0x5B}, 1, 0);             // cvttps2dq: truncated
+             e.cst({0x0F, 0x28}, 2, JcTwo31);            // movaps xmm2, 2^31
+@@ -1700,8 +1734,15 @@
+             host.workingClipOffset(),
+             static_cast<uint32_t>(reinterpret_cast<const char *>(&host.codeGeneration) - hostBase),
+             host.xgkickActiveOffset()};
+-        const bool noFlags = alternative == kJitNoFlags || alternative == kJitNoFlagsPlain;
+-        (alternative == 0 ? s.jitTried : alternative == kJitNoFlags ? s.jitNoFlagsTried : s.jitCallsTried) = true;
++        const bool noFlags = alternative == kJitNoFlags || alternative == kJitNoFlagsPlain ||
++                             alternative == kJitNoFlagsNoMask;
++        // Patch 0224 (A/B mode 186: not, in s.jitOld or, with noFlags, s.jitCalls): jitEmitFmac's and jitEmitSimple's
++        // (FTOI) masked lanes.
++        const bool maskLanes = alternative != kJitAbNoMask && alternative != kJitNoFlagsNoMask;
++        (alternative == 0             ? s.jitTried
++         : alternative == kJitNoFlags  ? s.jitNoFlagsTried
++         : alternative == kJitAbNoMask ? s.jitOldTried
++                                       : s.jitCallsTried) = true;
+         if (noFlags && !s_jitSse41)
+             return false; // its commits would go through s.jitRanges, which the other compiles point into
+         if (!noFlags)
+@@ -1919,8 +1960,9 @@
+             {
+                 if (!(inlineFmac && s_jitInlineFmac &&
+                       jitEmitFmac(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, alternative != 35 && alternative != 40,
+-                                  nullptr, stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p))) &&
+-                    !(inlineSimple && jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u})))
++                                  nullptr, stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p), maskLanes)) &&
++                    !(inlineSimple &&
++                      jitEmitSimple(e, p, trackNormal ? known : JitKnownNormal{{0u}, 0u}, false, maskLanes)))
+                     e.call(reinterpret_cast<const void *>(p.upperEarly), &p);
+             }
+             else if (p.upperFn != nullptr)
+@@ -1928,8 +1970,9 @@
+                 const JitKnownNormal lateKnown = trackNormal ? known : JitKnownNormal{{0u}, 0u};
+                 if (!(inlineLate && jitEmitFmac(e, p, lateKnown, alternative != 35 && alternative != 40,
+                                                 reinterpret_cast<const void *>(&jitUpperLate<Host>),
+-                                                stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p))) &&
+-                    !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true)))
++                                                stickyOnlyPair(p), shadow, noEntryPair(p), kindOnlyPair(p),
++                                                maskLanes)) &&
++                    !(inlineLate && inlineSimple && jitEmitSimple(e, p, lateKnown, true, maskLanes)))
+                     e.call(reinterpret_cast<const void *>(&jitUpperLate<Host>), &p);
+             }
+             else if (p.upperPath == UpperClip)
+@@ -2017,9 +2060,10 @@
+             e.call(reinterpret_cast<const void *>(&jitEnd<Host>), &s);
+         // A/B modes 71 and 73: every schedule returns to runBlocks, as before patch 0081.
+         jitEmitChain(e, layout, engine, s,
+-                     alternative == 0             ? offsetof(Schedule, jit)
+-                     : alternative == kJitNoFlags ? offsetof(Schedule, jitNoFlags)
+-                                                  : offsetof(Schedule, jitCalls),
++                     alternative == 0              ? offsetof(Schedule, jit)
++                     : alternative == kJitNoFlags  ? offsetof(Schedule, jitNoFlags)
++                     : alternative == kJitAbNoMask ? offsetof(Schedule, jitOld)
++                                                   : offsetof(Schedule, jitCalls),
+                      s_jitChain && alternative != 71 && alternative != 73 && alternative != 76 && alternative != 78,
+                      invariant != 0u);
+         e.epilogue();
+@@ -2028,7 +2072,10 @@
+         if (code == nullptr)
+             return false;
+         std::memcpy(code, e.code().data(), e.code().size());
+-        (alternative == 0 ? s.jit : alternative == kJitNoFlags ? s.jitNoFlags : s.jitCalls) = code;
++        (alternative == 0              ? s.jit
++         : alternative == kJitNoFlags  ? s.jitNoFlags
++         : alternative == kJitAbNoMask ? s.jitOld
++                                       : s.jitCalls) = code;
+         if (mapFile != nullptr)
+         {
+             static std::mutex s_mapMutex; // the VU0 and VU1 engines may compile on different threads
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 391c639..c7d540c 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -7,9 +7,13 @@
+ #include "runtime/ps2_ab.h"
+ #include "gs_test_sync.h"
+ 
++#include <xmmintrin.h>
++
++#include <array>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstring>
++#include <functional>
+ #include <limits>
+ #include <vector>
+ 
+@@ -213,6 +217,76 @@ namespace
+     {
+         std::memcpy(values, data + qwordIndex * 16u, sizeof(float) * 4u);
+     }
++
++    // Patch 0224: the integer data (denormal as floats) that the probes keep in the lanes a partial destination does
++    // not write.
++    constexpr uint32_t kProbeDenormal = 0x00000123u;
++
++    uint32_t probeBitsOf(float value)
++    {
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &value, sizeof(bits));
++        return bits;
++    }
++
++    // Patch 0224: a program (lower, upper pairs) followed by XGKICK vi4 (a PATH1 packet in data qword 16), FMAND vi5,
++    // vi6 when readFlags (Schedule::jit; without it, Schedule::jitNoFlags) and E, run four times in A/B mode `mode`
++    // from a clean MXCSR. setup prepares the registers of every run (vi4 = 16 and vi6 = 0xFFFF are set after it) and
++    // check looks at them and at data afterwards. Returns the runs in which the MXCSR denormal flag (DE), read in the
++    // PATH1 callback, was set: whether any SSE instruction before the XGKICK saw a denormal operand.
++    uint32_t runDenormalLaneProbe(TestCase &t, const std::vector<std::array<uint32_t, 2>> &pairs, bool readFlags,
++                                  int mode, const std::function<void(VU1State &)> &setup,
++                                  const std::function<void(const VU1State &, const uint8_t *)> &check)
++    {
++        Vu1Fixture fx;
++        t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++        bool sawDenormal = false;
++        size_t packets = 0u;
++        fx.mem.setGifPacketCallback([&](const uint8_t *, uint32_t)
++        {
++            ++packets;
++            sawDenormal = sawDenormal || (_mm_getcsr() & 0x2u) != 0u;
++        });
++        const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
++        std::memset(fx.code, 0, PS2_VU1_CODE_SIZE);
++        std::vector<std::array<uint32_t, 2>> program = pairs;
++        program.push_back({makeVuLowerSpecial(0x6Cu, 4u), kVuUpperNop});                     // XGKICK vi4
++        program.push_back({readFlags ? makeVuFlagRegister(0x1Au, 5u, 6u) : 0u, kVuUpperNop}); // FMAND vi5, vi6
++        program.push_back({0u, kVuUpperNop | 0x40000000u});                                  // E
++        program.push_back({0u, kVuUpperNop});
++        for (uint32_t i = 0; i < program.size(); ++i)
++            writeVuInstructionPair(fx.code, i * 8u, program[i][0], program[i][1]);
++        const unsigned int savedCsr = _mm_getcsr();
++        g_ps2AbMode.store(mode);
++        VU1Interpreter vu1;
++        uint32_t runsWithDenormal = 0u;
++        for (uint32_t run = 0; run < 4u; ++run)
++        {
++            // The packet away from data qwords 0-3, which run() reads as floats (patch 0108's matrix).
++            std::memset(fx.data, 0, 32u * 16u);
++            std::memcpy(fx.data + 16u * 16u, &tag, sizeof(tag));
++            setup(vu1.state());
++            vu1.state().vi[4] = 16;
++            vu1.state().vi[6] = 0xFFFF;
++            sawDenormal = false;
++            _mm_setcsr(savedCsr & ~0x3Fu);
++            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 65536u);
++            _mm_setcsr(savedCsr);
++            check(vu1.state(), fx.data);
++            if (readFlags)
++                t.Equals(vu1.state().vi[5], 0, "FMAND should see positive, non-zero results");
++            runsWithDenormal += sawDenormal ? 1u : 0u;
++        }
++        g_ps2AbMode.store(0);
++        t.Equals(packets, static_cast<size_t>(4u), "every run should send its PATH1 packet");
++        return runsWithDenormal;
++    }
++
++    bool probeLanesAre(const float lanes[4], uint32_t x, uint32_t y, uint32_t z, uint32_t w)
++    {
++        const uint32_t want[4] = {x, y, z, w};
++        return std::memcmp(lanes, want, 16u) == 0;
++    }
+ }
+ 
+ void register_ps2_vu1_tests()
+@@ -1803,6 +1877,192 @@ void register_ps2_vu1_tests()
+                      "the underflowing product should set sticky Z and U");
+         });
+ 
++        // Patch 0224: the compiled FMAC of a partial destination no longer computes the lanes it does not write. A
++        // register that an earlier FMAC of the same schedule wrote in x and z is read raw (its x and z are known to be
++        // normal), and its y and w here hold integer data (denormal as floats): before, ADDPS added them too, which
++        // costs a microcode assist per instruction on cores that handle denormal operands slowly (the Gracemont E
++        // cores, about 11-17 times the cost of a P core in the race). The MXCSR denormal flag (DE), read in the PATH1
++        // callback halfway through the run, shows whether any SSE instruction saw a denormal operand. A/B mode 186:
++        // the previous code (DE set). Results identical in both modes, with and without a flag read after them
++        // (Schedule::jitNoFlags and Schedule::jit).
++        tc.Run("VU1 compiled partial FMAC leaves unwritten denormal lanes out of the arithmetic", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            bool sawDenormal = false;
++            size_t packets = 0u;
++            fx.mem.setGifPacketCallback([&](const uint8_t *, uint32_t)
++            {
++                ++packets;
++                sawDenormal = sawDenormal || (_mm_getcsr() & 0x2u) != 0u;
++            });
++            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
++            const uint32_t denormal = 0x00000123u;
++            const auto bitsOf = [](float value)
++            {
++                uint32_t bits = 0u;
++                std::memcpy(&bits, &value, sizeof(bits));
++                return bits;
++            };
++            const unsigned int savedCsr = _mm_getcsr();
++            for (const bool readFlags : {false, true})
++            {
++                std::memset(fx.code, 0, PS2_VU1_CODE_SIZE);
++                const uint32_t program[][2] = {
++                    {0u, makeVuUpper(0x28u, 0xAu, 1u, 1u, 2u)},                       // ADD.xz vf2, vf1, vf1
++                    {0u, makeVuUpper(0x28u, 0xAu, 2u, 2u, 3u)},                       // ADD.xz vf3, vf2, vf2
++                    {makeVuLowerSpecial(0x6Cu, 4u), kVuUpperNop},                     // XGKICK vi4
++                    {readFlags ? makeVuFlagRegister(0x1Au, 5u, 6u) : 0u, kVuUpperNop}, // FMAND vi5, vi6
++                    {0u, kVuUpperNop | 0x40000000u},                                  // E
++                    {0u, kVuUpperNop},
++                };
++                for (uint32_t i = 0; i < sizeof(program) / sizeof(program[0]); ++i)
++                    writeVuInstructionPair(fx.code, i * 8u, program[i][0], program[i][1]);
++                for (const int mode : {0, 186})
++                {
++                    g_ps2AbMode.store(mode);
++                    VU1Interpreter vu1;
++                    packets = 0u;
++                    uint32_t runsWithDenormal = 0u;
++                    for (uint32_t run = 0; run < 4u; ++run)
++                    {
++                        // The packet away from data qwords 0-3, which run() reads as floats (patch 0108's matrix).
++                        std::memset(fx.data, 0, 18u * 16u);
++                        std::memcpy(fx.data + 16u * 16u, &tag, sizeof(tag));
++                        std::memset(vu1.state().vf[3], 0, 16u);
++                        const uint32_t vf1[4] = {bitsOf(1.0f), denormal, bitsOf(2.0f), denormal};
++                        const uint32_t vf2[4] = {0u, denormal, 0u, denormal};
++                        std::memcpy(vu1.state().vf[1], vf1, 16u);
++                        std::memcpy(vu1.state().vf[2], vf2, 16u);
++                        vu1.state().vi[4] = 16;
++                        vu1.state().vi[6] = 0xFFFF;
++                        sawDenormal = false;
++                        _mm_setcsr(savedCsr & ~0x3Fu);
++                        vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u,
++                                    0u, 65536u);
++                        uint32_t got2[4], got3[4];
++                        std::memcpy(got2, vu1.state().vf[2], 16u);
++                        std::memcpy(got3, vu1.state().vf[3], 16u);
++                        const uint32_t want2[4] = {bitsOf(2.0f), denormal, bitsOf(4.0f), denormal};
++                        const uint32_t want3[4] = {bitsOf(4.0f), 0u, bitsOf(8.0f), 0u};
++                        t.IsTrue(std::memcmp(got2, want2, 16u) == 0,
++                                 "ADD.xz should write x and z and keep the integer y and w of vf2");
++                        t.IsTrue(std::memcmp(got3, want3, 16u) == 0,
++                                 "the second ADD.xz should write x and z of vf3 only");
++                        if (readFlags)
++                            t.Equals(vu1.state().vi[5], 0, "FMAND should see positive, non-zero results");
++                        runsWithDenormal += sawDenormal ? 1u : 0u;
++                    }
++                    t.Equals(packets, static_cast<size_t>(4u), "every run should send its PATH1 packet");
++                    if (mode == 0)
++                        t.Equals(runsWithDenormal, 0u, "no SSE instruction should see the denormal lanes");
++                    else
++                        t.IsTrue(runsWithDenormal != 0u, "A/B mode 186 should still add the unwritten lanes, as before");
++                }
++            }
++            _mm_setcsr(savedCsr);
++            g_ps2AbMode.store(0);
++        });
++
++        // Patch 0224 (verification, A2): every other form of the compiled FMAC with a partial destination masks the
++        // lanes it does not write too: MULA to ACC, MADD with ACC, a broadcast lane (x), Q, I, MUL with two registers
++        // and a late result (the pair's SQ reads the upper's destination, so it waits until after the lower
++        // instruction). vf2's x and z come from a FMAC (read raw), its y and w and those of ACC and of every destination
++        // are integer data. Results identical in mode 0 and in A/B mode 186 (previous code: DE set).
++        tc.Run("VU1 compiled partial FMAC forms (ACC, broadcast, Q, I, MUL, late) leave denormal lanes out",
++               [](TestCase &t)
++        {
++            const uint32_t d = kProbeDenormal;
++            const std::vector<std::array<uint32_t, 2>> pairs = {
++                {0u, makeVuUpper(0x28u, 0xAu, 1u, 1u, 2u)},              // ADD.xz vf2, vf1, vf1
++                {0u, makeVuUpperSpecial(0x2Au, 0xAu, 2u, 2u)},           // MULA.xz acc, vf2, vf2
++                {0u, makeVuUpper(0x29u, 0xAu, 2u, 2u, 3u)},              // MADD.xz vf3, vf2, vf2
++                {0u, makeVuUpper(0x00u, 0xAu, 2u, 2u, 4u)},              // ADDx.xz vf4, vf2, vf2x
++                {0u, makeVuUpper(0x1Cu, 0xAu, 0u, 2u, 5u)},              // MULq.xz vf5, vf2, Q
++                {0u, makeVuUpper(0x1Eu, 0xAu, 0u, 2u, 6u)},              // MULi.xz vf6, vf2, I
++                {0u, makeVuUpper(0x2Au, 0xAu, 3u, 2u, 7u)},              // MUL.xz vf7, vf2, vf3
++                {makeVuSq(0xFu, 8u, 7u, 0), makeVuUpper(0x28u, 0xAu, 2u, 2u, 8u)}, // SQ vf8, 0(vi7) | ADD.xz vf8
++            };
++            const auto setup = [d](VU1State &s)
++            {
++                const uint32_t vf1[4] = {probeBitsOf(1.0f), d, probeBitsOf(2.0f), d};
++                const uint32_t other[4] = {0u, d, 0u, d};
++                std::memcpy(s.vf[1], vf1, 16u);
++                for (uint32_t r = 2u; r <= 8u; ++r)
++                    std::memcpy(s.vf[r], other, 16u);
++                std::memcpy(s.acc, other, 16u);
++                s.q = 0.5f;
++                s.i = 3.0f;
++                s.vi[7] = 24;
++            };
++            for (const bool readFlags : {false, true})
++                for (const int mode : {0, 186})
++                {
++                    const uint32_t runs = runDenormalLaneProbe(
++                        t, pairs, readFlags, mode, setup, [&t, d](const VU1State &s, const uint8_t *data)
++                    {
++                        const auto f = probeBitsOf;
++                        t.IsTrue(probeLanesAre(s.vf[2], f(2.0f), d, f(4.0f), d), "ADD.xz should write x and z of vf2");
++                        t.IsTrue(probeLanesAre(s.acc, f(4.0f), d, f(16.0f), d), "MULA.xz should write x and z of ACC");
++                        t.IsTrue(probeLanesAre(s.vf[3], f(8.0f), d, f(32.0f), d), "MADD.xz should add ACC in x and z");
++                        t.IsTrue(probeLanesAre(s.vf[4], f(4.0f), d, f(6.0f), d), "ADDx.xz should add vf2.x");
++                        t.IsTrue(probeLanesAre(s.vf[5], f(1.0f), d, f(2.0f), d), "MULq.xz should multiply by Q");
++                        t.IsTrue(probeLanesAre(s.vf[6], f(6.0f), d, f(12.0f), d), "MULi.xz should multiply by I");
++                        t.IsTrue(probeLanesAre(s.vf[7], f(16.0f), d, f(128.0f), d), "MUL.xz should multiply vf2 by vf3");
++                        t.IsTrue(probeLanesAre(s.vf[8], f(4.0f), d, f(8.0f), d), "the late ADD.xz should write vf8");
++                        float stored[4];
++                        readVuQword(data, 24u, stored);
++                        t.IsTrue(probeLanesAre(stored, 0u, d, 0u, d), "SQ should store vf8 before its upper wrote it");
++                    });
++                    if (mode == 0)
++                        t.Equals(runs, 0u, "no SSE instruction should see the denormal lanes");
++                    else
++                        t.IsTrue(runs != 0u, "A/B mode 186 should still compute the unwritten lanes, as before");
++                }
++        });
++
++        // Patch 0224 (verification, A3): the compiled FTOI of a partial destination whose source lanes are known
++        // normal (written by a FMAC) reads it raw, and before it multiplied and compared all four lanes, integer data
++        // (denormal as floats) included. Now those lanes are zeroed first, early and late (the SQ of FTOI4's pair
++        // reads its destination). Results identical in mode 0 and in A/B mode 186 (previous code: DE set).
++        tc.Run("VU1 compiled partial FTOI leaves unwritten denormal lanes out of the arithmetic", [](TestCase &t)
++        {
++            const uint32_t d = kProbeDenormal;
++            const std::vector<std::array<uint32_t, 2>> pairs = {
++                {0u, makeVuUpper(0x28u, 0xAu, 1u, 1u, 2u)},                            // ADD.xz vf2, vf1, vf1
++                {0u, makeVuUpperSpecial(0x14u, 0xAu, 3u, 2u)},                         // FTOI0.xz vf3, vf2
++                {makeVuSq(0xFu, 4u, 7u, 0), makeVuUpperSpecial(0x15u, 0xAu, 4u, 2u)}, // SQ vf4 | FTOI4.xz vf4, vf2
++            };
++            const auto setup = [d](VU1State &s)
++            {
++                const uint32_t vf1[4] = {probeBitsOf(1.0f), d, probeBitsOf(2.0f), d};
++                const uint32_t other[4] = {0u, d, 0u, d};
++                std::memcpy(s.vf[1], vf1, 16u);
++                for (uint32_t r = 2u; r <= 4u; ++r)
++                    std::memcpy(s.vf[r], other, 16u);
++                s.vi[7] = 24;
++            };
++            for (const bool readFlags : {false, true})
++                for (const int mode : {0, 186})
++                {
++                    const uint32_t runs = runDenormalLaneProbe(
++                        t, pairs, readFlags, mode, setup, [&t, d](const VU1State &s, const uint8_t *data)
++                    {
++                        t.IsTrue(probeLanesAre(s.vf[2], probeBitsOf(2.0f), d, probeBitsOf(4.0f), d),
++                                 "ADD.xz should write x and z of vf2");
++                        t.IsTrue(probeLanesAre(s.vf[3], 2u, d, 4u, d), "FTOI0.xz should write x and z of vf3 only");
++                        t.IsTrue(probeLanesAre(s.vf[4], 32u, d, 64u, d), "FTOI4.xz should write x and z of vf4 only");
++                        float stored[4];
++                        readVuQword(data, 24u, stored);
++                        t.IsTrue(probeLanesAre(stored, 0u, d, 0u, d), "SQ should store vf4 before FTOI4 wrote it");
++                    });
++                    if (mode == 0)
++                        t.Equals(runs, 0u, "no SSE instruction should see the denormal lanes");
++                    else
++                        t.IsTrue(runs != 0u, "A/B mode 186 should still convert the unwritten lanes, as before");
++                }
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;
