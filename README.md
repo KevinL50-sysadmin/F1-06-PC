@@ -52,8 +52,8 @@ with its own fonts, colours and controller navigation: no overlays, no external 
 |---|---|
 | ![Photo mode with its control bar: the pack under the Bridgestone bridge at Hockenheim](docs/lanzamiento/img/v113-modo-foto-barra-hockenheim-peloton-x4.png) | ![First-lap pack through the hairpin at Montreal](docs/lanzamiento/img/v113-montreal-varios-horquilla-x4.png) |
 | *Photo mode with its control bar, Hockenheim* | *First lap through the hairpin, Montreal* |
-| ![Replay with its control bar: rewind, fast-forward, cameras and photo mode, the Honda kicking up dust at Montreal](docs/lanzamiento/img/v113-repeticion-barra-montreal-honda-x4.png) | ![Ferrari, Renault, McLaren and Honda through the hairpin at Sepang](docs/lanzamiento/img/v113-sepang-ferrari-renault-curva-x4.png) |
-| *Replay with its control bar, Montreal* | *Hairpin battle, Sepang* |
+| ![Replay with its control bar: rewind, fast-forward, cameras and photo mode, the Honda kicking up dust at Montreal](docs/lanzamiento/img/v113-repeticion-barra-montreal-honda-x4.png) | ![Onboard the Renault on the Silverstone grid, five red lights, the pack ahead](docs/lanzamiento/img/v112-semaforo-cabina-x4-doble.png) |
+| *Replay with its control bar, Montreal* | *Onboard, start lights at Silverstone* |
 | ![Ferrari and Renault through the Loews hairpin at Monaco, TV camera](docs/lanzamiento/img/v112-monaco-ferrari-horquilla-x4.png) | ![PC GRAPHICS page inside the game's OPTIONS menu](docs/lanzamiento/img/v112-menu-pc-graphics.png) |
 | *Loews hairpin, Monaco, TV camera* | *PC GRAPHICS, a native page in the game's OPTIONS menu* |
 
