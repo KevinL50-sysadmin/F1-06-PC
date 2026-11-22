@@ -1,0 +1,641 @@
+diff --git a/ps2xRuntime/include/ps2_salida.h b/ps2xRuntime/include/ps2_salida.h
+index 03dc544..54af76e 100644
+--- a/ps2xRuntime/include/ps2_salida.h
++++ b/ps2xRuntime/include/ps2_salida.h
+@@ -1,7 +1,9 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+ 
+ // Salida del proceso (odd/tasks/fallos-con-log.md T2). RecompLauncher solo adjunta el .log mas reciente a un informe
+ // de fallo cuando el juego termina con un codigo distinto de 0, asi que un fallo anota aqui su codigo y su motivo, y la
+@@ -44,9 +46,21 @@ namespace ps2x::salida
+ 
+     // Con una fuente registrada, escribe primero "[salida] partida: <resumen>"; despues, siempre,
+     // "[salida] motivo=<motivo> codigo=<codigo>" en std::cout, y vacia std::cout y std::cerr (std::_Exit no vacia
+-    // nada).
++    // nada). Las mismas lineas van tambien a la consola guardada (aLaConsola).
+     void escribir(int codigo, const char *motivo);
+ 
+-    // Solo para las pruebas: vuelve al estado sin fallo y sin fuente de la partida.
++    // lanzamiento-1.1.4 S2: con el registro abierto (F1-06.log), un resumen corto sale tambien por la salida de antes
++    // (la consola, o la tuberia de RecompLauncher, que a veces adjunta eso en vez del registro: informe #147208): la
++    // cabecera ([version], [sistema], [opciones]), las lineas [salida] y la primera linea de un fallo. El registro no
++    // cambia.
++    // guardarConsola: copia (DuplicateHandle) el manejador de la salida estandar de ahora, antes de que main.cpp la
++    // lleve al registro. Sin manejador valido (sin consola) no guarda nada y devuelve false. Solo Windows.
++    bool guardarConsola();
++    // Escribe texto tal cual en la consola guardada, sin bufer (WriteFile: ya va vaciado), sin el CRT ni reservar
++    // memoria (vale en un filtro de excepciones). Sin consola guardada no hace nada; un error de escritura se ignora.
++    void aLaConsola(const char *texto, size_t largo);
++    void aLaConsola(std::string_view texto);
++
++    // Solo para las pruebas: vuelve al estado sin fallo, sin fuente de la partida y sin consola guardada.
+     void reiniciarParaPruebas();
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+index 788d873..55c22c4 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_bridge.h
+@@ -73,7 +73,7 @@ uint32_t ps2GsGpuQualityIgnoredWarnings();
+ // <exe>\cache, installed LocalAppData\F1-06\cache, development next to the runner) before creating the device; the
+ // DLL only uses it on the GPU and driver it was saved on. It is saved again when the driver's cache grew, by a thread
+ // of its own that looks every 10 s: once it stopped growing (or every minute while it keeps growing), so that a crash
+-// keeps it; and at shutdown. Always written atomically. At 4x it is ~50 MB (paraLLEl-GS precompiles its shader
++// keeps it; and at the normal close (ps2GsGpuSavePipelineCacheAtExit) or at shutdown. Always written atomically. At 4x it is ~50 MB (paraLLEl-GS precompiles its shader
+ // variants).
+ // PS2X_GS_GPU_CACHE=0: no cache; =<file>: that file instead.
+ // The file: a 64-byte header ("PS2XVKPC", format version 1, header size, the device, the payload's size and a 64-bit
+@@ -117,6 +117,10 @@ public:
+     GSGpuDeviceIdentity DeviceIdentity() const;
+     // What became of the pipeline cache file at creation (Valid: loaded).
+     GSGpuPipelineCacheStatus PipelineCacheStatus() const;
++    // lanzamiento-1.1.4 S3: stops the saver thread and writes the pipeline cache now if it changed since it was loaded
++    // or last written; the device keeps running. Only the first call (or the destructor, which does the same on the GS
++    // GPU thread) saves; later ones do nothing. True when it wrote the file.
++    bool FinishPipelineCache();
+ 
+     // The quality in use (superSampling as the GPU runs it: at most its top rate).
+     GSGpuQuality Quality() const;
+@@ -177,3 +181,12 @@ uint32_t ps2GsGpuFallbackWarnings();
+ // Phase 3 (T3): the backend ps2GsCreateRequestedGpuBackend made, while it lives (null with the CPU GS). The options
+ // menu changes its quality (SetQuality) while the game runs.
+ GSGpuBackend *ps2GsActiveGpuBackend();
++
++// lanzamiento-1.1.4 S3: main ends with std::_Exit (patch 0212), which never destroys the runtime and with it the GPU
++// backend, whose shutdown saved the pipeline cache: a session under the saver's first check (10 s), or one whose cache
++// was still growing, lost what it compiled. The normal close (main.cpp, after runtime.run() with exit code 0, before
++// the [salida] line) saves it here, once (FinishPipelineCache). False without a GPU backend or with nothing to write.
++// Not on the failure paths (a noted failure, the exception filter, the 10 s timeout of a game thread that does not
++// stop): there the GPU thread or the heap may be what failed; the saver thread already kept the cache up to its last
++// check.
++bool ps2GsGpuSavePipelineCacheAtExit();
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+index 2610314..f63544c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_bridge.cpp
+@@ -562,11 +562,14 @@ struct GSGpuBackend::Impl
+     // The pipeline cache (empty path: none); its payload size as loaded or last saved, and the thread writing it.
+     std::filesystem::path pipelineCacheFile;
+     GSGpuPipelineCacheStatus pipelineCacheStatus = GSGpuPipelineCacheStatus::Missing;
+-    size_t pipelineCacheSize = 0u; // the saver thread's, then the GS GPU thread's after joining it
++    size_t pipelineCacheSize = 0u; // the saver thread's, then finishPipelineCache's after joining it
+     std::thread pipelineCacheSaver;
+     std::mutex pipelineCacheMutex;
+     std::condition_variable pipelineCacheWake;
+     bool pipelineCacheStop = false;
++    // lanzamiento-1.1.4 S3: the last save (finishPipelineCache) runs once, from the normal close or the GS GPU thread.
++    std::mutex pipelineCacheFinishMutex;
++    bool pipelineCacheFinished = false;
+ 
+     // The queue: producers append records to pending under mutex, the GS GPU thread swaps it with working.
+     std::thread worker;
+@@ -1095,30 +1098,33 @@ struct GSGpuBackend::Impl
+             std::fprintf(stderr, "[gs:traza] fin (%u paquetes)\n", trace.packetIndex);
+     }
+ 
+-    // Writes the driver's pipeline cache if its size changed since it was loaded or written (the saver thread, or the
+-    // GS GPU thread at shutdown). The copy alone takes ~60-75 ms for the ~50 MB of a 4x session: not on the GS GPU
+-    // thread while the game runs.
+-    void savePipelineCache()
++    // Writes the driver's pipeline cache if its size changed since it was loaded or written (the saver thread, or
++    // finishPipelineCache at the normal close or at shutdown). True when it wrote the file. The copy alone takes
++    // ~60-75 ms for the ~50 MB of a 4x session: not on the GS GPU thread while the game runs.
++    bool savePipelineCache()
+     {
+         const int64_t start = nowNs();
+         const size_t size = api.get_pipeline_cache_size(context);
+         if (size == 0u || size == pipelineCacheSize)
+-            return;
++            return false;
+         size_t copied = 0u;
+         const auto *data = static_cast<const uint8_t *>(api.get_pipeline_cache(context, &copied));
+         if (data == nullptr || copied == 0u)
+-            return;
++            return false;
+         pipelineCacheSize = copied;
+         const std::vector<uint8_t> bytes =
+             ps2GsGpuEncodePipelineCache(deviceIdentity, std::vector<uint8_t>(data, data + copied));
+         const double copyMs = static_cast<double>(nowNs() - start) / 1e6;
+         std::string error;
+-        if (ps2GsGpuWriteFileAtomically(pipelineCacheFile, bytes, error))
+-            std::fprintf(stderr, "[gs:gpu] cache de pipelines guardada: %s (%.0f KB; copia %.1f ms, total %.1f ms)\n",
+-                         ps2x::pathForLog(pipelineCacheFile).c_str(), static_cast<double>(bytes.size()) / 1024.0, copyMs,
+-                         static_cast<double>(nowNs() - start) / 1e6);
+-        else
++        if (!ps2GsGpuWriteFileAtomically(pipelineCacheFile, bytes, error))
++        {
+             std::fprintf(stderr, "[gs:gpu] no se pudo guardar la cache de pipelines: %s\n", error.c_str());
++            return false;
++        }
++        std::fprintf(stderr, "[gs:gpu] cache de pipelines guardada: %s (%.0f KB; copia %.1f ms, total %.1f ms)\n",
++                     ps2x::pathForLog(pipelineCacheFile).c_str(), static_cast<double>(bytes.size()) / 1024.0, copyMs,
++                     static_cast<double>(nowNs() - start) / 1e6);
++        return true;
+     }
+ 
+     // The saver thread (see kPipelineCacheCheck), so that a crash or a killed process keeps the cache.
+@@ -1142,6 +1148,24 @@ struct GSGpuBackend::Impl
+         }
+     }
+ 
++    // lanzamiento-1.1.4 S3: stops the saver thread and saves a last time if the cache changed (savePipelineCache),
++    // once: at the normal close (GSGpuBackend::FinishPipelineCache, with the device still running) or at shutdown on
++    // the GS GPU thread, before the context is destroyed. True when a file was written.
++    bool finishPipelineCache()
++    {
++        std::lock_guard<std::mutex> finish(pipelineCacheFinishMutex);
++        if (pipelineCacheFinished || !pipelineCacheSaver.joinable())
++            return false;
++        pipelineCacheFinished = true;
++        {
++            std::lock_guard<std::mutex> lock(pipelineCacheMutex);
++            pipelineCacheStop = true;
++        }
++        pipelineCacheWake.notify_all();
++        pipelineCacheSaver.join();
++        return savePipelineCache();
++    }
++
+     void workerLoop()
+     {
+         t_onGpuThread = true;
+@@ -1232,16 +1256,7 @@ struct GSGpuBackend::Impl
+             busyNs += static_cast<uint64_t>(end - start);
+             report(end);
+         }
+-        if (pipelineCacheSaver.joinable())
+-        {
+-            {
+-                std::lock_guard<std::mutex> lock(pipelineCacheMutex);
+-                pipelineCacheStop = true;
+-            }
+-            pipelineCacheWake.notify_all();
+-            pipelineCacheSaver.join();
+-            savePipelineCache();
+-        }
++        finishPipelineCache();
+         api.destroy(context);
+         context = nullptr;
+     }
+@@ -1427,6 +1442,17 @@ GSGpuPipelineCacheStatus GSGpuBackend::PipelineCacheStatus() const
+     return m_impl->pipelineCacheStatus;
+ }
+ 
++bool GSGpuBackend::FinishPipelineCache()
++{
++    return m_impl->finishPipelineCache();
++}
++
++bool ps2GsGpuSavePipelineCacheAtExit()
++{
++    GSGpuBackend *backend = g_activeGpuBackend.load();
++    return backend != nullptr && backend->FinishPipelineCache();
++}
++
+ GSGpuQuality GSGpuBackend::Quality() const
+ {
+     std::lock_guard<std::mutex> lock(m_impl->qualityMutex);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index dfee9c1..20c4cb9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3958,6 +3958,7 @@ void PS2Runtime::run()
+         catch (const std::exception &e)
+         {
+             std::cerr << "Error during program execution: " << e.what() << std::endl;
++            ps2x::salida::aLaConsola(std::string("Error during program execution: ") + e.what() + "\n"); // 1.1.4 S2
+             ReportGameThreadException(); // T3b
+             // odd/tasks/fallos-con-log.md T2: el proceso sale distinto de 0 (RecompLauncher adjunta el registro).
+             ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+@@ -3965,6 +3966,7 @@ void PS2Runtime::run()
+         catch (...)
+         {
+             std::cerr << "Error during program execution: unknown exception" << std::endl;
++            ps2x::salida::aLaConsola("Error during program execution: unknown exception\n"); // 1.1.4 S2
+             ReportGameThreadException(); // T3b
+             ps2x::salida::anotarFallo(ps2x::salida::kExcepcionJuego, "excepcion-hilo-juego");
+         }
+@@ -4175,6 +4177,7 @@ void PS2Runtime::run()
+             if (ps2x::vigilante::latidoParado("EE"))
+             {
+                 std::cout << "[salida] el EE sigue colgado al cerrar la ventana" << std::endl;
++                ps2x::salida::aLaConsola("[salida] el EE sigue colgado al cerrar la ventana\n"); // 1.1.4 S2
+                 ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "cuelgue-al-cerrar");
+             }
+             // L14: la imagen lleva el umbral del vigilante sin cambiar (p. ej. el menu congelado tras un error de Lua
+@@ -4182,6 +4185,7 @@ void PS2Runtime::run()
+             else if (ps2x::vigilante::latidoParado("pantalla"))
+             {
+                 std::cout << "[salida] la imagen sigue parada al cerrar la ventana" << std::endl;
++                ps2x::salida::aLaConsola("[salida] la imagen sigue parada al cerrar la ventana\n"); // 1.1.4 S2
+                 ps2x::salida::anotarFallo(ps2x::salida::kCuelgueAlCerrar, "imagen-parada-al-cerrar");
+             }
+             requestStop();
+diff --git a/ps2xRuntime/src/lib/ps2_salida.cpp b/ps2xRuntime/src/lib/ps2_salida.cpp
+index c0b3c90..2f16705 100644
+--- a/ps2xRuntime/src/lib/ps2_salida.cpp
++++ b/ps2xRuntime/src/lib/ps2_salida.cpp
+@@ -6,6 +6,17 @@
+ #include <cstring>
+ #include <iostream>
+ #include <mutex>
++#include <string>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ namespace ps2x::salida
+ {
+@@ -15,6 +26,10 @@ namespace ps2x::salida
+         int g_codigo = 0;
+         char g_motivo[64] = "normal";
+         std::atomic<FuentePartida> g_fuente{nullptr};
++#if defined(_WIN32)
++        // lanzamiento-1.1.4 S2: la copia del manejador de stdout de antes del registro (nullptr: ninguna).
++        std::atomic<HANDLE> g_consola{nullptr};
++#endif
+     }
+ 
+     void anotarFallo(int codigo, const char *motivo)
+@@ -64,11 +79,66 @@ namespace ps2x::salida
+ 
+     void escribir(int codigo, const char *motivo)
+     {
++        std::string lineas;
+         if (const FuentePartida fuente = g_fuente.load())
+-            std::cout << "[salida] partida: " << resumen(fuente()) << "\n";
+-        std::cout << "[salida] motivo=" << (motivo != nullptr ? motivo : "normal") << " codigo=" << codigo << "\n";
++            lineas = "[salida] partida: " + resumen(fuente()) + "\n";
++        lineas += std::string("[salida] motivo=") + (motivo != nullptr ? motivo : "normal") + " codigo=" +
++                  std::to_string(codigo) + "\n";
++        std::cout << lineas;
+         std::cout.flush();
+         std::cerr.flush();
++        aLaConsola(lineas);
++    }
++
++    bool guardarConsola()
++    {
++#if defined(_WIN32)
++        const HANDLE salida = GetStdHandle(STD_OUTPUT_HANDLE);
++        if (salida == nullptr || salida == INVALID_HANDLE_VALUE)
++            return false;
++        HANDLE copia = nullptr;
++        if (!DuplicateHandle(GetCurrentProcess(), salida, GetCurrentProcess(), &copia, 0, FALSE,
++                             DUPLICATE_SAME_ACCESS) ||
++            copia == nullptr)
++            return false;
++        // Una tuberia (RecompLauncher, o un programa que la lee) que nadie vacia no para el juego: sin espera, lo que
++        // no cabe se pierde (el registro lo tiene). Tras abrir el registro solo esta copia escribe en ella.
++        if (GetFileType(copia) == FILE_TYPE_PIPE)
++        {
++            DWORD modo = PIPE_READMODE_BYTE | PIPE_NOWAIT;
++            SetNamedPipeHandleState(copia, &modo, nullptr, nullptr);
++        }
++        if (const HANDLE antes = g_consola.exchange(copia))
++            CloseHandle(antes);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    void aLaConsola(const char *texto, size_t largo)
++    {
++#if defined(_WIN32)
++        const HANDLE consola = g_consola.load();
++        if (consola == nullptr || texto == nullptr)
++            return;
++        while (largo > 0u)
++        {
++            DWORD escritos = 0;
++            const DWORD pedazo = largo > 65536u ? 65536u : static_cast<DWORD>(largo);
++            if (!WriteFile(consola, texto, pedazo, &escritos, nullptr) || escritos == 0)
++                return; // sin lector (tuberia cerrada) o consola ya cerrada: el registro tiene lo mismo
++            texto += escritos;
++            largo -= escritos;
++        }
++#else
++        (void)texto, (void)largo;
++#endif
++    }
++
++    void aLaConsola(std::string_view texto)
++    {
++        aLaConsola(texto.data(), texto.size());
+     }
+ 
+     void reiniciarParaPruebas()
+@@ -77,5 +147,9 @@ namespace ps2x::salida
+         g_codigo = 0;
+         std::strcpy(g_motivo, "normal");
+         g_fuente.store(nullptr);
++#if defined(_WIN32)
++        if (const HANDLE consola = g_consola.exchange(nullptr))
++            CloseHandle(consola);
++#endif
+     }
+ }
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index b728d00..e2b6e70 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -11,6 +11,7 @@
+ #include "ps2_cabecera.h"
+ #include "ps2_fallo.h"
+ #include "runtime/ps2_ab.h" // g_ps2DisplayFlips: latido "pantalla" del vigilante (fallos-con-log L14)
++#include "runtime/gs/gs_gpu_bridge.h" // ps2GsGpuSavePipelineCacheAtExit (lanzamiento-1.1.4 S3)
+ #include "ps2x/iop/ps2_iso_image.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -137,6 +138,8 @@ namespace
+         void *thrown[48];
+         const int thrownCount = ps2x::fallo::pilaDelLanzamiento(thrown, 48, true);
+         ps2x::fallo::escribirLinea("[terminate] ", "abort() (std::terminate en un hilo sin manejador propio, o abort)");
++        // lanzamiento-1.1.4 S2: the first line also on the console the game had before the log.
++        ps2x::salida::aLaConsola("[terminate] abort() (std::terminate en un hilo sin manejador propio, o abort)\n");
+         if (thrownType != nullptr)
+         {
+             ps2x::fallo::escribirLinea("[terminate] ultimo throw de este hilo: ", thrownType);
+@@ -160,6 +163,7 @@ namespace
+                                void *thrown[48];
+                                const int thrownCount = ps2x::fallo::pilaDelLanzamiento(thrown, 48, true);
+                                std::cerr << "[terminate] unhandled exception" << std::endl;
++                               ps2x::salida::aLaConsola("[terminate] unhandled exception\n"); // 1.1.4 S2
+                                const std::exception_ptr ep = std::current_exception();
+                                if (ep)
+                                {
+@@ -234,6 +238,8 @@ namespace
+         if (std::filesystem::exists(log, error))
+             std::filesystem::rename(log, directory / (logName + ".anterior.log"), error);
+         std::cout << "[registro] " << ps2x::pathForLog(log) << std::endl;
++        // lanzamiento-1.1.4 S2: a copy of this output, for the short summary (ps2_salida.h, aLaConsola).
++        ps2x::salida::guardarConsola();
+         FILE *out = nullptr;
+         if (_wfreopen_s(&out, log.c_str(), L"w", stdout) != 0 || out == nullptr)
+             return;
+@@ -242,7 +248,12 @@ namespace
+         char stamp[32] = {};
+         std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+         std::cout << "[registro] " << stamp << " " << ps2x::pathForLog(executable) << std::endl;
+-        ps2x::cabecera::escribir(std::cout);
++        // lanzamiento-1.1.4 S2: the header ([version], [sistema], [opciones] efectivas) also on that console.
++        std::ostringstream cabecera;
++        ps2x::cabecera::escribir(cabecera);
++        std::cout << cabecera.str();
++        std::cout.flush();
++        ps2x::salida::aLaConsola(cabecera.str());
+ #else
+         (void)executable;
+         (void)directory;
+@@ -800,7 +811,12 @@ int main(int argc, char *argv[])
+ #endif
+         // odd/tasks/fallos-con-log.md T2: 0 en el cierre normal; un fallo anotado (ps2_salida.h) sale con su codigo
+         // para que RecompLauncher adjunte el registro. La ultima linea del registro dice el motivo.
++        // lanzamiento-1.1.4 S3: std::_Exit never destroys runtime (and with it the GPU backend, whose shutdown saved
++        // the Vulkan pipeline cache): on the normal close (code 0) it is saved here if it changed, before the [salida]
++        // line, which stays the last. Not after a noted failure (game thread exception, the game's exit(), a hang).
+         const int codigoSalida = ps2x::salida::codigo();
++        if (codigoSalida == 0)
++            ps2GsGpuSavePipelineCacheAtExit();
+         ps2x::salida::escribir(codigoSalida, ps2x::salida::motivo());
+         std::cout.flush();
+         std::cerr.flush();
+@@ -814,6 +830,7 @@ int main(int argc, char *argv[])
+         for (const std::string &line : pathLines)
+             std::cout << line << std::endl;
+         std::cerr << "[main] fatal exception: " << e.what() << std::endl;
++        ps2x::salida::aLaConsola(std::string("[main] fatal exception: ") + e.what() + "\n"); // 1.1.4 S2
+     }
+     catch (...)
+     {
+@@ -823,6 +840,7 @@ int main(int argc, char *argv[])
+         for (const std::string &line : pathLines)
+             std::cout << line << std::endl;
+         std::cerr << "[main] fatal exception: unknown" << std::endl;
++        ps2x::salida::aLaConsola("[main] fatal exception: unknown\n"); // 1.1.4 S2
+     }
+ 
+     ps2x::salida::escribir(1, "error-fatal");
+diff --git a/ps2xTest/src/ps2_gs_gpu_tests.cpp b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+index 2b9da58..3a94207 100644
+--- a/ps2xTest/src/ps2_gs_gpu_tests.cpp
++++ b/ps2xTest/src/ps2_gs_gpu_tests.cpp
+@@ -968,6 +968,45 @@ void register_ps2_gs_gpu_tests()
+             t.IsTrue(second && ps2GsGpuSameDevice(second->DeviceIdentity(), saved), "saved on this device");
+         });
+ 
++        // lanzamiento-1.1.4 S3: main ends with std::_Exit, so the destructor never saves on a normal close.
++        tc.Run("FinishPipelineCache saves the cache while the device lives, once", [](TestCase &t)
++        {
++            ScratchDir dir;
++            const fs::path file = dir.path / "cache" / "vulkan-pipelines.bin";
++            ScopedEnvironment cache("PS2X_GS_GPU_CACHE", file.string().c_str());
++            std::unique_ptr<GSGpuBackend> backend = testGpuBackend();
++            if (!backend)
++                return;
++            std::vector<uint8_t> vram = testFrameVram(640u, 448u);
++            backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            gpuScanout(*backend, f1Request());
++            t.IsFalse(fs::exists(file), "nothing saved before the close (under the saver's 10 s)");
++
++            t.IsTrue(backend->FinishPipelineCache(), "saved at the close");
++            GSGpuDeviceIdentity saved{};
++            std::vector<uint8_t> payload;
++            const std::vector<uint8_t> bytes = readBytes(file);
++            t.IsTrue(ps2GsGpuDecodePipelineCache(bytes, nullptr, saved, payload) == GSGpuPipelineCacheStatus::Valid,
++                     "a valid file with the device still alive (" + std::to_string(bytes.size()) + " bytes)");
++            t.IsTrue(ps2GsGpuSameDevice(saved, backend->DeviceIdentity()), "saved on this device");
++
++            fs::remove(file);
++            t.IsFalse(backend->FinishPipelineCache(), "a second call does nothing");
++            gpuScanout(*backend, f1Request());
++            backend.reset();
++            t.IsFalse(fs::exists(file), "and neither does the destructor after it");
++
++            std::unique_ptr<GSGpuBackend> second = testGpuBackend();
++            t.IsTrue(second && second->PipelineCacheStatus() == GSGpuPipelineCacheStatus::Missing,
++                     "the next device finds no file");
++        });
++
++        tc.Run("without a GPU backend saving the pipeline cache at exit does nothing", [](TestCase &t)
++        {
++            t.IsTrue(ps2GsActiveGpuBackend() == nullptr, "no active GPU backend in the tests");
++            t.IsFalse(ps2GsGpuSavePipelineCacheAtExit(), "nothing to save");
++        });
++
+         tc.Run("a pipeline cache of another device is discarded and replaced", [](TestCase &t)
+         {
+             ScratchDir dir;
+diff --git a/ps2xTest/src/ps2_salida_tests.cpp b/ps2xTest/src/ps2_salida_tests.cpp
+index fdc4497..653e6e8 100644
+--- a/ps2xTest/src/ps2_salida_tests.cpp
++++ b/ps2xTest/src/ps2_salida_tests.cpp
+@@ -7,6 +7,16 @@
+ #include <sstream>
+ #include <string>
+ 
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ // odd/tasks/fallos-con-log.md T2 (S1, S2): a failure exits non-zero so RecompLauncher attaches F1-06.log; a hang
+ // counts only while it is still going on when the player closes the game.
+ namespace
+@@ -27,6 +37,54 @@ namespace
+     {
+         (void)detector.muestra(now, &counter);
+     }
++
++#if defined(_WIN32)
++    // lanzamiento-1.1.4 S2: an anonymous pipe stands for the console (or RecompLauncher's pipe) while
++    // guardarConsola copies the standard output handle; the process's own standard output is put back right after.
++    struct ConsolaDePrueba
++    {
++        HANDLE leer = nullptr;
++        HANDLE escribir = nullptr;
++        bool guardada = false;
++
++        explicit ConsolaDePrueba(bool conManejador)
++        {
++            if (conManejador && !CreatePipe(&leer, &escribir, nullptr, 1u << 16))
++                leer = escribir = nullptr;
++            const HANDLE antes = GetStdHandle(STD_OUTPUT_HANDLE);
++            SetStdHandle(STD_OUTPUT_HANDLE, conManejador ? escribir : nullptr);
++            guardada = ps2x::salida::guardarConsola();
++            SetStdHandle(STD_OUTPUT_HANDLE, antes);
++            if (escribir != nullptr)
++                CloseHandle(escribir); // only the saved copy keeps the pipe open now
++            escribir = nullptr;
++        }
++
++        ~ConsolaDePrueba()
++        {
++            ps2x::salida::reiniciarParaPruebas();
++            if (leer != nullptr)
++                CloseHandle(leer);
++        }
++
++        // What reached the pipe so far (without waiting).
++        std::string leido() const
++        {
++            std::string texto;
++            DWORD hay = 0;
++            while (leer != nullptr && PeekNamedPipe(leer, nullptr, 0, nullptr, &hay, nullptr) && hay > 0)
++            {
++                char bufer[512];
++                DWORD n = 0;
++                if (!ReadFile(leer, bufer, hay < sizeof(bufer) ? hay : static_cast<DWORD>(sizeof(bufer)), &n, nullptr) ||
++                    n == 0)
++                    break;
++                texto.append(bufer, n);
++            }
++            return texto;
++        }
++    };
++#endif
+ }
+ 
+ void register_ps2_salida_tests()
+@@ -139,6 +197,84 @@ void register_ps2_salida_tests()
+         });
+     });
+ 
++#if defined(_WIN32)
++    // lanzamiento-1.1.4 S2: with the log open, a short summary also reaches the standard output the game had before
++    // (RecompLauncher sometimes attaches that instead of F1-06.log, report #147208).
++    MiniTest::Case("SalidaConsola", [](TestCase &tc)
++    {
++        tc.BeforeEach([]() { ps2x::salida::reiniciarParaPruebas(); });
++
++        tc.Run("the exit lines go to the saved console as well as to the log", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            t.IsTrue(consola.guardada, "the standard output handle is saved");
++            ps2x::salida::registrarPartida([]
++            {
++                ps2x::salida::Partida p;
++                p.segundos = 20.0;
++                p.fotogramas = 600u;
++                return p;
++            });
++            const std::string log = written(0, "normal");
++            const std::string lineas =
++                "[salida] partida: estado=menu duracion=20s fotogramas=600 fps_media=30.0\n"
++                "[salida] motivo=normal codigo=0\n";
++            t.Equals(log, lineas, "the log is unchanged");
++            t.Equals(consola.leido(), lineas, "the same two lines on the console, already flushed");
++        });
++
++        tc.Run("a failure's exit line reaches the console too", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            (void)written(12, "cuelgue-al-cerrar");
++            t.Equals(consola.leido(), std::string("[salida] motivo=cuelgue-al-cerrar codigo=12\n"), "reason and code");
++        });
++
++        tc.Run("aLaConsola writes the text as it is", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            ps2x::salida::aLaConsola("[version] 1.1.4 git=abc\n[sistema] windows=10\n");
++            ps2x::salida::aLaConsola("[fallo] excepcion 0xc0000005\n", 13u);
++            t.Equals(consola.leido(), std::string("[version] 1.1.4 git=abc\n[sistema] windows=10\n[fallo] excep"),
++                     "both texts, the second cut at its length");
++        });
++
++        tc.Run("without a console nothing is saved and writing does nothing", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(false);
++            t.IsFalse(consola.guardada, "no handle: nothing saved");
++            ps2x::salida::aLaConsola("[salida] motivo=normal codigo=0\n");
++            t.Equals(written(0, "normal"), std::string("[salida] motivo=normal codigo=0\n"), "the log still has it");
++        });
++
++        tc.Run("a console whose reader is gone does not stop the exit", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            CloseHandle(consola.leer);
++            consola.leer = nullptr;
++            t.Equals(written(0, "normal"), std::string("[salida] motivo=normal codigo=0\n"), "the log still has it");
++        });
++
++        tc.Run("a full pipe nobody reads does not block the exit", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            ps2x::salida::aLaConsola(std::string(1u << 20, 'x')); // 1 MB into a 64 KB pipe nobody reads
++            t.Equals(written(0, "normal"), std::string("[salida] motivo=normal codigo=0\n"), "the log still has it");
++            const std::string leido = consola.leido();
++            t.IsTrue(!leido.empty() && leido.size() < (1u << 20), "what fitted (" + std::to_string(leido.size()) +
++                                                                       " bytes), the rest dropped");
++        });
++
++        tc.Run("resetting for tests drops the saved console", [](TestCase &t)
++        {
++            ConsolaDePrueba consola(true);
++            ps2x::salida::reiniciarParaPruebas();
++            (void)written(0, "normal");
++            t.Equals(consola.leido(), std::string(), "nothing on the old console");
++        });
++    });
++#endif
++
+     MiniTest::Case("VigilanteParado", [](TestCase &tc)
+     {
+         tc.Run("not stalled while advancing or before the threshold", [](TestCase &t)

@@ -67,7 +67,7 @@ revisados=(
     scripts/lua_volcados.py scripts/medir-carrera.ps1 scripts/medir-menus.ps1 scripts/mips_dis.py scripts/mosaico.ps1
     scripts/obtener-parallel-gs.ps1 scripts/pct_decodificar.py scripts/perfil.cpp scripts/pgs-reproducir.ps1
     scripts/pila.cpp scripts/probar-circuitos.ps1 scripts/probar-modo.ps1
-    scripts/probar-red.ps1 scripts/prueba_ipu.cpp scripts/prueba_tablas_gs.cpp scripts/prueba_vu1.cmd
+    scripts/probar-controles.cpp scripts/probar-controles.sh scripts/probar-red.ps1 scripts/prueba_ipu.cpp scripts/prueba_tablas_gs.cpp scripts/prueba_vu1.cmd
     scripts/prueba_vu1.cpp scripts/recortar.ps1 scripts/simbolizar.ps1 scripts/tanda-tarjeta.ps1 scripts/teclas.ps1 scripts/vu_dis.py
     scripts/wav_chasquidos.py scripts/wav_comparar.py scripts/wav_niveles.py scripts/wav_recortar.py
     scripts/wav_vs_pss.py

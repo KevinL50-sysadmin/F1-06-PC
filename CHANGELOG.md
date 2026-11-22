@@ -4,6 +4,47 @@ All notable changes for players are listed here, newest first. Each GitHub relea
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-23
+
+### Added
+
+- The README links to the new **Formula One 2005/2006 PC Discord** (the community of F1 06 PC and F1 05 PC) for questions and chat:
+  https://discord.gg/sSFHTNQsmv.
+- Triangle can now be chosen for any driving action in **PC CONTROLS** (and as `triangulo` in `config\settings.ini`),
+  for example LOOK BEHIND on Triangle (Y on an Xbox controller). Triangle is the game's race camera button, so the
+  camera moves to the button that action leaves free: with LOOK BEHIND on Triangle, R1 changes the camera.
+  RecompLauncher's "Driving controls" has a preset with R2/L2 accelerate and brake, Square/X gears and Triangle
+  looks behind.
+- `F1-06.exe --reparar-iso "path\game.iso"` checks every file of the `data\` folder copied from that disc and copies
+  again only the damaged ones, without copying the whole 4.2 GB (exit code 0 done, 3 a file still does not copy
+  right, 5 no `data\` folder of that disc). The `[arranque]` lines of `F1-06.log` list the files repaired.
+
+### Changed
+
+- The installer's shortcuts are now called **F1 06** and **F1 06 - Jugar en red (invitado)** (they were "F1 06 PC").
+  Updating removes the old ones, so they do not appear twice. The name in Settings > Apps is still F1 06 PC.
+- Besides writing `F1-06.log`, the game now prints a short summary to its console output: the `[version]`,
+  `[sistema]` and `[opciones]` lines at start, the `[salida]` lines when it closes (how the session went, the reason
+  and the exit code) and the first line of a crash. Some RecompLauncher crash reports attach that output instead of
+  the log, and before they only had the log's path. `F1-06.log` itself does not change.
+
+### Fixed
+
+- The shader (pipeline) cache was not saved when you closed the game less than about a minute after starting it,
+  or while it was still growing, so the next start compiled those shaders again (short stutters). It is now saved
+  once when the game closes normally.
+- Custom driving controls only worked in Quick Race: in a Grand Prix weekend (practice, qualifying, race), the
+  championship and time trial the car still used the original game's buttons. They now apply whenever you drive.
+- No sound on Linux/Proton (issue #3): the copy of the disc could leave some game files damaged (with zeros, at the
+  right size) without any error. Now every file is checked as it is copied (its CRC32 against the supported dump,
+  and read back after it is written to the drive) and copied again if it comes out wrong; if it is still wrong after
+  three attempts, the copy stops with a message naming the file and exit code 3. A `data\` folder you already have
+  is checked and its damaged files are repaired: RecompLauncher runs its setup step once more after this update,
+  and `F1-06.exe --extraer-iso` does it when `data\` is already there.
+- Holding left or right for a moment on a **PC CONTROLS** row could change it twice (for example ACCELERATE from X
+  to Circle instead of Square). One press now changes it once; holding the arrow keeps changing it at the same pace
+  as the game's own rows.
+
 ## [1.1.3] - 2026-11-21
 
 ### Added

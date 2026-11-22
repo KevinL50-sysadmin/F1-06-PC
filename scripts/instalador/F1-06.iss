@@ -39,6 +39,8 @@
   #define NombreApp "F1 06"
   #define CarpetaApp "F1-06"
 #endif
+; lanzamiento-1.2.0 S6: los accesos se llaman "F1 06" en los dos (el nombre en Aplicaciones sigue siendo NombreApp).
+#define NombreAcceso "F1 06"
 
 [Setup]
 AppId={#IdApp}
@@ -134,12 +136,18 @@ Source: "{#Origen}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recurses
 ; player-folders T3: nombres de la 1.1.0 que pone el paquete (no son del jugador); se rehacen con los nuevos.
 Type: files; Name: "{app}\Jugar en red - Invitado.cmd"
 Type: filesandordirs; Name: "{app}\licencias"
+#ifdef SinDatos
+; lanzamiento-1.2.0 S6: los accesos de la 1.1.x se llamaban "F1 06 PC"; se quitan al actualizar para no repetirlos.
+Type: files; Name: "{autoprograms}\F1 06 PC.lnk"
+Type: files; Name: "{autoprograms}\F1 06 PC - Jugar en red (invitado).lnk"
+Type: files; Name: "{autodesktop}\F1 06 PC.lnk"
+#endif
 
 [Icons]
-Name: "{autoprograms}\{#NombreApp}"; Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#NombreAcceso}"; Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"
 ; Fase 5 (T15, N4): el invitado del juego en red (su formulario: direccion, puerto y contrasena del anfitrion).
-Name: "{autoprograms}\{#NombreApp} - Jugar en red (invitado)"; Filename: "{app}\{#NombreExe}"; Parameters: "--invitado"; WorkingDir: "{app}"; Comment: "{cm:InvitadoComentario}"
-Name: "{autodesktop}\{#NombreApp}"; Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#NombreAcceso} - Jugar en red (invitado)"; Filename: "{app}\{#NombreExe}"; Parameters: "--invitado"; WorkingDir: "{app}"; Comment: "{cm:InvitadoComentario}"
+Name: "{autodesktop}\{#NombreAcceso}"; Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#NombreExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#NombreApp}}"; Flags: nowait postinstall skipifsilent

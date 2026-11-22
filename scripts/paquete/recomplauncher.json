@@ -15,7 +15,7 @@
     "args": ["--extraer-iso", "{game}"],
     "label": "Copying the game data from your disc (about 4.2 GB)",
     "timeout": 1800,
-    "version": "1",
+    "version": "2",
     "done": ["{install}/data/F1-06-disco.txt"]
   },
   "start": {
@@ -145,7 +145,8 @@
       "choices": [
         { "label": "Original: X/Square accelerate and brake, R2/L2 gears", "set": { "boton_acelerar": "cruz", "boton_frenar": "cuadrado", "boton_subir_marcha": "r2", "boton_bajar_marcha": "l2", "boton_mirar_atras": "r1" } },
         { "label": "Triggers: R2/L2 accelerate and brake, X/Square gears", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "cruz", "boton_bajar_marcha": "cuadrado", "boton_mirar_atras": "r1" } },
-        { "label": "Triggers: R2/L2 accelerate and brake, R1/L1 gears, Circle looks behind", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "r1", "boton_bajar_marcha": "l1", "boton_mirar_atras": "circulo" } }
+        { "label": "Triggers: R2/L2 accelerate and brake, R1/L1 gears, Circle looks behind", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "r1", "boton_bajar_marcha": "l1", "boton_mirar_atras": "circulo" } },
+        { "label": "Triggers: R2/L2 accelerate and brake, Square/X gears, Triangle looks behind (R1 changes the camera)", "set": { "boton_acelerar": "r2", "boton_frenar": "l2", "boton_subir_marcha": "cuadrado", "boton_bajar_marcha": "cruz", "boton_mirar_atras": "triangulo" } }
       ],
       "defaults": { "boton_acelerar": "cruz", "boton_frenar": "cuadrado", "boton_subir_marcha": "r2", "boton_bajar_marcha": "l2", "boton_mirar_atras": "r1" }
     }

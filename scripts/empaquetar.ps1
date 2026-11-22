@@ -261,8 +261,9 @@ if ($Iso -or $origenDatos) {
 }
 
 $conDatos = (-not $SinDatos) -and (Test-Path (Join-Path $carpetaDatos 'SYSTEM.CNF'))
-# Lanzamiento T4: el instalador publico es otra aplicacion (F1-06.iss): sus accesos se llaman "F1 06 PC".
-$accesoJuego = if ($SinDatos) { 'F1 06 PC' } else { 'F1 06' }
+# Lanzamiento T4: el instalador publico es otra aplicacion (F1-06.iss). lanzamiento-1.2.0 S6: los accesos de los dos
+# se llaman "F1 06" (antes, en el publico, "F1 06 PC").
+$accesoJuego = 'F1 06'
 if ($SinDatos -and (Test-Path $carpetaDatos)) {
     Write-Warning "$carpetaDatos existe: se deja en la carpeta, pero no entra en el zip ni en el instalador"
 }
@@ -303,10 +304,15 @@ pide una vez:
   incompleta no se borra: se aparta como data.anterior\ (puedes borrarla tu).
 - Instalado en Archivos de programa sin elegir la ISO al instalar: la carpeta del juego no se puede escribir
   sin permisos de administrador, asi que data\ va a %LOCALAPPDATA%\F1-06\data.
-- Por linea de ordenes: $Nombre --extraer-iso `"ruta\juego.iso`" copia el disco en data\ sin abrir el juego
-  (codigos de salida: 0 hecho o ya estaba, 1 uso incorrecto, 2 no es Formula One 06 PAL, 3 error de lectura,
-  escritura o espacio, 4 cancelado; con --ventana muestra la barra y los errores en ventanas) y
-  $Nombre --comprobar-iso `"ruta\juego.iso`" solo lo comprueba." })
+- Cada archivo copiado se comprueba contra el disco (se vuelve a leer despues de escribirlo) y, si sale mal, se
+  copia otra vez; si sigue mal tras 3 intentos, la copia falla con un mensaje que dice que archivo.
+- Por linea de ordenes: $Nombre --extraer-iso `"ruta\juego.iso`" copia el disco en data\ sin abrir el juego; si
+  data\ ya tiene ese disco, comprueba sus archivos y vuelve a copiar solo los danados (codigos de salida: 0 hecho
+  o ya estaba, 1 uso incorrecto, 2 no es Formula One 06 PAL, 3 error de lectura, escritura o espacio, o un archivo
+  que no se copia bien, 4 cancelado; con --ventana muestra la barra y los errores en ventanas).
+  $Nombre --reparar-iso `"ruta\juego.iso`" solo comprueba data\ y vuelve a copiar los archivos danados (los
+  demas no se tocan; 5 si no hay una carpeta data\ de ese disco) y $Nombre --comprobar-iso `"ruta\juego.iso`"
+  solo comprueba la ISO." })
 - Portable (.zip): descomprime la carpeta donde quieras y abre $Nombre. Todo lo tuyo se guarda dentro de esa
   carpeta, asi que puedes moverla o llevarla en un USB.
 - Instalado: abre el acceso directo "$accesoJuego" del menu Inicio o del escritorio. Se desinstala desde
@@ -352,7 +358,8 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
   facil, 0, media, 50, y dificil, 100) y, para el juego en red, el puerto (red_puerto), la calidad de la imagen
   (red_calidad: baja, media o alta) y si acepta direcciones publicas (red_publicas), y el boton de cada accion de
   conduccion (boton_acelerar, boton_frenar, boton_subir_marcha, boton_bajar_marcha y boton_mirar_atras: cruz,
-  cuadrado, circulo, l1, r1, l2 o r2). La contrasena del juego en red
+  cuadrado, circulo, l1, r1, l2, r2 o triangulo; con triangulo, la camara pasa al boton que la accion deja libre).
+  La contrasena del juego en red
   nunca se guarda. Cada opcion viene explicada dentro; borralo para volver a los valores por defecto. Lo mas comodo es
   cambiarlas desde el propio menu del juego (OPCIONES > OPCIONES PC: $graficosPc, PANTALLA PC, AJUSTES PC,
   CONTROLES PC y JUEGO EN RED PC, ver abajo), que guarda este archivo.
@@ -384,6 +391,9 @@ del juego en red no renombra nada. El instalador renombra datos\ a data\ en la c
   audio_backend en config\settings.ini (auto, wasapi, directsound o winmm; variable PS2X_AUDIO_BACKEND) el
   elegido va primero y los otros quedan de respaldo. Las lineas [audio] del registro dicen cual se abrio. Sin
   sonido en Linux (Proton o Wine): prueba audio_backend = directsound o winmm y, si sigue igual, envia F1-06.log.
+  Sin sonido o con datos danados (sobre todo si copiaste el disco con Proton o Wine antes de esta version, issue
+  #3): repara la carpeta data con $Nombre --reparar-iso `"ruta\juego.iso`"; solo vuelve a copiar los archivos
+  danados. Las lineas [arranque] del registro dicen que archivos se repararon.
 - cache\vulkan-pipelines.bin: los graficos ya preparados para tu tarjeta grafica (gs = gpu), para que no haya
   tirones la segunda vez que ves cada cosa. Ocupa unos 20 a 50 MB y se puede borrar sin problema: el juego lo
   vuelve a crear (las primeras partidas despues pueden ir a tirones un momento). Tras cambiar de tarjeta grafica o
@@ -665,10 +675,15 @@ only asked for once:
   incomplete data\ folder is not deleted: it is moved aside as data.anterior\ (you can delete it yourself).
 - Installed in Program Files without choosing the ISO when installing: the game folder cannot be written without
   administrator rights, so data\ goes to %LOCALAPPDATA%\F1-06\data.
+- Every copied file is checked against the disc (it is read back after it is written) and copied again if it
+  comes out wrong; if it is still wrong after 3 attempts, the copy fails with a message naming the file.
 - From the command line: $Nombre --extraer-iso `"path\game.iso`" copies the disc to data\ without opening the
-  game (exit codes: 0 done or already there, 1 wrong usage, 2 not Formula One 06 PAL, 3 read, write or space
-  error, 4 cancelled; with --ventana it shows the progress bar and the errors in windows) and
-  $Nombre --comprobar-iso `"path\game.iso`" only checks it." })
+  game; if data\ already has that disc, it checks its files and copies again only the damaged ones (exit codes:
+  0 done or already there, 1 wrong usage, 2 not Formula One 06 PAL, 3 read, write or space error, or a file that
+  does not copy right, 4 cancelled; with --ventana it shows the progress bar and the errors in windows).
+  $Nombre --reparar-iso `"path\game.iso`" only checks data\ and copies the damaged files again (the others are
+  not touched; 5 if there is no data\ folder of that disc) and $Nombre --comprobar-iso `"path\game.iso`" only
+  checks the ISO." })
 - Portable (.zip): unzip the folder wherever you like and open $Nombre. Everything of yours is saved inside that
   folder, so you can move it or carry it on a USB stick.
 - Installed: open the `"$accesoJuego`" shortcut in the Start menu or on the desktop. It is uninstalled from
@@ -713,8 +728,9 @@ folder when updating.
   opponents' difficulty (dificultad_ia = 0, the game's; 1 to 100, a point between easy, 0, medium, 50, and
   hard, 100), for online play, the port (red_puerto), the picture quality (red_calidad: baja, media or alta)
   and whether it accepts public addresses (red_publicas), and the button for each driving action (boton_acelerar,
-  boton_frenar, boton_subir_marcha, boton_bajar_marcha and boton_mirar_atras: cruz, cuadrado, circulo, l1, r1, l2
-  or r2). The online play password is never saved. Each option
+  boton_frenar, boton_subir_marcha, boton_bajar_marcha and boton_mirar_atras: cruz, cuadrado, circulo, l1, r1, l2,
+  r2 or triangulo; with triangulo, the camera moves to the button that action leaves free). The online play password
+  is never saved. Each option
   is explained inside (in Spanish); delete the file to go back to the default values. The easiest way is to
   change them from the game's own menu (OPTIONS > PC OPTIONS: PC GRAPHICS, PC DISPLAY, PC SETTINGS, PC CONTROLS
   and PC NETPLAY, see below), which saves this file.
@@ -745,6 +761,9 @@ folder when updating.
   audio_backend in config\settings.ini (auto, wasapi, directsound or winmm; variable PS2X_AUDIO_BACKEND) the
   chosen one goes first and the others stay as fallback. The [audio] lines in the log say which one opened. No
   sound on Linux (Proton or Wine): try audio_backend = directsound or winmm and, if nothing changes, send F1-06.log.
+  No sound or damaged data (above all if you copied the disc with Proton or Wine before this version, issue #3):
+  repair the data folder with $Nombre --reparar-iso `"path\game.iso`"; it only copies the damaged files again.
+  The [arranque] lines of the log say which files were repaired.
 - cache\vulkan-pipelines.bin: the graphics already prepared for your graphics card (gs = gpu), so that there is
   no stutter the second time you see each thing. It takes about 20 to 50 MB and can be deleted without problem:
   the game creates it again (the first races afterwards may stutter for a moment). After changing graphics card

@@ -7,6 +7,7 @@
 // raylib, que choca con windows.h: por eso las pocas declaraciones de Win32 que hacen falta van aqui.
 // Tambien, por lo mismo, lo de los nucleos del procesador (f1EnNucleoEficiente, f1NucleosDeRendimiento).
 #include "ps2_fallo.h"
+#include "ps2_salida.h" // aLaConsola (lanzamiento-1.1.4 S2)
 
 #include <cstdint>
 #include <cstdio>
@@ -205,13 +206,27 @@ namespace
         uint64_t rsp = 0, rip = 0;
         std::memcpy(&rsp, info->ContextRecord + 0x98, 8);
         std::memcpy(&rip, info->ContextRecord + 0xF8, 8);
-        std::fprintf(stderr, "[fallo] excepcion 0x%08lx en 0x%p (hilo %lu)", r->ExceptionCode, r->ExceptionAddress,
-                     GetCurrentThreadId());
-        if (r->ExceptionCode == 0xC0000005ul && r->NumberParameters >= 2)
-            std::fprintf(stderr, ", %s 0x%llx",
-                         r->ExceptionInformation[0] == 8 ? "ejecutar" : r->ExceptionInformation[0] == 1 ? "escribir" : "leer",
-                         static_cast<unsigned long long>(r->ExceptionInformation[1]));
-        std::fprintf(stderr, "\n");
+        // La primera linea, tambien en la consola de antes del registro (lanzamiento-1.1.4 S2): sin reservar memoria.
+        char linea[192];
+        int largo = std::snprintf(linea, sizeof(linea), "[fallo] excepcion 0x%08lx en 0x%p (hilo %lu)",
+                                  r->ExceptionCode, r->ExceptionAddress, GetCurrentThreadId());
+        if (largo < 0)
+            largo = 0;
+        if (r->ExceptionCode == 0xC0000005ul && r->NumberParameters >= 2 && largo < static_cast<int>(sizeof(linea)))
+        {
+            const int mas = std::snprintf(linea + largo, sizeof(linea) - largo, ", %s 0x%llx",
+                                          r->ExceptionInformation[0] == 8   ? "ejecutar"
+                                          : r->ExceptionInformation[0] == 1 ? "escribir"
+                                                                            : "leer",
+                                          static_cast<unsigned long long>(r->ExceptionInformation[1]));
+            largo += mas > 0 ? mas : 0;
+        }
+        if (largo > static_cast<int>(sizeof(linea)) - 2)
+            largo = static_cast<int>(sizeof(linea)) - 2;
+        linea[largo++] = '\n';
+        linea[largo] = '\0';
+        std::fputs(linea, stderr);
+        ps2x::salida::aLaConsola(linea, static_cast<size_t>(largo));
         // Desde aqui, la pila pasa por el despachador de excepciones y sigue en el punto del fallo. Con un salto a la
         // direccion 0 no hay marco del fallo: el #0 es entonces quien llamo (la vuelta en la cima de la pila).
         void *pila[64] = {};

@@ -4,6 +4,8 @@
   <a href="https://recomplauncher.com/game/f1-06-pc"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher" height="48"></a>
   &nbsp;&nbsp;
   <a href="https://recompstore.com/dev/kevinl50-sysadmin"><img src="https://recompstore.com/assets/press/verified-dark.svg" alt="Verified developer on RecompStore" height="48"></a>
+  &nbsp;&nbsp;
+  <a href="https://discord.gg/sSFHTNQsmv"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white&style=for-the-badge" alt="Join the Formula One 2005/2006 PC Discord" height="48"></a>
 </p>
 
 # F1 06 PC: a native Windows port of Formula One 06 (PS2) by static recompilation
@@ -99,7 +101,7 @@ owners.
 
 1. Download either the **installer** (`.exe`) or the **portable** `.zip` from [the latest release](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). What changed in each
    version is in [CHANGELOG.md](CHANGELOG.md).
-   - Installer: creates "F1 06 PC" shortcuts in the Start menu and on the desktop; uninstall from Settings > Apps (it
+   - Installer: creates "F1 06" shortcuts in the Start menu and on the desktop; uninstall from Settings > Apps (it
      asks whether to also delete your saves and options). Your saves and settings go to
      `Documents\My Games\F1-06`. One installer page lets you pick your ISO (already filled in if one is found in your
      Downloads or on your Desktop) and copies the game data during the installation; leave it blank to do it on the
@@ -131,9 +133,10 @@ Dump your own disc: the project will never tell you where to download a game ima
   d-pad left/right changes car, △ cycles the race cameras, ○ takes the photo, START returns to the race (keyboard:
   W S A D, R F, arrows, Q E, Z X, TAB, V).
 - Driving controls (**PC CONTROLS**): choose the button for ACCELERATE, BRAKE, GEAR UP, GEAR DOWN and LOOK BEHIND
-  among X, Square, Circle, L1, R1, L2 and R2 (defaults, as in the original game: X, Square, R2, L2, R1). Choosing a
-  button another action uses swaps them. It only applies while driving: replays, photo mode, pause and menus keep the
-  usual buttons. Accelerate and brake keep the button's pressure, so analog triggers (RT/LT = R2/L2 on an Xbox
+  among X, Square, Circle, L1, R1, L2, R2 and Triangle (defaults, as in the original game: X, Square, R2, L2, R1).
+  Choosing a button another action uses swaps them. Triangle is the race camera button: if an action takes it, the
+  camera moves to the button that action leaves free (LOOK BEHIND on Triangle: R1 changes the camera). It applies
+  whenever you drive, in every mode: replays, photo mode, pause and menus keep the usual buttons. Accelerate and brake keep the button's pressure, so analog triggers (RT/LT = R2/L2 on an Xbox
   controller) give progressive throttle and brake. Reverse: hold brake with the car stopped. RecompLauncher offers
   the same as "Driving controls" presets. This is separate from `controls.ini`, which maps your physical inputs to
   PS2 buttons.
@@ -142,7 +145,7 @@ Dump your own disc: the project will never tell you where to download a game ima
   player). Wheel settings in its `[volante]` section: set `grados_volante` to the rotation configured in G HUB (900
   by default); `giro` is the lock-to-lock range the game uses (200 by default, like the original Driving Force Pro).
 - Netplay: the host turns HOST on in PC NETPLAY and tells the guest the address, port (TCP 50650 by default) and
-  password; the guest opens `Play online - Guest.cmd` (installed: "F1 06 PC - Jugar en red (invitado)" in the Start
+  password; the guest opens `Play online - Guest.cmd` (installed: "F1 06 - Jugar en red (invitado)" in the Start
   menu; or `F1-06.exe --invitado`) and does not need the game data. Image
   quality low / medium / high uses about 4 / 8 / 15 Mbit/s. Full details in `README.txt` inside the package (Spanish: `LEEME.txt`).
 - Audio: the game tries WASAPI, then DirectSound, then WinMM, and keeps the first one that really plays (one that
@@ -151,6 +154,12 @@ Dump your own disc: the project will never tell you where to download a game ima
   as fallback. The `[audio]` lines in `F1-06.log` say which one opened, its format and whether sound is playing.
   **No sound on Linux (Proton/Wine)?** Try `audio_backend = directsound` or `winmm`, and if it still fails, send
   `F1-06.log` (see [Reporting a problem](#reporting-a-problem)).
+- **No sound or damaged game data?** A copy of the disc made under Proton/Wine could leave some files in `data\`
+  damaged at the right size (issue #3). Now every copied file is checked against your disc and copied again if it
+  comes out wrong. To repair a `data\` folder you already have, run `F1-06.exe --reparar-iso "path\game.iso"`: it
+  checks every file and copies again only the damaged ones (exit code 0 done, 3 a file still does not copy right,
+  5 no `data\` folder of that disc). `F1-06.exe --extraer-iso` does the same when `data\` is already there, and
+  RecompLauncher runs it once more after this update. The `[arranque]` lines of `F1-06.log` list the repaired files.
 
 ## Known limitations
 
@@ -194,8 +203,11 @@ Only the European PAL release, SCES-53950. Other regions use a different executa
 
 ## Reporting a problem
 
+- **Questions or a quick chat:** the Formula One 2005/2006 PC Discord, the community of F1 06 PC and F1 05 PC:
+  https://discord.gg/sSFHTNQsmv (bugs that need a fix are still best as a GitHub issue).
 - **With [RecompLauncher](https://recomplauncher.com/game/f1-06-pc):** if the game closes because of a failure, the
-  launcher's crash report attaches `F1-06.log` for you.
+  launcher's crash report attaches `F1-06.log` for you. The game also prints a short summary (version, PC, options
+  and how it closed) to its console output, for reports that attach that instead of the log.
 - **Otherwise:** open an issue at https://github.com/KevinL50-sysadmin/F1-06-PC/issues (you need a free GitHub
   account), say what you were doing and attach `F1-06.log`.
 
@@ -309,7 +321,7 @@ presentación de Vulkan/OpenGL (*Vulkan/OpenGL present method*) en **Preferir na
 el programa mientras juegas en el PC.
 
 **Instalación:** descarga el instalador o el `.zip` portable de
-[la última versión](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). El instalador crea los accesos "F1 06 PC"
+[la última versión](https://github.com/KevinL50-sysadmin/F1-06-PC/releases/latest). El instalador crea los accesos "F1 06"
 y puede copiar los datos de tu ISO durante la instalación. Si no, la primera vez el juego te pide la ISO una sola vez
 (te ofrece la que encuentre en Descargas o en el Escritorio, o la buscas tú), comprueba que es la PAL (SCES-53950),
 copia los datos con una barra de progreso y arranca; después, a jugar. La ISO solo se lee. Con
@@ -325,13 +337,21 @@ completa, F10 aspecto, F12 foto, H HUD, F8 o R3 modo foto. Todo explicado en `LE
 primero y deja los otros de respaldo. Las líneas `[audio]` de `F1-06.log` dicen cuál se abrió. ¿Sin sonido en Linux
 (Proton/Wine)? Prueba `audio_backend = directsound` o `winmm` y, si sigue igual, envía `F1-06.log`.
 
+**¿Sin sonido o datos dañados?** Una copia del disco hecha con Proton/Wine podía dejar archivos de `data\` dañados con
+su tamaño bueno (issue #3). Ahora cada archivo copiado se comprueba contra tu disco y se copia otra vez si sale mal.
+Para reparar una carpeta `data\` que ya tienes: `F1-06.exe --reparar-iso "ruta\juego.iso"` comprueba cada archivo y
+vuelve a copiar solo los dañados (código de salida 0 hecho, 3 un archivo sigue sin copiarse bien, 5 no hay carpeta
+`data\` de ese disco). `F1-06.exe --extraer-iso` hace lo mismo si `data\` ya está, y RecompLauncher lo vuelve a
+ejecutar una vez tras esta actualización. Las líneas `[arranque]` de `F1-06.log` dicen qué archivos se repararon.
+
 **Limitaciones conocidas:** con el plan de energía Equilibrado y programas abiertos, la salida con 22 coches puede bajar
 a 42-45 fps unos segundos (con Alto rendimiento, 50); DETALLE ALTO cuesta un 16 % y MÁXIMO va a unos 25 fps en la
 salida; sin 60 fps; el juego en red es experimental (2 jugadores, firmado pero sin cifrar; falta la prueba en dos PC
 con cortafuegos real); la vibración del DualShock 4 no está probada; el `.exe` no está firmado.
 
 **Cómo enviar un fallo:** si juegas con RecompLauncher y el juego se cierra por un fallo, el informe de fallo del
-lanzador adjunta `F1-06.log` solo. Si no, abre un issue en https://github.com/KevinL50-sysadmin/F1-06-PC/issues (hace
+lanzador adjunta `F1-06.log` solo (el juego escribe además un resumen corto, con la versión, el PC, las opciones y cómo
+se cerró, en su salida de consola, por si el informe adjunta eso en vez del registro). Si no, abre un issue en https://github.com/KevinL50-sysadmin/F1-06-PC/issues (hace
 falta una cuenta gratuita de GitHub), cuenta qué estabas haciendo y adjunta `F1-06.log`. Está en
 `%LOCALAPPDATA%\F1-06\logs\F1-06.log` (instalado; pega la ruta en la barra del Explorador) o en `logs\F1-06.log`
 dentro de la carpeta del juego (portable). Cada arranque lo sustituye: la partida anterior queda en
@@ -341,6 +361,9 @@ RAM, tarjeta gráfica y opciones, y rutas de carpetas que pueden incluir tu nomb
 
 **Online:** hoy hay juego en red experimental para 2 PC. Un online con cuentas y servidores comunitarios es algo que
 nos gustaría explorar en el futuro: un objetivo, no una promesa.
+
+**Comunidad:** el Discord Formula One 2005/2006 PC (la comunidad de F1 06 PC y F1 05 PC), para dudas y charla: https://discord.gg/sSFHTNQsmv.
+Los fallos que haya que arreglar, mejor en una issue de GitHub.
 
 **Apoyo:** Ko-fi en **https://ko-fi.com/kevinl50**. Las donaciones apoyan el trabajo del port, las herramientas y, ojalá, futuros
 servidores comunitarios; nunca compran versiones, funciones ni contenido del juego: todo sigue gratis para todos.

@@ -1,0 +1,1499 @@
+diff --git a/ps2xRuntime/include/ps2_disc_setup.h b/ps2xRuntime/include/ps2_disc_setup.h
+index ef5aa34..1a91d76 100644
+--- a/ps2xRuntime/include/ps2_disc_setup.h
++++ b/ps2xRuntime/include/ps2_disc_setup.h
+@@ -37,6 +37,23 @@ namespace ps2x::disc
+         uint64_t size = 0u;
+     };
+ 
++    // copia-iso (issue #3, odd/tasks/copia-iso.md S2): the size and CRC32 (zlib's, as in Redump) of one disc file.
++    struct ExpectedFile
++    {
++        std::string path; // as in DiscFile
++        uint64_t size = 0u;
++        uint32_t crc32 = 0u;
++    };
++
++    // The fingerprint (DiscReport::fingerprint) of the supported dump: SCES-53950 v1.01, Redump CRC32 de5021a1.
++    inline constexpr const char *kSupportedDumpFingerprint = "c68bedf56e209bf4";
++
++    // Every file of the dump with that fingerprint (98, from the developer's verified copy); empty for any other.
++    std::vector<ExpectedFile> knownDumpFiles(const std::string &fingerprint);
++
++    // zlib's crc32(): start with 0 and pass the result back in for the next block.
++    uint32_t crc32Update(uint32_t crc, const void *data, size_t size);
++
+     enum class DiscStatus
+     {
+         Valid,
+@@ -59,6 +76,9 @@ namespace ps2x::disc
+         std::vector<DiscFile> files; // sorted by path
+         uint64_t totalBytes = 0u;
+         std::string fingerprint; // 16 hex digits: FNV-1a 64 of the volume id and the file list (no content hash)
++        // knownDumpFiles(fingerprint), set by inspectDisc: what every copied file must hold. Empty (another dump,
++        // a disc folder): each copy is still read back and compared with what was read from the disc.
++        std::vector<ExpectedFile> expected;
+     };
+ 
+     // Reads only the volume descriptor, the directories and SYSTEM.CNF (a folder: its file list and SYSTEM.CNF).
+@@ -84,17 +104,39 @@ namespace ps2x::disc
+         std::string detail; // for the log and the error message
+         std::filesystem::path dataDirectory;
+         std::filesystem::path previousData; // where an incomplete data was moved, if any
++        bool repairing = false; // the result of repairDataFolder (an existing data was checked, not copied whole)
++        std::vector<std::string> repaired; // disc paths copied again by repairDataFolder, in disc order
++        std::vector<std::string> log; // lines for the log without "[disco] ": copies retried, files repaired
+     };
+ 
+-    // Called after every block with the bytes copied so far and the file being copied; false cancels.
++    // Called after every block with the bytes copied (or checked) so far and the file; false cancels.
+     using ExtractProgress = std::function<bool(uint64_t done, uint64_t total, const std::string &file)>;
+ 
+     // Copies every file of a Valid report into <parent>/data.extrayendo, writes the marker and renames it to
+     // <parent>/data (an existing incomplete data is renamed to data.anterior first). On failure or cancel nothing
+-    // is left but what was there before. A complete data (or v1.1.0 datos) from the same disc is kept (AlreadyThere).
++    // is left but what was there before. A complete data (or v1.1.0 datos) from the same disc is checked and repaired
++    // instead (repairDataFolder; AlreadyThere when it ends well).
++    // copia-iso S2: every file is checked as it is copied: its CRC32 as read from the disc (against
++    // report.expected, when there is one), written, flushed to the drive (FlushFileBuffers / fsync), closed, read back
++    // and its CRC32 compared again. A file that comes out wrong is copied again, up to 3 times in all; then the copy
++    // fails with ReadFailed (the disc gave other bytes than expected) or WriteFailed (the copy read back differs), the
++    // file named in detail.
+     ExtractResult extractDisc(const DiscReport &report, const std::filesystem::path &parent,
+                               const ExtractProgress &progress);
+ 
++    // copia-iso S3: checks every file of the disc in an existing data folder of that disc: there and of its size, and
++    // its CRC32 that of report.expected (without one: that of the same file on the disc, which is read too). Only the
++    // damaged files are copied again from the disc, each into <file>.reparando (with the checks of extractDisc) and
++    // then renamed over the damaged one; the other files are only read. The repaired files are noted in the marker
++    // (dataFolderRepairs). AlreadyThere when every file ends good (repaired lists what was copied), else Cancelled,
++    // ReadFailed or WriteFailed (the files repaired before it are kept; the failed one stays as it was).
++    ExtractResult repairDataFolder(const DiscReport &report, const std::filesystem::path &dataDirectory,
++                                   const ExtractProgress &progress);
++
++    // Tests only: called after each verified copy is written and closed, before it is read back (attempt 1-3).
++    using CopyHook = std::function<void(const std::filesystem::path &written, const std::string &discPath, int attempt)>;
++    void setCopyHookForTests(CopyHook hook);
++
+     // The player's text for a failed or cancelled extraction (UTF-8).
+     std::string describeExtractProblem(const ExtractResult &result, bool spanish);
+ 
+@@ -111,6 +153,9 @@ namespace ps2x::disc
+     // The fingerprint written in a data marker (empty without one).
+     std::string dataFolderFingerprint(const std::filesystem::path &dataDirectory);
+ 
++    // The repairs noted in a data marker, oldest first: "2026-11-22 10:15 DATA2006/AUDIO/COMMON.AWB".
++    std::vector<std::string> dataFolderRepairs(const std::filesystem::path &dataDirectory);
++
+     // Folders that may hold data, in lookup order: the .exe's folder and, for an installed game (no portable.txt),
+     // <LocalAppData>/F1-06, used when the .exe's folder cannot be written (Program Files).
+     std::vector<std::filesystem::path> dataParents(const std::filesystem::path &exeDirectory,
+@@ -137,12 +182,18 @@ namespace ps2x::disc
+     // launcherProgressLine: "progress 0.42 Copying the game data (1854 of 4214 MB)".
+     std::string launcherProgressFraction(uint64_t done, uint64_t total);
+     std::string launcherProgressLine(uint64_t done, uint64_t total);
+-
+-    // F1-06.exe --extraer-iso <iso or folder> [--ventana] and --comprobar-iso <iso or folder>. Returns the exit code:
+-    // 0 done (or already extracted / valid), 1 bad arguments, 2 not Formula One 06 PAL, 3 read, write or space
+-    // failure, 4 cancelled. Returns -1 when args is not one of these commands. --extraer-iso without --ventana also
+-    // writes launcherProgressLine lines (a first one at 0, one per hundredth, "progress 1 Game data ready" when it
+-    // ends with 0) next to the "[disco] NN %" ones.
++    // "progress 0.42 Checking the game data (1854 of 4214 MB)": an existing data checked by --extraer-iso.
++    std::string launcherCheckLine(uint64_t done, uint64_t total);
++
++    // F1-06.exe --extraer-iso <iso or folder> [--ventana], --comprobar-iso <iso or folder> and --reparar-iso <iso or
++    // folder> [--ventana]. Returns the exit code: 0 done (or already extracted / valid / nothing damaged / repaired),
++    // 1 bad arguments, 2 not Formula One 06 PAL, 3 read, write or space failure (copia-iso: also a file that does not
++    // copy right after 3 attempts), 4 cancelled, 5 (--reparar-iso) no data folder of this disc to repair. Returns -1
++    // when args is not one of these commands. --extraer-iso on a complete data of the same disc checks and repairs it
++    // (repairDataFolder) instead of saying it is there; --reparar-iso does only that (never a whole copy: use
++    // --extraer-iso), also for a data of this disc with files missing. --extraer-iso without --ventana also writes
++    // launcherProgressLine (or launcherCheckLine) lines (a first one at 0, one per hundredth, "progress 1 Game data
++    // ready" when it ends with 0) next to the "[disco] NN %" ones. Each repaired file: "[disco] reparado <path>".
+     int runDiscCommand(const std::vector<std::string> &args, const std::filesystem::path &exeDirectory,
+                        const std::filesystem::path &localAppDataDirectory, std::ostream &out,
+                        const DiscCommandUi *ui, bool spanish);
+diff --git a/ps2xRuntime/include/ps2_salida.h b/ps2xRuntime/include/ps2_salida.h
+index 78ab3c9..03dc544 100644
+--- a/ps2xRuntime/include/ps2_salida.h
++++ b/ps2xRuntime/include/ps2_salida.h
+@@ -11,7 +11,8 @@
+ // cambiaria el informe por un mensaje.
+ namespace ps2x::salida
+ {
+-    // Distintos de los de --extraer-iso (0-4), del error fatal (1), del invitado de red (2) y de abort() (3).
++    // Distintos de los de --extraer-iso y --reparar-iso (0-5), del error fatal (1), del invitado de red (2) y de
++    // abort() (3).
+     constexpr int kExcepcionJuego = 10;  // excepcion C++ en el hilo del juego
+     constexpr int kExitDelJuego = 11;    // el juego llamo a exit() (p. ej. un error de Lua sin pcall)
+     constexpr int kCuelgueAlCerrar = 12; // el EE seguia colgado al cerrar, o el juego no se paro al cerrar
+diff --git a/ps2xRuntime/src/lib/ps2_disc_setup.cpp b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+index 782f8b5..0717dc7 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_setup.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_setup.cpp
+@@ -3,17 +3,35 @@
+ #include "ps2x/iop/ps2_iso_image.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cctype>
++#include <cerrno>
+ #include <cstdio>
+ #include <cstring>
++#include <ctime>
+ #include <fstream>
+ #include <iterator>
++#include <mutex>
+ #include <optional>
+ #include <sstream>
+ #include <string_view>
+ #include <system_error>
++#include <unordered_map>
+ #include <unordered_set>
+ 
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ namespace ps2x::disc
+ {
+     namespace
+@@ -25,6 +43,275 @@ namespace ps2x::disc
+         constexpr size_t kCopyBlock = 4u << 20u;
+         // Room left on the drive besides the files (the marker, the file system).
+         constexpr uint64_t kSpareBytes = 64u << 20u;
++        // copia-iso S2: a file that does not copy right is tried this many times in all.
++        constexpr int kCopyAttempts = 3;
++        // Next to a file being repaired, renamed over it once its copy is checked.
++        constexpr const char *kRepairSuffix = ".reparando";
++
++        struct KnownFile
++        {
++            const char *path;
++            uint64_t size;
++            uint32_t crc32;
++        };
++
++        // copia-iso S2: SCES-53950 v1.01 (Redump "Formula One 06 (Europe, Australia)", CRC32 de5021a1, fingerprint
++        // c68bedf56e209bf4). Made from the developer's verified copy (juego/, the SHA-1 of every file equal to
++        // logs/issue-3/sha1-referencia.txt) with Python's zlib.crc32.
++        constexpr KnownFile kSupportedDump[] = {
++            {"DATA2006/AUDIO/ALPHA158.AWB", 385024ull, 0x6474fda5u},
++            {"DATA2006/AUDIO/COM/ESP06.BIN", 82780ull, 0x7bb18df4u},
++            {"DATA2006/AUDIO/COM/ESP06.IDX", 67460ull, 0x5c6b70a7u},
++            {"DATA2006/AUDIO/COM/ESP06.WAD", 506238976ull, 0x270af9cdu},
++            {"DATA2006/AUDIO/COM/FIN06.BIN", 82788ull, 0xcdb205ddu},
++            {"DATA2006/AUDIO/COM/FIN06.IDX", 67476ull, 0xc2116a50u},
++            {"DATA2006/AUDIO/COM/FIN06.WAD", 501774336ull, 0x60ad73dcu},
++            {"DATA2006/AUDIO/COM/FRE06.BIN", 82780ull, 0xd17adf73u},
++            {"DATA2006/AUDIO/COM/FRE06.IDX", 67460ull, 0x4da680f1u},
++            {"DATA2006/AUDIO/COM/FRE06.WAD", 429361152ull, 0x17f1ae9fu},
++            {"DATA2006/AUDIO/COM/GBR06.BIN", 82788ull, 0x1154eb96u},
++            {"DATA2006/AUDIO/COM/GBR06.IDX", 67276ull, 0xd42bf907u},
++            {"DATA2006/AUDIO/COM/GBR06.WAD", 433934336ull, 0x74aa156bu},
++            {"DATA2006/AUDIO/COM/GER06.BIN", 82780ull, 0xd22723fdu},
++            {"DATA2006/AUDIO/COM/GER06.IDX", 67444ull, 0xcd28b55fu},
++            {"DATA2006/AUDIO/COM/GER06.WAD", 494297088ull, 0xff2eea11u},
++            {"DATA2006/AUDIO/COM/ITA06.BIN", 82788ull, 0x2f928b5cu},
++            {"DATA2006/AUDIO/COM/ITA06.IDX", 67460ull, 0x025904edu},
++            {"DATA2006/AUDIO/COM/ITA06.WAD", 495097856ull, 0x612343d1u},
++            {"DATA2006/AUDIO/COM/POR06.BIN", 82772ull, 0x6b1a5431u},
++            {"DATA2006/AUDIO/COM/POR06.IDX", 67460ull, 0x3f20b68du},
++            {"DATA2006/AUDIO/COM/POR06.WAD", 534532096ull, 0xfbbb1e12u},
++            {"DATA2006/AUDIO/COMMON.AWB", 2611200ull, 0x9f39d664u},
++            {"DATA2006/AUDIO/COM_TS/TS_ESP06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_ESP06.IDX", 5356ull, 0x63e63571u},
++            {"DATA2006/AUDIO/COM_TS/TS_ESP06.WAD", 35307520ull, 0xa10edb3du},
++            {"DATA2006/AUDIO/COM_TS/TS_FIN06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_FIN06.IDX", 5356ull, 0x5e174917u},
++            {"DATA2006/AUDIO/COM_TS/TS_FIN06.WAD", 36227072ull, 0x9b25e48fu},
++            {"DATA2006/AUDIO/COM_TS/TS_FRE06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_FRE06.IDX", 5356ull, 0x9f3d354fu},
++            {"DATA2006/AUDIO/COM_TS/TS_FRE06.WAD", 27418624ull, 0xe0dd1fa5u},
++            {"DATA2006/AUDIO/COM_TS/TS_GBR06.BIN", 6032ull, 0x1cd45fcbu},
++            {"DATA2006/AUDIO/COM_TS/TS_GBR06.IDX", 5356ull, 0x0fabc5b7u},
++            {"DATA2006/AUDIO/COM_TS/TS_GBR06.WAD", 24702976ull, 0xb4ed84afu},
++            {"DATA2006/AUDIO/COM_TS/TS_GER06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_GER06.IDX", 5356ull, 0x6e5b16abu},
++            {"DATA2006/AUDIO/COM_TS/TS_GER06.WAD", 31655936ull, 0x481d5f82u},
++            {"DATA2006/AUDIO/COM_TS/TS_ITA06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_ITA06.IDX", 5356ull, 0xfce51756u},
++            {"DATA2006/AUDIO/COM_TS/TS_ITA06.WAD", 32831488ull, 0x8f2691aau},
++            {"DATA2006/AUDIO/COM_TS/TS_POR06.BIN", 6072ull, 0x2f40656eu},
++            {"DATA2006/AUDIO/COM_TS/TS_POR06.IDX", 5356ull, 0x7cac5f98u},
++            {"DATA2006/AUDIO/COM_TS/TS_POR06.WAD", 38610944ull, 0x1e0a0a0fu},
++            {"DATA2006/AUDIO/CROWDS.AWB", 2162688ull, 0x8a2dc744u},
++            {"DATA2006/AUDIO/FERRARI.AWB", 532480ull, 0x0e9f90d6u},
++            {"DATA2006/AUDIO/FORDDFV.AWB", 389120ull, 0x7425b8feu},
++            {"DATA2006/AUDIO/HONDA.AWB", 569344ull, 0x350be65eu},
++            {"DATA2006/AUDIO/INCAR.AWB", 507904ull, 0x7ef16cc2u},
++            {"DATA2006/AUDIO/MCLAREN.AWB", 550912ull, 0x95ed6a3bu},
++            {"DATA2006/AUDIO/MENU.AWB", 118784ull, 0x20fe30edu},
++            {"DATA2006/AUDIO/RENAULT.AWB", 534528ull, 0x71ff719bu},
++            {"DATA2006/AUDIO/RS08.AWB", 397312ull, 0x36fe4fe2u},
++            {"DATA2006/AUDIO/TVCARS.AWB", 415744ull, 0x89850f4bu},
++            {"DATA2006/CAREER2.WAD", 1926528ull, 0x144ea7c4u},
++            {"DATA2006/F12006.WAD", 253461056ull, 0xb3479b0cu},
++            {"DATA2006/MOVIES/PAL/EXTRAMOV.IPF", 4197020ull, 0xeeca10e5u},
++            {"DATA2006/MOVIES/PAL/INTRO.PSS", 30130180ull, 0xbc192fbeu},
++            {"DATA2006/MOVIES/PAL/MULTIMOV.IPF", 4799420ull, 0x7f86bde3u},
++            {"DATA2006/MOVIES/PAL/OPTIOMOV.IPF", 3568220ull, 0x261aaa9fu},
++            {"DATA2006/MOVIES/PAL/PROFIMOV.IPF", 4355420ull, 0xc669b20au},
++            {"DATA2006/MOVIES/PAL/SINGLMOV.IPF", 3763220ull, 0x127e39a1u},
++            {"DATA2006/MOVIES/PAL/TRACK/BAHRAIN_.IPF", 22738068ull, 0x2d6a9fddu},
++            {"DATA2006/MOVIES/PAL/TRACK/BUDAPEST.IPF", 22361336ull, 0x5320c8a2u},
++            {"DATA2006/MOVIES/PAL/TRACK/CATALUNY.IPF", 24313876ull, 0xa539f46bu},
++            {"DATA2006/MOVIES/PAL/TRACK/HOCKENHE.IPF", 24746300ull, 0xee705499u},
++            {"DATA2006/MOVIES/PAL/TRACK/IMOLATRK.IPF", 24683668ull, 0x7977d8dbu},
++            {"DATA2006/MOVIES/PAL/TRACK/INDY_TRK.IPF", 22830612ull, 0xf0b8b420u},
++            {"DATA2006/MOVIES/PAL/TRACK/ISTANBUL.IPF", 21596868ull, 0x5cab5a31u},
++            {"DATA2006/MOVIES/PAL/TRACK/JEREZTRK.IPF", 22697620ull, 0x2aeef734u},
++            {"DATA2006/MOVIES/PAL/TRACK/KUALALUM.IPF", 23353620ull, 0x5231543bu},
++            {"DATA2006/MOVIES/PAL/TRACK/MAGNYCOU.IPF", 20838180ull, 0x029bfbf8u},
++            {"DATA2006/MOVIES/PAL/TRACK/MELBOURN.IPF", 24880612ull, 0x50ea8ee4u},
++            {"DATA2006/MOVIES/PAL/TRACK/MONTECAR.IPF", 25474548ull, 0x640de924u},
++            {"DATA2006/MOVIES/PAL/TRACK/MONTREAL.IPF", 22457108ull, 0x1d90ab78u},
++            {"DATA2006/MOVIES/PAL/TRACK/MONZATRK.IPF", 24298892ull, 0xd78c5efau},
++            {"DATA2006/MOVIES/PAL/TRACK/NURBURGR.IPF", 17269652ull, 0x579c5d7cu},
++            {"DATA2006/MOVIES/PAL/TRACK/SAOPAULO.IPF", 21307988ull, 0x3ecdc674u},
++            {"DATA2006/MOVIES/PAL/TRACK/SHANGHAI.IPF", 24806420ull, 0x6cfad2ddu},
++            {"DATA2006/MOVIES/PAL/TRACK/SILVERST.IPF", 23275072ull, 0x36b972adu},
++            {"DATA2006/MOVIES/PAL/TRACK/SUZUKA_T.IPF", 24105080ull, 0x95ab658bu},
++            {"DATA2006/REFRONT.WAD", 3126464ull, 0x148eb7b5u},
++            {"DATA2006/STARTUP.WAD", 7115328ull, 0x5e9dadf0u},
++            {"DATA2006/STREAM.WAD", 5475776ull, 0x3e9d9491u},
++            {"IOP/AUDIO.IRX", 99516ull, 0x622137b5u},
++            {"IOP/CORE.IRX", 27356ull, 0x7601c3e4u},
++            {"IOP/IOPRP310.IMG", 278353ull, 0x66b33e2fu},
++            {"IOP/LGDEVW.IRX", 52605ull, 0xf87e36ebu},
++            {"IOP/LGKBM.IRX", 12041ull, 0x7deaa9c2u},
++            {"IOP/LIBSD.IRX", 30085ull, 0x8e5285ecu},
++            {"IOP/MCMAN.IRX", 103677ull, 0xec5f33f9u},
++            {"IOP/MCSERV.IRX", 7713ull, 0x532bb62bu},
++            {"IOP/PADMAN.IRX", 45925ull, 0x60d385d3u},
++            {"IOP/SIO2MAN.IRX", 5217ull, 0x0fdd9f27u},
++            {"IOP/USBD.IRX", 35009ull, 0x91867790u},
++            {"IOP/USBPSPCM.IRX", 55621ull, 0x3089d015u},
++            {"SCES_539.50", 3731704ull, 0x23efda7au},
++            {"SYSTEM.CNF", 56ull, 0x4dab937fu},
++        };
++
++        // Slicing by 8 (about 2 GB/s): the 4 GB of a disc are summed twice per copy, once more when repaired.
++        const std::array<std::array<uint32_t, 256>, 8> &crcTables()
++        {
++            static const std::array<std::array<uint32_t, 256>, 8> tables = []
++            {
++                std::array<std::array<uint32_t, 256>, 8> t{};
++                for (uint32_t i = 0u; i < 256u; ++i)
++                {
++                    uint32_t value = i;
++                    for (int bit = 0; bit < 8; ++bit)
++                        value = (value & 1u) ? (0xEDB88320u ^ (value >> 1u)) : (value >> 1u);
++                    t[0][i] = value;
++                }
++                for (uint32_t i = 0u; i < 256u; ++i)
++                    for (size_t k = 1u; k < 8u; ++k)
++                        t[k][i] = (t[k - 1u][i] >> 8u) ^ t[0][t[k - 1u][i] & 0xFFu];
++                return t;
++            }();
++            return tables;
++        }
++
++        std::string hex32(uint32_t value)
++        {
++            char text[9] = {};
++            std::snprintf(text, sizeof(text), "%08x", static_cast<unsigned>(value));
++            return text;
++        }
++
++        std::mutex g_copyHookMutex;
++        CopyHook g_copyHook;
++
++        CopyHook copyHook()
++        {
++            std::lock_guard<std::mutex> lock(g_copyHookMutex);
++            return g_copyHook;
++        }
++
++        // A file written and then flushed to the drive before it is closed: FlushFileBuffers / fsync, each result
++        // checked (copia-iso S1: an ofstream's close never says whether the data reached the disk).
++        class SyncedWriter
++        {
++        public:
++            SyncedWriter() = default;
++            SyncedWriter(const SyncedWriter &) = delete;
++            SyncedWriter &operator=(const SyncedWriter &) = delete;
++            ~SyncedWriter() { close(); }
++
++            bool open(const fs::path &path)
++            {
++#if defined(_WIN32)
++                handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0u, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
++                                      nullptr);
++                if (handle_ == INVALID_HANDLE_VALUE)
++                    return failed("CreateFile");
++#else
++                fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++                if (fd_ < 0)
++                    return failed("open");
++#endif
++                return true;
++            }
++
++            bool write(const char *data, size_t size)
++            {
++                while (size != 0u)
++                {
++#if defined(_WIN32)
++                    DWORD written = 0u;
++                    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, 1u << 30u));
++                    if (!WriteFile(handle_, data, chunk, &written, nullptr) || written == 0u)
++                        return failed("WriteFile");
++#else
++                    const ssize_t written = ::write(fd_, data, size);
++                    if (written < 0 && errno == EINTR)
++                        continue;
++                    if (written <= 0)
++                        return failed("write");
++#endif
++                    data += written;
++                    size -= static_cast<size_t>(written);
++                }
++                return true;
++            }
++
++            // Flushes and closes; false if either fails.
++            bool finish()
++            {
++#if defined(_WIN32)
++                const bool flushed = FlushFileBuffers(handle_) != 0 || failed("FlushFileBuffers");
++                const bool closed = CloseHandle(handle_) != 0 || failed("CloseHandle");
++                handle_ = INVALID_HANDLE_VALUE;
++#else
++                const bool flushed = ::fsync(fd_) == 0 || failed("fsync");
++                const bool closed = ::close(fd_) == 0 || failed("close");
++                fd_ = -1;
++#endif
++                return flushed && closed;
++            }
++
++            const std::string &error() const { return error_; }
++
++        private:
++            void close()
++            {
++#if defined(_WIN32)
++                if (handle_ != INVALID_HANDLE_VALUE)
++                    CloseHandle(handle_);
++                handle_ = INVALID_HANDLE_VALUE;
++#else
++                if (fd_ >= 0)
++                    ::close(fd_);
++                fd_ = -1;
++#endif
++            }
++
++            bool failed(const char *what)
++            {
++#if defined(_WIN32)
++                const unsigned long code = GetLastError();
++#else
++                const int code = errno;
++#endif
++                if (error_.empty())
++                    error_ = std::string(what) + " " + std::to_string(code);
++                return false;
++            }
++
++#if defined(_WIN32)
++            HANDLE handle_ = INVALID_HANDLE_VALUE;
++#else
++            int fd_ = -1;
++#endif
++            std::string error_;
++        };
++
++        // The CRC32 and size of a whole file, read in blocks of buffer; false if it cannot be read to its end.
++        bool crcOfFile(const fs::path &path, std::vector<char> &buffer, uint32_t &crc, uint64_t &size)
++        {
++            crc = 0u;
++            size = 0u;
++            std::ifstream in(path, std::ios::binary);
++            if (!in)
++                return false;
++            for (;;)
++            {
++                in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++                const size_t got = static_cast<size_t>(in.gcount());
++                crc = crc32Update(crc, buffer.data(), got);
++                size += got;
++                if (got < buffer.size())
++                    return in.eof() && !in.bad();
++            }
++        }
+ 
+         bool equalsIgnoringCase(std::string_view left, std::string_view right)
+         {
+@@ -128,6 +415,7 @@ namespace ps2x::disc
+             for (const DiscFile &file : report.files)
+                 report.totalBytes += file.size;
+             report.fingerprint = fingerprintOf(report.volumeId, report.files);
++            report.expected = knownDumpFiles(report.fingerprint);
+         }
+ 
+         DiscReport inspectImage(const fs::path &path)
+@@ -294,6 +582,7 @@ namespace ps2x::disc
+         {
+             std::string fingerprint;
+             std::vector<DiscFile> files;
++            std::vector<std::string> repairs; // "reparado = <date> <time> <path>" lines (copia-iso S3)
+         };
+ 
+         std::optional<Marker> readMarker(const fs::path &dataDirectory)
+@@ -314,6 +603,8 @@ namespace ps2x::disc
+                 const std::string value = trim(std::string_view(line).substr(equals + 1u));
+                 if (key == "huella")
+                     marker.fingerprint = value;
++                else if (key == "reparado")
++                    marker.repairs.push_back(value);
+                 else if (key == "archivo")
+                 {
+                     const size_t space = value.find(' ');
+@@ -335,9 +626,10 @@ namespace ps2x::disc
+             return marker;
+         }
+ 
+-        bool writeMarker(const fs::path &dataDirectory, const DiscReport &report)
++        bool writeMarker(const fs::path &dataDirectory, const DiscReport &report,
++                         const std::vector<std::string> &repairs = {}, const char *fileName = kMarkerName)
+         {
+-            std::ofstream out(dataDirectory / kMarkerName, std::ios::binary);
++            std::ofstream out(dataDirectory / fileName, std::ios::binary);
+             out << "# Formula One 06: archivos copiados de tu disco. El juego lo usa para comprobar que la carpeta\r\n"
+                 << "# data esta completa; no lo cambies (sin el, data se usa igual, pero sin esa comprobacion).\r\n"
+                 << "disco = " << report.bootElf << "\r\n"
+@@ -349,10 +641,174 @@ namespace ps2x::disc
+                 << "bytes = " << report.totalBytes << "\r\n";
+             for (const DiscFile &file : report.files)
+                 out << "archivo = " << file.size << " " << file.path << "\r\n";
++            // copia-iso S3: older versions skip these lines.
++            for (const std::string &repair : repairs)
++                out << "reparado = " << repair << "\r\n";
+             out.close();
+             return static_cast<bool>(out);
+         }
+ 
++        std::string nowForMarker()
++        {
++            const std::time_t now = std::time(nullptr);
++            std::tm local{};
++#if defined(_WIN32)
++            localtime_s(&local, &now);
++#else
++            localtime_r(&now, &local);
++#endif
++            char text[32] = {};
++            std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M", &local);
++            return text;
++        }
++
++        // Where the disc's files are read from: the image (opened once) or, for a disc folder, each file.
++        class CopySource
++        {
++        public:
++            explicit CopySource(const DiscReport &report) : report_(report) {}
++
++            bool openImage()
++            {
++                if (report_.folder)
++                    return true;
++                image_.open(report_.source, std::ios::binary);
++                return static_cast<bool>(image_);
++            }
++
++            // Positioned at the start of the file; null if it cannot be opened.
++            std::istream *open(const DiscFile &file)
++            {
++                if (report_.folder)
++                {
++                    folderFile_.close();
++                    folderFile_.clear();
++                    folderFile_.open(report_.source / fs::path(file.path), std::ios::binary);
++                    return folderFile_ ? &folderFile_ : nullptr;
++                }
++                image_.clear();
++                image_.seekg(static_cast<std::streamoff>(static_cast<uint64_t>(file.lsn) * kSector), std::ios::beg);
++                return image_ ? &image_ : nullptr;
++            }
++
++            fs::path pathOf(const DiscFile &file) const
++            {
++                return report_.folder ? report_.source / fs::path(file.path) : report_.source;
++            }
++
++            void close()
++            {
++                image_.close();
++                folderFile_.close();
++            }
++
++        private:
++            const DiscReport &report_;
++            std::ifstream image_;
++            std::ifstream folderFile_;
++        };
++
++        // The CRC32 of a file as the disc gives it; false if the disc ends first.
++        bool crcOnDisc(CopySource &source, const DiscFile &file, std::vector<char> &buffer, uint32_t &crc)
++        {
++            crc = 0u;
++            std::istream *in = source.open(file);
++            if (!in)
++                return false;
++            for (uint64_t left = file.size; left != 0u;)
++            {
++                const size_t want = static_cast<size_t>(std::min<uint64_t>(left, buffer.size()));
++                in->read(buffer.data(), static_cast<std::streamsize>(want));
++                if (static_cast<size_t>(in->gcount()) != want)
++                    return false;
++                crc = crc32Update(crc, buffer.data(), want);
++                left -= want;
++            }
++            return true;
++        }
++
++        struct CopyOutcome
++        {
++            ExtractStatus status = ExtractStatus::Done; // Done, Cancelled, ReadFailed or WriteFailed
++            std::string detail;
++        };
++
++        // copia-iso S2: one file from the disc into target, summed as it is read (checked against expected when
++        // there is one), flushed, closed, read back and summed again; up to kCopyAttempts times. done goes up with
++        // the bytes copied (back to where it was for each new attempt).
++        CopyOutcome copyVerified(CopySource &source, const DiscFile &file, const fs::path &target,
++                                 const std::optional<uint32_t> &expected, std::vector<char> &buffer,
++                                 const ExtractProgress &progress, uint64_t &done, uint64_t total,
++                                 std::vector<std::string> &log)
++        {
++            const uint64_t start = done;
++            const CopyHook hook = copyHook();
++            bool discWrong = false;
++            std::string last;
++            for (int attempt = 1; attempt <= kCopyAttempts; ++attempt)
++            {
++                done = start;
++                std::istream *in = source.open(file);
++                if (!in)
++                    return {ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(source.pathOf(file))};
++                SyncedWriter out;
++                if (!out.open(target))
++                    return {ExtractStatus::WriteFailed, "no se puede crear " + pathForLog(target) + " (" + out.error() + ")"};
++                uint32_t readCrc = 0u;
++                for (uint64_t left = file.size; left != 0u;)
++                {
++                    const size_t want = static_cast<size_t>(std::min<uint64_t>(left, buffer.size()));
++                    in->read(buffer.data(), static_cast<std::streamsize>(want));
++                    if (static_cast<size_t>(in->gcount()) != want)
++                        return {ExtractStatus::ReadFailed, "el disco se acaba antes de tiempo en " + file.path};
++                    readCrc = crc32Update(readCrc, buffer.data(), want);
++                    if (!out.write(buffer.data(), want))
++                        return {ExtractStatus::WriteFailed,
++                                "no se puede escribir " + pathForLog(target) + " (" + out.error() + ")"};
++                    left -= want;
++                    done += want;
++                    if (progress && !progress(done, total, file.path))
++                        return {ExtractStatus::Cancelled, {}};
++                }
++                if (!out.finish())
++                    return {ExtractStatus::WriteFailed,
++                            "no se puede escribir " + pathForLog(target) + " (" + out.error() + ")"};
++                if (hook)
++                    hook(target, file.path, attempt);
++                uint32_t backCrc = 0u;
++                uint64_t backSize = 0u;
++                const bool readBack = crcOfFile(target, buffer, backCrc, backSize);
++                discWrong = expected && readCrc != *expected;
++                const bool backWrong = !readBack || backSize != file.size || backCrc != readCrc;
++                if (!discWrong && !backWrong)
++                {
++                    if (attempt > 1)
++                        log.push_back(file.path + ": bien al intento " + std::to_string(attempt));
++                    return {};
++                }
++                if (discWrong)
++                    last = "el disco da CRC32 " + hex32(readCrc) + " y el volcado " + kGameCode + " v1.01 tiene " +
++                           hex32(*expected) + " (la ISO puede estar dañada)";
++                else if (!readBack)
++                    last = "no se puede volver a leer " + pathForLog(target);
++                else
++                    last = "la copia se lee con CRC32 " + hex32(backCrc) + " (" + std::to_string(backSize) +
++                           " bytes) y del disco salió " + hex32(readCrc) + " (" + std::to_string(file.size) + " bytes)";
++                log.push_back(file.path + ": copia mal (intento " + std::to_string(attempt) + " de " +
++                              std::to_string(kCopyAttempts) + "): " + last);
++            }
++            return {discWrong ? ExtractStatus::ReadFailed : ExtractStatus::WriteFailed,
++                    file.path + " no sale bien tras " + std::to_string(kCopyAttempts) + " intentos: " + last};
++        }
++
++        const ExpectedFile *findExpected(const std::vector<ExpectedFile> &expected, std::string_view path)
++        {
++            for (const ExpectedFile &file : expected)
++                if (equalsIgnoringCase(file.path, path))
++                    return &file;
++            return nullptr;
++        }
++
+         std::string gigabytes(uint64_t bytes)
+         {
+             char text[32] = {};
+@@ -387,6 +843,39 @@ namespace ps2x::disc
+         }
+     }
+ 
++    std::vector<ExpectedFile> knownDumpFiles(const std::string &fingerprint)
++    {
++        std::vector<ExpectedFile> files;
++        if (fingerprint != kSupportedDumpFingerprint)
++            return files;
++        for (const KnownFile &file : kSupportedDump)
++            files.push_back({file.path, file.size, file.crc32});
++        return files;
++    }
++
++    uint32_t crc32Update(uint32_t crc, const void *data, size_t size)
++    {
++        const auto &t = crcTables();
++        const auto *bytes = static_cast<const uint8_t *>(data);
++        uint32_t c = ~crc;
++        for (; size >= 8u; size -= 8u, bytes += 8u)
++        {
++            const uint32_t low = c ^ (static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8u) |
++                                      (static_cast<uint32_t>(bytes[2]) << 16u) | (static_cast<uint32_t>(bytes[3]) << 24u));
++            c = t[7][low & 0xFFu] ^ t[6][(low >> 8u) & 0xFFu] ^ t[5][(low >> 16u) & 0xFFu] ^ t[4][low >> 24u] ^
++                t[3][bytes[4]] ^ t[2][bytes[5]] ^ t[1][bytes[6]] ^ t[0][bytes[7]];
++        }
++        for (; size != 0u; --size, ++bytes)
++            c = t[0][(c ^ *bytes) & 0xFFu] ^ (c >> 8u);
++        return ~c;
++    }
++
++    void setCopyHookForTests(CopyHook hook)
++    {
++        std::lock_guard<std::mutex> lock(g_copyHookMutex);
++        g_copyHook = std::move(hook);
++    }
++
+     DiscReport inspectDisc(const fs::path &source)
+     {
+         std::error_code error;
+@@ -449,12 +938,9 @@ namespace ps2x::disc
+             result.detail = describeDiscProblem(report, true);
+             return result;
+         }
++        // copia-iso S3: the right sizes are not enough (issue #3: files with zeros); checked and repaired instead.
+         if (checkDataFolder(existing) == DataState::Complete && dataFolderFingerprint(existing) == report.fingerprint)
+-        {
+-            result.status = ExtractStatus::AlreadyThere;
+-            result.dataDirectory = existing;
+-            return result;
+-        }
++            return repairDataFolder(report, existing, progress);
+         if (report.folder && (sameFolder(report.source, data) || sameFolder(report.source, existing)))
+         {
+             result.dataDirectory = existing;
+@@ -477,15 +963,11 @@ namespace ps2x::disc
+         }
+ 
+         std::error_code error;
+-        std::ifstream image;
+-        std::ifstream folderFile;
+-        std::ofstream out;
++        CopySource source(report);
+         const auto fail = [&](ExtractStatus status, std::string detail)
+         {
+             // Nothing stays open: an open file would keep part of the temporary folder.
+-            image.close();
+-            folderFile.close();
+-            out.close();
++            source.close();
+             std::error_code ignored;
+             fs::remove_all(temp, ignored);
+             result.status = status;
+@@ -508,60 +990,24 @@ namespace ps2x::disc
+             return fail(ExtractStatus::NoSpace, gigabytes(report.totalBytes + kSpareBytes) + " GB / " +
+                                                     gigabytes(space.available) + " GB");
+ 
+-        if (!report.folder)
+-        {
+-            image.open(report.source, std::ios::binary);
+-            if (!image)
+-                return fail(ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(report.source));
+-        }
++        if (!source.openImage())
++            return fail(ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(report.source));
+         std::vector<char> buffer(kCopyBlock);
+         uint64_t done = 0u;
+         for (const DiscFile &file : report.files)
+         {
+-            const fs::path relative = fs::path(file.path);
+-            const fs::path target = temp / relative;
++            const fs::path target = temp / fs::path(file.path);
+             fs::create_directories(target.parent_path(), error);
+-            out.clear();
+-            out.open(target, std::ios::binary);
+-            if (error || !out)
+-                return fail(ExtractStatus::WriteFailed, "no se puede crear " + pathForLog(target));
+-            std::istream *in = &image;
+-            if (report.folder)
+-            {
+-                folderFile.close();
+-                folderFile.clear();
+-                folderFile.open(report.source / relative, std::ios::binary);
+-                if (!folderFile)
+-                    return fail(ExtractStatus::ReadFailed, "no se puede abrir " + pathForLog(report.source / relative));
+-                in = &folderFile;
+-            }
+-            else
+-            {
+-                image.clear();
+-                image.seekg(static_cast<std::streamoff>(static_cast<uint64_t>(file.lsn) * kSector), std::ios::beg);
+-            }
+-            uint64_t left = file.size;
+-            while (left != 0u)
+-            {
+-                const size_t want = static_cast<size_t>(std::min<uint64_t>(left, buffer.size()));
+-                in->read(buffer.data(), static_cast<std::streamsize>(want));
+-                const size_t got = static_cast<size_t>(in->gcount());
+-                if (got != want)
+-                    return fail(ExtractStatus::ReadFailed, "el disco se acaba antes de tiempo en " + file.path);
+-                out.write(buffer.data(), static_cast<std::streamsize>(got));
+-                if (!out)
+-                    return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(target));
+-                left -= got;
+-                done += got;
+-                if (progress && !progress(done, report.totalBytes, file.path))
+-                    return fail(ExtractStatus::Cancelled, {});
+-            }
+-            out.close();
+-            if (!out)
+-                return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(target));
++            if (error)
++                return fail(ExtractStatus::WriteFailed, "no se puede crear " + pathForLog(target.parent_path()));
++            const ExpectedFile *expected = findExpected(report.expected, file.path);
++            CopyOutcome copied =
++                copyVerified(source, file, target, expected ? std::optional<uint32_t>(expected->crc32) : std::nullopt,
++                             buffer, progress, done, report.totalBytes, result.log);
++            if (copied.status != ExtractStatus::Done)
++                return fail(copied.status, std::move(copied.detail));
+         }
+-        image.close();
+-        folderFile.close();
++        source.close();
+         if (!writeMarker(temp, report))
+             return fail(ExtractStatus::WriteFailed, "no se puede escribir " + pathForLog(temp / kMarkerName));
+ 
+@@ -592,8 +1038,153 @@ namespace ps2x::disc
+         return result;
+     }
+ 
++    ExtractResult repairDataFolder(const DiscReport &report, const fs::path &data, const ExtractProgress &progress)
++    {
++        ExtractResult result;
++        result.repairing = true;
++        result.dataDirectory = data;
++        if (report.status != DiscStatus::Valid)
++        {
++            result.status = ExtractStatus::InvalidDisc;
++            result.detail = describeDiscProblem(report, true);
++            return result;
++        }
++        // A disc folder that is this data (or inside it) has nothing else to be compared with.
++        if (report.folder && insideFolder(report.source, data))
++        {
++            result.status = ExtractStatus::AlreadyThere;
++            result.detail = "la carpeta elegida es la propia carpeta " + data.filename().string();
++            return result;
++        }
++        CopySource source(report);
++        if (!source.openImage())
++        {
++            result.status = ExtractStatus::ReadFailed;
++            result.detail = "no se puede abrir " + pathForLog(report.source);
++            return result;
++        }
++
++        struct Damaged
++        {
++            const DiscFile *file;
++            std::optional<uint32_t> crc; // what it must hold, when known
++        };
++        std::vector<Damaged> damaged;
++        std::vector<char> buffer(kCopyBlock);
++        uint64_t done = 0u;
++        uint64_t total = report.totalBytes;
++        const auto cancelled = [&](const std::string &file) { return progress && !progress(done, total, file); };
++        for (const DiscFile &file : report.files)
++        {
++            const fs::path target = data / fs::path(file.path);
++            const ExpectedFile *expected = findExpected(report.expected, file.path);
++            std::error_code error;
++            const uint64_t size = fs::file_size(target, error);
++            std::string why;
++            std::optional<uint32_t> wanted;
++            if (expected)
++                wanted = expected->crc32;
++            if (error)
++                why = "falta";
++            else if (size != file.size)
++                why = "tiene " + std::to_string(size) + " bytes y no " + std::to_string(file.size);
++            else
++            {
++                uint32_t crc = 0u;
++                uint64_t read = 0u;
++                if (!crcOfFile(target, buffer, crc, read) || read != file.size)
++                    why = "no se puede leer";
++                else if (!wanted)
++                {
++                    uint32_t discCrc = 0u;
++                    if (!crcOnDisc(source, file, buffer, discCrc))
++                    {
++                        result.status = ExtractStatus::ReadFailed;
++                        result.detail = "el disco se acaba antes de tiempo en " + file.path;
++                        return result;
++                    }
++                    wanted = discCrc;
++                }
++                if (why.empty() && wanted && crc != *wanted)
++                    why = "CRC32 " + hex32(crc) + " y no " + hex32(*wanted);
++            }
++            done += file.size;
++            if (!why.empty())
++            {
++                result.log.push_back("dañado " + file.path + ": " + why);
++                damaged.push_back({&file, wanted});
++                total += file.size; // copied again after the check
++            }
++            if (cancelled(file.path))
++            {
++                result.status = ExtractStatus::Cancelled;
++                return result;
++            }
++        }
++
++        // The marker notes what was repaired, also when a later file fails (those stay repaired).
++        const auto noteRepairs = [&]()
++        {
++            std::optional<Marker> marker = readMarker(data);
++            if (result.repaired.empty() || !marker)
++                return true;
++            const std::string when = nowForMarker();
++            for (const std::string &path : result.repaired)
++                marker->repairs.push_back(when + " " + path);
++            const std::string next = std::string(kMarkerName) + ".nuevo";
++            std::error_code error;
++            if (!writeMarker(data, report, marker->repairs, next.c_str()))
++            {
++                fs::remove(data / next, error);
++                return false;
++            }
++            fs::rename(data / next, data / kMarkerName, error);
++            return !error;
++        };
++        for (const Damaged &bad : damaged)
++        {
++            const DiscFile &file = *bad.file;
++            const fs::path target = data / fs::path(file.path);
++            const fs::path fresh = target.parent_path() / (target.filename().string() + kRepairSuffix);
++            std::error_code error;
++            fs::create_directories(target.parent_path(), error);
++            CopyOutcome copied = copyVerified(source, file, fresh, bad.crc, buffer, progress, done, total, result.log);
++            if (copied.status == ExtractStatus::Done)
++            {
++                fs::rename(fresh, target, error); // replaces the damaged file
++                if (error)
++                    copied = {ExtractStatus::WriteFailed, "no se puede cambiar " + pathForLog(target) + ": " + error.message()};
++            }
++            if (copied.status != ExtractStatus::Done)
++            {
++                std::error_code ignored;
++                fs::remove(fresh, ignored);
++                source.close();
++                (void)noteRepairs();
++                result.status = copied.status;
++                result.detail = std::move(copied.detail);
++                return result;
++            }
++            result.repaired.push_back(file.path);
++            result.log.push_back("reparado " + file.path);
++        }
++        source.close();
++        if (!noteRepairs())
++            result.log.push_back("no se pudo anotar la reparación en " + pathForLog(data / kMarkerName));
++        result.status = ExtractStatus::AlreadyThere;
++        return result;
++    }
++
+     std::string describeExtractProblem(const ExtractResult &result, bool spanish)
+     {
++        if (result.repairing && (result.status == ExtractStatus::ReadFailed || result.status == ExtractStatus::WriteFailed))
++            return spanish ? "No se pudo reparar la carpeta data: " + result.detail +
++                                 ". Los archivos que estaban bien no se han tocado."
++                           : "The data folder could not be repaired: " + result.detail +
++                                 ". The files that were fine have not been touched.";
++        if (result.repairing && result.status == ExtractStatus::Cancelled)
++            return spanish ? "Comprobación cancelada: los archivos que ya se habían reparado se quedan así."
++                           : "Check cancelled: the files already repaired stay that way.";
+         switch (result.status)
+         {
+         case ExtractStatus::Done:
+@@ -650,6 +1241,12 @@ namespace ps2x::disc
+         return marker ? marker->fingerprint : std::string{};
+     }
+ 
++    std::vector<std::string> dataFolderRepairs(const fs::path &dataDirectory)
++    {
++        std::optional<Marker> marker = readMarker(dataDirectory);
++        return marker ? std::move(marker->repairs) : std::vector<std::string>{};
++    }
++
+     std::vector<fs::path> dataParents(const fs::path &exeDirectory, const fs::path &localAppDataDirectory)
+     {
+         std::vector<fs::path> parents{exeDirectory};
+@@ -708,19 +1305,27 @@ namespace ps2x::disc
+                std::to_string(done / (1024u * 1024u)) + " of " + std::to_string(total / (1024u * 1024u)) + " MB)";
+     }
+ 
++    std::string launcherCheckLine(uint64_t done, uint64_t total)
++    {
++        return "progress " + launcherProgressFraction(done, total) + " Checking the game data (" +
++               std::to_string(done / (1024u * 1024u)) + " of " + std::to_string(total / (1024u * 1024u)) + " MB)";
++    }
++
+     int runDiscCommand(const std::vector<std::string> &args, const fs::path &exeDirectory,
+                        const fs::path &localAppDataDirectory, std::ostream &out, const DiscCommandUi *ui, bool spanish)
+     {
+-        if (args.empty() || (args[0] != "--extraer-iso" && args[0] != "--comprobar-iso"))
++        if (args.empty() || (args[0] != "--extraer-iso" && args[0] != "--comprobar-iso" && args[0] != "--reparar-iso"))
+             return -1;
+         const bool extract = args[0] == "--extraer-iso";
++        const bool repair = args[0] == "--reparar-iso";
+         bool window = false;
+         for (size_t i = 2u; i < args.size(); ++i)
+             window = window || args[i] == "--ventana";
+         if (args.size() < 2u || args[1].empty() || args[1].rfind("--", 0u) == 0u ||
+             std::any_of(args.begin() + 2, args.end(), [](const std::string &arg) { return arg != "--ventana"; }))
+         {
+-            out << "[disco] uso: --extraer-iso <ruta.iso o carpeta del disco> [--ventana] | --comprobar-iso <ruta>"
++            out << "[disco] uso: --extraer-iso <ruta.iso o carpeta del disco> [--ventana] | --comprobar-iso <ruta> | "
++                   "--reparar-iso <ruta> [--ventana]"
+                 << std::endl;
+             return 1;
+         }
+@@ -750,23 +1355,81 @@ namespace ps2x::disc
+             error(describeDiscProblem(report, spanish));
+             return 2;
+         }
+-        if (!extract)
++        if (!extract && !repair)
+         {
+             out << "[disco] valido: Formula One 06 PAL (" << kGameCode << ")" << std::endl;
+             return 0;
+         }
++        out << "[disco] sumas de referencia: "
++            << (report.expected.empty() ? "no (otro volcado: cada copia se compara con lo leido del disco)"
++                                        : std::to_string(report.expected.size()) + " archivos del volcado " + kGameCode +
++                                              " v1.01")
++            << std::endl;
+ 
++        int lastTenth = -1;
++        std::string lastFraction = "0"; // the first line, before the copy, is at 0
++        bool checking = false;          // checking an existing data rather than copying the disc
++        const ExtractProgress console = [&](uint64_t done, uint64_t total, const std::string &file)
++        {
++            const int tenth = total == 0u ? 10 : static_cast<int>(done * 10u / total);
++            if (tenth != lastTenth)
++            {
++                lastTenth = tenth;
++                out << "[disco] " << (checking ? "comprobando " : "") << tenth * 10 << " % (" << done / (1024u * 1024u)
++                    << " de " << total / (1024u * 1024u) << " MB) " << file << std::endl;
++            }
++            // One line per hundredth (at most 101); the 1 is written once, when the folder is complete (ready()).
++            const std::string fraction = launcherProgressFraction(done, total);
++            if (launcherProgress && fraction != lastFraction && fraction != "1")
++            {
++                lastFraction = fraction;
++                out << (checking ? launcherCheckLine(done, total) : launcherProgressLine(done, total)) << std::endl;
++            }
++            return !(dialogs && dialogs->progress) || dialogs->progress(done, total, file);
++        };
++        const auto writeLog = [&](const ExtractResult &result)
++        {
++            for (const std::string &line : result.log)
++                out << "[disco] " << line << std::endl;
++        };
++
++        // copia-iso S3: a data of this disc is checked file by file and only its damaged files are copied again.
+         const std::vector<fs::path> parents = dataParents(exeDirectory, localAppDataDirectory);
+         for (const fs::path &parent : parents)
+         {
+             const fs::path data = ps2x::iop::dataFolderIn(parent); // data, or a v1.1.0 datos not renamed
+-            if (checkDataFolder(data) == DataState::Complete && dataFolderFingerprint(data) == report.fingerprint)
++            if (dataFolderFingerprint(data) != report.fingerprint ||
++                (!repair && checkDataFolder(data) != DataState::Complete))
++                continue;
++            out << "[disco] comprobando los archivos de " << pathForLog(data) << std::endl;
++            checking = true;
++            if (launcherProgress)
++                out << launcherCheckLine(0u, report.totalBytes) << std::endl;
++            const ExtractResult result = repairDataFolder(report, data, console);
++            writeLog(result);
++            if (result.status == ExtractStatus::AlreadyThere)
+             {
+-                out << "[disco] " << pathForLog(data) << " ya tiene este disco: no se copia otra vez" << std::endl;
++                if (result.repaired.empty())
++                    out << "[disco] " << pathForLog(data) << " ya tiene este disco: " << report.files.size()
++                        << " archivos comprobados, todos bien" << std::endl;
++                else
++                    out << "[disco] " << pathForLog(data) << ": " << result.repaired.size()
++                        << " archivos dañados copiados otra vez, los demás estaban bien" << std::endl;
+                 ready();
+                 return 0;
+             }
++            error(describeExtractProblem(result, spanish));
++            return result.status == ExtractStatus::Cancelled ? 4 : 3;
+         }
++        if (repair)
++        {
++            error(spanish ? "No hay una carpeta data copiada de este disco que reparar. Para copiarlo entero: "
++                            "--extraer-iso \"" + args[1] + "\""
++                          : "There is no data folder copied from this disc to repair. To copy it whole: "
++                            "--extraer-iso \"" + args[1] + "\"");
++            return 5;
++        }
++
+         const fs::path parent = writableDataParent(parents);
+         if (parent.empty())
+         {
+@@ -776,31 +1439,13 @@ namespace ps2x::disc
+             error(describeExtractProblem(failed, spanish));
+             return 3;
+         }
+-        int lastTenth = -1;
+-        std::string lastFraction = "0"; // the first line, before the copy, is at 0
+-        const ExtractProgress console = [&](uint64_t done, uint64_t total, const std::string &file)
+-        {
+-            const int tenth = total == 0u ? 10 : static_cast<int>(done * 10u / total);
+-            if (tenth != lastTenth)
+-            {
+-                lastTenth = tenth;
+-                out << "[disco] " << tenth * 10 << " % (" << done / (1024u * 1024u) << " de " << total / (1024u * 1024u)
+-                    << " MB) " << file << std::endl;
+-            }
+-            // One line per hundredth (at most 101); the 1 is written once, when the folder is complete (ready()).
+-            const std::string fraction = launcherProgressFraction(done, total);
+-            if (launcherProgress && fraction != lastFraction && fraction != "1")
+-            {
+-                lastFraction = fraction;
+-                out << launcherProgressLine(done, total) << std::endl;
+-            }
+-            return !(dialogs && dialogs->progress) || dialogs->progress(done, total, file);
+-        };
++        checking = false;
+         out << "[disco] copiando en " << pathForLog(parent / kDataFolderName) << " (pasa por "
+             << kTempFolderName << ")" << std::endl;
+         if (launcherProgress)
+             out << launcherProgressLine(0u, report.totalBytes) << std::endl;
+         const ExtractResult result = extractDisc(report, parent, console);
++        writeLog(result);
+         if (!result.previousData.empty())
+             out << "[disco] la carpeta data anterior (incompleta) queda en " << pathForLog(result.previousData)
+                 << std::endl;
+@@ -808,7 +1453,7 @@ namespace ps2x::disc
+         {
+         case ExtractStatus::Done:
+             out << "[disco] listo: " << report.files.size() << " archivos en " << pathForLog(result.dataDirectory)
+-                << std::endl;
++                << " (cada uno comprobado)" << std::endl;
+             ready();
+             return 0;
+         case ExtractStatus::AlreadyThere:
+diff --git a/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp b/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp
+index 5273307..30dee3a 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_setup_win.cpp
+@@ -322,6 +322,8 @@ namespace ps2x::disc
+             const ExtractResult result = extractDisc(report, parent, [&](uint64_t done, uint64_t total, const std::string &file)
+                                                      { return window.update(done, total, file); });
+             window.close();
++            for (const std::string &line : result.log) // copia-iso: copies retried, files repaired
++                log << "[disco] " << line << std::endl;
+             log << "[disco] copia en " << pathForLog(result.dataDirectory) << ": "
+                 << (result.status == ExtractStatus::Done || result.status == ExtractStatus::AlreadyThere ? "lista"
+                                                                                                           : result.detail)
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index bc986bc..b728d00 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -397,6 +397,10 @@ namespace
+                 }
+                 out << "[arranque] carpeta data: " << ps2x::pathForLog(data->dataDirectory) << " (ELF "
+                     << data->elfPath.filename().string() << ")" << std::endl;
++                // copia-iso S3: what --extraer-iso / --reparar-iso copied again (their output goes to RecompLauncher
++                // or a console). Only the marker is read here: the contents are never summed at start.
++                for (const std::string &repair : ps2x::disc::dataFolderRepairs(data->dataDirectory))
++                    out << "[arranque] archivo de data reparado el " << repair << std::endl;
+                 return BootSource{data->elfPath, {}, 0u, executable.parent_path()};
+             }
+ 
+@@ -510,6 +514,10 @@ namespace
+ //   F1-06.exe --extraer-iso <iso or folder> [--ventana]  does only that (exit 0 done, 1 usage, 2 not the game,
+ //       3 read/write/space, 4 cancelled); --ventana shows the progress and errors as windows (the installer).
+ //   F1-06.exe --comprobar-iso <iso or folder>  only checks the disc (0 valid, 2 not).
++//   F1-06.exe --reparar-iso <iso or folder> [--ventana]  checks every file of the data folder copied from that disc
++//       and copies again only the damaged ones (0 good or repaired, 3 a file that still does not copy right, 4
++//       cancelled, 5 no data folder of this disc). --extraer-iso does the same on a complete data of the same disc
++//       (copia-iso, issue #3: files with zeros under Proton); every copied file is checked (CRC32, read back).
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+diff --git a/ps2xTest/src/ps2_disc_setup_tests.cpp b/ps2xTest/src/ps2_disc_setup_tests.cpp
+index 9f33ce0..4f92d96 100644
+--- a/ps2xTest/src/ps2_disc_setup_tests.cpp
++++ b/ps2xTest/src/ps2_disc_setup_tests.cpp
+@@ -185,6 +185,32 @@ namespace
+     }
+ 
+     bool contains(const std::string &text, const std::string &part) { return text.find(part) != std::string::npos; }
++
++    uint32_t crcOf(const std::vector<uint8_t> &bytes) { return ps2x::disc::crc32Update(0u, bytes.data(), bytes.size()); }
++
++    // The synthetic disc's files with their right CRC32: the table a known dump would have.
++    std::vector<ps2x::disc::ExpectedFile> syntheticTable()
++    {
++        return {{"DATA/A.BIN", kBinSize, crcOf(pattern(kBinSize, 2u))},
++                {"DATA/SUB/B.TXT", kTxt.size(), crcOf(std::vector<uint8_t>(kTxt.begin(), kTxt.end()))},
++                {"SCES_539.50", kElfSize, crcOf(pattern(kElfSize, 1u))},
++                {"SYSTEM.CNF", kGameCnf.size(), crcOf(std::vector<uint8_t>(kGameCnf.begin(), kGameCnf.end()))}};
++    }
++
++    // copia-iso: a copy hook for one test, always removed (the next test must copy for real).
++    struct ScopedCopyHook
++    {
++        explicit ScopedCopyHook(ps2x::disc::CopyHook hook) { ps2x::disc::setCopyHookForTests(std::move(hook)); }
++        ~ScopedCopyHook() { ps2x::disc::setCopyHookForTests({}); }
++    };
++
++    // Zeroes 64 bytes of a written file, keeping its size (what issue #3 found in COMMON.AWB).
++    void zeroSome(const fs::path &path)
++    {
++        std::vector<uint8_t> bytes = readBytes(path);
++        std::fill(bytes.begin(), bytes.begin() + std::min<size_t>(64u, bytes.size()), uint8_t{0u});
++        writeBytes(path, bytes);
++    }
+ }
+ 
+ void register_ps2_disc_setup_tests()
+@@ -779,5 +805,293 @@ void register_ps2_disc_setup_tests()
+             t.IsTrue(contains(out.str(), "ya tiene este disco"), "says so: " + out.str());
+             t.IsFalse(fs::exists(exe / "data"), "no second copy");
+         });
++
++        // odd/tasks/copia-iso.md S3 (issue #3): under Proton five files came out with zeros at the right size.
++        tc.Run("--extraer-iso on a data with a file zeroed at the same size re-copies only that file", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const fs::path exe = dir.path / "F1-06";
++            fs::create_directories(exe);
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "extracted");
++            const fs::path data = exe / "data";
++            writeBytes(data / "DATA" / "A.BIN", std::vector<uint8_t>(kBinSize, 0u));
++            const auto old = fs::last_write_time(data / "DATA" / "A.BIN") - std::chrono::hours(1);
++            for (const char *name : {"SYSTEM.CNF", "SCES_539.50", "DATA/SUB/B.TXT", "DATA/A.BIN"})
++                fs::last_write_time(data / name, old);
++            t.IsTrue(ps2x::disc::checkDataFolder(data) == DataState::Complete, "the sizes alone look complete");
++
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "repaired: " + out.str());
++            t.Equals(readBytes(data / "DATA" / "A.BIN"), pattern(kBinSize, 2u), "A.BIN has the disc's bytes again");
++            t.IsTrue(contains(out.str(), "[disco] reparado DATA/A.BIN"), "names the repaired file: " + out.str());
++            t.IsTrue(contains(out.str(), "progress 1 Game data ready\n"), "ready for RecompLauncher: " + out.str());
++            for (const char *name : {"SYSTEM.CNF", "SCES_539.50", "DATA/SUB/B.TXT"})
++                t.IsTrue(fs::last_write_time(data / name) == old, std::string("not copied again: ") + name);
++            t.IsFalse(fs::last_write_time(data / "DATA" / "A.BIN") == old, "A.BIN written again");
++            t.Equals(listTree(data).size(), size_t{5u}, "no temporary file left");
++            t.IsFalse(fs::exists(exe / "data.anterior"), "nothing moved aside: not a full copy");
++
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "checked again");
++            t.IsFalse(contains(out.str(), "reparado"), "nothing to repair now: " + out.str());
++            t.IsTrue(contains(out.str(), "ya tiene este disco"), "says so: " + out.str());
++        });
++
++        tc.Run("--reparar-iso: exit codes and only the damaged files copied", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const fs::path exe = dir.path / "F1-06";
++            fs::create_directories(exe);
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            const auto run = [&](std::vector<std::string> args)
++            {
++                out.str("");
++                return ps2x::disc::runDiscCommand(args, exe, {}, out, nullptr, true);
++            };
++            t.Equals(run({"--reparar-iso"}), 1, "missing path");
++            t.IsTrue(contains(out.str(), "--reparar-iso <ruta>"), "the usage names it: " + out.str());
++            t.Equals(run({"--reparar-iso", iso.string(), "--otra"}), 1, "unknown argument");
++            const fs::path other = dir.path / "otro.iso";
++            writeBytes(other, buildDisc("BOOT2 = cdrom0:\\SLES_123.45;1\r\n"));
++            t.Equals(run({"--reparar-iso", other.string()}), 2, "another game");
++            t.Equals(run({"--reparar-iso", iso.string()}), 5, "no data to repair: " + out.str());
++            t.IsTrue(contains(out.str(), "--extraer-iso"), "points to --extraer-iso: " + out.str());
++            t.IsFalse(fs::exists(exe / "data"), "--reparar-iso never makes a full copy");
++
++            t.Equals(run({"--extraer-iso", iso.string()}), 0, "extracted");
++            const fs::path data = exe / "data";
++            t.Equals(run({"--reparar-iso", iso.string()}), 0, "nothing damaged: " + out.str());
++            t.IsFalse(contains(out.str(), "reparado"), "nothing repaired: " + out.str());
++            t.IsFalse(contains(out.str(), "progress "), "no RecompLauncher lines by hand: " + out.str());
++
++            std::vector<uint8_t> elf = pattern(kElfSize, 1u);
++            std::fill(elf.begin() + 100, elf.begin() + 164, uint8_t{0u}); // 64 bytes at 0, as in COMMON.AWB
++            writeBytes(data / "SCES_539.50", elf);
++            fs::remove(data / "DATA" / "SUB" / "B.TXT");
++            const auto old = fs::last_write_time(data / "DATA" / "A.BIN") - std::chrono::hours(1);
++            fs::last_write_time(data / "DATA" / "A.BIN", old);
++            t.Equals(run({"--reparar-iso", iso.string()}), 0, "repaired: " + out.str());
++            t.IsTrue(contains(out.str(), "[disco] reparado SCES_539.50"), "the ELF: " + out.str());
++            t.IsTrue(contains(out.str(), "[disco] reparado DATA/SUB/B.TXT"), "the missing file: " + out.str());
++            t.IsFalse(contains(out.str(), "reparado DATA/A.BIN"), "A.BIN was fine: " + out.str());
++            t.Equals(readBytes(data / "SCES_539.50"), pattern(kElfSize, 1u), "ELF bytes");
++            const std::vector<uint8_t> txt = readBytes(data / "DATA" / "SUB" / "B.TXT");
++            t.Equals(std::string(txt.begin(), txt.end()), kTxt, "B.TXT bytes");
++            t.IsTrue(fs::last_write_time(data / "DATA" / "A.BIN") == old, "A.BIN not copied again");
++            t.IsTrue(ps2x::disc::checkDataFolder(data) == DataState::Complete, "complete");
++
++            // Another disc's data is not repaired from this one.
++            const fs::path exe2 = dir.path / "F1-06b";
++            writeText(exe2 / "portable.txt", "x");
++            writeText(exe2 / "data" / "SYSTEM.CNF", kGameCnf);
++            writeBytes(exe2 / "data" / "SCES_539.50", pattern(kElfSize, 1u));
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--reparar-iso", iso.string()}, exe2, {}, out, nullptr, true), 5,
++                     "a data without this disc's marker: " + out.str());
++            t.Equals(listTree(exe2 / "data").size(), size_t{2u}, "left as it is");
++        });
++
++        tc.Run("CRC32 is zlib's, also block by block", [](TestCase &t)
++        {
++            const std::string text = "123456789";
++            t.Equals(ps2x::disc::crc32Update(0u, text.data(), text.size()), 0xCBF43926u, "the standard check value");
++            const std::vector<uint8_t> bytes = pattern(100003u, 9u);
++            uint32_t crc = 0u;
++            for (size_t at = 0u; at < bytes.size(); at += 4099u)
++                crc = ps2x::disc::crc32Update(crc, bytes.data() + at, std::min<size_t>(4099u, bytes.size() - at));
++            uint32_t slow = 0xFFFFFFFFu;
++            for (const uint8_t byte : bytes)
++            {
++                slow ^= byte;
++                for (int bit = 0; bit < 8; ++bit)
++                    slow = (slow & 1u) ? (0xEDB88320u ^ (slow >> 1u)) : (slow >> 1u);
++            }
++            t.Equals(crc, ~slow, "blocks of any size give the bit-by-bit value");
++            t.Equals(ps2x::disc::crc32Update(0u, nullptr, 0u), 0u, "nothing is 0");
++        });
++
++        tc.Run("the supported dump's table: 98 files by its fingerprint, none for another", [](TestCase &t)
++        {
++            const std::vector<ps2x::disc::ExpectedFile> table =
++                ps2x::disc::knownDumpFiles(ps2x::disc::kSupportedDumpFingerprint);
++            t.Equals(table.size(), size_t{98u}, "98 files");
++            uint64_t bytes = 0u;
++            bool common = false;
++            for (const ps2x::disc::ExpectedFile &file : table)
++            {
++                bytes += file.size;
++                common = common || (file.path == "DATA2006/AUDIO/COMMON.AWB" && file.size == 2611200u &&
++                                    file.crc32 == 0x9f39d664u);
++            }
++            t.Equals(bytes, uint64_t{4396735938u}, "the bytes of the marker of that dump");
++            t.IsTrue(common, "COMMON.AWB (SHA-1 0ae667f5...) is there with its CRC32");
++            t.IsTrue(ps2x::disc::knownDumpFiles("0000000000000000").empty(), "no table for another dump");
++
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            t.IsTrue(report.expected.empty(), "the synthetic disc is an unknown dump");
++        });
++
++        tc.Run("unknown dump: a copy that reads back wrong once is copied again", [](TestCase &t)
++        {
++            TempDir dir;
++            const DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            std::vector<int> attempts;
++            ExtractResult result;
++            {
++                ScopedCopyHook hook([&](const fs::path &written, const std::string &discPath, int attempt)
++                                    {
++                                        if (discPath != "DATA/A.BIN")
++                                            return;
++                                        attempts.push_back(attempt);
++                                        if (attempt == 1)
++                                            zeroSome(written); });
++                result = ps2x::disc::extractDisc(report, parent, nullptr);
++            }
++            t.IsTrue(result.status == ExtractStatus::Done, "done: " + result.detail);
++            t.Equals(attempts, std::vector<int>{1, 2}, "copied a second time");
++            t.Equals(readBytes(parent / "data" / "DATA" / "A.BIN"), pattern(kBinSize, 2u), "the good bytes");
++            bool logged = false;
++            for (const std::string &line : result.log)
++                logged = logged || (contains(line, "DATA/A.BIN: copia mal (intento 1 de 3)"));
++            t.IsTrue(logged, "the retry is logged");
++        });
++
++        tc.Run("a copy that always reads back wrong fails with the file named and leaves nothing", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const DiscReport report = ps2x::disc::inspectDisc(iso);
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            int calls = 0;
++            ScopedCopyHook hook([&](const fs::path &written, const std::string &discPath, int)
++                                {
++                                    if (discPath == "DATA/A.BIN")
++                                    {
++                                        ++calls;
++                                        zeroSome(written);
++                                    } });
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::WriteFailed, "write failure: " + result.detail);
++            t.Equals(calls, 3, "three attempts");
++            t.IsTrue(contains(result.detail, "DATA/A.BIN no sale bien tras 3 intentos"), "names it: " + result.detail);
++            t.IsTrue(contains(ps2x::disc::describeExtractProblem(result, true), "DATA/A.BIN"), "the player's text too");
++            t.IsTrue(fs::is_empty(parent), "no data and no temporary folder");
++
++            const fs::path exe = dir.path / "F1-06";
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 3,
++                     "exit code 3 for RecompLauncher");
++            t.IsTrue(contains(out.str(), "[disco] No se pudo escribir la carpeta data: DATA/A.BIN no sale bien"),
++                     "a clear [disco] line: " + out.str());
++            t.IsFalse(contains(out.str(), "progress 1 "), "never ready: " + out.str());
++            t.IsFalse(fs::exists(exe / "data"), "no data");
++        });
++
++        tc.Run("a reference table the disc does not match fails the copy as a read failure", [](TestCase &t)
++        {
++            TempDir dir;
++            DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            report.expected = syntheticTable();
++            const fs::path good = dir.path / "bien";
++            fs::create_directories(good);
++            t.IsTrue(ps2x::disc::extractDisc(report, good, nullptr).status == ExtractStatus::Done,
++                     "the right table copies");
++            report.expected[1].crc32 ^= 1u; // DATA/SUB/B.TXT
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            const ExtractResult result = ps2x::disc::extractDisc(report, parent, nullptr);
++            t.IsTrue(result.status == ExtractStatus::ReadFailed, "read failure: " + result.detail);
++            t.IsTrue(contains(result.detail, "DATA/SUB/B.TXT no sale bien tras 3 intentos"), "names it: " + result.detail);
++            t.IsTrue(contains(result.detail, "la ISO puede estar"), "says the disc is the problem: " + result.detail);
++            t.Equals(result.log.size(), size_t{3u}, "three logged attempts");
++            t.IsTrue(fs::is_empty(parent), "nothing left");
++        });
++
++        tc.Run("repair with a reference table re-copies only the damaged file and notes it in the marker", [](TestCase &t)
++        {
++            TempDir dir;
++            DiscReport report = ps2x::disc::inspectDisc(writeDisc(dir, kGameCnf));
++            report.expected = syntheticTable();
++            const fs::path parent = dir.path / "juego";
++            fs::create_directories(parent);
++            t.IsTrue(ps2x::disc::extractDisc(report, parent, nullptr).status == ExtractStatus::Done, "extracted");
++            const fs::path data = parent / "data";
++            t.IsTrue(ps2x::disc::dataFolderRepairs(data).empty(), "no repairs yet");
++            zeroSome(data / "DATA" / "A.BIN");
++            const auto old = fs::last_write_time(data / "SYSTEM.CNF") - std::chrono::hours(1);
++            for (const char *name : {"SYSTEM.CNF", "SCES_539.50", "DATA/SUB/B.TXT"})
++                fs::last_write_time(data / name, old);
++            // The disc is not read for the good files: a table says what they hold.
++            std::vector<std::string> copied;
++            ExtractResult result;
++            {
++                ScopedCopyHook hook([&](const fs::path &, const std::string &discPath, int) { copied.push_back(discPath); });
++                result = ps2x::disc::repairDataFolder(report, data, nullptr);
++            }
++            t.IsTrue(result.status == ExtractStatus::AlreadyThere, "repaired: " + result.detail);
++            t.Equals(result.repaired, std::vector<std::string>{"DATA/A.BIN"}, "only A.BIN");
++            t.Equals(copied, std::vector<std::string>{"DATA/A.BIN"}, "only A.BIN copied");
++            t.Equals(readBytes(data / "DATA" / "A.BIN"), pattern(kBinSize, 2u), "A.BIN good again");
++            for (const char *name : {"SYSTEM.CNF", "SCES_539.50", "DATA/SUB/B.TXT"})
++                t.IsTrue(fs::last_write_time(data / name) == old, std::string("untouched: ") + name);
++            t.IsFalse(fs::exists(data / "DATA" / "A.BIN.reparando"), "no temporary file left");
++            const std::vector<std::string> repairs = ps2x::disc::dataFolderRepairs(data);
++            t.Equals(repairs.size(), size_t{1u}, "one repair noted");
++            t.IsTrue(!repairs.empty() && repairs[0].size() > 17u && repairs[0].substr(16) == " DATA/A.BIN",
++                     "date, time and path: " + (repairs.empty() ? std::string() : repairs[0]));
++            t.IsTrue(ps2x::disc::checkDataFolder(data) == DataState::Complete, "the marker still works");
++            t.Equals(ps2x::disc::dataFolderFingerprint(data), report.fingerprint, "same fingerprint");
++
++            const ExtractResult again = ps2x::disc::repairDataFolder(report, data, nullptr);
++            t.IsTrue(again.status == ExtractStatus::AlreadyThere && again.repaired.empty(), "nothing more to repair");
++            t.Equals(ps2x::disc::dataFolderRepairs(data).size(), size_t{1u}, "the note is kept, not repeated");
++        });
++
++        tc.Run("repair whose copy keeps failing leaves the damaged file and fails with exit code 3", [](TestCase &t)
++        {
++            TempDir dir;
++            const fs::path iso = writeDisc(dir, kGameCnf);
++            const fs::path exe = dir.path / "F1-06";
++            writeText(exe / "portable.txt", "x");
++            std::ostringstream out;
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "extracted");
++            const fs::path bin = exe / "data" / "DATA" / "A.BIN";
++            zeroSome(bin);
++            const std::vector<uint8_t> damaged = readBytes(bin);
++            out.str("");
++            int result = 0;
++            {
++                ScopedCopyHook hook([](const fs::path &written, const std::string &, int) { zeroSome(written); });
++                result = ps2x::disc::runDiscCommand({"--reparar-iso", iso.string()}, exe, {}, out, nullptr, true);
++            }
++            t.Equals(result, 3, "exit code 3: " + out.str());
++            t.IsTrue(contains(out.str(), "[disco] No se pudo reparar la carpeta data: DATA/A.BIN no sale bien"),
++                     "names it: " + out.str());
++            t.Equals(readBytes(bin), damaged, "the damaged file stays as it was");
++            t.IsFalse(fs::exists(exe / "data" / "DATA" / "A.BIN.reparando"), "no temporary file left");
++            t.IsTrue(ps2x::disc::dataFolderRepairs(exe / "data").empty(), "nothing noted as repaired");
++
++            out.str("");
++            t.Equals(ps2x::disc::runDiscCommand({"--extraer-iso", iso.string()}, exe, {}, out, nullptr, true), 0,
++                     "without the fault --extraer-iso repairs it: " + out.str());
++            t.Equals(readBytes(bin), pattern(kBinSize, 2u), "good again");
++            t.IsTrue(contains(out.str(), "progress 0 Checking the game data (0 of 0 MB)"),
++                     "RecompLauncher sees a check: " + out.str());
++            t.Equals(ps2x::disc::dataFolderRepairs(exe / "data").size(), size_t{1u}, "noted");
++        });
+     });
+ }

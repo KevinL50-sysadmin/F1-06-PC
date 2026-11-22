@@ -1,0 +1,138 @@
+diff --git a/ps2xRuntime/src/lib/ps2_options.cpp b/ps2xRuntime/src/lib/ps2_options.cpp
+index 4d3a06d..cc6188d 100644
+--- a/ps2xRuntime/src/lib/ps2_options.cpp
++++ b/ps2xRuntime/src/lib/ps2_options.cpp
+@@ -78,11 +78,12 @@ namespace ps2x
+             return parseWindowSize(value, width, height);
+         }
+ 
+-        // Controles personalizados T1: the buttons a driving action can have (controles.ini's names).
++        // Controles personalizados T1: the buttons a driving action can have (controles.ini's names). Triangle
++        // (controles-en-carrera T3) is the last one, so the game's rows 0-6 keep their numbers.
+         std::vector<OptionChoice> drivingButtonChoices()
+         {
+             return {{"cruz", "cruz"}, {"cuadrado", "cuadrado"}, {"circulo", "circulo"}, {"l1", "l1"},
+-                    {"r1", "r1"},     {"l2", "l2"},             {"r2", "r2"}};
++                    {"r1", "r1"},     {"l2", "l2"},             {"r2", "r2"},           {"triangulo", "triangulo"}};
+         }
+ 
+         const char *const kUnknownKeysHeader =
+@@ -314,9 +315,10 @@ namespace ps2x
+             // file with two actions on one button takes the original game's five (parseOptions). The choices keep
+             // controles.ini's names; their order is the number of the game's row.
+             {"boton_acelerar", "PS2X_BOTON_ACELERAR", "cruz", drivingButtonChoices(), 0, 0,
+-             "Boton de acelerar al conducir: cruz, cuadrado, circulo, l1, r1, l2 o r2 (cruz en el juego original).\n"
+-             "Cada boton es de una sola accion: si dos acciones de conduccion tienen el mismo, todas vuelven a las\n"
+-             "del juego original. En repeticiones, modo foto, pausa y menus los botones hacen lo de siempre."},
++             "Boton de acelerar al conducir: cruz, cuadrado, circulo, l1, r1, l2, r2 o triangulo (cruz en el juego\n"
++             "original). Cada boton es de una sola accion: si dos acciones de conduccion tienen el mismo, todas\n"
++             "vuelven a las del juego original. Con triangulo (la camara del juego), la camara pasa al boton que la\n"
++             "accion deja libre. En repeticiones, modo foto, pausa y menus los botones hacen lo de siempre."},
+             {"boton_frenar", "PS2X_BOTON_FRENAR", "cuadrado", drivingButtonChoices(), 0, 0,
+              "Boton de frenar (y de marcha atras con el coche parado): los mismos valores (cuadrado en el juego)."},
+             {"boton_subir_marcha", "PS2X_BOTON_SUBIR_MARCHA", "r2", drivingButtonChoices(), 0, 0,
+diff --git a/ps2xRuntime/src/lib/ps2_options_menu.cpp b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+index 1f6c8cc..4342400 100644
+--- a/ps2xRuntime/src/lib/ps2_options_menu.cpp
++++ b/ps2xRuntime/src/lib/ps2_options_menu.cpp
+@@ -54,16 +54,16 @@ namespace
+         std::vector<Row> rows;
+     };
+ 
+-    // Controles personalizados T1: the buttons of the driving actions.
++    // Controles personalizados T1: the buttons of the driving actions (triangle: controles-en-carrera T3).
+     std::vector<Choice> drivingButtons()
+     {
+         return {{"cruz", "Cruz"}, {"cuadrado", "Cuadrado"}, {"circulo", "Círculo"}, {"l1", "L1"},
+-                {"r1", "R1"},     {"l2", "L2"},             {"r2", "R2"}};
++                {"r1", "R1"},     {"l2", "L2"},             {"r2", "R2"},           {"triangulo", "Triángulo"}};
+     }
+ 
+     constexpr const char *kDrivingButtonHint =
+-        "El botón de esta acción al conducir. Si otra acción lo tiene, se intercambian. En repeticiones, modo foto, "
+-        "pausa y menús los botones hacen lo de siempre.";
++        "El botón de esta acción al conducir. Si otra acción lo tiene, se intercambian. Con Triángulo (la cámara), la "
++        "cámara pasa al botón que deja libre. En repeticiones, modo foto, pausa y menús los botones hacen lo de siempre.";
+ 
+     const std::vector<Section> &sections()
+     {
+diff --git a/ps2xTest/src/ps2_options_menu_tests.cpp b/ps2xTest/src/ps2_options_menu_tests.cpp
+index 952dae2..00d3f42 100644
+--- a/ps2xTest/src/ps2_options_menu_tests.cpp
++++ b/ps2xTest/src/ps2_options_menu_tests.cpp
+@@ -730,8 +730,8 @@ void register_ps2_options_menu_tests()
+             t.Equals(fileValue(saved, "detalle_coches"), std::string("1"), "the other options keep their values");
+         });
+ 
+-        // Controles personalizados T1 (S1): the button of each driving action, one of cross, square, circle, L1, R1, L2
+-        // and R2; the original game's by default.
++        // Controles personalizados T1 (S1): the button of each driving action, one of cross, square, circle, L1, R1, L2,
++        // R2 and (controles-en-carrera T3) triangle; the original game's by default.
+         tc.Run("the driving button options have their defaults, variables, checks and numbers", [](TestCase &t)
+         {
+             const std::vector<std::pair<const char *, const char *>> defaults = {
+@@ -759,7 +759,7 @@ void register_ps2_options_menu_tests()
+             t.Equals(variables["PS2X_BOTON_BAJAR_MARCHA"], std::string("l1"), "-> PS2X_BOTON_BAJAR_MARCHA");
+             t.Equals(variables["PS2X_BOTON_MIRAR_ATRAS"], std::string("circulo"), "-> PS2X_BOTON_MIRAR_ATRAS");
+ 
+-            for (const char *line : {"boton_acelerar = triangulo\n", "boton_frenar = r3\n", "boton_mirar_atras = 1\n"})
++            for (const char *line : {"boton_acelerar = l3\n", "boton_frenar = r3\n", "boton_mirar_atras = 1\n"})
+             {
+                 const ps2x::OptionsFile bad = ps2x::parseOptions(line);
+                 t.Equals(bad.warnings.size(), size_t{1u}, std::string("a button off the list warns: ") + line);
+@@ -778,20 +778,52 @@ void register_ps2_options_menu_tests()
+             t.IsTrue(ps2x::menuOptionNumber(model, "boton_acelerar", value), "a number for the game's row");
+             t.Equals(value, 0.0f, "cross: the first choice");
+             t.IsTrue(ps2x::menuOptionNumber(model, "boton_subir_marcha", value), "gear up");
+-            t.Equals(value, 6.0f, "R2: the last choice");
++            t.Equals(value, 6.0f, "R2: the seventh choice");
+             t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 2.0f), "circle for looking back");
+             t.Equals(model.current.at("boton_mirar_atras"), std::string("circulo"), "is circulo");
+             t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 3.0f), "L1 for looking back");
+             t.Equals(model.current.at("boton_mirar_atras"), std::string("l1"), "is l1");
+-            t.IsFalse(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 7.0f), "past R2");
++            t.IsFalse(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 8.0f), "past triangle");
+             t.IsFalse(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", -1.0f), "before cross");
+-            t.IsFalse(ps2x::setMenuOption(model, "boton_mirar_atras", "triangulo"), "triangle is not on the list");
++            t.IsFalse(ps2x::setMenuOption(model, "boton_mirar_atras", "l3"), "L3 is not on the list");
+             t.Equals(model.current.at("boton_mirar_atras"), std::string("l1"), "refused values change nothing");
+             const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
+             t.Equals(fileValue(saved, "boton_mirar_atras"), std::string("l1"), "CONFIRM writes it");
+             t.Equals(fileValue(saved, "boton_acelerar"), std::string("cruz"), "the other actions keep their buttons");
+         });
+ 
++        // controles-en-carrera T3 (S2): triangle is a driving button too ("mirar atras ... en triangulo/y"), the eighth
++        // choice (number 7), in settings.ini, its variable, the game's row and the swaps.
++        tc.Run("triangle is a driving button choice", [](TestCase &t)
++        {
++            const ps2x::OptionsFile file = ps2x::parseOptions("boton_mirar_atras = triangulo\n");
++            t.IsTrue(file.warnings.empty(), "triangulo gives no warning");
++            t.Equals(file.values.at("boton_mirar_atras"), std::string("triangulo"), "and is kept");
++            std::map<std::string, std::string> variables;
++            for (const ps2x::EnvironmentSetting &setting : ps2x::optionsEnvironment(file, environmentOf({})))
++                variables[setting.variable] = setting.value;
++            t.Equals(variables["PS2X_BOTON_MIRAR_ATRAS"], std::string("triangulo"), "-> PS2X_BOTON_MIRAR_ATRAS");
++
++            ps2x::OptionsMenuModel model = ps2x::makeOptionsMenuModel("", false, {}, environmentOf({}));
++            t.IsTrue(ps2x::setMenuOptionNumber(model, "boton_mirar_atras", 7.0f), "triangle, as the game's row 7");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("triangulo"), "look back is triangle");
++            float value = -99.0f;
++            t.IsTrue(ps2x::menuOptionNumber(model, "boton_mirar_atras", value), "a number for the game's row");
++            t.Equals(value, 7.0f, "triangle: the last choice");
++            t.Equals(model.current.at("boton_acelerar"), std::string("cruz"), "nobody else changes");
++            t.IsTrue(ps2x::setMenuOption(model, "boton_acelerar", "triangulo"), "triangle for accelerating");
++            t.Equals(model.current.at("boton_acelerar"), std::string("triangulo"), "accelerate is triangle");
++            t.Equals(model.current.at("boton_mirar_atras"), std::string("cruz"), "look back takes cross");
++            const std::string saved = ps2x::rewriteOptionsText("", ps2x::menuValuesToSave(model), false);
++            t.Equals(fileValue(saved, "boton_acelerar"), std::string("triangulo"), "CONFIRM writes it");
++            t.IsTrue(ps2x::parseOptions(saved).warnings.empty(), "and the file reads back without warnings");
++
++            const Environment environment = {{"PS2X_BOTON_MIRAR_ATRAS", "triangulo"}};
++            const ps2x::OptionsMenuModel forced = ps2x::makeOptionsMenuModel(
++                "", false, ps2x::optionsForcedByEnvironment(environmentOf(environment)), environmentOf(environment));
++            t.Equals(forced.current.at("boton_mirar_atras"), std::string("triangulo"), "the variable sets it");
++        });
++
+         // Controles personalizados T1 (S3): choosing a button another action holds swaps them; two actions never share
+         // a button.
+         tc.Run("choosing a button another driving action holds swaps the two", [](TestCase &t)

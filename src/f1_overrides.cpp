@@ -2942,12 +2942,14 @@ namespace
     // conduce, el boton del juego de cada accion (X, cuadrado, R2, L2, R1) recibe el estado del boton elegido: su bit
     // (byte 3, activo a 0) y su presion (bytes 8-19 del DualShock 2). Se calcula sobre una copia del informe (es una
     // permutacion, no se encadena). O y L1 (sin uso en carrera) pasan tal cual salvo que una accion los use: entonces
-    // se leen sueltos. Con los botones del juego original el informe no cambia.
+    // se leen sueltos. El triangulo (la camara del juego, controles-en-carrera T3) pasa tal cual si no se usa; si una
+    // accion lo usa, el triangulo del juego recibe el boton fisico que esa accion deja libre (MIRAR ATRAS=triangulo:
+    // R1 fisico hace de camara). Con los botones del juego original el informe no cambia.
     // El bloque entre F1CONTROLES-PURO-INICIO y -FIN solo usa <cstdint>: la prueba lo extrae y lo compila aparte.
     // F1CONTROLES-PURO-INICIO
     namespace controles
     {
-        constexpr int kBotones = 7;  // cruz cuadrado circulo l1 r1 l2 r2 (el numero de la fila del ajuste, 0-6)
+        constexpr int kBotones = 8;  // cruz cuadrado circulo l1 r1 l2 r2 triangulo (el valor del ajuste, 0-7)
         constexpr int kAcciones = 5; // acelerar frenar subir_marcha bajar_marcha mirar_atras
         struct BotonPad
         {
@@ -2955,8 +2957,9 @@ namespace
             uint8_t presion; // byte de presion
         };
         constexpr BotonPad kBoton[kBotones] = {{6u, 14u}, {7u, 15u}, {5u, 13u}, {2u, 16u},
-                                               {3u, 18u}, {0u, 17u}, {1u, 19u}};
+                                               {3u, 18u}, {0u, 17u}, {1u, 19u}, {4u, 12u}};
         constexpr int kBotonDelJuego[kAcciones] = {0, 1, 6, 5, 4}; // cruz cuadrado r2 l2 r1
+        constexpr int kTriangulo = 7; // la camara del juego: no se deja suelto
 
         inline bool eleccionValida(const int elegido[kAcciones])
         {
@@ -2979,7 +2982,29 @@ namespace
             return true;
         }
 
-        // informe: los 20 primeros bytes del de scePadRead. Una eleccion invalida (fuera de 0-6 o con dos acciones en
+        // El boton fisico que deja libre la accion que usa el boton b (que no es del juego): el del juego de esa accion,
+        // o, si otra accion lo usa, el de esa, y asi (la cadena acaba: la eleccion es valida y b no es del juego).
+        // -1 si ninguna accion usa b.
+        inline int libreDe(const int elegido[kAcciones], int b)
+        {
+            int accion = -1;
+            for (int a = 0; a < kAcciones; ++a)
+                if (elegido[a] == b)
+                    accion = a;
+            for (int paso = 0; accion >= 0 && paso < kAcciones; ++paso)
+            {
+                const int libre = kBotonDelJuego[accion];
+                accion = -1;
+                for (int a = 0; a < kAcciones; ++a)
+                    if (elegido[a] == libre)
+                        accion = a;
+                if (accion < 0)
+                    return libre;
+            }
+            return -1;
+        }
+
+        // informe: los 20 primeros bytes del de scePadRead. Una eleccion invalida (fuera de 0-7 o con dos acciones en
         // un boton) no cambia nada.
         inline void reasignar(uint8_t *informe, const int elegido[kAcciones])
         {
@@ -3003,7 +3028,7 @@ namespace
                 if (!delJuego)
                     for (int a = 0; a < kAcciones; ++a)
                         if (elegido[a] == b)
-                            fuente = -1;
+                            fuente = b == kTriangulo ? libreDe(elegido, b) : -1;
                 const uint8_t mascara = static_cast<uint8_t>(1u << kBoton[b].bit);
                 const bool pulsado = fuente >= 0 && (byte3 & (1u << kBoton[fuente].bit)) == 0u;
                 salida = static_cast<uint8_t>(pulsado ? (salida & ~mascara) : (salida | mascara));
@@ -3011,12 +3036,51 @@ namespace
             }
             informe[3] = salida;
         }
+
+        // Lo que decide si se conduce (S2), por separado para el registro de PS2X_PAD_DEPURAR.
+        struct Conduccion
+        {
+            bool foto = false;        // modo foto del PC
+            bool partida = false;     // *0x3FE3EC apunta a una partida
+            bool pasoCarrera = false; // metodo +0x134 de su tabla +0x7C = 0x195900 (como medirIa)
+            uint32_t servidor = 0u;   // partida +0x20: pause.server_state() (4 en marcha; 3 pausa, 0 y 6 fuera)
+            uint32_t menu = 0u;       // partida +0x568 (el menu de pausa para pilotar; al pausar la carrera sigue en 0)
+            uint32_t repeticion = 0u; // partida +0x24
+            uint32_t coche = 0u;      // HUD del jugador +0x20: estado de su coche (4 en carrera)
+            uint32_t aviso = 0u;      // HUD del jugador +0x44: el aviso de la cola (0x25 ninguno)
+            bool activo = false;
+            bool operator==(const Conduccion &o) const
+            {
+                return foto == o.foto && partida == o.partida && pasoCarrera == o.pasoCarrera &&
+                       servidor == o.servidor && menu == o.menu && repeticion == o.repeticion && coche == o.coche &&
+                       aviso == o.aviso && activo == o.activo;
+            }
+        };
+
+        // Avisos de la cola del HUD (gestor en HUD +0x30: aviso actual en +0x40, su tipo en +0x44; tipos de la fabrica
+        // func_1F8590) que esperan una pulsacion: 1 clasificacion de la carrera (CONTINUE), 12 OVL_COM_WFRC "Waiting
+        // for race completion", 14 OVL_COM_RET (retirado), 15 OVL_COM_DISQ "Disqualified", 17 y 21 los de la salida y
+        // del final (func_219080). Los informativos (13 WOP, 16 FLC, 22 FT, 31 PIT_LPL, 36) no quitan la reasignacion.
+        inline bool avisoConPulsacion(uint32_t tipo)
+        {
+            return tipo == 1u || tipo == 12u || tipo == 14u || tipo == 15u || tipo == 17u || tipo == 21u;
+        }
+
+        // El paso de carrera (0x195900) y el menu (+0x568) = 0 solo se cumplen en la carrera rapida: en el fin de
+        // semana de GP el paso es otro y el menu vale 0xFFFFFFFF, y en la contrarreloj vale 1, con el coche en pista
+        // (controles-en-carrera T1). Se registran, pero no deciden: basta el coche del jugador en carrera, sin pausa,
+        // repeticion, modo foto ni aviso que espere una pulsacion.
+        inline bool activa(const Conduccion &c)
+        {
+            return !c.foto && c.partida && c.servidor == 4u && c.repeticion == 0u && c.coche == 4u &&
+                   !avisoConPulsacion(c.aviso);
+        }
     }
     // F1CONTROLES-PURO-FIN
 
     namespace controles
     {
-        const char *const kNombres[kBotones] = {"cruz", "cuadrado", "circulo", "l1", "r1", "l2", "r2"};
+        const char *const kNombres[kBotones] = {"cruz", "cuadrado", "circulo", "l1", "r1", "l2", "r2", "triangulo"};
         const char *const kClaves[kAcciones] = {"boton_acelerar", "boton_frenar", "boton_subir_marcha",
                                                 "boton_bajar_marcha", "boton_mirar_atras"};
         const char *const kVariables[kAcciones] = {"PS2X_BOTON_ACELERAR", "PS2X_BOTON_FRENAR", "PS2X_BOTON_SUBIR_MARCHA",
@@ -3041,26 +3105,6 @@ namespace
             return kBotonDelJuego[accion];
         }
 
-        // Lo que decide si se conduce (S2), por separado para el registro de PS2X_PAD_DEPURAR.
-        struct Conduccion
-        {
-            bool foto = false;        // modo foto del PC
-            bool partida = false;     // *0x3FE3EC apunta a una partida
-            bool pasoCarrera = false; // metodo +0x134 de su tabla +0x7C = 0x195900 (como medirIa)
-            uint32_t servidor = 0u;   // partida +0x20: pause.server_state() (4 en marcha; 3 pausa, 0 y 6 fuera)
-            uint32_t menu = 0u;       // partida +0x568 (el menu de pausa para pilotar; al pausar la carrera sigue en 0)
-            uint32_t repeticion = 0u; // partida +0x24
-            uint32_t coche = 0u;      // HUD del jugador +0x20: estado de su coche (4 en carrera)
-            uint32_t aviso = 0u;      // HUD del jugador +0x44: el aviso de la cola (0x25 ninguno)
-            bool activo = false;
-            bool operator==(const Conduccion &o) const
-            {
-                return foto == o.foto && partida == o.partida && pasoCarrera == o.pasoCarrera &&
-                       servidor == o.servidor && menu == o.menu && repeticion == o.repeticion && coche == o.coche &&
-                       aviso == o.aviso && activo == o.activo;
-            }
-        };
-
         struct Estado
         {
             int elegido[kAcciones] = {0, 1, 6, 5, 4};
@@ -3083,19 +3127,10 @@ namespace
             return s_depurar;
         }
 
-        // Avisos de la cola del HUD (gestor en HUD +0x30: aviso actual en +0x40, su tipo en +0x44; tipos de la fabrica
-        // func_1F8590) que esperan una pulsacion: 1 clasificacion de la carrera (CONTINUE), 12 OVL_COM_WFRC "Waiting
-        // for race completion", 14 OVL_COM_RET (retirado), 15 OVL_COM_DISQ "Disqualified", 17 y 21 los de la salida y
-        // del final (func_219080). Los informativos (13 WOP, 16 FLC, 22 FT, 31 PIT_LPL, 36) no quitan la reasignacion.
-        bool avisoConPulsacion(uint32_t tipo)
-        {
-            return tipo == 1u || tipo == 12u || tipo == 14u || tipo == 15u || tipo == 17u || tipo == 21u;
-        }
-
-        // Conduciendo (S2): fuera del modo foto; partida en *0x3FE3EC en el paso de carrera, en marcha (+0x20 = 4: con
-        // el menu de pausa es 3), sin menu (+0x568) ni repeticion (+0x24); y el coche del jugador en carrera (+0x20 de
-        // su HUD = 4: 3 en la parrilla antes de la salida, 1 tras retirarse o ser descalificado, 6 en boxes) sin un
-        // aviso que espere una pulsacion. El HUD es el del puerto en *(*0x3FE5BC + 0x34) (vector: +0x3C cuantos; el
+        // Conduciendo (S2, activa()): fuera del modo foto; partida en *0x3FE3EC en marcha (+0x20 = 4: con el menu de
+        // pausa es 3), sin repeticion (+0x24); y el coche del jugador en carrera (+0x20 de su HUD = 4: 3 en la
+        // parrilla de la carrera rapida, 1 tras retirarse o ser descalificado, 6 en boxes, 7 en el garaje) sin un
+        // aviso que espere una pulsacion. El paso y el menu solo van al registro. El HUD es el del puerto en *(*0x3FE5BC + 0x34) (vector: +0x3C cuantos; el
         // del jugador 1 si no hay otro); lo crea func_1F19B8 y lo actualiza func_1F9078 (car +0x240 -> HUD +0x20).
         Conduccion conduciendo(const uint8_t *rdram, uint32_t puerto)
         {
@@ -3124,8 +3159,7 @@ namespace
                     c.aviso = leer32(rdram, hud + 0x44u);
                 }
             }
-            c.activo = !c.foto && c.partida && c.pasoCarrera && c.servidor == 4u && c.menu == 0u &&
-                       c.repeticion == 0u && c.coche == 4u && !avisoConPulsacion(c.aviso);
+            c.activo = activa(c);
             return c;
         }
 
@@ -6194,6 +6228,8 @@ if Menu and Menu.customActivate and Menu.pauseCustomActivate and Menu.insertItem
       G("ps2x:abrir")
       if recordada then G("ps2x:recordar") end
     end
+    local antes = nil
+    if rehaciendo then antes = filas end
     filas = crearFilas(pausa, n)
     self.mMenuObjects = nil
     self.mMenuObjects = {}
@@ -6209,6 +6245,16 @@ if Menu and Menu.customActivate and Menu.pauseCustomActivate and Menu.insertItem
       self.mMenuSpacingY = espaciado * 8 / (table.getn(filas) - 1)
     end
     self:onActivate()
+    -- lanzamiento-1.2.0 S5: onActivate deja cada fila lista para cambiar (setState: mLastUpdate = os.time() - 2), y
+    -- con la flecha aun pulsada la fila nueva cambiaba otra vez a las ~0,12 s (addValue solo espera 0,19 s desde el
+    -- ultimo cambio de esa fila). Las filas rehechas siguen con la hora del ultimo cambio de las de antes.
+    if antes then
+      for k = 1, table.getn(filas) do
+        if antes[k] and antes[k][1].mLastUpdate and filas[k][1].mLastUpdate then
+          filas[k][1].mLastUpdate = antes[k][1].mLastUpdate
+        end
+      end
+    end
   end
 
   local activar = Menu.customActivate
@@ -6431,14 +6477,15 @@ end
 
     // CONTROLES PC (Controles personalizados T1): el boton de cada accion de conduccion (boton_acelerar...,
     // ps2x::gameOptionsPageKeys(6)), en un trozo que la pagina pide al abrirse (=ps2x:controles-pc). Cada fila vale el
-    // numero de su boton en settings.ini (0 cruz ... 6 R2). Elegir un boton que tiene otra accion los intercambia en el
-    // runtime (ps2x::setMenuOption), asi que cada cambio rehace la pagina para que la otra fila muestre su boton nuevo.
+    // numero de su boton en settings.ini (0 cruz ... 6 R2, 7 triangulo). Elegir un boton que tiene otra accion los
+    // intercambia en el runtime (ps2x::setMenuOption), asi que cada cambio rehace la pagina para que la otra fila
+    // muestre su boton nuevo.
     // VALORES POR DEFECTO, como en AJUSTES PC. La fuente del juego no tiene los simbolos de los botones: van con texto.
     constexpr const char *kTrozoControlesPc = "controles-pc";
     constexpr const char *kPaginaControlesPc = R"lua(
 return function(fila, T, onoff, lista, G, rehacer)
   local botones = {{"X", 0}, {T("CUADRADO", "SQUARE"), 1}, {T("C\195\141RCULO", "CIRCLE"), 2}, {"L1", 3}, {"R1", 4},
-    {"L2", 5}, {"R2", 6}}
+    {"L2", 5}, {"R2", 6}, {T("TRI\195\129NGULO", "TRIANGLE"), 7}}
   local cambio = T(" Si otra acci\195\179n lo tiene, se intercambian.", " If another action has it, they swap.")
   local function control(clave, nombre, ayuda)
     fila(clave, nombre, botones, ayuda .. cambio)
@@ -6460,7 +6507,8 @@ return function(fila, T, onoff, lista, G, rehacer)
   control("boton_bajar_marcha", T("BAJAR MARCHA", "GEAR DOWN"),
     T("El bot\195\179n que baja de marcha.", "The button that shifts down a gear."))
   control("boton_mirar_atras", T("MIRAR ATR\195\129S", "LOOK BEHIND"),
-    T("El bot\195\179n que mira hacia atr\195\161s mientras se mantiene.", "The button that looks behind while held."))
+    T("El bot\195\179n que mira hacia atr\195\161s mientras se mantiene. Con TRI\195\129NGULO, R1 cambia la c\195\161mara.",
+      "The button that looks behind while held. With TRIANGLE, R1 changes the camera."))
   local aplicar = T("APLICAR", "APPLY")
   local defecto = ClassConfigMenuToggleItem()
   defecto.mTitle = T("VALORES POR DEFECTO", "DEFAULT VALUES")
