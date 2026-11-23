@@ -1,0 +1,33 @@
+{
+  "servidor": "Formula One 2005/2006 PC",
+  "canales": {
+    "rules": "1573853179450359818",
+    "announcements": "1573853181111304252",
+    "github": "1573853182784966828",
+    "faq": "1573867289042755724",
+    "installation-guide": "1573867291211337809",
+    "known-issues": "1573867292796784710",
+    "general": "1573851497022627984",
+    "help": "1573853189915287713",
+    "problems-and-errors": "1573853191223779411",
+    "ideas-and-suggestions": "1573867297674756188",
+    "f1-06-pc": "1573853192968470572",
+    "f1-05-pc": "1573853194868760727"
+  },
+  "juegos": {
+    "f1-06": {
+      "nombre": "F1 06 PC",
+      "repo": "https://github.com/KevinL50-sysadmin/F1-06-PC",
+      "canal_juego": "f1-06-pc",
+      "mensaje_known_issues": "1574407986556706908",
+      "pie": null
+    },
+    "f1-05": {
+      "nombre": "F1 05 PC",
+      "repo": "https://github.com/KevinL50-sysadmin/F1-05-PC",
+      "canal_juego": "f1-05-pc",
+      "mensaje_known_issues": "1574407989467684918",
+      "pie": "This list is updated with every release. Found something not listed? #problems-and-errors."
+    }
+  }
+}

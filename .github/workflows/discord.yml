@@ -1,0 +1,55 @@
+# Copy to .github/workflows/discord.yml in a game repo and set JUEGO.
+# The game repo carries its own copy of the tools in tools/discord/ (sync.py, discord_api.py, juegos.json),
+# copied from the shared Discord tools (copiar-a-juego.py).
+# Repository secrets needed (Settings > Secrets and variables > Actions):
+#   DISCORD_WEBHOOK_KNOWN_ISSUES   webhook "Race Control" of #known-issues
+#   DISCORD_WEBHOOK_ANNOUNCEMENTS  webhook "Race Control" of #announcements
+# They are webhook URLs only: they can post and edit their own messages, nothing else.
+# Store them exactly as Discord gives them (no trailing slash, no query) so GitHub masks them in logs.
+name: Discord
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version, e.g. 1.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord
+  cancel-in-progress: false
+
+env:
+  JUEGO: f1-06
+
+jobs:
+  discord:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Version
+        run: |
+          v="${INPUT_VERSION:-$TAG}"
+          [[ "$v" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid version: $v"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TAG: ${{ github.event.release.tag_name }}
+      - name: Known issues
+        run: python3 tools/discord/sync.py known-issues --juego "$JUEGO" --version "$VERSION" --fuente discord/known-issues.md --config tools/discord/juegos.json --publicar
+        env:
+          DISCORD_WEBHOOK_KNOWN_ISSUES: ${{ secrets.DISCORD_WEBHOOK_KNOWN_ISSUES }}
+      - name: Announcement
+        if: ${{ !cancelled() && env.VERSION != '' }}
+        run: python3 tools/discord/sync.py anuncio --juego "$JUEGO" --version "$VERSION" --changelog CHANGELOG.md --texto "discord/anuncios/${VERSION#v}.md" --config tools/discord/juegos.json --publicar
+        env:
+          DISCORD_WEBHOOK_ANNOUNCEMENTS: ${{ secrets.DISCORD_WEBHOOK_ANNOUNCEMENTS }}

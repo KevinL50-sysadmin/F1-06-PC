@@ -4,7 +4,8 @@
 /juego/
 /build/
 /logs/
-/tools/
+/tools/*
+!/tools/discord/
 /third_party/
 /mc0/
 /mc1/

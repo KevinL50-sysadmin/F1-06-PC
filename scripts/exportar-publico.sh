@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Exporta la parte publica del proyecto a dist/F1-06-PC, la copia de trabajo del repositorio publico F1-06-PC
-# (este repositorio sigue privado). Solo sale una lista blanca revisada de archivos del repositorio (nunca lo que
-# .gitignore deja fuera): archivo a archivo los .cmd de la raiz, .gitignore, README.md, LICENSE, .github/FUNDING.yml,
-# config/recomp.toml, gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/
-# y los .patch de parches/. Se quedan fuera las notas de trabajo (odd/, ESTADO.md, ROADMAP.md, analisis/), los
-# borradores del anuncio (docs/lanzamiento/*.md), scripts/pcsx2-ref.ps1 (lleva la ruta de la ISO del usuario),
-# scripts/comentarios.ps1 (herramienta del autor para leer y contestar comentarios de la gente),
-# scripts/cerrojo-pc.sh (coordina el PC del autor entre sus sesiones de trabajo),
-# scripts/exportar-personales.txt (patrones privados de datos personales), .git-blame-ignore-revs (nombra
-# commits privados) y, por supuesto, cualquier dato del juego. Un archivo nuevo en src/, parches/, gpu/, config/,
-# scripts/, docs/ o .github/ que no este en la lista ni entre los privados conocidos hace fallar la exportacion: hay que
-# revisarlo y anadirlo a una de las dos listas de abajo.
+# Exporta la parte publica del proyecto a dist/F1-06-PC, la copia de trabajo del repositorio publico F1-06-PC.
+# Solo sale una lista blanca revisada de archivos del repositorio (nunca lo que .gitignore deja fuera): archivo a
+# archivo los .cmd de la raiz, .gitignore, README.md, LICENSE, .github/FUNDING.yml, config/recomp.toml,
+# gpu/pgs_puente/, scripts/ y las capturas de docs/lanzamiento/img/; por tipo los .cpp y .h de src/ y los .patch de
+# parches/. Para el servidor de Discord salen el workflow .github/workflows/discord.yml, la copia de sus herramientas
+# (tools/discord/sync.py, discord_api.py y juegos.json: lo unico de tools/ que se publica) y sus textos
+# (discord/known-issues.md y discord/anuncios/*.md). Nunca sale ningun dato del juego.
+#
+# Los archivos privados y los patrones de datos personales no estan en este script, que se publica: se leen de dos
+# listas que no se exportan, scripts/exportar-privados.txt (rutas) y scripts/exportar-personales.txt (patrones); el
+# formato de cada una esta al principio del archivo. Si falta alguna, o esta vacia, la exportacion falla (codigo 1)
+# antes de tocar dist/. Un archivo nuevo en src/, parches/, gpu/, config/, scripts/, docs/, .github/, discord/ o
+# tools/discord/ que no este en la lista blanca ni entre los privados hace fallar la exportacion: hay que revisarlo y
+# anadirlo a una de las dos listas.
 #
 # La exportacion se monta en una carpeta temporal y se comprueba; falla (codigo 1, sin tocar dist/F1-06-PC) si
 # encuentra archivos sin revisar, rutas excluidas, datos personales (tambien en UTF-16 y en el texto de los binarios,
-# como los metadatos tEXt de un PNG; el texto comprimido de un PNG, zTXt/iTXt, no se mira), archivos de mas de 5 MB o
-# datos del juego. Si todo esta bien sustituye el contenido de dist/F1-06-PC entero (sin restos de archivos
-# borrados o renombrados) y conserva su .git, asi cada version es un commit nuevo encima del anterior.
+# como los metadatos tEXt de un PNG; el texto comprimido de un PNG, zTXt/iTXt, no se mira), archivos de mas de 5 MB,
+# datos del juego o un README.md que nombra notas privadas. Si todo esta bien sustituye el contenido de dist/F1-06-PC
+# entero (sin restos de archivos borrados o renombrados) y conserva su .git, asi cada version es un commit nuevo encima
+# del anterior.
 #
 # Despues comprueba la identidad con la que se hara el commit publico y falla (codigo 2, con la exportacion ya
 # copiada) si no se ha elegido a proposito o si algun commit de dist/F1-06-PC tiene otro autor. Se elige con
@@ -28,7 +31,6 @@
 #   bash scripts/exportar-publico.sh             # exporta lo que hay en HEAD (git archive: solo lo que tiene commit)
 #   bash scripts/exportar-publico.sh --trabajo   # exporta la carpeta tal como quedaria tras el proximo commit
 #                                                # (cambios sin commit y archivos nuevos no ignorados incluidos)
-# Prueba del propio script: bash scripts/probar-exportar-publico.sh
 set -euo pipefail
 
 raiz="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,7 +45,7 @@ esac
 
 # Lista blanca revisada, archivo a archivo. Un archivo de la lista que no exista no es un fallo.
 revisados=(
-    .gitignore README.md CHANGELOG.md LICENSE .github/FUNDING.yml
+    .gitignore README.md CHANGELOG.md LICENSE .github/FUNDING.yml .github/workflows/discord.yml
     compilar-ps2recomp.cmd compilar-runner.cmd ejecutar.cmd entorno.cmd recompilar.cmd
     config/recomp.toml
     gpu/pgs_puente/CMakeLists.txt gpu/pgs_puente/LICENSE.txt gpu/pgs_puente/compilar.cmd
@@ -71,28 +73,148 @@ revisados=(
     scripts/prueba_vu1.cpp scripts/recortar.ps1 scripts/simbolizar.ps1 scripts/tanda-tarjeta.ps1 scripts/teclas.ps1 scripts/vu_dis.py
     scripts/wav_chasquidos.py scripts/wav_comparar.py scripts/wav_niveles.py scripts/wav_recortar.py
     scripts/wav_vs_pss.py
+    tools/discord/sync.py tools/discord/discord_api.py tools/discord/juegos.json
+    discord/known-issues.md
 )
 declare -A es_revisado
 for f in "${revisados[@]}"; do es_revisado[$f]=1; done
+
+no_valida() {
+    echo "FALLO: $*" >&2
+    echo "Exportacion NO valida. dist/F1-06-PC no se ha tocado." >&2
+    exit 1
+}
+# leer_lista <archivo> <prefijo>...: deja en $lineas las lineas que cuentan (sin CR ni espacios al principio y al final;
+# sin # ni en blanco) y en $numeros su numero de linea. Formato comun de las dos listas: una linea que empieza por una
+# palabra en minusculas seguida de ": " lleva un prefijo, que tiene que ser uno de los dados (una unidad como "J:" no
+# es un prefijo). Cualquier espacio en blanco tras "prefijo:" (tab incluido) se deja como ": ", para que un tab no
+# convierta la linea en un patron literal que nunca casa. Falla si el archivo no existe o si una linea lleva un prefijo
+# desconocido.
+leer_lista() {
+    local archivo=$1 linea=0 l p conocido
+    shift
+    lineas=()
+    numeros=()
+    [ -f "$raiz/$archivo" ] || no_valida "falta $archivo (lista privada que no se exporta; hace falta para exportar)."
+    while IFS= read -r l || [ -n "$l" ]; do
+        linea=$((linea + 1))
+        l="${l%$'\r'}"
+        l="${l#"${l%%[![:space:]]*}"}"
+        l="${l%"${l##*[![:space:]]}"}"
+        case "$l" in "" | "#"*) continue ;; esac
+        if [[ $l =~ ^([a-z]+):[[:space:]]+(.*)$ ]]; then
+            l="${BASH_REMATCH[1]}: ${BASH_REMATCH[2]}"
+            conocido=0
+            for p in "$@"; do [ "${BASH_REMATCH[1]}" != "$p" ] || conocido=1; done
+            [ "$conocido" = 1 ] || no_valida "prefijo desconocido \"${BASH_REMATCH[1]}:\" en $archivo, linea $linea."
+        fi
+        lineas+=("$l")
+        numeros+=("$linea")
+    done < "$raiz/$archivo"
+}
+# sin_barra <ruta>: deja en $ruta la ruta sin "/" al final si no lleva comodines (* ? [): "carpeta/" cubre lo mismo que "carpeta".
+sin_barra() {
+    ruta=$1
+    case "$ruta" in *[*?[]*) return ;; esac
+    while [ "${ruta%/}" != "$ruta" ]; do ruta="${ruta%/}"; done
+}
+
+# Archivos privados (scripts/exportar-privados.txt): rutas o patrones de shell (privados), "excluida: <ruta>" (solo
+# no puede aparecer en lo exportado) y "nota: <ERE>" (notas que el README.md no puede nombrar). Una ruta sin comodines
+# cubre esa ruta y todo lo que tiene dentro, con o sin "/" al final. Las dos listas son privadas siempre, aunque no se
+# nombren a si mismas.
+lista_privados=scripts/exportar-privados.txt
+lista_personales=scripts/exportar-personales.txt
+privados_rutas=("$lista_privados" "$lista_personales")
+excluidas_privadas=("$lista_privados" "$lista_personales")
+notas=""
+# grep sale con 2 si el patron no vale: no se puede tomar por "sin coincidencias".
+patron_valido() { local r=0; printf '' | grep -E -e "$1" || r=$?; [ "$r" -le 1 ]; }
+# valor <linea> <prefijo>: lo que va tras "<prefijo>:", sin espacios delante; vacio no vale.
+valor() {
+    v="${1#"$2":}"; v="${v#"${v%%[![:space:]]*}"}"
+    [ -n "$v" ] || no_valida "\"$2:\" sin valor en $3, linea $4."
+}
+leer_lista "$lista_privados" excluida nota
+[ "${#lineas[@]}" -gt 0 ] || no_valida "$lista_privados no tiene ninguna ruta."
+for i in "${!lineas[@]}"; do
+    l="${lineas[$i]}"
+    case "$l" in
+        "excluida: "* | excluida:)
+            valor "$l" excluida "$lista_privados" "${numeros[$i]}"
+            sin_barra "$v"; excluidas_privadas+=("$ruta") ;;
+        "nota: "* | nota:)
+            valor "$l" nota "$lista_privados" "${numeros[$i]}"
+            patron_valido "($v)" 2>/dev/null \
+                || no_valida "patron no valido para grep -E en $lista_privados, linea ${numeros[$i]}."
+            notas+="${notas:+|}($v)" ;;
+        *)
+            sin_barra "$l"
+            privados_rutas+=("$ruta")
+            case "$ruta" in *[*?[]*) ;; *) excluidas_privadas+=("$ruta") ;; esac ;;
+    esac
+done
+# coincide <ruta> <ruta o patron>: la ruta es esa, casa con el patron o esta dentro de esa carpeta.
+coincide() {
+    # shellcheck disable=SC2053 # el patron va sin comillas a proposito
+    [[ $1 == $2 || $1 == $2/* ]]
+}
+
+# Datos personales (scripts/exportar-personales.txt), sin distinguir mayusculas: una ERE por linea para texto, UTF-16 y
+# binarios, "texto: <ERE>" solo para texto y UTF-16, "binario: <ERE>" solo para binarios y "permitido: <ERE>" lo que se
+# borra de las lineas de texto antes de buscar (enlaces y perfiles publicos). Un patron no valido para grep -E (o para
+# sed -E, los permitidos) hace fallar la exportacion. Con -i no siempre se igualan mayusculas fuera del ASCII: una
+# letra acentuada se escribe alli en las dos formas (en los binarios se busca byte a byte: el texto debe ir en UTF-8).
+personales=""
+personales_binario=""
+permitidos=""
+sep=$'\001'
+leer_lista "$lista_personales" texto binario permitido
+for i in "${!lineas[@]}"; do
+    l="${lineas[$i]}"
+    tipo=ambos
+    case "$l" in
+        "texto: "* | texto:) tipo=texto; valor "$l" texto "$lista_personales" "${numeros[$i]}"; l="$v" ;;
+        "binario: "* | binario:) tipo=binario; valor "$l" binario "$lista_personales" "${numeros[$i]}"; l="$v" ;;
+        "permitido: "* | permitido:)
+            tipo=permitido; valor "$l" permitido "$lista_personales" "${numeros[$i]}"; l="$v" ;;
+    esac
+    if [ "$tipo" = permitido ]; then
+        case "$l" in *"$sep"*) no_valida "patron no valido para sed -E en $lista_personales, linea ${numeros[$i]}." ;; esac
+        printf '' | sed -E "s$sep$l$sep${sep}gI" 2>/dev/null \
+            || no_valida "patron no valido para sed -E en $lista_personales, linea ${numeros[$i]}."
+        permitidos+="s$sep$l$sep${sep}gI;"
+        continue
+    fi
+    patron_valido "($l)" 2>/dev/null \
+        || no_valida "patron no valido para grep -E en $lista_personales, linea ${numeros[$i]}."
+    [ "$tipo" = binario ] || personales+="${personales:+|}($l)"
+    [ "$tipo" = texto ] || personales_binario+="${personales_binario:+|}($l)"
+done
+[ -n "$personales" ] || no_valida "$lista_personales no tiene ningun patron para texto."
+[ -n "$personales_binario" ] || no_valida "$lista_personales no tiene ningun patron para binarios."
+for p in "$personales" "$personales_binario"; do
+    patron_valido "$p" || no_valida "patron de datos personales no valido"
+done
 
 # Deja en $clase si un archivo del repositorio es publico, privado, sin revisar (en una carpeta publicada pero en
 # ninguna lista) o queda fuera sin mas (el resto del repositorio).
 clasificar() {
     if [ -n "${es_revisado[$1]:-}" ]; then clase=publico; return; fi
     case "$1" in
-        src/*.cpp | src/*.h | parches/*.patch) clase=publico ;;
-        # probar-exportar-publico.sh monta por piezas el nombre y las rutas reales del usuario para probar la busqueda: privado.
-        # comentarios.ps1 es una herramienta del autor para atender a la gente, no de los jugadores: privado.
-        # cerrojo-pc.sh coordina el PC del autor entre sus sesiones de trabajo: privado.
-        scripts/pcsx2-ref.ps1 | scripts/probar-exportar-publico.sh | scripts/exportar-personales.txt | scripts/comentarios.ps1 | scripts/cerrojo-pc.sh | docs/lanzamiento/*.md | docs/lanzamiento/img/redes/* | docs/lanzamiento/img/*-espejo.png) clase=privado ;;
-        # Candidatas de capturas que el README no usa (las que usa estan en revisados).
-        docs/lanzamiento/img/v11[0-9]-*) clase=privado ;;
-        # Pruebas del autor en su PC (GUI de RecompLauncher, instalador, fallos provocados): privado.
-        scripts/pruebas/fallos-t4.ps1 | scripts/rl-t4-*.ps1 | scripts/rl-t5-*.ps1 | scripts/rl-t8-*.ps1 | scripts/rl-t9-*.ps1 | scripts/rl-t12-*) clase=privado ;;
-        src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/*) clase=sin-revisar ;;
+        discord/anuncios/*/*) clase=sin-revisar; return ;;
+        src/*.cpp | src/*.h | parches/*.patch | discord/anuncios/*.md) clase=publico; return ;;
+    esac
+    local p
+    for p in "${privados_rutas[@]}"; do
+        if coincide "$1" "$p"; then clase=privado; return; fi
+    done
+    case "$1" in
+        src/* | parches/* | gpu/* | config/* | scripts/* | docs/* | .github/* | discord/* | tools/discord/*)
+            clase=sin-revisar ;;
         # Un archivo nuevo en la raiz (p. ej. otro .cmd) hay que revisarlo, no dejarlo fuera sin avisar.
         */*) clase=fuera ;;
-        *.md | ESTADO* | ROADMAP* | .git-blame-ignore-revs) clase=fuera ;;
+        *.md) clase=fuera ;;
         *) clase=sin-revisar ;;
     esac
 }
@@ -152,56 +274,32 @@ for f in ${de_carpeta[@]+"${de_carpeta[@]}"}; do
     cp -- "$raiz/$f" "$arbol/$f"
 done
 for f in ${sin_revisar[@]+"${sin_revisar[@]}"}; do
-    fallo "archivo sin revisar (anadelo a la lista blanca o a los privados de scripts/exportar-publico.sh): $f"
+    fallo "archivo sin revisar (anadelo a la lista blanca de scripts/exportar-publico.sh o a $lista_privados): $f"
 done
 
 # Comprobaciones, sobre la carpeta temporal.
 cd "$arbol"
 
-excluidas=(odd ESTADO.md ROADMAP.md analisis .git-blame-ignore-revs config/recomp.toml.antes-entradas logs
-           scripts/pcsx2-ref.ps1 scripts/exportar-personales.txt scripts/comentarios.ps1 scripts/cerrojo-pc.sh juego mc0 mc1 datos data build tools
-           third_party)
+excluidas=(juego mc0 mc1 datos data build third_party)
 for ruta in "${excluidas[@]}"; do
     [ ! -e "$ruta" ] || fallo "ruta excluida presente: $ruta"
 done
-for borrador in docs/lanzamiento/*.md; do
-    [ ! -e "$borrador" ] || fallo "borrador del anuncio presente: $borrador"
+# Las rutas excluidas de la lista privada: ninguna ruta exportada (archivo o carpeta) puede coincidir.
+exportadas=()
+while IFS= read -r -d '' f; do exportadas+=("${f#./}"); done < <(find . -mindepth 1 -print0)
+for ruta in "${excluidas_privadas[@]}"; do
+    for f in ${exportadas[@]+"${exportadas[@]}"}; do
+        if coincide "$f" "$ruta"; then fallo "ruta excluida presente: $ruta"; break; fi
+    done
 done
-
-# Datos personales, sin distinguir mayusculas: rutas de la unidad J: y de la carpeta del usuario de Windows, su nombre,
-# su correo y las carpetas del proyecto y de la ISO. Se permiten el enlace al repositorio publico
-# (github.com/<cuenta>/F1-06-PC), los perfiles publicos de Ko-fi y X del autor (tambien el ko_fi de .github/FUNDING.yml)
-# y las carpetas de usuario genericas (Users/Public y Users/p de los tests). Se anaden los patrones del archivo privado
-# scripts/exportar-personales.txt si existe (una ERE por linea, sin los espacios del final; # y lineas en blanco no
-# cuentan): asi los datos que no deben salir ni como patron no estan en este script, que se publica. Un patron no
-# valido para grep -E hace fallar la exportacion. Con -i no siempre se igualan mayusculas fuera del ASCII: una letra
-# acentuada se escribe alli en las dos formas (en los binarios se busca byte a byte: el texto debe ir en UTF-8).
-# Los corchetes evitan que este mismo script coincida con sus patrones.
-personales='J:[\\/]|[a-z]:[\\/]+users[\\/]+[a-z0-9._-]{2,}|K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula'
-permitidos='s#github\.com/K[e]vinL50-sysadmin/##gI; s#ko-fi\.com/k[e]vinl50##gI; s#(recompstore|recomplauncher)\.com/dev/k[e]vinl50-sysadmin\b##gI; s#ko_fi: k[e]vinl50##gI; s#(x|twitter)\.com/K[e]vinLA50##gI; s#@K[e]vinLA50##gI; s#users[\\/]+(public|default)\b##gI'
-# En los binarios solo los patrones largos (los cortos darian falsos positivos en datos comprimidos).
-personales_binario='K[e]vin|@[g]mail|IAs[\\/]+Claude|(Descargas|Downloads)[\\/]+Formula|[a-z]:[\\/]+users[\\/]+k[e]vin'
-# grep sale con 2 si el patron no vale: no se puede tomar por "sin coincidencias".
-patron_valido() { local r=0; printf '' | grep -E -e "$1" || r=$?; [ "$r" -le 1 ]; }
-if [ -f "$raiz/scripts/exportar-personales.txt" ]; then
-    linea=0
-    while IFS= read -r patron || [ -n "$patron" ]; do
-        linea=$((linea + 1))
-        patron="${patron%$'\r'}"
-        patron="${patron%"${patron##*[![:space:]]}"}"
-        case "$patron" in "" | "#"*) continue ;; esac
-        if ! patron_valido "($patron)" 2>/dev/null; then
-            echo "FALLO: patron no valido para grep -E en scripts/exportar-personales.txt, linea $linea." >&2
-            echo "Exportacion NO valida. dist/F1-06-PC no se ha tocado." >&2
-            exit 1
-        fi
-        personales+="|($patron)"
-        personales_binario+="|($patron)"
-    done < "$raiz/scripts/exportar-personales.txt"
+# tools/ (herramientas portables) tambien esta excluida, salvo la copia de las herramientas de Discord.
+if [ -e tools ]; then
+    otras_tools="$(find tools -mindepth 1 ! -path tools/discord ! -path tools/discord/sync.py \
+        ! -path tools/discord/discord_api.py ! -path tools/discord/juegos.json -print)"
+    [ -z "$otras_tools" ] || fallo "ruta excluida presente en tools/:"$'\n'"$otras_tools"
 fi
-for p in "$personales" "$personales_binario"; do
-    patron_valido "$p" || { echo "FALLO: patron de datos personales no valido" >&2; exit 1; }
-done
+
+# Datos personales, con los patrones leidos al principio.
 buscar_personales() { sed -E "$permitidos" | grep -i -E "$personales"; }
 # grep_personales <salida> <grep...>: deja las lineas en <salida>; un 2 de grep (no pudo leer) es un fallo, no "limpio".
 grep_personales() {
@@ -250,12 +348,14 @@ juego="$(find . \( -iname '*.iso' -o -iname '*.wad' -o -iname '*.elf' -o -iname 
     -print)"
 [ -z "$juego" ] || fallo "datos del juego:"$'\n'"$juego"
 
-privados='ESTADO\.md|ROADMAP\.md|odd[/\\]|analisis[/\\]'
-if [ -f README.md ] && grep -n -E "$privados" README.md >&2; then fallo "README.md nombra archivos privados"; fi
-menciones="$(grep -r -I -l -E "$privados" . | grep -v '^\./README\.md$' || true)"
-if [ -n "$menciones" ]; then
-    echo "Aviso: comentarios que nombran notas privadas (no se publican; no es un fallo):" >&2
-    echo "$menciones" | sed 's/^/  /' >&2
+# Notas privadas ("nota:" de la lista privada): el README.md no puede nombrarlas; en el resto, solo un aviso.
+if [ -n "$notas" ]; then
+    if [ -f README.md ] && grep -n -E "$notas" README.md >&2; then fallo "README.md nombra archivos privados"; fi
+    menciones="$(grep -r -I -l -E "$notas" . | grep -v '^\./README\.md$' || true)"
+    if [ -n "$menciones" ]; then
+        echo "Aviso: comentarios que nombran notas privadas (no se publican; no es un fallo):" >&2
+        echo "$menciones" | sed 's/^/  /' >&2
+    fi
 fi
 
 archivos="$(find . -type f | wc -l)"
@@ -274,7 +374,7 @@ find "$arbol" -mindepth 1 -maxdepth 1 -exec mv -t "$destino" {} +
 echo "Exportado ($origen) a $destino"
 echo "Comprobaciones superadas."
 
-# Identidad del commit publico: nunca la del repositorio privado sin mas.
+# Identidad del commit publico: nunca la del repositorio de trabajo sin mas.
 nombre="${F1_PUBLICO_NOMBRE:-}"
 correo="${F1_PUBLICO_EMAIL:-}"
 identidad=0
@@ -294,7 +394,7 @@ elif [ -d "$destino/.git" ]; then
         *@users.noreply.github.com) ;;
         *)
             echo "FALLO: la identidad de dist/F1-06-PC/.git (\"$nombre <$correo>\") no es un correo noreply de GitHub" \
-                 "ni se ha elegido con F1_PUBLICO_NOMBRE/F1_PUBLICO_EMAIL; puede ser la copiada del repositorio privado." >&2
+                 "ni se ha elegido con F1_PUBLICO_NOMBRE/F1_PUBLICO_EMAIL; puede ser la copiada del repositorio de trabajo." >&2
             identidad=1 ;;
     esac
 else
