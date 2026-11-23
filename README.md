@@ -8,6 +8,8 @@
   <a href="https://discord.gg/sSFHTNQsmv"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white&style=for-the-badge" alt="Join the Formula One 2005/2006 PC Discord" height="48"></a>
 </p>
 
+<p align="center"><b>Discord:</b> <a href="https://discord.gg/sSFHTNQsmv">https://discord.gg/sSFHTNQsmv</a></p>
+
 # F1 06 PC: a native Windows port of Formula One 06 (PS2) by static recompilation
 
 > **Fan project. Not affiliated with, endorsed by or connected to Sony Interactive Entertainment, SCE Studio Liverpool,
