@@ -2,9 +2,7 @@
 
 <p align="center">
   <a href="https://recomplauncher.com/game/f1-06-pc"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher" height="48"></a>
-  &nbsp;&nbsp;
   <a href="https://recompstore.com/dev/kevinl50-sysadmin"><img src="https://recompstore.com/assets/press/verified-dark.svg" alt="Verified developer on RecompStore" height="48"></a>
-  &nbsp;&nbsp;
   <a href="https://discord.gg/sSFHTNQsmv"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white&style=for-the-badge" alt="Join the Formula One 2005/2006 PC Discord" height="48"></a>
 </p>
 
